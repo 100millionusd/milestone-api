@@ -1,0 +1,420 @@
+[
+  {
+    "proposalId": 1,
+    "status": "approved",
+    "createdAt": 1756385486013,
+    "orgName": "Test School",
+    "title": "Repair roof",
+    "summary": "Fix leaking roof",
+    "contact": "school@example.org",
+    "address": "Main St 1",
+    "city": "Nairobi",
+    "country": "KE",
+    "amountUSD": 3000,
+    "docs": []
+  },
+  {
+    "proposalId": 2,
+    "status": "approved",
+    "createdAt": 1756385624574,
+    "orgName": "xsaxa",
+    "title": "sxaxsax",
+    "summary": "saxsax",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Carrer Joan Miro 17",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 0,
+    "docs": [
+      {
+        "name": "Screenshot 2025-08-27 at 17.28.40.png",
+        "cid": "QmborrMMbBgF12TQD1aZWakMyvrW5eMJgjkbAWC2xmYAQd",
+        "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmborrMMbBgF12TQD1aZWakMyvrW5eMJgjkbAWC2xmYAQd",
+        "size": 283858
+      }
+    ]
+  },
+  {
+    "proposalId": 3,
+    "orgName": "qsq",
+    "title": "qsqs",
+    "summary": "sqsq",
+    "contact": "schmidt@heitaria.ch",
+    "address": "s",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 400,
+    "docs": [],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-08-28T19:32:20.880Z"
+  },
+  {
+    "proposalId": 4,
+    "orgName": "aS",
+    "title": "ASA",
+    "summary": "Sasas",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Carrer Joan Miro 17\n3 B",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 400,
+    "docs": [
+      {
+        "cid": "QmRK3oDGqeWg3Ni7RrzkPC2VjP7sjUmUy3jEz8EjUyWquX",
+        "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmRK3oDGqeWg3Ni7RrzkPC2VjP7sjUmUy3jEz8EjUyWquX",
+        "name": "Screenshot 2025-08-28 at 11.44.25.png",
+        "size": 634411
+      }
+    ],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-08-28T21:38:24.621Z"
+  },
+  {
+    "proposalId": 5,
+    "orgName": "axaxa",
+    "title": "aXAX",
+    "summary": "Axax",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Carrer Joan Miro 17\n3 B",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 3999.96,
+    "docs": [
+      {
+        "cid": "QmRK3oDGqeWg3Ni7RrzkPC2VjP7sjUmUy3jEz8EjUyWquX",
+        "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmRK3oDGqeWg3Ni7RrzkPC2VjP7sjUmUy3jEz8EjUyWquX",
+        "name": "Screenshot 2025-08-28 at 11.44.25.png",
+        "size": 634411
+      }
+    ],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-08-29T07:14:25.809Z"
+  },
+  {
+    "proposalId": 6,
+    "orgName": "Token",
+    "title": "Token",
+    "summary": "Token",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Carrer Joan Miro 17\n3 B",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 5000,
+    "docs": [],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-08-29T15:57:51.034Z"
+  },
+  {
+    "proposalId": 7,
+    "orgName": "BARCELONA",
+    "title": "BARCELONA",
+    "summary": "BARCELONA",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Carrer Joan Miro 17\n3 B",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 1,
+    "docs": [],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-08-29T16:07:30.993Z"
+  },
+  {
+    "proposalId": 8,
+    "orgName": "begur",
+    "title": "begur",
+    "summary": "begur",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Carrer Joan Miro 17\n3 B",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 5000,
+    "docs": [
+      {
+        "cid": "QmanfjB22FUL7twyfD9gpT5EMn97gQ9zW7eYypw2Y8RHGv",
+        "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmanfjB22FUL7twyfD9gpT5EMn97gQ9zW7eYypw2Y8RHGv",
+        "name": "bfdw_analyse_lithium-broschuere_report.pdf",
+        "size": 3089878
+      }
+    ],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-08-29T16:23:27.771Z"
+  },
+  {
+    "proposalId": 9,
+    "orgName": "SCHMIDT",
+    "title": "SCHMIDT",
+    "summary": "REPAIR",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Carrer Joan Miro 17\n3 B",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 5000,
+    "docs": [
+      {
+        "cid": "Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS",
+        "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS",
+        "name": "Screenshot 2025-08-30 at 13.26.43.png",
+        "size": 245178
+      }
+    ],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-08-30T13:24:32.112Z"
+  },
+  {
+    "proposalId": 10,
+    "orgName": "MIM",
+    "title": "MIM",
+    "summary": "MIM",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Carrer Joan Miro 17\n3 B",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 5000,
+    "docs": [
+      {
+        "cid": "Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS",
+        "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS",
+        "name": "Screenshot 2025-08-30 at 13.26.43.png",
+        "size": 245178
+      }
+    ],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-08-30T15:40:19.575Z"
+  },
+  {
+    "proposalId": 11,
+    "orgName": "GAVA",
+    "title": "GAVA",
+    "summary": "GAVA",
+    "contact": "schmidt@flyandjump.de",
+    "address": "96 rue du Paradis",
+    "city": "Marseille",
+    "country": "France",
+    "amountUSD": 5,
+    "docs": [
+      {
+        "cid": "Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS",
+        "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS",
+        "name": "Screenshot 2025-08-30 at 13.26.43.png",
+        "size": 245178
+      }
+    ],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-08-31T12:51:15.447Z"
+  },
+  {
+    "proposalId": 12,
+    "orgName": "GAVA",
+    "title": "GAVA",
+    "summary": "GAVA",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Carrer Joan Miro 17\n3 B",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 5,
+    "docs": [],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-08-31T12:59:30.411Z"
+  },
+  {
+    "proposalId": 13,
+    "orgName": "Birthday",
+    "title": "Birthday",
+    "summary": "Birthday",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Carrer Joan Miro 17\n3 B",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 1,
+    "docs": [
+      {
+        "cid": "QmTqLMn4JLg22mB3e6h1SVFr8mK8NjUabsjoQpQstNDJhf",
+        "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmTqLMn4JLg22mB3e6h1SVFr8mK8NjUabsjoQpQstNDJhf",
+        "name": "IMG_0317.jpeg",
+        "size": 3060510
+      }
+    ],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-09-01T15:34:57.083Z"
+  },
+  {
+    "proposalId": 14,
+    "orgName": "21",
+    "title": "21",
+    "summary": "21",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Carrer Joan Miro 17\n3 B",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 1,
+    "docs": [
+      {
+        "cid": "QmdK2HGCsThjeRZbABw7fdYNgoJDFjKKJ6p74oJTQDr54a",
+        "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmdK2HGCsThjeRZbABw7fdYNgoJDFjKKJ6p74oJTQDr54a",
+        "name": "Screenshot 2025-09-01 at 17.49.05.png",
+        "size": 156419
+      }
+    ],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-09-01T15:53:21.448Z"
+  },
+  {
+    "proposalId": 15,
+    "orgName": "25",
+    "title": "25",
+    "summary": "25",
+    "contact": "schmidt@flyandjump.de",
+    "address": "96 rue du Paradis",
+    "city": "Marseille",
+    "country": "France",
+    "amountUSD": 1,
+    "docs": [
+      {
+        "cid": "QmdK2HGCsThjeRZbABw7fdYNgoJDFjKKJ6p74oJTQDr54a",
+        "url": "https://ivory-negative-spoonbird-17.mypinata.cloud/ipfs/QmdK2HGCsThjeRZbABw7fdYNgoJDFjKKJ6p74oJTQDr54a",
+        "name": "Screenshot 2025-09-01 at 17.49.05.png",
+        "size": 156419
+      }
+    ],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-09-01T16:03:14.228Z"
+  },
+  {
+    "proposalId": 16,
+    "orgName": "TEST",
+    "title": "TEST",
+    "summary": "TEST",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Carrer Joan Miro 17\n3 B",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 1,
+    "docs": [
+      {
+        "cid": "QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+        "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+        "name": "Screenshot 2025-09-03 at 14.50.26.png",
+        "size": 62418
+      }
+    ],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-09-03T13:49:19.802Z"
+  },
+  {
+    "proposalId": 17,
+    "orgName": "TEST3",
+    "title": "TEST3",
+    "summary": "test3",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Frohmattstrasse 12",
+    "city": "Freienbach",
+    "country": "Switzerland",
+    "amountUSD": 1,
+    "docs": [
+      {
+        "cid": "Qmcz4KYf9TDuNyyiPSpS2JC26YqVdMVvsiqRNwnJCKvj9C",
+        "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmcz4KYf9TDuNyyiPSpS2JC26YqVdMVvsiqRNwnJCKvj9C",
+        "name": "Screenshot 2025-09-03 at 14.36.04.png",
+        "size": 425771
+      }
+    ],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-09-03T13:54:25.049Z"
+  },
+  {
+    "proposalId": 18,
+    "orgName": "TEST6",
+    "title": "TEST6",
+    "summary": "test6",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Frohmattstrasse 12",
+    "city": "Freienbach",
+    "country": "Switzerland",
+    "amountUSD": 1,
+    "docs": [
+      {
+        "cid": "QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+        "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+        "name": "Screenshot 2025-09-03 at 14.50.26.png",
+        "size": 62418
+      }
+    ],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-09-03T14:14:37.962Z"
+  },
+  {
+    "proposalId": 19,
+    "orgName": "TEST7",
+    "title": "TEST7",
+    "summary": "test",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Carrer Joan Miro 17\n3 B",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 0.94,
+    "docs": [
+      {
+        "cid": "QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+        "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+        "name": "Screenshot 2025-09-03 at 14.50.26.png",
+        "size": 62418
+      }
+    ],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-09-03T14:24:49.751Z"
+  },
+  {
+    "proposalId": 20,
+    "orgName": "1",
+    "title": "1",
+    "summary": "1",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Carrer Joan Miro 17\n3 B",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 1,
+    "docs": [],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-09-03T14:52:45.579Z"
+  },
+  {
+    "proposalId": 21,
+    "orgName": "jump",
+    "title": "jump",
+    "summary": "jump",
+    "contact": "schmidt@heitaria.ch",
+    "address": "Carrer Joan Miro 17\n3 B",
+    "city": "Esplugues de Llobregat",
+    "country": "Spain",
+    "amountUSD": 1,
+    "docs": [
+      {
+        "cid": "Qmet56kN3jtR54CA2B8nF4DdTypgRZSyJ9AgYVaxF55aLA",
+        "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmet56kN3jtR54CA2B8nF4DdTypgRZSyJ9AgYVaxF55aLA",
+        "name": "Screenshot 2025-09-03 at 16.38.23.png",
+        "size": 230588
+      }
+    ],
+    "cid": "",
+    "status": "approved",
+    "createdAt": "2025-09-03T15:57:30.162Z"
+  }
+]

@@ -1,0 +1,693 @@
+[
+  {
+    "bidId": 1,
+    "proposalId": 5,
+    "vendorName": "kosel ag",
+    "priceUSD": 300,
+    "days": 30,
+    "notes": "kosel 2",
+    "walletAddress": "0x6Ea01052F315EBf1a4E907eF3B6CC1006D37Ce9D",
+    "preferredStablecoin": "USDT",
+    "milestones": [
+      {
+        "name": "1",
+        "amount": 50,
+        "dueDate": "2025-08-30T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-08-30T11:28:53.392Z",
+        "proof": "\n\nAttachments:\n- Screenshot 2025-08-30 at 13.26.43.png: https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS"
+      },
+      {
+        "name": "2",
+        "amount": 50,
+        "dueDate": "2025-08-30T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-08-30T13:28:04.949Z",
+        "proof": "completed\n\nPayment TX: 0x65f247a134c8e8"
+      }
+    ],
+    "doc": {
+      "cid": "QmRK3oDGqeWg3Ni7RrzkPC2VjP7sjUmUy3jEz8EjUyWquX",
+      "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmRK3oDGqeWg3Ni7RrzkPC2VjP7sjUmUy3jEz8EjUyWquX",
+      "name": "Screenshot 2025-08-28 at 11.44.25.png",
+      "size": 634411
+    },
+    "status": "rejected",
+    "createdAt": "2025-08-29T07:16:15.940Z"
+  },
+  {
+    "bidId": 2,
+    "proposalId": 6,
+    "vendorName": "ACISA",
+    "priceUSD": 2500,
+    "days": 1,
+    "notes": "Complete",
+    "walletAddress": "0x6Ea01052F315EBf1a4E907eF3B6CC1006D37Ce9D",
+    "preferredStablecoin": "USDT",
+    "milestones": [
+      {
+        "name": "One",
+        "amount": 0.1125,
+        "dueDate": "2025-08-29T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-08-29T16:47:06.900Z",
+        "proof": "completed"
+      }
+    ],
+    "doc": null,
+    "status": "completed",
+    "createdAt": "2025-08-29T15:58:49.275Z"
+  },
+  {
+    "bidId": 3,
+    "proposalId": 8,
+    "vendorName": "1",
+    "priceUSD": 5000,
+    "days": 1,
+    "notes": "",
+    "walletAddress": "0x6Ea01052F315EBf1a4E907eF3B6CC1006D37Ce9D",
+    "preferredStablecoin": "USDT",
+    "milestones": [
+      {
+        "name": "1",
+        "amount": 5000,
+        "dueDate": "2025-08-29T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-08-29T17:20:45.511Z",
+        "proof": "completed"
+      }
+    ],
+    "doc": null,
+    "status": "completed",
+    "createdAt": "2025-08-29T16:25:14.657Z"
+  },
+  {
+    "bidId": 4,
+    "proposalId": 4,
+    "vendorName": "NEW",
+    "priceUSD": 5,
+    "days": 1,
+    "notes": "complete",
+    "walletAddress": "0x6Ea01052F315EBf1a4E907eF3B6CC1006D37Ce9D",
+    "preferredStablecoin": "USDT",
+    "milestones": [
+      {
+        "name": "1",
+        "amount": 0.82,
+        "dueDate": "2025-08-29T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-08-29T17:23:17.789Z",
+        "proof": "completed"
+      }
+    ],
+    "doc": null,
+    "status": "completed",
+    "createdAt": "2025-08-29T17:22:15.555Z"
+  },
+  {
+    "bidId": 5,
+    "proposalId": 9,
+    "vendorName": "BROSE",
+    "priceUSD": 3000,
+    "days": 5,
+    "notes": "REPAIR",
+    "walletAddress": "0x6Ea01052F315EBf1a4E907eF3B6CC1006D37Ce9D",
+    "preferredStablecoin": "USDT",
+    "milestones": [
+      {
+        "name": "dach",
+        "amount": 50,
+        "dueDate": "2025-08-30T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-08-30T13:27:29.241Z",
+        "proof": "completedcompleted\n\nAttachments:\n- Screenshot 2025-08-30 at 13.26.43.png: https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS"
+      },
+      {
+        "name": "dach2",
+        "amount": 2500,
+        "dueDate": "2025-08-31T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-01T15:57:27.770Z",
+        "proof": "yes"
+      }
+    ],
+    "doc": null,
+    "status": "completed",
+    "createdAt": "2025-08-30T13:25:34.851Z"
+  },
+  {
+    "bidId": 6,
+    "proposalId": 10,
+    "vendorName": "LEON",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "",
+    "walletAddress": "0x6Ea01052F315EBf1a4E907eF3B6CC1006D37Ce9D",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "DONE",
+        "amount": 1,
+        "dueDate": "2025-08-30T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-01T14:52:37.975Z",
+        "proof": "xax",
+        "paymentTxHash": "0x860b08664b907bb018ef6048a688e94dffee0a304971397227d51699daf88ab9",
+        "paymentDate": "2025-09-01T14:52:51.420Z"
+      }
+    ],
+    "doc": {
+      "cid": "Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS",
+      "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS",
+      "name": "Screenshot 2025-08-30 at 13.26.43.png",
+      "size": 245178
+    },
+    "status": "completed",
+    "createdAt": "2025-08-30T15:41:41.908Z"
+  },
+  {
+    "bidId": 7,
+    "proposalId": 10,
+    "vendorName": "Leon",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "test",
+    "walletAddress": "0x6Ea01052F315EBf1a4E907eF3B6CC1006D37Ce9D",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "test",
+        "amount": 1,
+        "dueDate": "2025-08-30T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-08-30T15:49:40.938Z",
+        "proof": "completed\n\nAttachments:\n- bfdw_analyse_lithium-broschuere_report.pdf: https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmanfjB22FUL7twyfD9gpT5EMn97gQ9zW7eYypw2Y8RHGv",
+        "paymentTxHash": null,
+        "paymentDate": null
+      }
+    ],
+    "doc": {
+      "cid": "Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS",
+      "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS",
+      "name": "Screenshot 2025-08-30 at 13.26.43.png",
+      "size": 245178
+    },
+    "status": "completed",
+    "createdAt": "2025-08-30T15:43:57.171Z"
+  },
+  {
+    "bidId": 8,
+    "proposalId": 11,
+    "vendorName": "CASTELL",
+    "priceUSD": 5,
+    "days": 1,
+    "notes": "CASTELL",
+    "walletAddress": "0x6Ea01052F315EBf1a4E907eF3B6CC1006D37Ce9D",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "csatell",
+        "amount": 1,
+        "dueDate": "2025-08-31T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-01T15:24:30.472Z",
+        "proof": "zaZ",
+        "paymentTxHash": "0x4cb1964e8dd76822ec389faa914ffdeab834f7ca80e7e789b69392885a410e4b",
+        "paymentDate": "2025-09-01T15:26:48.748Z"
+      }
+    ],
+    "doc": {
+      "cid": "Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS",
+      "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS",
+      "name": "Screenshot 2025-08-30 at 13.26.43.png",
+      "size": 245178
+    },
+    "status": "completed",
+    "createdAt": "2025-08-31T12:53:31.346Z"
+  },
+  {
+    "bidId": 9,
+    "proposalId": 10,
+    "vendorName": "GAVA",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "gava",
+    "walletAddress": "0x6Ea01052F315EBf1a4E907eF3B6CC1006D37Ce9D",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "gava",
+        "amount": 1,
+        "dueDate": "2025-08-31T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-08-31T14:47:24.967Z",
+        "proof": "done\n\nAttachments:\n- Screenshot 2025-08-30 at 13.26.43.png: https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS",
+        "paymentTxHash": null,
+        "paymentDate": null
+      }
+    ],
+    "doc": null,
+    "status": "approved",
+    "createdAt": "2025-08-31T13:01:32.407Z"
+  },
+  {
+    "bidId": 10,
+    "proposalId": 12,
+    "vendorName": "KARLSRUHE",
+    "priceUSD": 5,
+    "days": 1,
+    "notes": "ka",
+    "walletAddress": "0x6Ea01052F315EBf1a4E907eF3B6CC1006D37Ce9D",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "ka",
+        "amount": 5,
+        "dueDate": "2025-08-31T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-01T14:52:08.737Z",
+        "proof": "complete\n\nAttachments:\n- IMG_0317.jpeg: https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmTqLMn4JLg22mB3e6h1SVFr8mK8NjUabsjoQpQstNDJhf",
+        "paymentTxHash": null,
+        "paymentDate": null
+      }
+    ],
+    "doc": null,
+    "status": "approved",
+    "createdAt": "2025-08-31T13:36:36.890Z"
+  },
+  {
+    "bidId": 11,
+    "proposalId": 11,
+    "vendorName": "GAG",
+    "priceUSD": 5,
+    "days": 1,
+    "notes": "GAG",
+    "walletAddress": "0x6Ea01052F315EBf1a4E907eF3B6CC1006D37Ce9D",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "GAG",
+        "amount": 5,
+        "dueDate": "2025-08-30T00:00:00.000Z",
+        "completed": false,
+        "completionDate": null,
+        "proof": "",
+        "paymentTxHash": null,
+        "paymentDate": null
+      }
+    ],
+    "doc": null,
+    "status": "approved",
+    "createdAt": "2025-08-31T13:52:07.111Z"
+  },
+  {
+    "bidId": 12,
+    "proposalId": 15,
+    "vendorName": "22",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "22",
+    "walletAddress": "0x6Ea01052F315EBf1a4E907eF3B6CC1006D37Ce9D",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "22",
+        "amount": 1,
+        "dueDate": "2025-09-01T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-03T13:03:48.646Z",
+        "proof": "w",
+        "paymentTxHash": "0x0a273e5b38043686575b3a45ffb4826be386ce87b797896a984ac1595fd4d9ad",
+        "paymentDate": "2025-09-03T13:04:16.423Z"
+      }
+    ],
+    "doc": {
+      "cid": "QmdK2HGCsThjeRZbABw7fdYNgoJDFjKKJ6p74oJTQDr54a",
+      "url": "https://ivory-negative-spoonbird-17.mypinata.cloud/ipfs/QmdK2HGCsThjeRZbABw7fdYNgoJDFjKKJ6p74oJTQDr54a",
+      "name": "Screenshot 2025-09-01 at 17.49.05.png",
+      "size": 156419
+    },
+    "status": "completed",
+    "createdAt": "2025-09-01T16:03:59.196Z"
+  },
+  {
+    "bidId": 13,
+    "proposalId": 13,
+    "vendorName": "BID",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "BID",
+    "walletAddress": "0x6Ea01052F315EBf1a4E907eF3B6CC1006D37Ce9D",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "BID",
+        "amount": 1,
+        "dueDate": "2025-09-02T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-02T11:31:58.551Z",
+        "proof": "did\n\nAttachments:\n- Screenshot 2025-09-02 at 12.32.10.png: https://ivory-negative-spoonbird-17.mypinata.cloud/ipfs/QmY9P3UjzhbPx7gRk9maMHbGa9TXi1LUvStJFk3urC23te",
+        "paymentTxHash": null,
+        "paymentDate": null
+      }
+    ],
+    "doc": {
+      "cid": "QmfMgU6V2ry1YgGQ4LAamDHn2fEBNqWwGiKPpZhaY1Qf5p",
+      "url": "https://ivory-negative-spoonbird-17.mypinata.cloud/ipfs/QmfMgU6V2ry1YgGQ4LAamDHn2fEBNqWwGiKPpZhaY1Qf5p",
+      "name": "Screenshot 2025-09-02 at 13.16.14.png",
+      "size": 234188
+    },
+    "status": "completed",
+    "createdAt": "2025-09-02T11:31:40.944Z"
+  },
+  {
+    "bidId": 14,
+    "proposalId": 14,
+    "vendorName": "SEVILLA",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "SEVILLA",
+    "walletAddress": "0x6Ea01052F315EBf1a4E907eF3B6CC1006D37Ce9D",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "1",
+        "amount": 1,
+        "dueDate": "2025-09-03T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-03T09:04:35.420Z",
+        "proof": "completed\n\nAttachments:\n- Screenshot 2025-08-30 at 13.26.43.png: https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmf8vWrBhxBykzmCrt8KhPtoRtFr7Xfx1D6LbvpqQECqqS",
+        "paymentTxHash": null,
+        "paymentDate": null
+      }
+    ],
+    "doc": {
+      "cid": "QmanfjB22FUL7twyfD9gpT5EMn97gQ9zW7eYypw2Y8RHGv",
+      "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmanfjB22FUL7twyfD9gpT5EMn97gQ9zW7eYypw2Y8RHGv",
+      "name": "bfdw_analyse_lithium-broschuere_report.pdf",
+      "size": 3089878
+    },
+    "status": "completed",
+    "createdAt": "2025-09-03T09:04:14.152Z"
+  },
+  {
+    "bidId": 15,
+    "proposalId": 15,
+    "vendorName": "KIDO",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "kido",
+    "walletAddress": "0xd400f281090DE99b98C1dbde10C6C951c7d59086",
+    "preferredStablecoin": "USDT",
+    "milestones": [
+      {
+        "name": "1",
+        "amount": 1,
+        "dueDate": "2025-09-03T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-03T13:02:45.897Z",
+        "proof": "w\n\nAttachments:\n- Screenshot 2025-09-03 at 14.50.26.png: https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+        "paymentTxHash": null,
+        "paymentDate": null
+      }
+    ],
+    "doc": {
+      "cid": "QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+      "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+      "name": "Screenshot 2025-09-03 at 14.50.26.png",
+      "size": 62418
+    },
+    "status": "approved",
+    "createdAt": "2025-09-03T13:02:28.168Z"
+  },
+  {
+    "bidId": 16,
+    "proposalId": 16,
+    "vendorName": "TEST2",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "TEST 2",
+    "walletAddress": "0xd400f281090DE99b98C1dbde10C6C951c7d59086",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "1",
+        "amount": 1,
+        "dueDate": "2025-09-03T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-03T13:50:54.629Z",
+        "proof": "TEST2\n\nAttachments:\n- Screenshot 2025-09-03 at 14.36.04.png: https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmcz4KYf9TDuNyyiPSpS2JC26YqVdMVvsiqRNwnJCKvj9C",
+        "paymentTxHash": null,
+        "paymentDate": null
+      }
+    ],
+    "doc": {
+      "cid": "Qmcz4KYf9TDuNyyiPSpS2JC26YqVdMVvsiqRNwnJCKvj9C",
+      "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmcz4KYf9TDuNyyiPSpS2JC26YqVdMVvsiqRNwnJCKvj9C",
+      "name": "Screenshot 2025-09-03 at 14.36.04.png",
+      "size": 425771
+    },
+    "status": "completed",
+    "createdAt": "2025-09-03T13:50:20.420Z"
+  },
+  {
+    "bidId": 17,
+    "proposalId": 17,
+    "vendorName": "TEST4",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "test3",
+    "walletAddress": "0xd400f281090DE99b98C1dbde10C6C951c7d59086",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "1",
+        "amount": 1,
+        "dueDate": "2025-09-03T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-03T13:55:40.313Z",
+        "proof": "done\n\nAttachments:\n- Screenshot 2025-09-03 at 14.36.04.png: https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmcz4KYf9TDuNyyiPSpS2JC26YqVdMVvsiqRNwnJCKvj9C",
+        "paymentTxHash": null,
+        "paymentDate": null
+      }
+    ],
+    "doc": {
+      "cid": "QmYECfshdLsJwwyeLF7XUzyy3MqefnpHtGyXs59yDkThge",
+      "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmYECfshdLsJwwyeLF7XUzyy3MqefnpHtGyXs59yDkThge",
+      "name": "Screenshot 2025-09-03 at 13.20.27.png",
+      "size": 426758
+    },
+    "status": "completed",
+    "createdAt": "2025-09-03T13:55:22.708Z"
+  },
+  {
+    "bidId": 18,
+    "proposalId": 18,
+    "vendorName": "TST",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "tst",
+    "walletAddress": "0xAD1cefc1d7d05DC5FCc2Fc1084D7f2e700B8d893",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "1",
+        "amount": 1,
+        "dueDate": "2025-09-03T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-03T14:16:23.830Z",
+        "proof": "tst",
+        "paymentTxHash": "0xb283e20e8d41d7b9e36fbbb2709f73a02137e0a8428afc85cffa7b03acac7576",
+        "paymentDate": "2025-09-03T14:16:37.625Z"
+      }
+    ],
+    "doc": {
+      "cid": "QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+      "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+      "name": "Screenshot 2025-09-03 at 14.50.26.png",
+      "size": 62418
+    },
+    "status": "completed",
+    "createdAt": "2025-09-03T14:15:51.723Z"
+  },
+  {
+    "bidId": 19,
+    "proposalId": 18,
+    "vendorName": "TSG",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "tsg",
+    "walletAddress": "0xAD1cefc1d7d05DC5FCc2Fc1084D7f2e700B8d893",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "1",
+        "amount": 1,
+        "dueDate": "2025-09-03T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-03T14:18:13.850Z",
+        "proof": "s\n\nAttachments:\n- Screenshot 2025-09-03 at 14.50.26.png: https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+        "paymentTxHash": null,
+        "paymentDate": null
+      }
+    ],
+    "doc": {
+      "cid": "QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+      "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+      "name": "Screenshot 2025-09-03 at 14.50.26.png",
+      "size": 62418
+    },
+    "status": "completed",
+    "createdAt": "2025-09-03T14:17:37.295Z"
+  },
+  {
+    "bidId": 20,
+    "proposalId": 19,
+    "vendorName": "core",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "core",
+    "walletAddress": "0xAD1cefc1d7d05DC5FCc2Fc1084D7f2e700B8d893",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "1",
+        "amount": 1,
+        "dueDate": "2025-09-03T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-03T14:26:00.526Z",
+        "proof": "ssq",
+        "paymentTxHash": "0x74460b2b65a5797e5495dc4dc7377220442fbe6434117820c46fe1ffc5b8670f",
+        "paymentDate": "2025-09-03T14:26:13.656Z"
+      }
+    ],
+    "doc": {
+      "cid": "QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+      "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+      "name": "Screenshot 2025-09-03 at 14.50.26.png",
+      "size": 62418
+    },
+    "status": "completed",
+    "createdAt": "2025-09-03T14:25:42.371Z"
+  },
+  {
+    "bidId": 21,
+    "proposalId": 19,
+    "vendorName": "gag",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "gag",
+    "walletAddress": "0x9dA318D0c9B27E46fc74a5a3573bC15C17f0459d",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "1",
+        "amount": 1,
+        "dueDate": "2025-09-03T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-03T14:30:46.196Z",
+        "proof": "sqs\n\nAttachments:\n- Screenshot 2025-09-03 at 14.50.26.png: https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+        "paymentTxHash": null,
+        "paymentDate": null
+      }
+    ],
+    "doc": {
+      "cid": "QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+      "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmPeAr6isWoZTVJbnL774mKynRVyafj26ZaFx2Kfq8dmnw",
+      "name": "Screenshot 2025-09-03 at 14.50.26.png",
+      "size": 62418
+    },
+    "status": "completed",
+    "createdAt": "2025-09-03T14:30:01.632Z"
+  },
+  {
+    "bidId": 22,
+    "proposalId": 19,
+    "vendorName": "gog",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "gog",
+    "walletAddress": "0x9dA318D0c9B27E46fc74a5a3573bC15C17f0459d",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "1",
+        "amount": 1,
+        "dueDate": "2025-09-03T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-03T14:49:20.217Z",
+        "proof": "v",
+        "paymentTxHash": "0x467d7fb5b6ff38de0246bb900a2a48b7cc59141b7a3e98b498ebc2cc5dff3f40",
+        "paymentDate": "2025-09-03T14:49:25.405Z"
+      }
+    ],
+    "doc": {
+      "cid": "Qmcz4KYf9TDuNyyiPSpS2JC26YqVdMVvsiqRNwnJCKvj9C",
+      "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmcz4KYf9TDuNyyiPSpS2JC26YqVdMVvsiqRNwnJCKvj9C",
+      "name": "Screenshot 2025-09-03 at 14.36.04.png",
+      "size": 425771
+    },
+    "status": "completed",
+    "createdAt": "2025-09-03T14:34:39.989Z"
+  },
+  {
+    "bidId": 23,
+    "proposalId": 20,
+    "vendorName": "2",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "2",
+    "walletAddress": "0x9dA318D0c9B27E46fc74a5a3573bC15C17f0459d",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "2",
+        "amount": 1,
+        "dueDate": "2025-09-03T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-03T14:53:37.140Z",
+        "proof": "s",
+        "paymentTxHash": "0xa38a60ac59caad6a741c02d190db0f7dcd8f296ca950755a2930e07a21c42746",
+        "paymentDate": "2025-09-03T14:53:52.436Z"
+      }
+    ],
+    "doc": {
+      "cid": "QmRozcrEx2zwxmCzP5zjFfwcvr5nX42WKMfKfb6NZMbjmC",
+      "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmRozcrEx2zwxmCzP5zjFfwcvr5nX42WKMfKfb6NZMbjmC",
+      "name": "Screenshot 2025-09-03 at 16.35.49.png",
+      "size": 354535
+    },
+    "status": "completed",
+    "createdAt": "2025-09-03T14:53:28.383Z"
+  },
+  {
+    "bidId": 24,
+    "proposalId": 21,
+    "vendorName": "1",
+    "priceUSD": 1,
+    "days": 1,
+    "notes": "1",
+    "walletAddress": "0x9dA318D0c9B27E46fc74a5a3573bC15C17f0459d",
+    "preferredStablecoin": "USDC",
+    "milestones": [
+      {
+        "name": "1",
+        "amount": 1,
+        "dueDate": "2025-09-03T00:00:00.000Z",
+        "completed": true,
+        "completionDate": "2025-09-03T15:58:26.332Z",
+        "proof": "1",
+        "paymentTxHash": "0xe3fda5da083d6960d23e041dd423d777a16768a12017c59c168015a7dc8ee425",
+        "paymentDate": "2025-09-03T15:58:38.704Z"
+      }
+    ],
+    "doc": {
+      "cid": "Qmet56kN3jtR54CA2B8nF4DdTypgRZSyJ9AgYVaxF55aLA",
+      "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/Qmet56kN3jtR54CA2B8nF4DdTypgRZSyJ9AgYVaxF55aLA",
+      "name": "Screenshot 2025-09-03 at 16.38.23.png",
+      "size": 230588
+    },
+    "status": "completed",
+    "createdAt": "2025-09-03T15:58:12.506Z"
+  }
+]

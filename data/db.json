@@ -1,0 +1,116 @@
+{
+  "proposals": [
+    {
+      "proposalId": 1,
+      "status": "pending",
+      "orgName": "q",
+      "title": "s",
+      "summary": "q",
+      "contact": "schmidt@heitaria.ch",
+      "address": "Carrer Joan Miro 17",
+      "city": "Esplugues de Llobregat",
+      "country": "Spain",
+      "amountUSD": null,
+      "docs": [
+        {
+          "name": "Screenshot 2025-08-27 at 17.28.40.png",
+          "cid": "QmborrMMbBgF12TQD1aZWakMyvrW5eMJgjkbAWC2xmYAQd",
+          "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmborrMMbBgF12TQD1aZWakMyvrW5eMJgjkbAWC2xmYAQd",
+          "size": 283858
+        }
+      ],
+      "cid": "QmPhc9pR72wAb8VDmKoN2wGPskpYKCKNypoCLhu8fAfcS9",
+      "createdAt": "2025-08-28T13:07:30.365Z"
+    },
+    {
+      "proposalId": 2,
+      "status": "pending",
+      "orgName": "qs",
+      "title": "sq",
+      "summary": "s",
+      "contact": "qsq",
+      "address": "sq",
+      "city": "s",
+      "country": "q",
+      "amountUSD": null,
+      "docs": [],
+      "cid": null,
+      "createdAt": "2025-08-28T13:47:53.765Z"
+    },
+    {
+      "proposalId": 3,
+      "status": "pending",
+      "orgName": "aXA",
+      "title": "axaX",
+      "summary": "Axa",
+      "contact": "schmidt@heitaria.ch",
+      "address": "Carrer Joan Miro 17",
+      "city": "Esplugues de Llobregat",
+      "country": "Spain",
+      "amountUSD": 5000,
+      "docs": [],
+      "cid": null,
+      "createdAt": "2025-08-28T19:20:55.687Z"
+    }
+  ],
+  "bids": [
+    {
+      "bidId": 1,
+      "proposalId": 1,
+      "vendorName": "wsws",
+      "amountUSD": 3000,
+      "durationDays": 14,
+      "notes": "qwwqdwq dwqdwqd",
+      "attachments": [
+        {
+          "name": "Screenshot 2025-08-27 at 17.28.40.png",
+          "cid": "QmborrMMbBgF12TQD1aZWakMyvrW5eMJgjkbAWC2xmYAQd",
+          "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmborrMMbBgF12TQD1aZWakMyvrW5eMJgjkbAWC2xmYAQd",
+          "size": 283858
+        }
+      ],
+      "createdAt": "2025-08-28T13:20:08.033Z"
+    },
+    {
+      "bidId": 2,
+      "proposalId": 1,
+      "vendorName": "sqs",
+      "amountUSD": 0,
+      "durationDays": 0,
+      "notes": "sq",
+      "attachments": [
+        {
+          "name": "Screenshot 2025-08-27 at 17.28.40.png",
+          "cid": "QmborrMMbBgF12TQD1aZWakMyvrW5eMJgjkbAWC2xmYAQd",
+          "url": "https://ivory-negative-spoonbill-17.mypinata.cloud/ipfs/QmborrMMbBgF12TQD1aZWakMyvrW5eMJgjkbAWC2xmYAQd",
+          "size": 283858
+        }
+      ],
+      "createdAt": "2025-08-28T13:22:11.577Z"
+    },
+    {
+      "bidId": 3,
+      "proposalId": 1,
+      "vendorName": "qs",
+      "amountUSD": 33,
+      "durationDays": 14,
+      "notes": "fewfwef",
+      "attachments": [],
+      "createdAt": "2025-08-28T13:32:21.427Z"
+    },
+    {
+      "bidId": 4,
+      "proposalId": 2,
+      "vendorName": "a",
+      "amountUSD": 0,
+      "durationDays": 0,
+      "notes": "",
+      "attachments": [],
+      "createdAt": "2025-08-28T13:48:55.725Z"
+    }
+  ],
+  "counters": {
+    "proposal": 3,
+    "bid": 4
+  }
+}
