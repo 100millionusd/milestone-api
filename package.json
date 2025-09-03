@@ -2,7 +2,7 @@
   "name": "milestone-api",
   "version": "1.0.0",
   "description": "Milestone API with USDT/USDC payments",
-  "main": "server.js",  # This ensures line 5 has more characters
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
