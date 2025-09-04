@@ -30,8 +30,9 @@ const CORS_ORIGIN = getEnv(
 );
 
 // Optional: Pinata can be empty; routes already error nicely if not set.
-const PINATA_JWT = getEnv("PINATA_JWT", "");
 const PINATA_GATEWAY = getEnv("PINATA_GATEWAY_DOMAIN", "gateway.pinata.cloud");
+
+// NOTE: PINATA_JWT is read directly in the upload helpers below.
 
 // Blockchain configuration
 const NETWORK = getEnv("NETWORK", "sepolia");
@@ -250,6 +251,9 @@ class BlockchainService {
 // ========== App ==========
 const app = express();
 
+// >>> FIX: trust proxy for Railway edge (required for express-rate-limit v7)
+app.set('trust proxy', 1);
+
 // Initialize blockchain service
 const blockchainService = new BlockchainService();
 
@@ -263,7 +267,6 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// ----- CORS (supports multiple origins / CSV / "*") -----
 const ALLOWED_ORIGINS = CORS_ORIGIN.split(",").map(s => s.trim()).filter(Boolean);
 app.use(
   cors({
@@ -302,6 +305,8 @@ function toNumber(v, d = 0) {
 
 // ========== IPFS / Pinata ==========
 async function pinataUploadFile(oneFile) {
+  const RAW_PINATA_JWT = process.env.PINATA_JWT ?? "";
+  const PINATA_JWT = RAW_PINATA_JWT.trim().replace(/^Bearer\s+/i, "").replace(/^["']+|["']+$/g, "").replace(/\s+/g, "");
   if (!PINATA_JWT) throw new Error("No Pinata auth configured (PINATA_JWT).");
   
   const form = new FormData();
@@ -340,6 +345,8 @@ async function pinataUploadFile(oneFile) {
 }
 
 async function pinataUploadJson(obj) {
+  const RAW_PINATA_JWT = process.env.PINATA_JWT ?? "";
+  const PINATA_JWT = RAW_PINATA_JWT.trim().replace(/^Bearer\s+/i, "").replace(/^["']+|["']+$/g, "").replace(/\s+/g, "");
   if (!PINATA_JWT) throw new Error("No Pinata auth configured (PINATA_JWT).");
   
   const r = await fetch("https://api.pinata.cloud/pinning/pinJSONToIPFS", {
@@ -409,7 +416,7 @@ app.get("/health", async (_req, res) => {
       signer: signerAddress,
       blockchain: blockchainStatus,
       balances: balances,
-      pinata: !!PINATA_JWT,
+      pinata: !!(process.env.PINATA_JWT),
       counts: { proposals: proposals.length, bids: bids.length },
       endpoints: [
         "POST /ipfs/upload-file",
@@ -819,8 +826,6 @@ app.use((req, res, next) => {
 // Keep validation minimal to avoid false exits; CORS_ORIGIN now has a safe default in prod.
 function validateEnv() {
   const missing = [];
-  // If you want to force Pinata in prod, uncomment:
-  // if (IS_PROD && !PINATA_JWT) missing.push('PINATA_JWT');
   if (missing.length > 0) {
     console.error(`Missing required environment variables: ${missing.join(', ')}`);
     process.exit(1);
@@ -840,7 +845,7 @@ async function startServer() {
     app.listen(PORT, () => {
       console.log(`[api] listening on :${PORT}`);
       console.log(`[api] CORS origins: ${ALLOWED_ORIGINS.join(", ") || "(none)"}`);
-      console.log(`[api] Pinata configured: ${!!PINATA_JWT}`);
+      console.log(`[api] Pinata configured: ${!!(process.env.PINATA_JWT)}`);
       console.log(`[api] Blockchain configured: ${blockchainService.isConfigured()}`);
       
       if (blockchainService.isConfigured()) {
