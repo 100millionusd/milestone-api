@@ -528,8 +528,8 @@ app.get("/transaction/:txHash", async (req, res) => {
   }
 });
 
-// Uploads
-app.post("/ipfs/upload-file", async (req, res) {
+// Uploads - FIXED THE SYNTAX ERROR HERE
+app.post("/ipfs/upload-file", async (req, res) => {
   try {
     const f = req.files?.file || req.files?.files;
     if (!f) return res.status(400).json({ error: "file is required" });
