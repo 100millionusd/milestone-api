@@ -104,12 +104,23 @@ const bidSchema = Joi.object({
 class JSONDatabase {
   constructor(filePath) {
     this.filePath = filePath;
+    this.nextId = 1;
   }
   
   async read() {
     try {
       const data = await fsp.readFile(this.filePath, 'utf8');
-      return JSON.parse(data || '[]');
+      const parsedData = JSON.parse(data || '[]');
+      
+      // Find the highest ID to set nextId
+      if (parsedData.length > 0) {
+        const ids = parsedData.map(item => item.proposalId || item.bidId);
+        this.nextId = Math.max(...ids) + 1;
+      } else {
+        this.nextId = 1;
+      }
+      
+      return parsedData;
     } catch (error) {
       if (error.code === 'ENOENT') {
         await this.write([]);
@@ -136,15 +147,17 @@ class JSONDatabase {
   
   async add(item) {
     const data = await this.read();
-    const newId = data.length > 0 ? Math.max(...data.map(i => i.proposalId || i.bidId)) + 1 : 1;
     
+    // Assign ID based on whether it's a proposal or bid
     if (item.proposalId !== undefined) {
-      item.proposalId = newId;
+      item.proposalId = this.nextId;
     } else if (item.bidId !== undefined) {
-      item.bidId = newId;
+      item.bidId = this.nextId;
     }
     
     data.push(item);
+    this.nextId++; // Increment for next addition
+    
     await this.write(data);
     return item;
   }
@@ -516,7 +529,7 @@ app.get("/transaction/:txHash", async (req, res) => {
 });
 
 // Uploads
-app.post("/ipfs/upload-file", async (req, res) => {
+app.post("/ipfs/upload-file", async (req, res) {
   try {
     const f = req.files?.file || req.files?.files;
     if (!f) return res.status(400).json({ error: "file is required" });
@@ -551,11 +564,7 @@ app.post("/proposals", async (req, res) => {
       return res.status(400).json({ error: error.details[0].message });
     }
 
-    const proposals = await proposalsDB.read();
-    const proposalId = proposals.length ? Math.max(...proposals.map(p => p.proposalId)) + 1 : 1;
-
     const record = {
-      proposalId,
       orgName: value.orgName,
       title: value.title,
       summary: value.summary,
@@ -570,8 +579,8 @@ app.post("/proposals", async (req, res) => {
       createdAt: new Date().toISOString(),
     };
     
-    await proposalsDB.add(record);
-    res.json({ ok: true, proposalId, cid: record.cid || null });
+    const result = await proposalsDB.add(record);
+    res.json({ ok: true, proposalId: result.proposalId, cid: record.cid || null });
   } catch (error) {
     console.error('Error creating proposal:', error);
     res.status(500).json({ error: "Failed to create proposal" });
@@ -635,11 +644,7 @@ app.post("/bids", async (req, res) => {
     const proposal = await proposalsDB.findById(value.proposalId);
     if (!proposal) return res.status(404).json({ error: "proposal 404" });
 
-    const bids = await bidsDB.read();
-    const bidId = bids.length ? Math.max(...bids.map(b => b.bidId)) + 1 : 1;
-
     const rec = {
-      bidId,
       proposalId: value.proposalId,
       vendorName: value.vendorName,
       priceUSD: value.priceUSD,
@@ -660,8 +665,8 @@ app.post("/bids", async (req, res) => {
       createdAt: new Date().toISOString(),
     };
     
-    await bidsDB.add(rec);
-    res.json({ ok: true, bidId, proposalId: value.proposalId });
+    const result = await bidsDB.add(rec);
+    res.json({ ok: true, bidId: result.bidId, proposalId: value.proposalId });
   } catch (error) {
     console.error('Error creating bid:', error);
     res.status(500).json({ error: "Failed to create bid" });
