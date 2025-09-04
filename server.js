@@ -88,7 +88,6 @@ const bidSchema = Joi.object({
   milestones: Joi.array().items(Joi.object({
     name: Joi.string().required(),
     amount: Joi.number().min(0).required(),
-    dueDate: Joi.date().iso().required()
   })).min(1).required(),
   doc: Joi.object({
     cid: Joi.string().required(),
@@ -392,7 +391,9 @@ app.get("/health", async (_req, res) => {
         "POST /ipfs/upload-json",
         "POST /proposals",
         "GET /proposals",
+        "GET /projects", // Added this endpoint
         "GET /proposals/:id",
+        "GET /projects/:id", // Added this endpoint
         "POST /proposals/:id/approve",
         "POST /proposals/:id/reject",
         "POST /bids",
@@ -412,6 +413,7 @@ app.get("/health", async (_req, res) => {
 // Test endpoint for debugging
 app.get("/test", async (req, res) => {
   try {
+    const proposals = await proposalsDB.read();
     const bids = await bidsDB.read();
     
     let blockchainInfo = { configured: blockchainService.isConfigured() };
@@ -421,7 +423,9 @@ app.get("/test", async (req, res) => {
     
     res.json({ 
       success: true, 
+      proposalCount: proposals.length,
       bidCount: bids.length,
+      sampleProposal: proposals[0] || null,
       sampleBid: bids[0] || null,
       blockchain: blockchainInfo,
       message: "Server is working correctly"
@@ -548,6 +552,17 @@ app.get("/proposals", async (_req, res) => {
   }
 });
 
+// ADDED: Projects endpoint (same as proposals)
+app.get("/projects", async (_req, res) => {
+  try {
+    const proposals = await proposalsDB.read();
+    res.json(proposals);
+  } catch (error) {
+    console.error('Error fetching projects:', error);
+    res.status(500).json({ error: "Failed to fetch projects" });
+  }
+});
+
 app.get("/proposals/:id", async (req, res) => {
   try {
     const id = toNumber(req.params.id, -1);
@@ -557,6 +572,19 @@ app.get("/proposals/:id", async (req, res) => {
   } catch (error) {
     console.error('Error fetching proposal:', error);
     res.status(500).json({ error: "Failed to fetch proposal" });
+  }
+});
+
+// ADDED: Projects by ID endpoint (same as proposals by ID)
+app.get("/projects/:id", async (req, res) => {
+  try {
+    const id = toNumber(req.params.id, -1);
+    const proposal = await proposalsDB.findById(id);
+    if (!proposal) return res.status(404).json({ error: "project 404" });
+    res.json(proposal);
+  } catch (error) {
+    console.error('Error fetching project:', error);
+    res.status(500).json({ error: "Failed to fetch project" });
   }
 });
 
@@ -785,7 +813,7 @@ app.use((error, req, res, next) => {
 
 // Helpful JSON 404 for API-ish paths
 app.use((req, res, next) => {
-  if (req.path.startsWith("/api") || req.path.match(/^\/(proposals|bids|ipfs|health|test|balances|transaction)/)) {
+  if (req.path.startsWith("/api") || req.path.match(/^\/(proposals|projects|bids|ipfs|health|test|balances|transaction)/)) {
     return res.status(404).json({ error: "route 404" });
   }
   next();
@@ -795,8 +823,6 @@ app.use((req, res, next) => {
 // Keep validation minimal to avoid false exits; CORS_ORIGIN now has a safe default in prod.
 function validateEnv() {
   const missing = [];
-  // If you want to force Pinata in prod, uncomment:
-  // if (IS_PROD && !PINATA_JWT) missing.push('PINATA_JWT');
   if (missing.length > 0) {
     console.error(`Missing required environment variables: ${missing.join(', ')}`);
     process.exit(1);
@@ -827,6 +853,7 @@ async function startServer() {
       
       console.log(`[api] Test endpoint: http://localhost:${PORT}/test`);
       console.log(`[api] Health endpoint: http://localhost:${PORT}/health`);
+      console.log(`[api] Projects endpoint: http://localhost:${PORT}/projects`);
     });
   } catch (error) {
     console.error('Failed to start server:', error);
