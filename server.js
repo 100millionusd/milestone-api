@@ -15,7 +15,14 @@ const { ethers } = require("ethers");
 
 // ========== Config ==========
 const PORT = Number(process.env.PORT || 3000);
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:3001";
+const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://lithiumx.netlify.app' || 'http://localhost:3001';
+
+app.use(cors({
+  origin: CORS_ORIGIN,
+  credentials: true
+}));
+
+console.log(`[api] CORS configured for origin: ${CORS_ORIGIN}`);
 
 const PINATA_JWT = process.env.PINATA_JWT || "";
 const PINATA_GATEWAY = process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud";
