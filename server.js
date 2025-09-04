@@ -30,7 +30,12 @@ const CORS_ORIGIN = getEnv(
 );
 
 // Optional: Pinata can be empty; routes already error nicely if not set.
-const PINATA_JWT = getEnv("PINATA_JWT", "");
+const RAW_PINATA_JWT = getEnv("PINATA_JWT", "");
+const PINATA_JWT = RAW_PINATA_JWT
+  .trim()
+  .replace(/^Bearer\s+/i, "")      // remove accidental "Bearer "
+  .replace(/^["']+|["']+$/g, "")   // remove wrapping quotes
+  .replace(/\s+/g, "");            // remove any whitespace/newlines
 const PINATA_GATEWAY = getEnv("PINATA_GATEWAY_DOMAIN", "gateway.pinata.cloud");
 
 // Blockchain configuration
@@ -249,6 +254,9 @@ class BlockchainService {
 
 // ========== App ==========
 const app = express();
+
+// >>> FIX: running behind Railway/edge — make rate-limit trust X-Forwarded-For
+app.set('trust proxy', 1);
 
 // Initialize blockchain service
 const blockchainService = new BlockchainService();
@@ -862,4 +870,3 @@ startServer();
 
 // Fresh deploy timestamp: Thu Sep  4 00:17:52 CEST 2025
 // Redeploy trigger: Thu Sep  4 15:26:42 CEST 2025
-
