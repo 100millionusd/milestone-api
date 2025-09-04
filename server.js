@@ -13,22 +13,32 @@ const rateLimit = require("express-rate-limit");
 const Joi = require("joi");
 const { ethers } = require("ethers");
 
-// ========== Config ==========
-const PORT = Number(process.env.PORT || 3000);
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:3001";
+// ===== Helpers for env handling =====
+const IS_PROD = process.env.NODE_ENV === "production";
+const getEnv = (k, fallback = "") => {
+  const v = process.env[k];
+  return (typeof v === "string" && v.trim() !== "") ? v.trim() : fallback;
+};
 
-const PINATA_JWT = process.env.PINATA_JWT || "";
-const PINATA_GATEWAY = process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud";
+// ========== Config ==========
+const PORT = Number(getEnv("PORT", "3000"));
+
+// Resolve once (trimmed). In dev we default to localhost; in prod we require it (validated below).
+const CORS_ORIGIN = getEnv("CORS_ORIGIN", IS_PROD ? "" : "http://localhost:3001");
+
+// Optional: Pinata can be empty; routes already error nicely if not set.
+const PINATA_JWT = getEnv("PINATA_JWT", "");
+const PINATA_GATEWAY = getEnv("PINATA_GATEWAY_DOMAIN", "gateway.pinata.cloud");
 
 // Blockchain configuration
-const NETWORK = process.env.NETWORK || "sepolia";
-const SEPOLIA_RPC_URL = process.env.SEPOLIA_RPC_URL || "https://ethereum-sepolia.publicnode.com";
-const PRIVATE_KEY = process.env.PRIVATE_KEY || "";
-const ESCROW_ADDR = process.env.ESCROW_ADDR || "";
+const NETWORK = getEnv("NETWORK", "sepolia");
+const SEPOLIA_RPC_URL = getEnv("SEPOLIA_RPC_URL", "https://ethereum-sepolia.publicnode.com");
+const PRIVATE_KEY = getEnv("PRIVATE_KEY", "");
+const ESCROW_ADDR = getEnv("ESCROW_ADDR", "");
 
 // Sepolia token addresses
-const USDC_ADDRESS = process.env.USDC_ADDRESS || "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
-const USDT_ADDRESS = process.env.USDT_ADDRESS || "0x7169D38820dfd117C3FA1f22a697dBA58d90BA06";
+const USDC_ADDRESS = getEnv("USDC_ADDRESS", "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
+const USDT_ADDRESS = getEnv("USDT_ADDRESS", "0x7169D38820dfd117C3FA1f22a697dBA58d90BA06");
 
 // ERC20 ABI (simplified)
 const ERC20_ABI = [
@@ -40,15 +50,13 @@ const ERC20_ABI = [
 
 // Token configurations
 const TOKENS = {
-  USDC: {
-    address: USDC_ADDRESS,
-    decimals: 6
-  },
-  USDT: {
-    address: USDT_ADDRESS,
-    decimals: 6
-  }
+  USDC: { address: USDC_ADDRESS, decimals: 6 },
+  USDT: { address: USDT_ADDRESS, decimals: 6 }
 };
+
+// Debug what we actually resolved
+console.log("[debug] NODE_ENV:", process.env.NODE_ENV);
+console.log("[debug] Effective CORS_ORIGIN:", CORS_ORIGIN);
 
 // ========== Validation Schemas ==========
 const proposalSchema = Joi.object({
@@ -252,12 +260,21 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
+// ----- CORS (supports multiple origins / CSV / "*") -----
+const ALLOWED_ORIGINS = CORS_ORIGIN.split(",").map(s => s.trim()).filter(Boolean);
 app.use(
   cors({
-    origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN,
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true); // non-browser / curl
+      if (ALLOWED_ORIGINS.includes("*") || ALLOWED_ORIGINS.includes(origin)) {
+        return cb(null, true);
+      }
+      return cb(new Error("Not allowed by CORS"));
+    },
     credentials: false,
   })
 );
+
 app.use(express.json({ limit: "20mb" }));
 app.use(
   fileUpload({
@@ -797,12 +814,13 @@ app.use((req, res, next) => {
 
 // ========== Environment Validation ==========
 function validateEnv() {
-  const required = ['CORS_ORIGIN'];
-  if (process.env.NODE_ENV === 'production') {
-    required.push('PINATA_JWT');
-  }
-  
-  const missing = required.filter(key => !process.env[key]);
+  const missing = [];
+  // Require CORS_ORIGIN in production only; dev has a default
+  if (IS_PROD && !CORS_ORIGIN) missing.push('CORS_ORIGIN');
+
+  // If you want to force Pinata in prod, uncomment:
+  // if (IS_PROD && !PINATA_JWT) missing.push('PINATA_JWT');
+
   if (missing.length > 0) {
     console.error(`Missing required environment variables: ${missing.join(', ')}`);
     process.exit(1);
@@ -821,7 +839,7 @@ async function startServer() {
     
     app.listen(PORT, () => {
       console.log(`[api] listening on :${PORT}`);
-      console.log(`[api] CORS origin: ${CORS_ORIGIN}`);
+      console.log(`[api] CORS origins: ${ALLOWED_ORIGINS.join(", ") || "(none)"}`);
       console.log(`[api] Pinata configured: ${!!PINATA_JWT}`);
       console.log(`[api] Blockchain configured: ${blockchainService.isConfigured()}`);
       
@@ -840,6 +858,7 @@ async function startServer() {
   }
 }
 
-startServer();// Fresh deploy timestamp: Thu Sep  4 00:17:52 CEST 2025
-// Redeploy trigger: Thu Sep  4 15:26:42 CEST 2025
+startServer();
 
+// Fresh deploy timestamp: Thu Sep  4 00:17:52 CEST 2025
+// Redeploy trigger: Thu Sep  4 15:26:42 CEST 2025
