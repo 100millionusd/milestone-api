@@ -23,8 +23,11 @@ const getEnv = (k, fallback = "") => {
 // ========== Config ==========
 const PORT = Number(getEnv("PORT", "3000"));
 
-// Resolve once (trimmed). In dev we default to localhost; in prod we require it (validated below).
-const CORS_ORIGIN = getEnv("CORS_ORIGIN", IS_PROD ? "" : "http://localhost:3001");
+// In prod, default to your Netlify app if env is missing; in dev, default to localhost:3001.
+const CORS_ORIGIN = getEnv(
+  "CORS_ORIGIN",
+  IS_PROD ? "https://lithiumx.netlify.app" : "http://localhost:3001"
+);
 
 // Optional: Pinata can be empty; routes already error nicely if not set.
 const PINATA_JWT = getEnv("PINATA_JWT", "");
@@ -813,14 +816,11 @@ app.use((req, res, next) => {
 });
 
 // ========== Environment Validation ==========
+// Keep validation minimal to avoid false exits; CORS_ORIGIN now has a safe default in prod.
 function validateEnv() {
   const missing = [];
-  // Require CORS_ORIGIN in production only; dev has a default
-  if (IS_PROD && !CORS_ORIGIN) missing.push('CORS_ORIGIN');
-
   // If you want to force Pinata in prod, uncomment:
   // if (IS_PROD && !PINATA_JWT) missing.push('PINATA_JWT');
-
   if (missing.length > 0) {
     console.error(`Missing required environment variables: ${missing.join(', ')}`);
     process.exit(1);
