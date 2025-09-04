@@ -16,6 +16,6 @@
     "helmet": "^7.0.0",
     "express-rate-limit": "^6.8.1",
     "joi": "^17.9.2",
-    "ethers": "^6.0.0"  // ← ADD THIS LINE
+    "ethers": "^6.0.0"
   }
 }}
