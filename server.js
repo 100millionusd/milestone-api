@@ -12,6 +12,7 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const Joi = require("joi");
 const { ethers } = require("ethers");
+const FormData = require("form-data");
 
 // ===== Helpers for env handling =====
 const IS_PROD = process.env.NODE_ENV === "production";
@@ -135,6 +136,14 @@ class JSONDatabase {
   
   async add(item) {
     const data = await this.read();
+    const newId = data.length > 0 ? Math.max(...data.map(i => i.proposalId || i.bidId)) + 1 : 1;
+    
+    if (item.proposalId !== undefined) {
+      item.proposalId = newId;
+    } else if (item.bidId !== undefined) {
+      item.bidId = newId;
+    }
+    
     data.push(item);
     await this.write(data);
     return item;
@@ -543,7 +552,7 @@ app.post("/proposals", async (req, res) => {
     }
 
     const proposals = await proposalsDB.read();
-    const proposalId = proposals.length ? proposals[proposals.length - 1].proposalId + 1 : 1;
+    const proposalId = proposals.length ? Math.max(...proposals.map(p => p.proposalId)) + 1 : 1;
 
     const record = {
       proposalId,
@@ -627,7 +636,7 @@ app.post("/bids", async (req, res) => {
     if (!proposal) return res.status(404).json({ error: "proposal 404" });
 
     const bids = await bidsDB.read();
-    const bidId = bids.length ? bids[bids.length - 1].bidId + 1 : 1;
+    const bidId = bids.length ? Math.max(...bids.map(b => b.bidId)) + 1 : 1;
 
     const rec = {
       bidId,
@@ -864,6 +873,3 @@ async function startServer() {
 }
 
 startServer();
-
-// Fresh deploy timestamp: Thu Sep  4 00:17:52 CEST 2025
-// Redeploy trigger: Thu Sep  4 15:26:42 CEST 2025
