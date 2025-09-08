@@ -586,7 +586,7 @@ app.get("/balances/:address", async (req, res) => {
 });
 
 // Get transaction status
-app.get("/transaction/:txHash", async (req, res) {
+app.get("/transaction/:txHash", async (req, res) => {
   try {
     const { txHash } = req.params;
     const status = await blockchainService.getTransactionStatus(txHash);
