@@ -22,7 +22,7 @@ const PINATA_GATEWAY = process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.clou
 const NETWORK = process.env.NETWORK || "sepolia";
 const SEPOLIA_RPC_URL = process.env.SEPOLIA_RPC_URL || "https://ethereum-sepolia.publicnode.com";
 const PRIVATE_KEY = process.env.PRIVATE_KEY || "";
-const ESCROW_ADDR = process.env.Escrow_ADDR || "";
+const ESCROW_ADDR = process.env.ESCROW_ADDR || "";
 
 // Sepolia token addresses
 const USDC_ADDRESS = process.env.USDC_ADDRESS || "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
@@ -248,7 +248,7 @@ app.set('trust proxy', 1);
 app.options('*', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', 'https://lithiumx.netlify.app');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-Wallet-Address');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Max-Age', '86400');
   return res.status(200).end();
@@ -259,7 +259,7 @@ app.use(cors({
   origin: 'https://lithiumx.netlify.app',
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Wallet-Address']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
 
 // Security middleware
@@ -285,114 +285,6 @@ const bidsDB = new JSONDatabase(BIDS_FILE);
 function toNumber(v, d = 0) {
   const n = Number(v);
   return Number.isFinite(n) ? n : d;
-}
-
-// ========== Authentication Middleware ==========
-// Simple auth middleware (for demo purposes - enhance for production)
-const authMiddleware = (req, res, next) => {
-  // For demo, we'll use wallet address from header
-  // In production, use proper JWT or session authentication
-  const walletAddress = req.headers['x-wallet-address'] || req.headers.authorization;
-  
-  if (!walletAddress) {
-    return res.status(401).json({ error: "Authentication required. Please provide wallet address." });
-  }
-  
-  // Store wallet address in request for later use
-  req.walletAddress = walletAddress.replace('Bearer ', '').trim();
-  console.log('Authenticated request from:', req.walletAddress);
-  next();
-};
-
-// ========== Vendor Route Handlers ==========
-async function getVendorBids(req, res) {
-  try {
-    const walletAddress = req.walletAddress;
-    const bids = await bidsDB.read();
-    
-    // Filter bids for this vendor only
-    const vendorBids = bids.filter(bid => 
-      bid.walletAddress.toLowerCase() === walletAddress.toLowerCase()
-    );
-    
-    res.json(vendorBids);
-  } catch (error) {
-    console.error('Error fetching vendor bids:', error);
-    res.status(500).json({ error: "Failed to fetch vendor bids" });
-  }
-}
-
-async function vendorCompleteMilestone(req, res) {
-  try {
-    const id = toNumber(req.params.id, -1);
-    const { milestoneIndex, proof } = req.body;
-    const walletAddress = req.walletAddress;
-    
-    const bids = await bidsDB.read();
-    const i = bids.findIndex((b) => b.bidId === id);
-    
-    if (i < 0) return res.status(404).json({ error: "bid 404" });
-    
-    // Verify this bid belongs to the authenticated vendor
-    if (bids[i].walletAddress.toLowerCase() !== walletAddress.toLowerCase()) {
-      return res.status(403).json({ error: "Access denied. This bid does not belong to you." });
-    }
-    
-    if (!bids[i].milestones[milestoneIndex]) {
-      return res.status(400).json({ error: "milestone not found" });
-    }
-    
-    bids[i].milestones[milestoneIndex].completed = true;
-    bids[i].milestones[milestoneIndex].completionDate = new Date().toISOString();
-    bids[i].milestones[milestoneIndex].proof = proof || "";
-    
-    // Check if all milestones are completed
-    const allCompleted = bids[i].milestones.every(m => m.completed);
-    if (allCompleted) {
-      bids[i].status = "completed";
-    }
-    
-    await bidsDB.write(bids);
-    res.json({ ok: true, bidId: id, milestoneIndex });
-  } catch (error) {
-    console.error('Error completing milestone:', error);
-    res.status(500).json({ error: "Failed to complete milestone" });
-  }
-}
-
-async function getVendorPayments(req, res) {
-  try {
-    const walletAddress = req.walletAddress;
-    const bids = await bidsDB.read();
-    
-    // Get all payments for this vendor
-    const vendorPayments = [];
-    
-    bids.forEach(bid => {
-      if (bid.walletAddress.toLowerCase() === walletAddress.toLowerCase()) {
-        bid.milestones.forEach((milestone, index) => {
-          if (milestone.paymentTxHash) {
-            vendorPayments.push({
-              bidId: bid.bidId,
-              proposalId: bid.proposalId,
-              milestoneIndex: index,
-              milestoneName: milestone.name,
-              amount: milestone.amount,
-              currency: bid.preferredStablecoin,
-              paymentTxHash: milestone.paymentTxHash,
-              paymentDate: milestone.paymentDate,
-              completed: milestone.completed
-            });
-          }
-        });
-      }
-    });
-    
-    res.json(vendorPayments);
-  } catch (error) {
-    console.error('Error fetching vendor payments:', error);
-    res.status(500).json({ error: "Failed to fetch vendor payments" });
-  }
 }
 
 // ========== IPFS / Pinata ==========
@@ -519,9 +411,6 @@ app.get("/health", async (_req, res) => {
         "POST /bids/:id/approve",
         "POST /bids/:id/complete-milestone",
         "POST /bids/:id/pay-milestone",
-        "GET /vendor/bids",
-        "POST /vendor/bids/:id/complete-milestone",
-        "GET /vendor/payments",
         "GET /balances/:address",
         "GET /transaction/:txHash"
       ],
@@ -895,11 +784,6 @@ app.post("/bids/:id/pay-milestone", async (req, res) => {
   }
 });
 
-// ========== Vendor Routes ==========
-app.get("/vendor/bids", authMiddleware, getVendorBids);
-app.post("/vendor/bids/:id/complete-milestone", authMiddleware, vendorCompleteMilestone);
-app.get("/vendor/payments", authMiddleware, getVendorPayments);
-
 // Centralized error handling
 app.use((error, req, res, next) => {
   console.error('Unhandled error:', error);
@@ -912,7 +796,7 @@ app.use((error, req, res, next) => {
 
 // Helpful JSON 404 for API-ish paths
 app.use((req, res, next) => {
-  if (req.path.startsWith("/api") || req.path.match(/^\/(proposals|bids|ipfs|health|test|balances|transaction|vendor)/)) {
+  if (req.path.startsWith("/api") || req.path.match(/^\/(proposals|bids|ipfs|health|test|balances|transaction)/)) {
     return res.status(404).json({ error: "route 404" });
   }
   next();
