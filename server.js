@@ -1,5 +1,5 @@
-// server.js — Milestone API with USDT/USDC payments + Proofs
-// -----------------------------------------------------------
+// server.js — Milestone API with USDT/USDC payments + Proofs (Pinata API key/secret auth)
+// --------------------------------------------------------------------------------------
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -10,17 +10,16 @@ const path = require("path");
 const helmet = require("helmet");
 const Joi = require("joi");
 const { ethers } = require("ethers");
-const FormData = require("form-data"); // ✅ use node-safe multipart
 
 // ========== Config ==========
 const PORT = Number(process.env.PORT || 3000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "https://lithiumx.netlify.app";
 
-const RAW_PINATA_JWT = (process.env.PINATA_JWT || "").trim();
-// tolerate accidental "Bearer " and accidental "0x" prefixes
-const PINATA_JWT = RAW_PINATA_JWT.replace(/^Bearer\s+/i, "").replace(/^0x/i, "");
+// Pinata API key/secret (NO JWT here)
+const PINATA_API_KEY = (process.env.PINATA_API_KEY || "").trim();
+const PINATA_API_SECRET = (process.env.PINATA_API_SECRET || "").trim();
 const PINATA_GATEWAY =
-  process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud";
+  (process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud").replace(/^https?:\/\//, "");
 
 // Blockchain configuration
 const NETWORK = process.env.NETWORK || "sepolia";
@@ -174,91 +173,52 @@ class BlockchainService {
         `Blockchain service initialized with address: ${this.signer.address}`
       );
     } else {
-      console.warn(
-        "No private key provided. Blockchain functions will be disabled."
-      );
+      console.warn("No private key provided. Blockchain functions will be disabled.");
       this.signer = null;
     }
   }
 
   async sendToken(tokenSymbol, toAddress, amount) {
     if (!this.signer) {
-      throw new Error(
-        "Blockchain service not configured. Please provide a PRIVATE_KEY."
-      );
+      throw new Error("Blockchain service not configured. Please provide a PRIVATE_KEY.");
     }
-
     const token = TOKENS[tokenSymbol];
-    if (!token) {
-      throw new Error(`Unsupported token: ${tokenSymbol}`);
-    }
+    if (!token) throw new Error(`Unsupported token: ${tokenSymbol}`);
+    if (!ethers.isAddress(toAddress)) throw new Error("Invalid recipient address");
 
-    // Validate address
-    if (!ethers.isAddress(toAddress)) {
-      throw new Error("Invalid recipient address");
-    }
-
-    const contract = new ethers.Contract(
-      token.address,
-      ERC20_ABI,
-      this.signer
-    );
-
-    // Get token decimals
+    const contract = new ethers.Contract(token.address, ERC20_ABI, this.signer);
     const decimals = await contract.decimals();
     const amountInWei = ethers.parseUnits(amount.toString(), decimals);
 
-    // Check balance first
     const balance = await contract.balanceOf(await this.signer.getAddress());
-    if (balance < amountInWei) {
-      throw new Error("Insufficient balance for payment");
-    }
+    if (balance < amountInWei) throw new Error("Insufficient balance for payment");
 
-    // Send transaction
     const tx = await contract.transfer(toAddress, amountInWei);
     const receipt = await tx.wait();
-
-    if (!receipt.status) {
-      throw new Error("Transaction failed");
-    }
+    if (!receipt.status) throw new Error("Transaction failed");
 
     return {
       success: true,
       transactionHash: receipt.hash,
-      amount: amount,
-      toAddress: toAddress,
+      amount,
+      toAddress,
       currency: tokenSymbol,
     };
   }
 
   async getBalance(tokenSymbol) {
-    if (!this.signer) {
-      return 0;
-    }
-
+    if (!this.signer) return 0;
     const token = TOKENS[tokenSymbol];
-    if (!token) {
-      throw new Error(`Unsupported token: ${tokenSymbol}`);
-    }
-
-    const contract = new ethers.Contract(
-      token.address,
-      ERC20_ABI,
-      this.signer
-    );
+    if (!token) throw new Error(`Unsupported token: ${tokenSymbol}`);
+    const contract = new ethers.Contract(token.address, ERC20_ABI, this.signer);
     const balance = await contract.balanceOf(await this.signer.getAddress());
     const decimals = await contract.decimals();
-
     return parseFloat(ethers.formatUnits(balance, decimals));
   }
 
   async getTransactionStatus(txHash) {
     const receipt = await this.provider.getTransactionReceipt(txHash);
-
-    if (!receipt) {
-      return { status: "not_found" };
-    }
-
+    if (!receipt) return { status: "not_found" };
     return {
       status: receipt.status === 1 ? "success" : "failed",
       blockNumber: receipt.blockNumber,
@@ -280,24 +240,15 @@ const blockchainService = new BlockchainService();
 // Add trust proxy for Railway (CRITICAL)
 app.set("trust proxy", 1);
 
-// ========== CORS FIX - MUST COME FIRST ==========
-// Handle preflight requests for all endpoints
+// ========== CORS (preflight first) ==========
 app.options("*", (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
-  res.setHeader(
-    "Access-Control-Allow-Methods",
-    "GET, POST, PUT, DELETE, OPTIONS, PATCH"
-  );
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Requested-With"
-  );
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Max-Age", "86400");
   return res.status(200).end();
 });
-
-// Regular CORS middleware
 app.use(
   cors({
     origin: CORS_ORIGIN,
@@ -309,7 +260,6 @@ app.use(
 
 // Security middleware
 app.use(helmet());
-
 app.use(express.json({ limit: "20mb" }));
 app.use(
   fileUpload({
@@ -332,22 +282,22 @@ function toNumber(v, d = 0) {
   return Number.isFinite(n) ? n : d;
 }
 
-// ========== IPFS / Pinata ==========
-// ✅ Node-safe multipart upload using form-data (no Blob / File in Node)
+// ========== IPFS / Pinata (API key/secret) ==========
 async function pinataUploadFile(oneFile) {
-  if (!PINATA_JWT) throw new Error("No Pinata auth configured (PINATA_JWT).");
+  if (!PINATA_API_KEY || !PINATA_API_SECRET) throw new Error("No Pinata API credentials");
 
   const form = new FormData();
-  form.append("file", oneFile.data, {
-    filename: oneFile.name || "upload.bin",
-    contentType: oneFile.mimetype || "application/octet-stream",
+  // Use web-standard Blob with undici's fetch (Node 18+)
+  const blob = new Blob([oneFile.data], {
+    type: oneFile.mimetype || "application/octet-stream",
   });
+  form.append("file", blob, oneFile.name || "upload.bin");
 
   const r = await fetch("https://api.pinata.cloud/pinning/pinFileToIPFS", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${PINATA_JWT}`,
-      ...form.getHeaders(),
+      pinata_api_key: PINATA_API_KEY,
+      pinata_secret_api_key: PINATA_API_SECRET,
     },
     body: form,
   });
@@ -361,9 +311,7 @@ async function pinataUploadFile(oneFile) {
   }
 
   if (!r.ok) {
-    throw new Error(
-      j?.error?.details || j?.error || j?.message || `Pinata error (${r.status})`
-    );
+    throw new Error(j?.error?.details || j?.error || j?.message || `Pinata error (${r.status})`);
   }
 
   const cid = j.IpfsHash || j.cid || j?.pin?.cid;
@@ -373,13 +321,14 @@ async function pinataUploadFile(oneFile) {
 }
 
 async function pinataUploadJson(obj) {
-  if (!PINATA_JWT) throw new Error("No Pinata auth configured (PINATA_JWT).");
+  if (!PINATA_API_KEY || !PINATA_API_SECRET) throw new Error("No Pinata API credentials");
 
   const r = await fetch("https://api.pinata.cloud/pinning/pinJSONToIPFS", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${PINATA_JWT}`,
       "content-type": "application/json",
+      pinata_api_key: PINATA_API_KEY,
+      pinata_secret_api_key: PINATA_API_SECRET,
     },
     body: JSON.stringify(obj),
   });
@@ -393,9 +342,7 @@ async function pinataUploadJson(obj) {
   }
 
   if (!r.ok) {
-    throw new Error(
-      j?.error?.details || j?.error || j?.message || `Pinata error (${r.status})`
-    );
+    throw new Error(j?.error?.details || j?.error || j?.message || `Pinata error (${r.status})`);
   }
 
   const cid = j.IpfsHash || j.cid || j?.pin?.cid;
@@ -421,7 +368,6 @@ app.get("/health", async (_req, res) => {
       blockchainStatus = "configured";
       signerAddress = await blockchainService.signer.getAddress();
 
-      // Try to get balances
       try {
         balances.USDC = await blockchainService.getBalance("USDC");
         balances.USDT = await blockchainService.getBalance("USDT");
@@ -439,7 +385,7 @@ app.get("/health", async (_req, res) => {
       signer: signerAddress,
       blockchain: blockchainStatus,
       balances: balances,
-      pinata: !!PINATA_JWT,
+      pinataAuth: PINATA_API_KEY && PINATA_API_SECRET ? "apiKeys" : "none",
       counts: { proposals: proposals.length, bids: bids.length },
       endpoints: [
         "POST /ipfs/upload-file",
@@ -471,8 +417,8 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-// Test endpoint for debugging
-app.get("/test", async (req, res) => {
+// Test endpoint
+app.get("/test", async (_req, res) => {
   try {
     const bids = await bidsDB.read();
 
@@ -541,7 +487,7 @@ app.get("/transaction/:txHash", async (req, res) => {
   }
 });
 
-// Uploads (with robust error reporting)
+// Uploads
 app.post("/ipfs/upload-file", async (req, res) => {
   try {
     const f = req.files?.file || req.files?.files;
@@ -587,9 +533,7 @@ app.post("/ipfs/upload-json", async (req, res) => {
 app.post("/proposals", async (req, res) => {
   try {
     const { error, value } = proposalSchema.validate(req.body);
-    if (error) {
-      return res.status(400).json({ error: error.details[0].message });
-    }
+    if (error) return res.status(400).json({ error: error.details[0].message });
 
     const proposals = await proposalsDB.read();
     const proposalId = proposals.length
@@ -670,9 +614,7 @@ app.post("/proposals/:id/reject", async (req, res) => {
 app.post("/bids", async (req, res) => {
   try {
     const { error, value } = bidSchema.validate(req.body);
-    if (error) {
-      return res.status(400).json({ error: error.details[0].message });
-    }
+    if (error) return res.status(400).json({ error: error.details[0].message });
 
     const proposal = await proposalsDB.findById(value.proposalId);
     if (!proposal) return res.status(404).json({ error: "proposal 404" });
@@ -716,19 +658,14 @@ app.get("/bids", async (req, res) => {
     const pid = toNumber(req.query.proposalId, 0);
     const bids = await bidsDB.read();
 
-    // Filter bids if proposalId is provided
     let filteredBids = bids;
     if (pid) {
       filteredBids = bids.filter((b) => b.proposalId === pid);
-
-      // Optional: Check if proposal exists
       if (filteredBids.length === 0) {
         const proposals = await proposalsDB.read();
         const proposalExists = proposals.some((p) => p.proposalId === pid);
         if (!proposalExists) {
-          return res
-            .status(404)
-            .json({ error: "Proposal not found", proposalId: pid });
+          return res.status(404).json({ error: "Proposal not found", proposalId: pid });
         }
       }
     }
@@ -738,8 +675,7 @@ app.get("/bids", async (req, res) => {
     console.error("Error fetching bids:", error);
     res.status(500).json({
       error: "Failed to fetch bids",
-      details:
-        process.env.NODE_ENV === "development" ? error.message : undefined,
+      details: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 });
@@ -802,11 +738,9 @@ app.post("/bids/:id/complete-milestone", async (req, res) => {
     }
 
     bids[i].milestones[milestoneIndex].completed = true;
-    bids[i].milestones[milestoneIndex].completionDate =
-      new Date().toISOString();
+    bids[i].milestones[milestoneIndex].completionDate = new Date().toISOString();
     bids[i].milestones[milestoneIndex].proof = proof || "";
 
-    // Check if all milestones are completed
     const allCompleted = bids[i].milestones.every((m) => m.completed);
     if (allCompleted) {
       bids[i].status = "completed";
@@ -833,26 +767,16 @@ app.post("/bids/:id/pay-milestone", async (req, res) => {
     const bid = bids[i];
     const milestone = bid.milestones[milestoneIndex];
 
-    if (!milestone) {
-      return res.status(400).json({ error: "milestone not found" });
-    }
+    if (!milestone) return res.status(400).json({ error: "milestone not found" });
+    if (!milestone.completed) return res.status(400).json({ error: "milestone not completed" });
+    if (milestone.paymentTxHash) return res.status(400).json({ error: "milestone already paid" });
 
-    if (!milestone.completed) {
-      return res.status(400).json({ error: "milestone not completed" });
-    }
-
-    if (milestone.paymentTxHash) {
-      return res.status(400).json({ error: "milestone already paid" });
-    }
-
-    // Send payment using blockchain
     const paymentResult = await blockchainService.sendToken(
       bid.preferredStablecoin,
       bid.walletAddress,
       milestone.amount
     );
 
-    // Update milestone with payment info
     milestone.paymentTxHash = paymentResult.transactionHash;
     milestone.paymentDate = new Date().toISOString();
 
@@ -868,15 +792,13 @@ app.post("/bids/:id/pay-milestone", async (req, res) => {
     console.error("Error paying milestone:", error);
     res.status(500).json({
       error: error.message || "Failed to pay milestone",
-      details:
-        process.env.NODE_ENV === "development" ? error.stack : undefined,
+      details: process.env.NODE_ENV === "development" ? error.stack : undefined,
     });
   }
 });
 
 // ======== PROOFS: Admin + Vendor ========
 
-// Helper to safely parse proof JSON (from vendor submission)
 function parseProof(proofStr) {
   if (!proofStr) return {};
   try {
@@ -887,8 +809,8 @@ function parseProof(proofStr) {
   }
 }
 
-// Consolidated listing for Admin
-app.get("/proofs", async (req, res) => {
+// Admin: list proofs
+app.get("/proofs", async (_req, res) => {
   try {
     const bids = await bidsDB.read();
     const out = [];
@@ -926,7 +848,7 @@ app.get("/proofs", async (req, res) => {
   }
 });
 
-// Approve a specific proof
+// Approve proof
 app.post("/proofs/:bidId/:milestoneIndex/approve", async (req, res) => {
   try {
     const bidId = toNumber(req.params.bidId, -1);
@@ -950,7 +872,7 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", async (req, res) => {
   }
 });
 
-// Reject a specific proof
+// Reject proof
 app.post("/proofs/:bidId/:milestoneIndex/reject", async (req, res) => {
   try {
     const bidId = toNumber(req.params.bidId, -1);
@@ -1071,7 +993,7 @@ app.get("/vendor/payments", async (req, res) => {
 });
 
 // Centralized error handling
-app.use((error, req, res, next) => {
+app.use((error, _req, res, _next) => {
   console.error("Unhandled error:", error);
   res.status(500).json({
     error:
@@ -1096,14 +1018,14 @@ app.use((req, res, next) => {
 
 // ========== Environment Validation ==========
 function validateEnv() {
-  // Set default CORS_ORIGIN if not provided
   if (!process.env.CORS_ORIGIN) {
     process.env.CORS_ORIGIN = "https://lithiumx.netlify.app";
   }
-
-  // Only require PINATA_JWT in production
-  if (process.env.NODE_ENV === "production" && !PINATA_JWT) {
-    console.error("Missing required environment variable: PINATA_JWT");
+  if (
+    process.env.NODE_ENV === "production" &&
+    (!PINATA_API_KEY || !PINATA_API_SECRET)
+  ) {
+    console.error("Missing required environment variables: PINATA_API_KEY / PINATA_API_SECRET");
     process.exit(1);
   }
 }
@@ -1111,7 +1033,6 @@ function validateEnv() {
 // ========== Start ==========
 validateEnv();
 
-// Initialize databases and start server
 async function startServer() {
   try {
     // Ensure databases are initialized
@@ -1121,10 +1042,8 @@ async function startServer() {
     app.listen(PORT, () => {
       console.log(`[api] listening on :${PORT}`);
       console.log(`[api] CORS origin: ${CORS_ORIGIN}`);
-      console.log(`[api] Pinata configured: ${!!PINATA_JWT}`);
-      console.log(
-        `[api] Blockchain configured: ${blockchainService.isConfigured()}`
-      );
+      console.log(`[api] Pinata (API keys) configured: ${!!PINATA_API_KEY && !!PINATA_API_SECRET}`);
+      console.log(`[api] Blockchain configured: ${blockchainService.isConfigured()}`);
 
       if (blockchainService.isConfigured()) {
         console.log(`[api] Signer address: ${blockchainService.signer.address}`);
