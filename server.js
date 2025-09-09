@@ -15,8 +15,13 @@ const { ethers } = require("ethers");
 const PORT = Number(process.env.PORT || 3000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "https://lithiumx.netlify.app";
 
-const PINATA_JWT = process.env.PINATA_JWT || "";
-const PINATA_GATEWAY = process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud";
+const RAW_PINATA_JWT = (process.env.PINATA_JWT || "").trim();
+// tolerate accidental "Bearer " and accidental "0x" prefixes
+const PINATA_JWT = RAW_PINATA_JWT
+  .replace(/^Bearer\s+/i, "")
+  .replace(/^0x/i, "");
+const PINATA_GATEWAY =
+  process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud";
 
 // Blockchain configuration
 const NETWORK = process.env.NETWORK || "sepolia";
@@ -279,7 +284,7 @@ app.set("trust proxy", 1);
 // ========== CORS FIX - MUST COME FIRST ==========
 // Handle preflight requests for all endpoints
 app.options("*", (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "https://lithiumx.netlify.app");
+  res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
   res.setHeader(
     "Access-Control-Allow-Methods",
     "GET, POST, PUT, DELETE, OPTIONS, PATCH"
@@ -296,7 +301,7 @@ app.options("*", (req, res) => {
 // Regular CORS middleware
 app.use(
   cors({
-    origin: "https://lithiumx.netlify.app",
+    origin: CORS_ORIGIN,
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
@@ -445,6 +450,7 @@ app.get("/health", async (_req, res) => {
         "GET /bids?proposalId=ID",
         "GET /bids/:id",
         "POST /bids/:id/approve",
+        "POST /bids/:id/reject",
         "POST /bids/:id/complete-milestone",
         "POST /bids/:id/pay-milestone",
         "GET /balances/:address",
@@ -453,6 +459,8 @@ app.get("/health", async (_req, res) => {
         "POST /proofs/:bidId/:milestoneIndex/approve",
         "POST /proofs/:bidId/:milestoneIndex/reject",
         "GET /vendor/proofs?address=0x...",
+        "GET /vendor/bids?address=0x...",
+        "GET /vendor/payments?address=0x...",
       ],
     });
   } catch (error) {
@@ -530,21 +538,35 @@ app.get("/transaction/:txHash", async (req, res) => {
   }
 });
 
-// Uploads
+// Uploads (with robust error reporting)
 app.post("/ipfs/upload-file", async (req, res) => {
   try {
     const f = req.files?.file || req.files?.files;
     if (!f) return res.status(400).json({ error: "file is required" });
 
-    if (Array.isArray(f)) {
-      const out = [];
-      for (const one of f) out.push(await pinataUploadFile(one));
-      return res.json({ files: out });
+    const files = Array.isArray(f) ? f : [f];
+    const results = [];
+
+    for (const one of files) {
+      try {
+        const uploaded = await pinataUploadFile(one);
+        results.push(uploaded);
+      } catch (err) {
+        console.error("Pinata upload failed for file:", one?.name, err);
+        return res.status(400).json({
+          error: "Pinata upload failed",
+          details: err?.message || String(err),
+        });
+      }
     }
 
-    const info = await pinataUploadFile(f);
-    res.json(info);
+    if (Array.isArray(f)) {
+      res.json({ files: results });
+    } else {
+      res.json(results[0]);
+    }
   } catch (e) {
+    console.error("/ipfs/upload-file error:", e);
     res.status(400).json({ error: String(e.message || e) });
   }
 });
@@ -669,7 +691,7 @@ app.post("/bids", async (req, res) => {
         completed: false,
         completionDate: null,
         proof: "",
-        approved: null, // <— added so Admin can mark approve/reject
+        approved: null, // Admin can mark approve/reject on submitted proof
         paymentTxHash: null,
         paymentDate: null,
       })),
@@ -744,6 +766,22 @@ app.post("/bids/:id/approve", async (req, res) => {
   } catch (error) {
     console.error("Error approving bid:", error);
     res.status(500).json({ error: "Failed to approve bid" });
+  }
+});
+
+app.post("/bids/:id/reject", async (req, res) => {
+  try {
+    const id = toNumber(req.params.id, -1);
+    const bids = await bidsDB.read();
+    const i = bids.findIndex((b) => b.bidId === id);
+    if (i < 0) return res.status(404).json({ error: "bid 404" });
+
+    bids[i].status = "rejected";
+    await bidsDB.write(bids);
+    res.json({ ok: true, bidId: id, status: "rejected" });
+  } catch (error) {
+    console.error("Error rejecting bid:", error);
+    res.status(500).json({ error: "Failed to reject bid" });
   }
 });
 
@@ -933,7 +971,7 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", async (req, res) => {
   }
 });
 
-// Vendor-scoped listing (Option 1): /vendor/proofs?address=0x...
+// Vendor-scoped listing: /vendor/proofs?address=0x...
 app.get("/vendor/proofs", async (req, res) => {
   try {
     const address = String(req.query.address || "").toLowerCase().trim();
@@ -978,6 +1016,57 @@ app.get("/vendor/proofs", async (req, res) => {
   }
 });
 
+// Vendor-scoped bids: /vendor/bids?address=0x...
+app.get("/vendor/bids", async (req, res) => {
+  try {
+    const address = String(req.query.address || "").toLowerCase().trim();
+    if (!address || !ethers.isAddress(address)) {
+      return res.status(400).json({ error: "Valid address query param required" });
+    }
+    const bids = await bidsDB.read();
+    const mine = bids.filter(
+      (b) => (b.walletAddress || "").toLowerCase() === address
+    );
+    res.json(mine);
+  } catch (err) {
+    console.error("Error fetching vendor bids:", err);
+    res.status(500).json({ error: "Failed to fetch vendor bids" });
+  }
+});
+
+// Vendor-scoped payments history: /vendor/payments?address=0x...
+app.get("/vendor/payments", async (req, res) => {
+  try {
+    const address = String(req.query.address || "").toLowerCase().trim();
+    if (!address || !ethers.isAddress(address)) {
+      return res.status(400).json({ error: "Valid address query param required" });
+    }
+    const bids = await bidsDB.read();
+    const out = [];
+    for (const bid of bids) {
+      if ((bid.walletAddress || "").toLowerCase() !== address) continue;
+      bid.milestones.forEach((m, idx) => {
+        if (m.paymentTxHash) {
+          out.push({
+            bidId: bid.bidId,
+            proposalId: bid.proposalId,
+            milestoneIndex: idx,
+            milestoneName: m.name,
+            amount: m.amount,
+            paidAt: m.paymentDate,
+            txHash: m.paymentTxHash,
+            token: bid.preferredStablecoin,
+          });
+        }
+      });
+    }
+    res.json(out);
+  } catch (err) {
+    console.error("Error fetching vendor payments:", err);
+    res.status(500).json({ error: "Failed to fetch vendor payments" });
+  }
+});
+
 // Centralized error handling
 app.use((error, req, res, next) => {
   console.error("Unhandled error:", error);
@@ -1010,7 +1099,7 @@ function validateEnv() {
   }
 
   // Only require PINATA_JWT in production
-  if (process.env.NODE_ENV === "production" && !process.env.PINATA_JWT) {
+  if (process.env.NODE_ENV === "production" && !PINATA_JWT) {
     console.error("Missing required environment variable: PINATA_JWT");
     process.exit(1);
   }
