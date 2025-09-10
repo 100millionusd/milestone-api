@@ -341,19 +341,16 @@ async function pinataUploadFile(oneFile) {
     throw new Error("No Pinata auth configured (PINATA_API_KEY/SECRET).");
   }
 
-  // Ensure we give Pinata what it expects
   const form = new FormData();
-  // Must be "file" as the field name, and third arg as filename only
-  const buf =
-    oneFile && oneFile.data
-      ? (Buffer.isBuffer(oneFile.data) ? oneFile.data : Buffer.from(oneFile.data))
-      : Buffer.from([]);
-  form.append("file", buf, oneFile.name || "upload.bin");
+  form.append("file", oneFile.data, {
+    filename: oneFile.name || "upload.bin",
+    contentType: oneFile.mimetype || "application/octet-stream",
+  });
 
   const r = await fetch("https://api.pinata.cloud/pinning/pinFileToIPFS", {
     method: "POST",
     headers: {
-      ...form.getHeaders(), // keep boundary
+      ...form.getHeaders(),
       pinata_api_key: PINATA_API_KEY,
       pinata_secret_api_key: PINATA_SECRET_API_KEY,
     },
@@ -552,7 +549,14 @@ app.post("/ipfs/upload-file", async (req, res) => {
 
     for (const one of files) {
       try {
-        const uploaded = await pinataUploadFile(one);
+        // Convert express-fileupload object to the format expected by pinataUploadFile
+        const fileForPinata = {
+          data: one.data,
+          name: one.name,
+          mimetype: one.mimetype,
+          size: one.size
+        };
+        const uploaded = await pinataUploadFile(fileForPinata);
         results.push(uploaded);
       } catch (err) {
         console.error("Pinata upload failed for file:", one?.name, err);
