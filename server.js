@@ -12,6 +12,10 @@ const Joi = require("joi");
 const { ethers } = require("ethers");
 const FormData = require("form-data"); // for multipart uploads to Pinata
 
+// ✅ Safe fetch import (works in Railway/Netlify regardless of Node version)
+const fetch = (...args) =>
+  import("node-fetch").then(({ default: fetch }) => fetch(...args));
+
 // ========== Config ==========
 const PORT = Number(process.env.PORT || 3000);
 
@@ -335,20 +339,24 @@ function toNumber(v, d = 0) {
 
 // ========== IPFS / Pinata (API key + secret) ==========
 
-// EXACT function you requested (field name "file", simple filename arg)
+// ✅ FIXED: include filename + contentType so Pinata accepts the multipart form
 async function pinataUploadFile(oneFile) {
   if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) {
     throw new Error("No Pinata auth configured (PINATA_API_KEY/SECRET).");
   }
 
-  // Ensure we give Pinata what it expects
   const form = new FormData();
-  // Must be "file" as the field name, and third arg as filename only
+
+  // Ensure correct buffer
   const buf =
     oneFile && oneFile.data
       ? (Buffer.isBuffer(oneFile.data) ? oneFile.data : Buffer.from(oneFile.data))
       : Buffer.from([]);
-  form.append("file", buf, oneFile.name || "upload.bin");
+
+  form.append("file", buf, {
+    filename: oneFile?.name || "upload.bin",
+    contentType: oneFile?.mimetype || "application/octet-stream",
+  });
 
   const r = await fetch("https://api.pinata.cloud/pinning/pinFileToIPFS", {
     method: "POST",
@@ -378,7 +386,7 @@ async function pinataUploadFile(oneFile) {
   if (!cid) throw new Error("Pinata response missing CID");
 
   const url = `https://${PINATA_GATEWAY}/ipfs/${cid}`;
-  return { cid, url, size: oneFile.size || 0, name: oneFile.name || "file" };
+  return { cid, url, size: oneFile?.size || 0, name: oneFile?.name || "file" };
 }
 
 async function pinataUploadJson(obj) {
@@ -1125,4 +1133,3 @@ async function startServer() {
 }
 
 startServer();
-
