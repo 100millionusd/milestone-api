@@ -10,11 +10,9 @@ const path = require("path");
 const helmet = require("helmet");
 const Joi = require("joi");
 const { ethers } = require("ethers");
-const FormData = require("form-data"); // for multipart uploads to Pinata
-
-// ✅ Safe fetch import (works in Railway/Netlify regardless of Node version)
-const fetch = (...args) =>
-  import("node-fetch").then(({ default: fetch }) => fetch(...args));
+const FormData = require("form-data");
+const https = require("https");
+const http = require("http");
 
 // ========== Config ==========
 const PORT = Number(process.env.PORT || 3000);
@@ -337,9 +335,42 @@ function toNumber(v, d = 0) {
   return Number.isFinite(n) ? n : d;
 }
 
+// ========== Minimal HTTP helpers (no node-fetch needed) ==========
+function sendRequest(method, urlStr, headers = {}, bodyStreamOrString = null) {
+  const u = new URL(urlStr);
+  const lib = u.protocol === "https:" ? https : http;
+
+  const options = {
+    method,
+    hostname: u.hostname,
+    port: u.port || (u.protocol === "https:" ? 443 : 80),
+    path: u.pathname + u.search,
+    headers,
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = lib.request(options, (res) => {
+      let data = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => resolve({ status: res.statusCode || 0, body: data }));
+    });
+    req.on("error", reject);
+
+    if (bodyStreamOrString && typeof bodyStreamOrString.pipe === "function") {
+      bodyStreamOrString.pipe(req);
+    } else if (bodyStreamOrString) {
+      req.write(bodyStreamOrString);
+      req.end();
+    } else {
+      req.end();
+    }
+  });
+}
+
 // ========== IPFS / Pinata (API key + secret) ==========
 
-// ✅ FIXED: include filename + contentType so Pinata accepts the multipart form
+// Uses FormData stream + https.request (no fetch)
 async function pinataUploadFile(oneFile) {
   if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) {
     throw new Error("No Pinata auth configured (PINATA_API_KEY/SECRET).");
@@ -347,10 +378,12 @@ async function pinataUploadFile(oneFile) {
 
   const form = new FormData();
 
-  // Ensure correct buffer
+  // Ensure correct buffer + metadata
   const buf =
     oneFile && oneFile.data
-      ? (Buffer.isBuffer(oneFile.data) ? oneFile.data : Buffer.from(oneFile.data))
+      ? Buffer.isBuffer(oneFile.data)
+        ? oneFile.data
+        : Buffer.from(oneFile.data)
       : Buffer.from([]);
 
   form.append("file", buf, {
@@ -358,33 +391,35 @@ async function pinataUploadFile(oneFile) {
     contentType: oneFile?.mimetype || "application/octet-stream",
   });
 
-  const r = await fetch("https://api.pinata.cloud/pinning/pinFileToIPFS", {
-    method: "POST",
-    headers: {
-      ...form.getHeaders(), // keep boundary
-      pinata_api_key: PINATA_API_KEY,
-      pinata_secret_api_key: PINATA_SECRET_API_KEY,
-    },
-    body: form,
-  });
+  const headers = {
+    ...form.getHeaders(), // includes correct multipart boundary
+    pinata_api_key: PINATA_API_KEY,
+    pinata_secret_api_key: PINATA_SECRET_API_KEY,
+    Accept: "application/json",
+  };
 
-  const t = await r.text();
-  let j;
+  const { status, body } = await sendRequest(
+    "POST",
+    "https://api.pinata.cloud/pinning/pinFileToIPFS",
+    headers,
+    form
+  );
+
+  let json;
   try {
-    j = t ? JSON.parse(t) : {};
+    json = body ? JSON.parse(body) : {};
   } catch {
-    throw new Error(`Pinata pinFileToIPFS bad JSON: ${t}`);
+    throw new Error(`Pinata pinFileToIPFS bad JSON: ${body}`);
   }
 
-  if (!r.ok) {
+  if (status < 200 || status >= 300) {
     throw new Error(
-      j?.error?.details || j?.error || j?.message || `Pinata error (${r.status})`
+      json?.error?.details || json?.error || json?.message || `Pinata error (${status})`
     );
   }
 
-  const cid = j.IpfsHash || j.cid || j?.pin?.cid;
+  const cid = json.IpfsHash || json.cid || json?.pin?.cid;
   if (!cid) throw new Error("Pinata response missing CID");
-
   const url = `https://${PINATA_GATEWAY}/ipfs/${cid}`;
   return { cid, url, size: oneFile?.size || 0, name: oneFile?.name || "file" };
 }
@@ -394,31 +429,36 @@ async function pinataUploadJson(obj) {
     throw new Error("No Pinata auth configured (PINATA_API_KEY/SECRET).");
   }
 
-  const r = await fetch("https://api.pinata.cloud/pinning/pinJSONToIPFS", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      pinata_api_key: PINATA_API_KEY,
-      pinata_secret_api_key: PINATA_SECRET_API_KEY,
-    },
-    body: JSON.stringify(obj),
-  });
+  const payload = JSON.stringify(obj || {});
+  const headers = {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(payload),
+    pinata_api_key: PINATA_API_KEY,
+    pinata_secret_api_key: PINATA_SECRET_API_KEY,
+    Accept: "application/json",
+  };
 
-  const t = await r.text();
-  let j;
+  const { status, body } = await sendRequest(
+    "POST",
+    "https://api.pinata.cloud/pinning/pinJSONToIPFS",
+    headers,
+    payload
+  );
+
+  let json;
   try {
-    j = t ? JSON.parse(t) : {};
+    json = body ? JSON.parse(body) : {};
   } catch {
-    throw new Error(`Pinata pinJSONToIPFS bad JSON: ${t}`);
+    throw new Error(`Pinata pinJSONToIPFS bad JSON: ${body}`);
   }
 
-  if (!r.ok) {
+  if (status < 200 || status >= 300) {
     throw new Error(
-      j?.error?.details || j?.error || j?.message || `Pinata error (${r.status})`
+      json?.error?.details || json?.error || json?.message || `Pinata error (${status})`
     );
   }
 
-  const cid = j.IpfsHash || j.cid || j?.pin?.cid;
+  const cid = json.IpfsHash || json.cid || json?.pin?.cid;
   if (!cid) throw new Error("Pinata response missing CID");
   const url = `https://${PINATA_GATEWAY}/ipfs/${cid}`;
   return { cid, url };
