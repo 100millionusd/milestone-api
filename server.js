@@ -103,11 +103,28 @@ const bidSchema = Joi.object({
     .allow(null),
 });
 
+// JSON schema for Pinata upload-json
+const pinataJsonSchema = Joi.object({
+  title: Joi.string().max(200).required(),
+  description: Joi.string().max(2000).optional().allow(""),
+  files: Joi.array()
+    .items(
+      Joi.object({
+        cid: Joi.string().required(),
+        name: Joi.string().required(),
+        url: Joi.string().uri().required(),
+      })
+    )
+    .optional()
+    .default([]),
+});
+
 // ========== Database Layer ==========
 class JSONDatabase {
   constructor(filePath) {
     this.filePath = filePath;
   }
+
   async read() {
     try {
       const data = await fsp.readFile(this.filePath, "utf8");
@@ -120,30 +137,36 @@ class JSONDatabase {
       throw error;
     }
   }
+
   async write(data) {
     await fsp.mkdir(path.dirname(this.filePath), { recursive: true });
     await fsp.writeFile(this.filePath, JSON.stringify(data, null, 2));
   }
+
   async findById(id) {
     const data = await this.read();
     return data.find((item) => item.proposalId === id || item.bidId === id);
   }
+
   async findByProposalId(proposalId) {
     const data = await this.read();
     return data.filter((item) => item.proposalId === proposalId);
   }
+
   async add(item) {
     const data = await this.read();
     data.push(item);
     await this.write(data);
     return item;
   }
+
   async update(id, updates) {
     const data = await this.read();
     const index = data.findIndex(
       (item) => item.proposalId === id || item.bidId === id
     );
     if (index === -1) return null;
+
     data[index] = { ...data[index], ...updates };
     await this.write(data);
     return data[index];
@@ -154,6 +177,7 @@ class JSONDatabase {
 class BlockchainService {
   constructor() {
     this.provider = new ethers.JsonRpcProvider(SEPOLIA_RPC_URL);
+
     if (PRIVATE_KEY) {
       const formattedPrivateKey = PRIVATE_KEY.startsWith("0x")
         ? PRIVATE_KEY
@@ -169,29 +193,38 @@ class BlockchainService {
       this.signer = null;
     }
   }
+
   async sendToken(tokenSymbol, toAddress, amount) {
     if (!this.signer) {
       throw new Error(
         "Blockchain service not configured. Please provide a PRIVATE_KEY."
       );
     }
+
     const token = TOKENS[tokenSymbol];
     if (!token) throw new Error(`Unsupported token: ${tokenSymbol}`);
+
     if (!ethers.isAddress(toAddress)) {
       throw new Error("Invalid recipient address");
     }
+
     const contract = new ethers.Contract(
       token.address,
       ERC20_ABI,
       this.signer
     );
+
     const decimals = await contract.decimals();
     const amountInWei = ethers.parseUnits(amount.toString(), decimals);
+
     const balance = await contract.balanceOf(await this.signer.getAddress());
     if (balance < amountInWei) throw new Error("Insufficient balance for payment");
+
     const tx = await contract.transfer(toAddress, amountInWei);
     const receipt = await tx.wait();
+
     if (!receipt.status) throw new Error("Transaction failed");
+
     return {
       success: true,
       transactionHash: receipt.hash,
@@ -200,10 +233,13 @@ class BlockchainService {
       currency: tokenSymbol,
     };
   }
+
   async getBalance(tokenSymbol) {
     if (!this.signer) return 0;
+
     const token = TOKENS[tokenSymbol];
     if (!token) throw new Error(`Unsupported token: ${tokenSymbol}`);
+
     const contract = new ethers.Contract(
       token.address,
       ERC20_ABI,
@@ -211,17 +247,21 @@ class BlockchainService {
     );
     const balance = await contract.balanceOf(await this.signer.getAddress());
     const decimals = await contract.decimals();
+
     return parseFloat(ethers.formatUnits(balance, decimals));
   }
+
   async getTransactionStatus(txHash) {
     const receipt = await this.provider.getTransactionReceipt(txHash);
     if (!receipt) return { status: "not_found" };
+
     return {
       status: receipt.status === 1 ? "success" : "failed",
       blockNumber: receipt.blockNumber,
       confirmations: receipt.confirmations,
     };
   }
+
   isConfigured() {
     return this.signer !== null;
   }
@@ -294,21 +334,26 @@ function toNumber(v, d = 0) {
 }
 
 // ========== IPFS / Pinata (API key + secret) ==========
+
+// EXACT function you requested (field name "file", simple filename arg)
 async function pinataUploadFile(oneFile) {
   if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) {
     throw new Error("No Pinata auth configured (PINATA_API_KEY/SECRET).");
   }
 
+  // Ensure we give Pinata what it expects
   const form = new FormData();
-  form.append("file", oneFile.data, {
-    filename: oneFile.name || "upload.bin",
-    contentType: oneFile.mimetype || "application/octet-stream",
-  });
+  // Must be "file" as the field name, and third arg as filename only
+  const buf =
+    oneFile && oneFile.data
+      ? (Buffer.isBuffer(oneFile.data) ? oneFile.data : Buffer.from(oneFile.data))
+      : Buffer.from([]);
+  form.append("file", buf, oneFile.name || "upload.bin");
 
   const r = await fetch("https://api.pinata.cloud/pinning/pinFileToIPFS", {
     method: "POST",
     headers: {
-      ...form.getHeaders(),
+      ...form.getHeaders(), // keep boundary
       pinata_api_key: PINATA_API_KEY,
       pinata_secret_api_key: PINATA_SECRET_API_KEY,
     },
@@ -331,6 +376,7 @@ async function pinataUploadFile(oneFile) {
 
   const cid = j.IpfsHash || j.cid || j?.pin?.cid;
   if (!cid) throw new Error("Pinata response missing CID");
+
   const url = `https://${PINATA_GATEWAY}/ipfs/${cid}`;
   return { cid, url, size: oneFile.size || 0, name: oneFile.name || "file" };
 }
@@ -495,7 +541,7 @@ app.get("/transaction/:txHash", async (req, res) => {
   }
 });
 
-// Uploads
+// Uploads (files)
 app.post("/ipfs/upload-file", async (req, res) => {
   try {
     const f = req.files?.file || req.files?.files;
@@ -528,11 +574,20 @@ app.post("/ipfs/upload-file", async (req, res) => {
   }
 });
 
+// Upload JSON with schema validation
 app.post("/ipfs/upload-json", async (req, res) => {
   try {
-    const info = await pinataUploadJson(req.body || {});
+    const { error, value } = pinataJsonSchema.validate(req.body, {
+      abortEarly: true,
+    });
+    if (error) {
+      return res.status(400).json({ error: error.details[0].message });
+    }
+
+    const info = await pinataUploadJson(value);
     res.json(info);
   } catch (e) {
+    console.error("/ipfs/upload-json error:", e);
     res.status(400).json({ error: String(e.message || e) });
   }
 });
@@ -644,7 +699,7 @@ app.post("/bids", async (req, res) => {
         completed: false,
         completionDate: null,
         proof: "",
-        approved: null,
+        approved: null, // Admin will mark approve/reject on submitted proof
         paymentTxHash: null,
         paymentDate: null,
       })),
@@ -669,6 +724,7 @@ app.get("/bids", async (req, res) => {
     let filteredBids = bids;
     if (pid) {
       filteredBids = bids.filter((b) => b.proposalId === pid);
+
       if (filteredBids.length === 0) {
         const proposals = await proposalsDB.read();
         const proposalExists = proposals.some((p) => p.proposalId === pid);
@@ -679,6 +735,7 @@ app.get("/bids", async (req, res) => {
         }
       }
     }
+
     res.json(filteredBids);
   } catch (error) {
     console.error("Error fetching bids:", error);
@@ -861,7 +918,7 @@ app.get("/proofs", async (_req, res) => {
   }
 });
 
-// Approve a specific proof (fixed variable name)
+// Approve a specific proof
 app.post("/proofs/:bidId/:milestoneIndex/approve", async (req, res) => {
   try {
     const bidId = toNumber(req.params.bidId, -1);
