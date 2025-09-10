@@ -315,7 +315,8 @@ app.use(express.json({ limit: "20mb" }));
 app.use(
   fileUpload({
     limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
-    useTempFiles: false,
+    useTempFiles: true,
+    tempFileDir: '/tmp/',
     abortOnLimit: true,
   })
 );
@@ -335,47 +336,66 @@ function toNumber(v, d = 0) {
 
 // ========== IPFS / Pinata (API key + secret) ==========
 
-// EXACT function you requested (field name "file", simple filename arg)
 async function pinataUploadFile(oneFile) {
   if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) {
     throw new Error("No Pinata auth configured (PINATA_API_KEY/SECRET).");
   }
 
   const form = new FormData();
-  form.append("file", oneFile.data, {
+  
+  // Get the file buffer directly
+  let fileBuffer;
+  if (oneFile.tempFilePath) {
+    // File was saved to temp file
+    fileBuffer = await fsp.readFile(oneFile.tempFilePath);
+  } else if (Buffer.isBuffer(oneFile.data)) {
+    fileBuffer = oneFile.data;
+  } else if (oneFile.data) {
+    // Convert to buffer if it's not already
+    fileBuffer = Buffer.from(oneFile.data);
+  } else {
+    fileBuffer = Buffer.from([]);
+  }
+
+  form.append("file", fileBuffer, {
     filename: oneFile.name || "upload.bin",
     contentType: oneFile.mimetype || "application/octet-stream",
   });
 
-  const r = await fetch("https://api.pinata.cloud/pinning/pinFileToIPFS", {
-    method: "POST",
-    headers: {
-      ...form.getHeaders(),
-      pinata_api_key: PINATA_API_KEY,
-      pinata_secret_api_key: PINATA_SECRET_API_KEY,
-    },
-    body: form,
-  });
-
-  const t = await r.text();
-  let j;
   try {
-    j = t ? JSON.parse(t) : {};
-  } catch {
-    throw new Error(`Pinata pinFileToIPFS bad JSON: ${t}`);
+    const r = await fetch("https://api.pinata.cloud/pinning/pinFileToIPFS", {
+      method: "POST",
+      headers: {
+        ...form.getHeaders(),
+        pinata_api_key: PINATA_API_KEY,
+        pinata_secret_api_key: PINATA_SECRET_API_KEY,
+      },
+      body: form,
+    });
+
+    const t = await r.text();
+    let j;
+    try {
+      j = t ? JSON.parse(t) : {};
+    } catch {
+      throw new Error(`Pinata pinFileToIPFS bad JSON: ${t}`);
+    }
+
+    if (!r.ok) {
+      throw new Error(
+        j?.error?.details || j?.error || j?.message || `Pinata error (${r.status})`
+      );
+    }
+
+    const cid = j.IpfsHash || j.cid || j?.pin?.cid;
+    if (!cid) throw new Error("Pinata response missing CID");
+
+    const url = `https://${PINATA_GATEWAY}/ipfs/${cid}`;
+    return { cid, url, size: oneFile.size || 0, name: oneFile.name || "file" };
+  } catch (error) {
+    console.error("Pinata upload error:", error);
+    throw new Error(`Failed to upload to Pinata: ${error.message}`);
   }
-
-  if (!r.ok) {
-    throw new Error(
-      j?.error?.details || j?.error || j?.message || `Pinata error (${r.status})`
-    );
-  }
-
-  const cid = j.IpfsHash || j.cid || j?.pin?.cid;
-  if (!cid) throw new Error("Pinata response missing CID");
-
-  const url = `https://${PINATA_GATEWAY}/ipfs/${cid}`;
-  return { cid, url, size: oneFile.size || 0, name: oneFile.name || "file" };
 }
 
 async function pinataUploadJson(obj) {
@@ -549,14 +569,7 @@ app.post("/ipfs/upload-file", async (req, res) => {
 
     for (const one of files) {
       try {
-        // Convert express-fileupload object to the format expected by pinataUploadFile
-        const fileForPinata = {
-          data: one.data,
-          name: one.name,
-          mimetype: one.mimetype,
-          size: one.size
-        };
-        const uploaded = await pinataUploadFile(fileForPinata);
+        const uploaded = await pinataUploadFile(one);
         results.push(uploaded);
       } catch (err) {
         console.error("Pinata upload failed for file:", one?.name, err);
