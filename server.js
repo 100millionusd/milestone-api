@@ -335,22 +335,25 @@ function toNumber(v, d = 0) {
 
 // ========== IPFS / Pinata (API key + secret) ==========
 
-// EXACT function you requested (with filename + contentType)
+// EXACT function you requested (field name "file", simple filename arg)
 async function pinataUploadFile(oneFile) {
   if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) {
     throw new Error("No Pinata auth configured (PINATA_API_KEY/SECRET).");
   }
 
+  // Ensure we give Pinata what it expects
   const form = new FormData();
-  form.append("file", oneFile.data, {
-    filename: oneFile.name || "upload.bin",
-    contentType: oneFile.mimetype || "application/octet-stream",
-  });
+  // Must be "file" as the field name, and third arg as filename only
+  const buf =
+    oneFile && oneFile.data
+      ? (Buffer.isBuffer(oneFile.data) ? oneFile.data : Buffer.from(oneFile.data))
+      : Buffer.from([]);
+  form.append("file", buf, oneFile.name || "upload.bin");
 
   const r = await fetch("https://api.pinata.cloud/pinning/pinFileToIPFS", {
     method: "POST",
     headers: {
-      ...form.getHeaders(),
+      ...form.getHeaders(), // keep boundary
       pinata_api_key: PINATA_API_KEY,
       pinata_secret_api_key: PINATA_SECRET_API_KEY,
     },
@@ -538,7 +541,7 @@ app.get("/transaction/:txHash", async (req, res) => {
   }
 });
 
-// Uploads (files) — patched for best-effort multi-upload
+// Uploads (files)
 app.post("/ipfs/upload-file", async (req, res) => {
   try {
     const f = req.files?.file || req.files?.files;
@@ -553,9 +556,8 @@ app.post("/ipfs/upload-file", async (req, res) => {
         results.push(uploaded);
       } catch (err) {
         console.error("Pinata upload failed for file:", one?.name, err);
-        results.push({
+        return res.status(400).json({
           error: "Pinata upload failed",
-          name: one?.name || "unknown",
           details: err?.message || String(err),
         });
       }
@@ -572,35 +574,21 @@ app.post("/ipfs/upload-file", async (req, res) => {
   }
 });
 
-// Upload JSON with schema validation — patched for clear error handling
+// Upload JSON with schema validation
 app.post("/ipfs/upload-json", async (req, res) => {
   try {
     const { error, value } = pinataJsonSchema.validate(req.body, {
       abortEarly: true,
     });
     if (error) {
-      return res.status(400).json({
-        error: "Schema validation failed",
-        details: error.details[0].message,
-      });
+      return res.status(400).json({ error: error.details[0].message });
     }
 
-    try {
-      const info = await pinataUploadJson(value);
-      res.json(info);
-    } catch (err) {
-      console.error("Pinata JSON upload failed:", err);
-      res.status(500).json({
-        error: "Pinata JSON upload failed",
-        details: err?.message || String(err),
-      });
-    }
+    const info = await pinataUploadJson(value);
+    res.json(info);
   } catch (e) {
     console.error("/ipfs/upload-json error:", e);
-    res.status(500).json({
-      error: "Unexpected server error",
-      details: e?.message || String(e),
-    });
+    res.status(400).json({ error: String(e.message || e) });
   }
 });
 
@@ -1137,3 +1125,4 @@ async function startServer() {
 }
 
 startServer();
+
