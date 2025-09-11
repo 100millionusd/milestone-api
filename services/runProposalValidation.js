@@ -1,8 +1,11 @@
-import OpenAI from "openai";
+// services/runProposalValidation.js
+const OpenAI = require("openai");
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-export async function runProposalValidation(proposal) {
+async function runProposalValidation(proposal) {
   try {
     const docs = (proposal.docs || []).map(d => d.name).join(", ");
     const prompt = `
@@ -18,7 +21,7 @@ export async function runProposalValidation(proposal) {
     const resp = await client.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [{ role: "user", content: prompt }],
-      response_format: { type: "json_object" }
+      response_format: { type: "json_object" },
     });
 
     return JSON.parse(resp.choices[0].message.content || "{}");
@@ -27,3 +30,5 @@ export async function runProposalValidation(proposal) {
     return { error: err.message };
   }
 }
+
+module.exports = { runProposalValidation };
