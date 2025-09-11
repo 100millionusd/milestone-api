@@ -1110,6 +1110,19 @@ app.get("/vendor/payments", async (req, res) => {
   }
 });
 
+// === AI Validation route ===
+const { runProposalValidation } = require("./services/runProposalValidation");
+
+app.post("/validate", async (req, res) => {
+  try {
+    const result = await runProposalValidation(req.body);
+    res.json(result);
+  } catch (err) {
+    console.error("AI validation failed:", err);
+    res.status(500).json({ error: "Validation failed", details: err.message });
+  }
+});
+
 // Centralized error handling
 app.use((error, _req, res, _next) => {
   console.error("Unhandled error:", error);
