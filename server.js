@@ -103,6 +103,8 @@ const bidSchema = Joi.object({
   })
     .optional()
     .allow(null),
+
+  aiAnalysis: Joi.any().optional(),  
 });
 
 // JSON schema for Pinata upload-json
@@ -733,6 +735,17 @@ app.post("/bids", async (req, res) => {
     const bids = await bidsDB.read();
     const bidId = bids.length ? bids[bids.length - 1].bidId + 1 : 1;
 
+        app.post("/bids", async (req, res) => {
+  try {
+    const { error, value } = bidSchema.validate(req.body);
+    if (error) return res.status(400).json({ error: error.details[0].message });
+
+    const proposal = await proposalsDB.findById(value.proposalId);
+    if (!proposal) return res.status(404).json({ error: "proposal 404" });
+
+    const bids = await bidsDB.read();
+    const bidId = bids.length ? bids[bids.length - 1].bidId + 1 : 1;
+
     const rec = {
       bidId,
       proposalId: value.proposalId,
@@ -747,22 +760,30 @@ app.post("/bids", async (req, res) => {
         completed: false,
         completionDate: null,
         proof: "",
-        approved: null, // Admin will mark approve/reject on submitted proof
+        approved: null,
         paymentTxHash: null,
         paymentDate: null,
       })),
       doc: value.doc || null,
+      aiAnalysis: value.aiAnalysis || null,  
       status: "pending",
       createdAt: new Date().toISOString(),
     };
 
     await bidsDB.add(rec);
-    res.json({ ok: true, bidId, proposalId: value.proposalId });
+
+    res.json({
+      ok: true,
+      bidId,
+      proposalId: value.proposalId,
+      aiAnalysis: rec.aiAnalysis || null,  
+    });
   } catch (error) {
     console.error("Error creating bid:", error);
     res.status(500).json({ error: "Failed to create bid" });
   }
 });
+
 
 app.get("/bids", async (req, res) => {
   try {
@@ -1174,3 +1195,4 @@ async function startServer() {
 }
 
 startServer();
+
