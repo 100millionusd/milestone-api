@@ -735,17 +735,6 @@ app.post("/bids", async (req, res) => {
     const bids = await bidsDB.read();
     const bidId = bids.length ? bids[bids.length - 1].bidId + 1 : 1;
 
-        app.post("/bids", async (req, res) => {
-  try {
-    const { error, value } = bidSchema.validate(req.body);
-    if (error) return res.status(400).json({ error: error.details[0].message });
-
-    const proposal = await proposalsDB.findById(value.proposalId);
-    if (!proposal) return res.status(404).json({ error: "proposal 404" });
-
-    const bids = await bidsDB.read();
-    const bidId = bids.length ? bids[bids.length - 1].bidId + 1 : 1;
-
     const rec = {
       bidId,
       proposalId: value.proposalId,
