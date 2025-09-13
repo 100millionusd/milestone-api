@@ -767,6 +767,29 @@ app.post("/bids", async (req, res) => {
       proposalId: value.proposalId,
       aiAnalysis: rec.aiAnalysis || null,  
     });
+
+        // 🔹 Trigger Agent 2 async (fire-and-forget)
+    try {
+      const agent2Url =
+        process.env.AGENT2_URL || "https://vendor-agent-production.up.railway.app/analyze";
+      fetch(agent2Url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bidId,
+          proposalId: value.proposalId,
+          vendorName: value.vendorName,
+          priceUSD: value.priceUSD,
+          days: value.days,
+          notes: value.notes,
+          walletAddress: value.walletAddress,
+        }),
+      }).catch((err) => {
+        console.error("Agent 2 trigger failed:", err);
+      });
+    } catch (err) {
+      console.error("Agent 2 trigger setup error:", err);
+    }
   } catch (error) {
     console.error("Error creating bid:", error);
     res.status(500).json({ error: "Failed to create bid" });
