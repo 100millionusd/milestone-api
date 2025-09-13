@@ -80,17 +80,24 @@ const bidSchema = Joi.object({
   notes: Joi.string().allow(""),
   walletAddress: Joi.string().pattern(/^0x[a-fA-F0-9]{40}$/).required(),
   preferredStablecoin: Joi.string().valid("USDT", "USDC").default("USDT"),
-  milestones: Joi.array().items(Joi.object({
-    name: Joi.string().required(),
-    amount: Joi.number().required(),
-    dueDate: Joi.date().iso().required(),
-  })).min(1).required(),
+  milestones: Joi.array()
+    .items(
+      Joi.object({
+        name: Joi.string().required(),
+        amount: Joi.number().required(),
+        dueDate: Joi.date().iso().required(),
+      })
+    )
+    .min(1)
+    .required(),
   doc: Joi.object({
     cid: Joi.string().required(),
     url: Joi.string().uri().required(),
     name: Joi.string().required(),
     size: Joi.number().required(),
-  }).optional().allow(null),
+  })
+    .optional()
+    .allow(null),
 });
 
 // ========== Blockchain Service ==========
@@ -137,7 +144,13 @@ const blockchainService = new BlockchainService();
 function sendRequest(method, urlStr, headers = {}, body = null) {
   const u = new URL(urlStr);
   const lib = u.protocol === "https:" ? https : http;
-  const options = { method, hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname + u.search, headers };
+  const options = {
+    method,
+    hostname: u.hostname,
+    port: u.port || (u.protocol === "https:" ? 443 : 80),
+    path: u.pathname + u.search,
+    headers,
+  };
   return new Promise((resolve, reject) => {
     const req = lib.request(options, (res) => {
       let data = "";
@@ -148,7 +161,10 @@ function sendRequest(method, urlStr, headers = {}, body = null) {
     req.on("error", reject);
     if (body) {
       if (typeof body.pipe === "function") body.pipe(req);
-      else { req.write(body); req.end(); }
+      else {
+        req.write(body);
+        req.end();
+      }
     } else req.end();
   });
 }
@@ -158,30 +174,52 @@ async function pinataUploadFile(file) {
   if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) throw new Error("Pinata not configured");
   const form = new FormData();
   const buf = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data);
-  form.append("file", buf, { filename: file.name, contentType: file.mimetype });
-  const { status, body } = await sendRequest("POST", "https://api.pinata.cloud/pinning/pinFileToIPFS",
-    { ...form.getHeaders(), pinata_api_key: PINATA_API_KEY, pinata_secret_api_key: PINATA_SECRET_API_KEY, Accept: "application/json" }, form);
+
+  // sanitize filename
+  const safeName = file.name.replace(/[^a-z0-9_\-\.]/gi, "_");
+
+  form.append("file", buf, { filename: safeName, contentType: file.mimetype });
+  const { status, body } = await sendRequest(
+    "POST",
+    "https://api.pinata.cloud/pinning/pinFileToIPFS",
+    {
+      ...form.getHeaders(),
+      pinata_api_key: PINATA_API_KEY,
+      pinata_secret_api_key: PINATA_SECRET_API_KEY,
+      Accept: "application/json",
+    },
+    form
+  );
   const json = JSON.parse(body);
   if (status < 200 || status >= 300) throw new Error(json?.error || "Pinata error");
   const cid = json.IpfsHash;
-  return { cid, url: `https://${PINATA_GATEWAY}/ipfs/${cid}`, size: file.size, name: file.name };
+  return { cid, url: `https://${PINATA_GATEWAY}/ipfs/${cid}`, size: file.size, name: safeName };
 }
 
 // ========== Express ==========
 const app = express();
+
+// Trust proxy (for Railway/Heroku/etc.)
 app.set("trust proxy", 1);
 
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (!origin || CORS_ORIGINS.includes(origin)) res.header("Access-Control-Allow-Origin", origin || "*");
-  res.header("Access-Control-Allow-Credentials", "true");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
+// CORS middleware
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (!origin) return callback(null, true); // allow curl/postman
+      if (CORS_ORIGINS.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error("Not allowed by CORS: " + origin));
+    },
+    credentials: true,
+  })
+);
 
-app.use(cors());
+// Handle preflight requests
+app.options("*", cors());
+
+// Security + JSON
 app.use(helmet());
 app.use(express.json({ limit: "20mb" }));
 app.use(fileUpload({ limits: { fileSize: 50 * 1024 * 1024 } }));
@@ -200,7 +238,8 @@ app.get("/health", async (_req, res) => {
       blockchain: blockchainService.signer ? "configured" : "not_configured",
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("[/health]", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -211,18 +250,37 @@ app.post("/proposals", async (req, res) => {
     if (error) return res.status(400).json({ error: error.message });
     const q = `INSERT INTO proposals (org_name,title,summary,contact,address,city,country,amount_usd,docs,cid)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`;
-    const vals = [value.orgName, value.title, value.summary, value.contact, value.address, value.city, value.country, value.amountUSD, JSON.stringify(value.docs || []), value.cid];
+    const vals = [
+      value.orgName,
+      value.title,
+      value.summary,
+      value.contact,
+      value.address,
+      value.city,
+      value.country,
+      value.amountUSD,
+      JSON.stringify(value.docs || []),
+      value.cid,
+    ];
     const { rows } = await pool.query(q, vals);
     res.json(rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("[/proposals]", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 app.get("/proposals/:id", async (req, res) => {
-  const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [req.params.id]);
-  if (!rows[0]) return res.status(404).json({ error: "proposal not found" });
-  res.json(rows[0]);
+  try {
+    const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [
+      req.params.id,
+    ]);
+    if (!rows[0]) return res.status(404).json({ error: "proposal not found" });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("[/proposals/:id]", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
 });
 
 // Bids
@@ -232,20 +290,39 @@ app.post("/bids", async (req, res) => {
     if (error) return res.status(400).json({ error: error.message });
     const q = `INSERT INTO bids (proposal_id,vendor_name,price_usd,price_bol,days,notes,wallet_address,preferred_stablecoin,milestones,doc,status)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending') RETURNING *`;
-    const vals = [value.proposalId, value.vendorName, value.priceUSD, value.priceBol, value.days, value.notes, value.walletAddress, value.preferredStablecoin, JSON.stringify(value.milestones), value.doc ? JSON.stringify(value.doc) : null];
+    const vals = [
+      value.proposalId,
+      value.vendorName,
+      value.priceUSD,
+      value.priceBol,
+      value.days,
+      value.notes,
+      value.walletAddress,
+      value.preferredStablecoin,
+      JSON.stringify(value.milestones),
+      value.doc ? JSON.stringify(value.doc) : null,
+    ];
     const { rows } = await pool.query(q, vals);
     res.json(rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("[/bids]", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 app.get("/bids", async (req, res) => {
-  const { rows } = await pool.query("SELECT * FROM bids WHERE proposal_id=$1", [req.query.proposalId]);
-  res.json(rows);
+  try {
+    const { rows } = await pool.query("SELECT * FROM bids WHERE proposal_id=$1", [
+      req.query.proposalId,
+    ]);
+    res.json(rows);
+  } catch (err) {
+    console.error("[/bids]", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
 });
 
-// Milestones: complete + pay etc → similar SQL updates (omitted here for brevity)
+// TODO: Milestone completion + payments
 
 // Start
 app.listen(PORT, () => {
