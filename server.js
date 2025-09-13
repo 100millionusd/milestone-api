@@ -1,5 +1,5 @@
-// server.js — Milestone API (Postgres + Payments + IPFS + CORS)
-// ===================================================================
+// server.js — Milestone API with Postgres + USDT/USDC payments + IPFS/Pinata
+// -----------------------------------------------------------------------------
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -14,24 +14,23 @@ const { Pool } = require("pg");
 
 // ========== Config ==========
 const PORT = Number(process.env.PORT || 3000);
-const DEFAULT_ORIGIN = "https://lithiumx.netlify.app";
 
-const CORS_ORIGINS = (process.env.CORS_ORIGINS ||
-  process.env.CORS_ORIGIN ||
-  DEFAULT_ORIGIN)
+const DEFAULT_ORIGIN = "https://lithiumx.netlify.app";
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || DEFAULT_ORIGIN)
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
 const PINATA_API_KEY = (process.env.PINATA_API_KEY || "").trim();
 const PINATA_SECRET_API_KEY = (process.env.PINATA_SECRET_API_KEY || "").trim();
-const PINATA_GATEWAY =
-  process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud";
+const PINATA_GATEWAY = process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud";
 
+// Blockchain
 const NETWORK = process.env.NETWORK || "sepolia";
 const SEPOLIA_RPC_URL =
   process.env.SEPOLIA_RPC_URL || "https://ethereum-sepolia.publicnode.com";
 const PRIVATE_KEY = process.env.PRIVATE_KEY || "";
+const ESCROW_ADDR = process.env.ESCROW_ADDR || "";
 
 const USDC_ADDRESS =
   process.env.USDC_ADDRESS ||
@@ -79,9 +78,7 @@ const bidSchema = Joi.object({
   priceBol: Joi.number().required(),
   days: Joi.number().integer().required(),
   notes: Joi.string().allow(""),
-  walletAddress: Joi.string()
-    .pattern(/^0x[a-fA-F0-9]{40}$/)
-    .required(),
+  walletAddress: Joi.string().pattern(/^0x[a-fA-F0-9]{40}$/).required(),
   preferredStablecoin: Joi.string().valid("USDT", "USDC").default("USDT"),
   milestones: Joi.array()
     .items(
@@ -140,6 +137,7 @@ class BlockchainService {
     return parseFloat(ethers.formatUnits(balance, decimals));
   }
 }
+
 const blockchainService = new BlockchainService();
 
 // ========== Helpers ==========
@@ -158,9 +156,7 @@ function sendRequest(method, urlStr, headers = {}, body = null) {
       let data = "";
       res.setEncoding("utf8");
       res.on("data", (c) => (data += c));
-      res.on("end", () =>
-        resolve({ status: res.statusCode || 0, body: data })
-      );
+      res.on("end", () => resolve({ status: res.statusCode || 0, body: data }));
     });
     req.on("error", reject);
     if (body) {
@@ -209,13 +205,17 @@ async function pinataUploadFile(file) {
 
 // ========== Express ==========
 const app = express();
+
+// Trust Railway proxy
 app.set("trust proxy", 1);
 
+// CORS middleware
 app.use(
   cors({
     origin: (origin, cb) => {
-      if (!origin || CORS_ORIGINS.includes(origin)) return cb(null, true);
-      cb(new Error("CORS blocked: " + origin));
+      if (!origin) return cb(null, true);
+      if (CORS_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error("Not allowed by CORS: " + origin));
     },
     credentials: true,
   })
@@ -243,36 +243,7 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-// Proposals
-app.post("/proposals", async (req, res) => {
-  try {
-    const { error, value } = proposalSchema.validate(req.body);
-    if (error) return res.status(400).json({ error: error.message });
-
-    const q = `INSERT INTO proposals
-      (org_name,title,summary,contact,address,city,country,amount_usd,docs,cid)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`;
-
-    const vals = [
-      value.orgName,
-      value.title,
-      value.summary,
-      value.contact,
-      value.address,
-      value.city,
-      value.country,
-      value.amountUSD,
-      JSON.stringify(value.docs || []),
-      value.cid,
-    ];
-
-    const { rows } = await pool.query(q, vals);
-    res.json(rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
+// ===== Proposals =====
 app.get("/proposals", async (_req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM proposals ORDER BY created_at DESC");
@@ -283,25 +254,64 @@ app.get("/proposals", async (_req, res) => {
 });
 
 app.get("/proposals/:id", async (req, res) => {
+  const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: "proposal not found" });
+  res.json(rows[0]);
+});
+
+app.post("/proposals", async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [req.params.id]);
-    if (!rows[0]) return res.status(404).json({ error: "proposal not found" });
+    const { error, value } = proposalSchema.validate(req.body);
+    if (error) return res.status(400).json({ error: error.message });
+    
+    // Only include columns we're explicitly providing - let database handle defaults for status, created_at, and proposal_id
+    const q = `INSERT INTO proposals (org_name, title, summary, contact, address, city, country, amount_usd, docs, cid)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`;
+    const vals = [
+      value.orgName,
+      value.title,
+      value.summary,
+      value.contact,
+      value.address || '',
+      value.city || '',
+      value.country || '',
+      value.amountUSD || 0,
+      JSON.stringify(value.docs || []),
+      value.cid || ''
+    ];
+    
+    const { rows } = await pool.query(q, vals);
     res.json(rows[0]);
+  } catch (err) {
+    console.error('Database error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===== Bids =====
+app.get("/bids", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM bids WHERE proposal_id=$1", [
+      req.query.proposalId,
+    ]);
+    res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Bids
+app.get("/bids/:id", async (req, res) => {
+  const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: "bid not found" });
+  res.json(rows[0]);
+});
+
 app.post("/bids", async (req, res) => {
   try {
     const { error, value } = bidSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
-
-    const q = `INSERT INTO bids
-      (proposal_id,vendor_name,price_usd,price_bol,days,notes,wallet_address,preferred_stablecoin,milestones,doc,status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending') RETURNING *`;
-
+    const q = `INSERT INTO bids (proposal_id,vendor_name,price_usd,price_bol,days,notes,wallet_address,preferred_stablecoin,milestones,doc,status)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending') RETURNING *`;
     const vals = [
       value.proposalId,
       value.vendorName,
@@ -314,7 +324,6 @@ app.post("/bids", async (req, res) => {
       JSON.stringify(value.milestones),
       value.doc ? JSON.stringify(value.doc) : null,
     ];
-
     const { rows } = await pool.query(q, vals);
     res.json(rows[0]);
   } catch (err) {
@@ -322,60 +331,85 @@ app.post("/bids", async (req, res) => {
   }
 });
 
-app.get("/bids", async (req, res) => {
+// ===== Milestones =====
+app.put("/milestones/:bidId/:index/complete", async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM bids WHERE proposal_id=$1", [req.query.proposalId]);
-    res.json(rows);
+    const { bidId, index } = req.params;
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    if (!rows[0]) return res.status(404).json({ error: "bid not found" });
+    const bid = rows[0];
+    let milestones = bid.milestones || [];
+    milestones = typeof milestones === "string" ? JSON.parse(milestones) : milestones;
+    if (!milestones[index]) return res.status(400).json({ error: "invalid milestone index" });
+    milestones[index].completed = true;
+    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [
+      JSON.stringify(milestones),
+      bidId,
+    ]);
+    res.json({ ok: true, milestones });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Proofs
+// ===== Proofs =====
 app.post("/proofs", async (req, res) => {
   try {
-    const { bidId, proofCid, description } = req.body;
-    if (!bidId || !proofCid) return res.status(400).json({ error: "Missing bidId or proofCid" });
-
-    const q = `INSERT INTO proofs (bid_id, proof_cid, description) VALUES ($1,$2,$3) RETURNING *`;
-    const { rows } = await pool.query(q, [bidId, proofCid, description || ""]);
-    res.json(rows[0]);
+    if (!req.files || !req.files.file) return res.status(400).json({ error: "file required" });
+    const file = req.files.file;
+    const uploaded = await pinataUploadFile(file);
+    const { bidId, description } = req.body;
+    const q = `INSERT INTO proofs (bid_id, proof_cid, description)
+               VALUES ($1,$2,$3) RETURNING *`;
+    const vals = [bidId, uploaded.cid, description || ""];
+    const { rows } = await pool.query(q, vals);
+    res.json({ ...rows[0], url: uploaded.url });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/proofs/:bidId", async (req, res) => {
-  try {
-    const { rows } = await pool.query("SELECT * FROM proofs WHERE bid_id=$1 ORDER BY created_at DESC", [req.params.bidId]);
-    res.json(rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Payments
-app.post("/pay", async (req, res) => {
-  try {
-    const { bidId, token, amount } = req.body;
-    if (!bidId || !token || !amount) return res.status(400).json({ error: "Missing params" });
-
-    const { rows } = await pool.query("SELECT wallet_address FROM bids WHERE bid_id=$1", [bidId]);
-    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
-
-    const result = await blockchainService.sendToken(token, rows[0].wallet_address, amount);
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// IPFS upload
+// ===== IPFS File Upload =====
 app.post("/ipfs/upload-file", async (req, res) => {
   try {
-    if (!req.files || !req.files.file) return res.status(400).json({ error: "Missing file" });
-    const result = await pinataUploadFile(req.files.file);
-    res.json(result);
+    if (!req.files || !req.files.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    const file = req.files.file;
+    
+    // Upload to Pinata
+    const uploaded = await pinataUploadFile(file);
+    
+    res.json({
+      success: true,
+      cid: uploaded.cid,
+      url: uploaded.url,
+      name: uploaded.name,
+      size: uploaded.size
+    });
+    
+  } catch (err) {
+    console.error("IPFS upload error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===== Payments =====
+app.post("/payments/:bidId/:index", async (req, res) => {
+  try {
+    const { bidId, index } = req.params;
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    if (!rows[0]) return res.status(404).json({ error: "bid not found" });
+    const bid = rows[0];
+    let milestones = bid.milestones || [];
+    milestones = typeof milestones === "string" ? JSON.parse(milestones) : milestones;
+    const milestone = milestones[index];
+    if (!milestone) return res.status(400).json({ error: "invalid milestone" });
+    if (!milestone.completed) return res.status(400).json({ error: "milestone not completed yet" });
+    const token = bid.preferred_stablecoin;
+    const tx = await blockchainService.sendToken(token, bid.wallet_address, milestone.amount);
+    res.json({ ok: true, tx });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
