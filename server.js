@@ -1,5 +1,5 @@
-// server.js — Milestone API with Postgres + USDT/USDC payments + IPFS/Pinata
-// -----------------------------------------------------------------------------
+// server.js — Milestone API with Postgres + USDT/USDC payments + IPFS/Pinata + Agent2
+// ---------------------------------------------------------------------------------
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -14,7 +14,6 @@ const { Pool } = require("pg");
 
 // ========== Config ==========
 const PORT = Number(process.env.PORT || 3000);
-
 const DEFAULT_ORIGIN = "https://lithiumx.netlify.app";
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || DEFAULT_ORIGIN)
   .split(",")
@@ -25,19 +24,15 @@ const PINATA_API_KEY = (process.env.PINATA_API_KEY || "").trim();
 const PINATA_SECRET_API_KEY = (process.env.PINATA_SECRET_API_KEY || "").trim();
 const PINATA_GATEWAY = process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud";
 
-// Blockchain
 const NETWORK = process.env.NETWORK || "sepolia";
-const SEPOLIA_RPC_URL =
-  process.env.SEPOLIA_RPC_URL || "https://ethereum-sepolia.publicnode.com";
+const SEPOLIA_RPC_URL = process.env.SEPOLIA_RPC_URL || "https://ethereum-sepolia.publicnode.com";
 const PRIVATE_KEY = process.env.PRIVATE_KEY || "";
 const ESCROW_ADDR = process.env.ESCROW_ADDR || "";
 
 const USDC_ADDRESS =
-  process.env.USDC_ADDRESS ||
-  "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
+  process.env.USDC_ADDRESS || "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
 const USDT_ADDRESS =
-  process.env.USDT_ADDRESS ||
-  "0x7169D38820dfd117C3FA1f22a697dBA58d90BA06";
+  process.env.USDT_ADDRESS || "0x7169D38820dfd117C3FA1f22a697dBA58d90BA06";
 
 const ERC20_ABI = [
   "function transfer(address to, uint256 amount) returns (bool)",
@@ -57,49 +52,6 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// ========== Validation ==========
-const proposalSchema = Joi.object({
-  orgName: Joi.string().required(),
-  title: Joi.string().required(),
-  summary: Joi.string().required(),
-  contact: Joi.string().email().required(),
-  address: Joi.string().allow(""),
-  city: Joi.string().allow(""),
-  country: Joi.string().allow(""),
-  amountUSD: Joi.number().min(0).default(0),
-  docs: Joi.array().default([]),
-  cid: Joi.string().allow(""),
-});
-
-const bidSchema = Joi.object({
-  proposalId: Joi.number().integer().required(),
-  vendorName: Joi.string().required(),
-  priceUSD: Joi.number().required(),
-  priceBol: Joi.number().required(),
-  days: Joi.number().integer().required(),
-  notes: Joi.string().allow(""),
-  walletAddress: Joi.string().pattern(/^0x[a-fA-F0-9]{40}$/).required(),
-  preferredStablecoin: Joi.string().valid("USDT", "USDC").default("USDT"),
-  milestones: Joi.array()
-    .items(
-      Joi.object({
-        name: Joi.string().required(),
-        amount: Joi.number().required(),
-        dueDate: Joi.date().iso().required(),
-      })
-    )
-    .min(1)
-    .required(),
-  doc: Joi.object({
-    cid: Joi.string().required(),
-    url: Joi.string().uri().required(),
-    name: Joi.string().required(),
-    size: Joi.number().required(),
-  })
-    .optional()
-    .allow(null),
-});
-
 // ========== Blockchain Service ==========
 class BlockchainService {
   constructor() {
@@ -107,6 +59,7 @@ class BlockchainService {
     if (PRIVATE_KEY) {
       const pk = PRIVATE_KEY.startsWith("0x") ? PRIVATE_KEY : `0x${PRIVATE_KEY}`;
       this.signer = new ethers.Wallet(pk, this.provider);
+      console.log("[blockchain] signer:", this.signer.address);
     } else {
       this.signer = null;
     }
@@ -144,13 +97,7 @@ const blockchainService = new BlockchainService();
 function sendRequest(method, urlStr, headers = {}, body = null) {
   const u = new URL(urlStr);
   const lib = u.protocol === "https:" ? https : http;
-  const options = {
-    method,
-    hostname: u.hostname,
-    port: u.port || (u.protocol === "https:" ? 443 : 80),
-    path: u.pathname + u.search,
-    headers,
-  };
+  const options = { method, hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname + u.search, headers };
   return new Promise((resolve, reject) => {
     const req = lib.request(options, (res) => {
       let data = "";
@@ -161,10 +108,7 @@ function sendRequest(method, urlStr, headers = {}, body = null) {
     req.on("error", reject);
     if (body) {
       if (typeof body.pipe === "function") body.pipe(req);
-      else {
-        req.write(body);
-        req.end();
-      }
+      else { req.write(body); req.end(); }
     } else req.end();
   });
 }
@@ -174,72 +118,99 @@ async function pinataUploadFile(file) {
   if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) throw new Error("Pinata not configured");
   const form = new FormData();
   const buf = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data);
+  form.append("file", buf, { filename: file.name, contentType: file.mimetype });
+  const { status, body } = await sendRequest("POST", "https://api.pinata.cloud/pinning/pinFileToIPFS",
+    { ...form.getHeaders(), pinata_api_key: PINATA_API_KEY, pinata_secret_api_key: PINATA_SECRET_API_KEY, Accept: "application/json" }, form);
+  const json = JSON.parse(body);
+  if (status < 200 || status >= 300) throw new Error(json?.error || "Pinata error");
+  const cid = json.IpfsHash;
+  return { cid, url: `https://${PINATA_GATEWAY}/ipfs/${cid}`, size: file.size, name: file.name };
+}
 
-  // sanitize filename
-  const safeName = file.name.replace(/[^a-z0-9_\-\.]/gi, "_");
-
-  form.append("file", buf, { filename: safeName, contentType: file.mimetype });
+async function pinataUploadJson(obj) {
+  const payload = JSON.stringify(obj);
   const { status, body } = await sendRequest(
     "POST",
-    "https://api.pinata.cloud/pinning/pinFileToIPFS",
+    "https://api.pinata.cloud/pinning/pinJSONToIPFS",
     {
-      ...form.getHeaders(),
+      "Content-Type": "application/json",
       pinata_api_key: PINATA_API_KEY,
       pinata_secret_api_key: PINATA_SECRET_API_KEY,
       Accept: "application/json",
     },
-    form
+    payload
   );
   const json = JSON.parse(body);
   if (status < 200 || status >= 300) throw new Error(json?.error || "Pinata error");
   const cid = json.IpfsHash;
-  return { cid, url: `https://${PINATA_GATEWAY}/ipfs/${cid}`, size: file.size, name: safeName };
+  return { cid, url: `https://${PINATA_GATEWAY}/ipfs/${cid}` };
 }
 
 // ========== Express ==========
 const app = express();
-
-// Trust proxy (for Railway/Heroku/etc.)
 app.set("trust proxy", 1);
 
-// CORS middleware
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      if (!origin) return callback(null, true); // allow curl/postman
-      if (CORS_ORIGINS.includes(origin)) {
-        return callback(null, true);
-      }
-      return callback(new Error("Not allowed by CORS: " + origin));
-    },
-    credentials: true,
-  })
-);
-
-// Handle preflight requests
+// CORS
+app.use(cors({
+  origin: function (origin, cb) {
+    if (!origin) return cb(null, true);
+    if (CORS_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error("Not allowed by CORS: " + origin));
+  },
+  credentials: true,
+}));
 app.options("*", cors());
 
-// Security + JSON
 app.use(helmet());
 app.use(express.json({ limit: "20mb" }));
 app.use(fileUpload({ limits: { fileSize: 50 * 1024 * 1024 } }));
+
+// ========== Schemas ==========
+const proposalSchema = Joi.object({
+  orgName: Joi.string().required(),
+  title: Joi.string().required(),
+  summary: Joi.string().required(),
+  contact: Joi.string().email().required(),
+  address: Joi.string().allow(""),
+  city: Joi.string().allow(""),
+  country: Joi.string().allow(""),
+  amountUSD: Joi.number().min(0).default(0),
+  docs: Joi.array().default([]),
+  cid: Joi.string().allow(""),
+});
+
+const bidSchema = Joi.object({
+  proposalId: Joi.number().integer().required(),
+  vendorName: Joi.string().required(),
+  priceUSD: Joi.number().required(),
+  priceBol: Joi.number().required(),
+  days: Joi.number().integer().required(),
+  notes: Joi.string().allow(""),
+  walletAddress: Joi.string().pattern(/^0x[a-fA-F0-9]{40}$/).required(),
+  preferredStablecoin: Joi.string().valid("USDT", "USDC").default("USDT"),
+  milestones: Joi.array().items(Joi.object({
+    name: Joi.string().required(),
+    amount: Joi.number().required(),
+    dueDate: Joi.date().iso().required(),
+  })).min(1).required(),
+  doc: Joi.object().optional().allow(null),
+});
 
 // ========== Routes ==========
 
 // Health
 app.get("/health", async (_req, res) => {
   try {
-    const { rows: proposals } = await pool.query("SELECT COUNT(*) FROM proposals");
-    const { rows: bids } = await pool.query("SELECT COUNT(*) FROM bids");
+    const proposals = await pool.query("SELECT COUNT(*) FROM proposals");
+    const bids = await pool.query("SELECT COUNT(*) FROM bids");
     res.json({
       ok: true,
-      proposals: proposals[0].count,
-      bids: bids[0].count,
+      proposals: proposals.rows[0].count,
+      bids: bids.rows[0].count,
       blockchain: blockchainService.signer ? "configured" : "not_configured",
     });
   } catch (err) {
-    console.error("[/health]", err);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -250,37 +221,23 @@ app.post("/proposals", async (req, res) => {
     if (error) return res.status(400).json({ error: error.message });
     const q = `INSERT INTO proposals (org_name,title,summary,contact,address,city,country,amount_usd,docs,cid)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`;
-    const vals = [
-      value.orgName,
-      value.title,
-      value.summary,
-      value.contact,
-      value.address,
-      value.city,
-      value.country,
-      value.amountUSD,
-      JSON.stringify(value.docs || []),
-      value.cid,
-    ];
+    const vals = [value.orgName, value.title, value.summary, value.contact, value.address, value.city, value.country, value.amountUSD, JSON.stringify(value.docs), value.cid];
     const { rows } = await pool.query(q, vals);
     res.json(rows[0]);
   } catch (err) {
-    console.error("[/proposals]", err);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: err.message });
   }
 });
 
+app.get("/proposals", async (_req, res) => {
+  const { rows } = await pool.query("SELECT * FROM proposals ORDER BY created_at DESC");
+  res.json(rows);
+});
+
 app.get("/proposals/:id", async (req, res) => {
-  try {
-    const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [
-      req.params.id,
-    ]);
-    if (!rows[0]) return res.status(404).json({ error: "proposal not found" });
-    res.json(rows[0]);
-  } catch (err) {
-    console.error("[/proposals/:id]", err);
-    res.status(500).json({ error: "Internal server error" });
-  }
+  const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: "proposal not found" });
+  res.json(rows[0]);
 });
 
 // Bids
@@ -290,41 +247,51 @@ app.post("/bids", async (req, res) => {
     if (error) return res.status(400).json({ error: error.message });
     const q = `INSERT INTO bids (proposal_id,vendor_name,price_usd,price_bol,days,notes,wallet_address,preferred_stablecoin,milestones,doc,status)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending') RETURNING *`;
-    const vals = [
-      value.proposalId,
-      value.vendorName,
-      value.priceUSD,
-      value.priceBol,
-      value.days,
-      value.notes,
-      value.walletAddress,
-      value.preferredStablecoin,
-      JSON.stringify(value.milestones),
-      value.doc ? JSON.stringify(value.doc) : null,
-    ];
+    const vals = [value.proposalId, value.vendorName, value.priceUSD, value.priceBol, value.days, value.notes, value.walletAddress, value.preferredStablecoin, JSON.stringify(value.milestones), value.doc ? JSON.stringify(value.doc) : null];
     const { rows } = await pool.query(q, vals);
+
+    // Trigger Agent2
+    try {
+      const agent2Url = process.env.AGENT2_URL || "https://vendor-agent-production.up.railway.app/analyze";
+      sendRequest("POST", agent2Url, { "Content-Type": "application/json" }, JSON.stringify(rows[0]))
+        .catch((e) => console.error("Agent2 trigger failed", e));
+    } catch (e) {
+      console.error("Agent2 error:", e);
+    }
+
     res.json(rows[0]);
   } catch (err) {
-    console.error("[/bids]", err);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: err.message });
   }
 });
 
 app.get("/bids", async (req, res) => {
+  const { rows } = await pool.query("SELECT * FROM bids WHERE proposal_id=$1", [req.query.proposalId]);
+  res.json(rows);
+});
+
+// Upload file
+app.post("/ipfs/upload-file", async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM bids WHERE proposal_id=$1", [
-      req.query.proposalId,
-    ]);
-    res.json(rows);
-  } catch (err) {
-    console.error("[/bids]", err);
-    res.status(500).json({ error: "Internal server error" });
+    const f = req.files?.file;
+    if (!f) return res.status(400).json({ error: "file is required" });
+    const uploaded = await pinataUploadFile(f);
+    res.json(uploaded);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
   }
 });
 
-// TODO: Milestone completion + payments
+app.post("/ipfs/upload-json", async (req, res) => {
+  try {
+    const uploaded = await pinataUploadJson(req.body);
+    res.json(uploaded);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
 
-// Start
+// ========== Start ==========
 app.listen(PORT, () => {
   console.log(`[api] Listening on :${PORT}`);
 });
