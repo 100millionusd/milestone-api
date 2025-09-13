@@ -1,0 +1,39 @@
+diff --git a/server.js b/server.js
+index 1234567..89abcde 100644
+--- a/server.js
++++ b/server.js
+@@ -1010,6 +1010,28 @@ app.post("/bids", async (req, res) => {
+     await bidsDB.add(rec);
+
+     res.json({
+       ok: true,
+       bidId,
+       proposalId: value.proposalId,
+       aiAnalysis: rec.aiAnalysis || null,
+     });
++
++    // 🔹 Trigger Agent 2 async (fire-and-forget)
++    try {
++      const agent2Url = process.env.AGENT2_URL || "https://<your-agent2-app>.up.railway.app/analyze";
++      fetch(agent2Url, {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({
++          bidId,
++          proposalId: value.proposalId,
++          vendorName: value.vendorName,
++          priceUSD: value.priceUSD,
++          days: value.days,
++          notes: value.notes,
++          walletAddress: value.walletAddress
++        }),
++      }).catch(err => {
++        console.error("Agent 2 trigger failed:", err);
++      });
++    } catch (err) {
++      console.error("Agent 2 trigger setup error:", err);
++    }
+   } catch (error) {
+     console.error("Error creating bid:", error);
+     res.status(500).json({ error: "Failed to create bid" });
+

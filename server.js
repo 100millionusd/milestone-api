@@ -203,7 +203,18 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-// Proposals
+// Proposals - list all
+app.get("/proposals", async (_req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM proposals ORDER BY created_at DESC");
+    res.json(rows.map(normalizeRow));
+  } catch (err) {
+    console.error("Error fetching proposals:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Proposals - create
 app.post("/proposals", async (req, res) => {
   try {
     const { error, value } = proposalSchema.validate(req.body);
@@ -223,13 +234,14 @@ app.post("/proposals", async (req, res) => {
   }
 });
 
+// Proposals - get by id
 app.get("/proposals/:id", async (req, res) => {
   const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [req.params.id]);
   if (!rows[0]) return res.status(404).json({ error: "proposal not found" });
   res.json(normalizeRow(rows[0]));
 });
 
-// Bids
+// Bids - create
 app.post("/bids", async (req, res) => {
   try {
     const { error, value } = bidSchema.validate(req.body);
@@ -250,12 +262,13 @@ app.post("/bids", async (req, res) => {
   }
 });
 
+// Bids - list by proposal
 app.get("/bids", async (req, res) => {
   const { rows } = await pool.query("SELECT * FROM bids WHERE proposal_id=$1", [req.query.proposalId]);
   res.json(rows.map(normalizeRow));
 });
 
-// Milestones
+// Milestones - mark complete
 app.post("/milestones/:id/complete", async (req, res) => {
   try {
     const { rows } = await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2 RETURNING *", [
@@ -268,7 +281,22 @@ app.post("/milestones/:id/complete", async (req, res) => {
   }
 });
 
-// Proofs
+// IPFS upload via Pinata
+app.post("/ipfs/upload-file", async (req, res) => {
+  try {
+    if (!req.files || !req.files.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+    const file = req.files.file;
+    const result = await pinataUploadFile(file);
+    res.json(result);
+  } catch (err) {
+    console.error("Error uploading file:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Proofs - alternative upload
 app.post("/proofs/upload", async (req, res) => {
   try {
     if (!req.files || !req.files.file) return res.status(400).json({ error: "No file uploaded" });
@@ -280,7 +308,7 @@ app.post("/proofs/upload", async (req, res) => {
   }
 });
 
-// Payments
+// Payments - release stablecoin
 app.post("/payments/release", async (req, res) => {
   try {
     const { token, to, amount } = req.body;
