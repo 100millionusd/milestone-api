@@ -365,6 +365,32 @@ app.post("/proofs", async (req, res) => {
   }
 });
 
+// ===== IPFS File Upload =====
+app.post("/ipfs/upload-file", async (req, res) => {
+  try {
+    if (!req.files || !req.files.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    const file = req.files.file;
+    
+    // Upload to Pinata
+    const uploaded = await pinataUploadFile(file);
+    
+    res.json({
+      success: true,
+      cid: uploaded.cid,
+      url: uploaded.url,
+      name: uploaded.name,
+      size: uploaded.size
+    });
+    
+  } catch (err) {
+    console.error("IPFS upload error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ===== Payments =====
 app.post("/payments/:bidId/:index", async (req, res) => {
   try {
