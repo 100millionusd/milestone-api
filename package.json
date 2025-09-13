@@ -15,6 +15,10 @@
     "form-data": "^4.0.4",
     "helmet": "^7.1.0",
     "joi": "^17.11.0",
-    "openai": "^5.20.1"
+    "openai": "^5.20.1",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.15.5"
   }
 }
