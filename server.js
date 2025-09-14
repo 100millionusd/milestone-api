@@ -462,6 +462,99 @@ app.post("/bids/:id/reject", async (req, res) => {
   }
 });
 
+// Complete a milestone (compat with frontend)
+app.post("/bids/:id/complete-milestone", async (req, res) => {
+  const bidId = Number(req.params.id);
+  const { milestoneIndex, proof } = req.body || {};
+  if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
+  if (!Number.isInteger(milestoneIndex) || milestoneIndex < 0) {
+    return res.status(400).json({ error: "Invalid milestoneIndex" });
+  }
+
+  try {
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
+
+    const bid = rows[0];
+    const raw = bid.milestones;
+    const milestones = Array.isArray(raw) ? raw : JSON.parse(raw || "[]");
+
+    if (!milestones[milestoneIndex]) {
+      return res.status(400).json({ error: "Milestone index out of range" });
+    }
+
+    const ms = milestones[milestoneIndex];
+    ms.completed = true;
+    ms.completionDate = new Date().toISOString();
+    if (typeof proof === "string" && proof.trim()) {
+      ms.proof = proof.trim();
+    }
+
+    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [
+      JSON.stringify(milestones),
+      bidId,
+    ]);
+
+    // Return the updated bid
+    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    return res.json(toCamel(updated[0]));
+  } catch (err) {
+    console.error("complete-milestone error", err);
+    return res.status(500).json({ error: "Internal error completing milestone" });
+  }
+});
+
+// Pay a milestone (compat with frontend)
+app.post("/bids/:id/pay-milestone", async (req, res) => {
+  const bidId = Number(req.params.id);
+  const { milestoneIndex } = req.body || {};
+  if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
+  if (!Number.isInteger(milestoneIndex) || milestoneIndex < 0) {
+    return res.status(400).json({ error: "Invalid milestoneIndex" });
+  }
+
+  try {
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
+
+    const bid = rows[0];
+    const raw = bid.milestones;
+    const milestones = Array.isArray(raw) ? raw : JSON.parse(raw || "[]");
+
+    if (!milestones[milestoneIndex]) {
+      return res.status(400).json({ error: "Milestone index out of range" });
+    }
+
+    const ms = milestones[milestoneIndex];
+    if (!ms.completed) {
+      return res.status(400).json({ error: "Milestone not completed" });
+    }
+
+    // Send token via blockchain service
+    const receipt = await blockchainService.sendToken(
+      bid.preferred_stablecoin,
+      bid.wallet_address,
+      ms.amount
+    );
+
+    // Persist payment metadata
+    ms.paymentTxHash = receipt.hash;
+    ms.paymentDate = new Date().toISOString();
+
+    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [
+      JSON.stringify(milestones),
+      bidId,
+    ]);
+
+    // Return success + updated bid (and receipt if you want)
+    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    return res.json({ success: true, bid: toCamel(updated[0]), receipt });
+  } catch (err) {
+    console.error("pay-milestone error", err);
+    return res.status(500).json({ error: "Internal error paying milestone" });
+  }
+});
+
 app.patch("/bids/:id", async (req, res) => {
   const id = Number(req.params.id);
   const desired = String(req.body?.status || "").toLowerCase();
