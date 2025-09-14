@@ -349,6 +349,16 @@ app.use(
 );
 app.use(helmet());
 app.use(express.json({ limit: "20mb" }));
+
+// ✅ prevent CDN/browser caching of GETs so polling sees fresh data
+app.use((req, res, next) => {
+  if (req.method === 'GET') {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.set('Pragma', 'no-cache');
+  }
+  next();
+});
+
 app.use(fileUpload({ limits: { fileSize: 50 * 1024 * 1024 } }));
 
 // ========== Routes ==========
