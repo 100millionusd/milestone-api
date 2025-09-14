@@ -82,7 +82,7 @@ const proposalSchema = Joi.object({
   cid: Joi.string().allow(""),
 });
 
-// ✅ priceBol removed entirely
+// priceBol removed entirely
 const bidSchema = Joi.object({
   proposalId: Joi.number().integer().required(),
   vendorName: Joi.string().required(),
@@ -297,7 +297,7 @@ app.post("/proposals", async (req, res) => {
   }
 });
 
-// ✅ Approve/Reject + Canonical status update
+// Approve/Reject + Canonical status update for Proposals
 app.post("/proposals/:id/approve", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
@@ -336,7 +336,6 @@ app.post("/proposals/:id/reject", async (req, res) => {
   }
 });
 
-// (Optional) Canonical RESTful status update: PATCH /proposals/:id  { "status": "approved" | "rejected" }
 app.patch("/proposals/:id", async (req, res) => {
   const id = Number(req.params.id);
   const desired = String(req.body?.status || "").toLowerCase();
@@ -365,13 +364,13 @@ app.get("/bids", async (req, res) => {
     const pid = req.query.proposalId;
     if (pid !== undefined && pid !== null && String(pid).trim() !== "") {
       const { rows } = await pool.query(
-        "SELECT * FROM bids WHERE proposal_id=$1 ORDER BY created_at DESC NULLS LAST, bid_id DESC",
+        "SELECT * FROM bids WHERE proposal_id=$1 ORDER BY bid_id DESC",
         [pid]
       );
       return res.json(mapRows(rows));
     } else {
       const { rows } = await pool.query(
-        "SELECT * FROM bids ORDER BY created_at DESC NULLS LAST, bid_id DESC"
+        "SELECT * FROM bids ORDER BY bid_id DESC"
       );
       return res.json(mapRows(rows));
     }
@@ -385,7 +384,7 @@ app.post("/bids", async (req, res) => {
     const { error, value } = bidSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
 
-    // ✅ price_bol removed from INSERT
+    // price_bol removed from INSERT
     const q = `INSERT INTO bids (proposal_id,vendor_name,price_usd,days,notes,wallet_address,preferred_stablecoin,milestones,doc,status)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending') RETURNING *`;
 
@@ -405,6 +404,70 @@ app.post("/bids", async (req, res) => {
     res.json(toCamel(rows[0]));
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Approve/Reject + Canonical status update for Bids
+app.post("/bids/:id/approve", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+
+  try {
+    const { rows } = await pool.query(
+      `UPDATE bids
+         SET status = 'approved'
+       WHERE bid_id = $1
+       RETURNING *`,
+      [id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
+    return res.json(toCamel(rows[0]));
+  } catch (err) {
+    console.error("approve bid error", err);
+    return res.status(500).json({ error: "Internal error approving bid" });
+  }
+});
+
+app.post("/bids/:id/reject", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+
+  try {
+    const { rows } = await pool.query(
+      `UPDATE bids
+         SET status = 'rejected'
+       WHERE bid_id = $1
+       RETURNING *`,
+      [id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
+    return res.json(toCamel(rows[0]));
+  } catch (err) {
+    console.error("reject bid error", err);
+    return res.status(500).json({ error: "Internal error rejecting bid" });
+  }
+});
+
+app.patch("/bids/:id", async (req, res) => {
+  const id = Number(req.params.id);
+  const desired = String(req.body?.status || "").toLowerCase();
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+  if (!["approved", "rejected"].includes(desired)) {
+    return res.status(400).json({ error: 'Invalid status; expected "approved" or "rejected"' });
+  }
+  try {
+    const { rows } = await pool.query(
+      `UPDATE bids
+         SET status = $2
+       WHERE bid_id = $1
+       RETURNING *`,
+      [id, desired]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
+    return res.json(toCamel(rows[0]));
+  } catch (err) {
+    console.error("patch bid status error", err);
+    return res.status(500).json({ error: "Internal error updating bid status" });
   }
 });
 
@@ -443,7 +506,6 @@ app.post("/proofs", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 app.get("/proofs/:bidId", async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM proofs WHERE bid_id=$1", [
