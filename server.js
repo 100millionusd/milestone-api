@@ -1,5 +1,5 @@
-// server.js — Milestone API (Postgres + Blockchain + IPFS + CamelCase)
-// ====================================================================
+// server.js — Milestone API (Postgres + Blockchain + IPFS + Agent2 + PDF parsing)
+// =================================================================================
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -11,6 +11,8 @@ const http = require("http");
 const { ethers } = require("ethers");
 const Joi = require("joi");
 const { Pool } = require("pg");
+const pdfParse = require("pdf-parse");
+const OpenAI = require("openai");
 
 // ========== Config ==========
 const PORT = Number(process.env.PORT || 3000);
@@ -25,17 +27,18 @@ const PINATA_API_KEY = (process.env.PINATA_API_KEY || "").trim();
 const PINATA_SECRET_API_KEY = (process.env.PINATA_SECRET_API_KEY || "").trim();
 const PINATA_GATEWAY = process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud";
 
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
+
 // Blockchain
 const NETWORK = process.env.NETWORK || "sepolia";
-const SEPOLIA_RPC_URL =
-  process.env.SEPOLIA_RPC_URL || "https://ethereum-sepolia.publicnode.com";
+const SEPOLIA_RPC_URL = process.env.SEPOLIA_RPC_URL || "https://ethereum-sepolia.publicnode.com";
 const PRIVATE_KEY = process.env.PRIVATE_KEY || "";
 const ESCROW_ADDR = process.env.ESCROW_ADDR || "";
 
-const USDC_ADDRESS =
-  process.env.USDC_ADDRESS || "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
-const USDT_ADDRESS =
-  process.env.USDT_ADDRESS || "0x7169D38820dfd117C3FA1f22a697dBA58d90BA06";
+const USDC_ADDRESS = process.env.USDC_ADDRESS || "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
+const USDT_ADDRESS = process.env.USDT_ADDRESS || "0x7169D38820dfd117C3FA1f22a697dBA58d90BA06";
 
 const ERC20_ABI = [
   "function transfer(address to, uint256 amount) returns (bool)",
@@ -102,10 +105,11 @@ const bidSchema = Joi.object({
     .min(1)
     .required(),
   doc: Joi.object({
-    cid: Joi.string().required(),
+    cid: Joi.string().optional(),
     url: Joi.string().uri().required(),
     name: Joi.string().required(),
-    size: Joi.number().required(),
+    size: Joi.number().optional(),
+    mimetype: Joi.string().optional(),
   })
     .optional()
     .allow(null),
@@ -179,10 +183,46 @@ function sendRequest(method, urlStr, headers = {}, body = null) {
   });
 }
 
+async function fetchAsBuffer(urlStr) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const lib = u.protocol === "https:" ? https : http;
+    const req = lib.get(urlStr, (res) => {
+      if (res.statusCode && res.statusCode >= 400) {
+        return reject(new Error(`HTTP ${res.statusCode} fetching ${urlStr}`));
+      }
+      const chunks = [];
+      res.on("data", (d) => chunks.push(d));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+    });
+    req.on("error", reject);
+  });
+}
+function coerceJson(val) {
+  if (!val) return null;
+  if (typeof val === "string") {
+    try {
+      return JSON.parse(val);
+    } catch {
+      return null;
+    }
+  }
+  return val;
+}
+async function extractPdfTextFromDoc(doc) {
+  if (!doc?.url) return null;
+  const name = doc.name || "";
+  const looksPdf = /\.pdf($|\?)/i.test(name) || doc.mimetype === "application/pdf";
+  if (!looksPdf) return null;
+  const buf = await fetchAsBuffer(doc.url);
+  const parsed = await pdfParse(buf);
+  const raw = (parsed.text || "").replace(/\s+/g, " ").trim();
+  return raw.slice(0, 15000); // cap ~15k chars for prompt size
+}
+
 // ========== IPFS ==========
 async function pinataUploadFile(file) {
-  if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY)
-    throw new Error("Pinata not configured");
+  if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) throw new Error("Pinata not configured");
   const form = new FormData();
   const buf = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data);
   form.append("file", buf, {
@@ -200,15 +240,90 @@ async function pinataUploadFile(file) {
     },
     form
   );
-  const json = JSON.parse(body);
+  const json = JSON.parse(body || "{}");
   if (status < 200 || status >= 300) throw new Error(json?.error || "Pinata error");
   const cid = json.IpfsHash;
-  return {
-    cid,
-    url: `https://${PINATA_GATEWAY}/ipfs/${cid}`,
-    size: file.size,
-    name: file.name,
-  };
+  return { cid, url: `https://${PINATA_GATEWAY}/ipfs/${cid}`, size: file.size, name: file.name };
+}
+
+async function pinataUploadJson(data) {
+  if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) throw new Error("Pinata not configured");
+  const payload = JSON.stringify({ pinataContent: data });
+  const { status, body } = await sendRequest(
+    "POST",
+    "https://api.pinata.cloud/pinning/pinJSONToIPFS",
+    {
+      "Content-Type": "application/json",
+      pinata_api_key: PINATA_API_KEY,
+      pinata_secret_api_key: PINATA_SECRET_API_KEY,
+      Accept: "application/json",
+      "Content-Length": Buffer.byteLength(payload),
+    },
+    payload
+  );
+  const json = JSON.parse(body || "{}");
+  if (status < 200 || status >= 300) throw new Error(json?.error || "Pinata error");
+  const cid = json.IpfsHash;
+  return { cid, url: `https://${PINATA_GATEWAY}/ipfs/${cid}` };
+}
+
+// ========== Agent2 ==========
+async function runAgent2OnBid(bidRow, proposalRow) {
+  if (!openai) return null;
+
+  const milestones = Array.isArray(bidRow.milestones)
+    ? bidRow.milestones
+    : JSON.parse(bidRow.milestones || "[]");
+
+  const docObj = coerceJson(bidRow.doc);
+  let pdfText = null;
+  try {
+    pdfText = await extractPdfTextFromDoc(docObj);
+  } catch (e) {
+    console.warn("PDF parse failed:", e?.message);
+  }
+
+  const prompt = `
+You are Agent2. Analyze this vendor bid for a proposal and return strict JSON.
+
+Proposal:
+- Org: ${proposalRow?.org_name || ""}
+- Title: ${proposalRow?.title || ""}
+- Summary: ${proposalRow?.summary || ""}
+- BudgetUSD: ${proposalRow?.amount_usd ?? 0}
+
+Bid:
+- Vendor: ${bidRow?.vendor_name || ""}
+- PriceUSD: ${bidRow?.price_usd ?? 0}
+- Days: ${bidRow?.days ?? 0}
+- Milestones: ${JSON.stringify(milestones)}
+
+${pdfText ? `Bid PDF (excerpt up to ~15k chars):\n${pdfText}\n` : ""}
+
+Return JSON with:
+{
+  "summary": string,
+  "risks": string[],
+  "fit": "low" | "medium" | "high",
+  "milestoneNotes": string[],
+  "confidence": number (0..1)
+}
+  `.trim();
+
+  try {
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+    });
+
+    const raw = resp.choices?.[0]?.message?.content || "{}";
+    return JSON.parse(raw);
+  } catch (e) {
+    console.warn("Agent2 analysis failed:", e?.message);
+    return null;
+  }
 }
 
 // ========== Express ==========
@@ -231,34 +346,32 @@ app.use(fileUpload({ limits: { fileSize: 50 * 1024 * 1024 } }));
 
 // ========== Routes ==========
 
-// Health
+// Health & test
 app.get("/health", async (_req, res) => {
   try {
     const { rows: proposals } = await pool.query("SELECT COUNT(*) FROM proposals");
     const { rows: bids } = await pool.query("SELECT COUNT(*) FROM bids");
     res.json({
       ok: true,
-      proposals: proposals[0].count,
-      bids: bids[0].count,
+      proposals: Number(proposals[0].count || 0),
+      bids: Number(bids[0].count || 0),
       blockchain: blockchainService.signer ? "configured" : "not_configured",
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+app.get("/test", (_req, res) => res.json({ ok: true }));
 
-// Proposals
+// -------- Proposals --------
 app.get("/proposals", async (_req, res) => {
   try {
-    const { rows } = await pool.query(
-      "SELECT * FROM proposals ORDER BY created_at DESC"
-    );
+    const { rows } = await pool.query("SELECT * FROM proposals ORDER BY created_at DESC");
     res.json(mapRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-
 app.get("/proposals/:id", async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [
@@ -270,14 +383,13 @@ app.get("/proposals/:id", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 app.post("/proposals", async (req, res) => {
   try {
     const { error, value } = proposalSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
 
-    const q = `INSERT INTO proposals (org_name,title,summary,contact,address,city,country,amount_usd,docs,cid)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`;
+    const q = `INSERT INTO proposals (org_name,title,summary,contact,address,city,country,amount_usd,docs,cid,status)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending') RETURNING *`;
     const vals = [
       value.orgName,
       value.title,
@@ -296,18 +408,12 @@ app.post("/proposals", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-// Approve/Reject + Canonical status update for Proposals
 app.post("/proposals/:id/approve", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-
   try {
     const { rows } = await pool.query(
-      `UPDATE proposals
-         SET status = 'approved'
-       WHERE proposal_id = $1
-       RETURNING *`,
+      `UPDATE proposals SET status='approved' WHERE proposal_id=$1 RETURNING *`,
       [id]
     );
     if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
@@ -316,17 +422,12 @@ app.post("/proposals/:id/approve", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 app.post("/proposals/:id/reject", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-
   try {
     const { rows } = await pool.query(
-      `UPDATE proposals
-         SET status = 'rejected'
-       WHERE proposal_id = $1
-       RETURNING *`,
+      `UPDATE proposals SET status='rejected' WHERE proposal_id=$1 RETURNING *`,
       [id]
     );
     if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
@@ -335,7 +436,6 @@ app.post("/proposals/:id/reject", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 app.patch("/proposals/:id", async (req, res) => {
   const id = Number(req.params.id);
   const desired = String(req.body?.status || "").toLowerCase();
@@ -345,10 +445,7 @@ app.patch("/proposals/:id", async (req, res) => {
   }
   try {
     const { rows } = await pool.query(
-      `UPDATE proposals
-         SET status = $2
-       WHERE proposal_id = $1
-       RETURNING *`,
+      `UPDATE proposals SET status=$2 WHERE proposal_id=$1 RETURNING *`,
       [id, desired]
     );
     if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
@@ -358,51 +455,45 @@ app.patch("/proposals/:id", async (req, res) => {
   }
 });
 
-// Bids
-// Get a single bid by id
-app.get("/bids/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
-
-  try {
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id = $1", [id]);
-    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
-    return res.json(toCamel(rows[0]));
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
-});
-
+// -------- Bids --------
 app.get("/bids", async (req, res) => {
   try {
-    const pid = req.query.proposalId;
-    if (pid !== undefined && pid !== null && String(pid).trim() !== "") {
+    const pid = Number(req.query.proposalId);
+    if (Number.isFinite(pid)) {
       const { rows } = await pool.query(
         "SELECT * FROM bids WHERE proposal_id=$1 ORDER BY bid_id DESC",
         [pid]
       );
       return res.json(mapRows(rows));
     } else {
-      const { rows } = await pool.query(
-        "SELECT * FROM bids ORDER BY bid_id DESC"
-      );
+      const { rows } = await pool.query("SELECT * FROM bids ORDER BY bid_id DESC");
       return res.json(mapRows(rows));
     }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-
+app.get("/bids/:id", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+  try {
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
+    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
+    return res.json(toCamel(rows[0]));
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 app.post("/bids", async (req, res) => {
   try {
     const { error, value } = bidSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
 
-    // price_bol removed from INSERT
-    const q = `INSERT INTO bids (proposal_id,vendor_name,price_usd,days,notes,wallet_address,preferred_stablecoin,milestones,doc,status)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending') RETURNING *`;
-
-    const vals = [
+    const insertQ = `
+      INSERT INTO bids (proposal_id,vendor_name,price_usd,days,notes,wallet_address,preferred_stablecoin,milestones,doc,status,created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending', NOW())
+      RETURNING *`;
+    const insertVals = [
       value.proposalId,
       value.vendorName,
       value.priceUSD,
@@ -410,28 +501,45 @@ app.post("/bids", async (req, res) => {
       value.notes,
       value.walletAddress,
       value.preferredStablecoin,
-      JSON.stringify(value.milestones),
+      JSON.stringify(value.milestones || []),
       value.doc ? JSON.stringify(value.doc) : null,
     ];
+    const { rows } = await pool.query(insertQ, insertVals);
+    const inserted = rows[0];
 
-    const { rows } = await pool.query(q, vals);
-    res.json(toCamel(rows[0]));
+    // Inline Agent2 analysis (best-effort)
+    try {
+      const { rows: pr } = await pool.query(
+        "SELECT * FROM proposals WHERE proposal_id=$1",
+        [inserted.proposal_id]
+      );
+      const prop = pr[0] || null;
+      if (prop) {
+        const analysis = await runAgent2OnBid(inserted, prop);
+        if (analysis) {
+          await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [
+            JSON.stringify(analysis),
+            inserted.bid_id,
+          ]);
+          inserted.ai_analysis = analysis;
+        }
+      }
+    } catch (e) {
+      console.warn("Agent2 post-insert analysis failed:", e?.message);
+    }
+
+    return res.status(201).json(toCamel(inserted));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("POST /bids error:", err);
+    return res.status(500).json({ error: err.message });
   }
 });
-
-// Approve/Reject + Canonical status update for Bids
 app.post("/bids/:id/approve", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
-
   try {
     const { rows } = await pool.query(
-      `UPDATE bids
-         SET status = 'approved'
-       WHERE bid_id = $1
-       RETURNING *`,
+      `UPDATE bids SET status='approved' WHERE bid_id=$1 RETURNING *`,
       [id]
     );
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
@@ -441,17 +549,12 @@ app.post("/bids/:id/approve", async (req, res) => {
     return res.status(500).json({ error: "Internal error approving bid" });
   }
 });
-
 app.post("/bids/:id/reject", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
-
   try {
     const { rows } = await pool.query(
-      `UPDATE bids
-         SET status = 'rejected'
-       WHERE bid_id = $1
-       RETURNING *`,
+      `UPDATE bids SET status='rejected' WHERE bid_id=$1 RETURNING *`,
       [id]
     );
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
@@ -461,100 +564,6 @@ app.post("/bids/:id/reject", async (req, res) => {
     return res.status(500).json({ error: "Internal error rejecting bid" });
   }
 });
-
-// Complete a milestone (compat with frontend)
-app.post("/bids/:id/complete-milestone", async (req, res) => {
-  const bidId = Number(req.params.id);
-  const { milestoneIndex, proof } = req.body || {};
-  if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
-  if (!Number.isInteger(milestoneIndex) || milestoneIndex < 0) {
-    return res.status(400).json({ error: "Invalid milestoneIndex" });
-  }
-
-  try {
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
-    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
-
-    const bid = rows[0];
-    const raw = bid.milestones;
-    const milestones = Array.isArray(raw) ? raw : JSON.parse(raw || "[]");
-
-    if (!milestones[milestoneIndex]) {
-      return res.status(400).json({ error: "Milestone index out of range" });
-    }
-
-    const ms = milestones[milestoneIndex];
-    ms.completed = true;
-    ms.completionDate = new Date().toISOString();
-    if (typeof proof === "string" && proof.trim()) {
-      ms.proof = proof.trim();
-    }
-
-    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [
-      JSON.stringify(milestones),
-      bidId,
-    ]);
-
-    // Return the updated bid
-    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
-    return res.json(toCamel(updated[0]));
-  } catch (err) {
-    console.error("complete-milestone error", err);
-    return res.status(500).json({ error: "Internal error completing milestone" });
-  }
-});
-
-// Pay a milestone (compat with frontend)
-app.post("/bids/:id/pay-milestone", async (req, res) => {
-  const bidId = Number(req.params.id);
-  const { milestoneIndex } = req.body || {};
-  if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
-  if (!Number.isInteger(milestoneIndex) || milestoneIndex < 0) {
-    return res.status(400).json({ error: "Invalid milestoneIndex" });
-  }
-
-  try {
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
-    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
-
-    const bid = rows[0];
-    const raw = bid.milestones;
-    const milestones = Array.isArray(raw) ? raw : JSON.parse(raw || "[]");
-
-    if (!milestones[milestoneIndex]) {
-      return res.status(400).json({ error: "Milestone index out of range" });
-    }
-
-    const ms = milestones[milestoneIndex];
-    if (!ms.completed) {
-      return res.status(400).json({ error: "Milestone not completed" });
-    }
-
-    // Send token via blockchain service
-    const receipt = await blockchainService.sendToken(
-      bid.preferred_stablecoin,
-      bid.wallet_address,
-      ms.amount
-    );
-
-    // Persist payment metadata
-    ms.paymentTxHash = receipt.hash;
-    ms.paymentDate = new Date().toISOString();
-
-    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [
-      JSON.stringify(milestones),
-      bidId,
-    ]);
-
-    // Return success + updated bid (and receipt if you want)
-    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
-    return res.json({ success: true, bid: toCamel(updated[0]), receipt });
-  } catch (err) {
-    console.error("pay-milestone error", err);
-    return res.status(500).json({ error: "Internal error paying milestone" });
-  }
-});
-
 app.patch("/bids/:id", async (req, res) => {
   const id = Number(req.params.id);
   const desired = String(req.body?.status || "").toLowerCase();
@@ -564,10 +573,7 @@ app.patch("/bids/:id", async (req, res) => {
   }
   try {
     const { rows } = await pool.query(
-      `UPDATE bids
-         SET status = $2
-       WHERE bid_id = $1
-       RETURNING *`,
+      `UPDATE bids SET status=$2 WHERE bid_id=$1 RETURNING *`,
       [id, desired]
     );
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
@@ -578,7 +584,111 @@ app.patch("/bids/:id", async (req, res) => {
   }
 });
 
-// Milestones
+// Complete/Pay milestone (frontend-compatible)
+app.post("/bids/:id/complete-milestone", async (req, res) => {
+  const bidId = Number(req.params.id);
+  const { milestoneIndex, proof } = req.body || {};
+  if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
+  if (!Number.isInteger(milestoneIndex) || milestoneIndex < 0) {
+    return res.status(400).json({ error: "Invalid milestoneIndex" });
+  }
+  try {
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
+
+    const bid = rows[0];
+    const milestones = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
+    if (!milestones[milestoneIndex]) return res.status(400).json({ error: "Milestone index out of range" });
+
+    const ms = milestones[milestoneIndex];
+    ms.completed = true;
+    ms.completionDate = new Date().toISOString();
+    if (typeof proof === "string" && proof.trim()) ms.proof = proof.trim();
+
+    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [
+      JSON.stringify(milestones),
+      bidId,
+    ]);
+
+    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    return res.json(toCamel(updated[0]));
+  } catch (err) {
+    console.error("complete-milestone error", err);
+    return res.status(500).json({ error: "Internal error completing milestone" });
+  }
+});
+app.post("/bids/:id/pay-milestone", async (req, res) => {
+  const bidId = Number(req.params.id);
+  const { milestoneIndex } = req.body || {};
+  if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
+  if (!Number.isInteger(milestoneIndex) || milestoneIndex < 0) {
+    return res.status(400).json({ error: "Invalid milestoneIndex" });
+  }
+  try {
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
+
+    const bid = rows[0];
+    const milestones = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
+    if (!milestones[milestoneIndex]) return res.status(400).json({ error: "Milestone index out of range" });
+
+    const ms = milestones[milestoneIndex];
+    if (!ms.completed) return res.status(400).json({ error: "Milestone not completed" });
+
+    const receipt = await blockchainService.sendToken(
+      bid.preferred_stablecoin,
+      bid.wallet_address,
+      ms.amount
+    );
+
+    ms.paymentTxHash = receipt.hash;
+    ms.paymentDate = new Date().toISOString();
+
+    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [
+      JSON.stringify(milestones),
+      bidId,
+    ]);
+
+    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    return res.json({ success: true, bid: toCamel(updated[0]), receipt });
+  } catch (err) {
+    console.error("pay-milestone error", err);
+    return res.status(500).json({ error: "Internal error paying milestone" });
+  }
+});
+
+// Analyze (manual trigger)
+app.post("/bids/:id/analyze", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+  try {
+    const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
+    if (!bids[0]) return res.status(404).json({ error: "Bid not found" });
+    const bid = bids[0];
+
+    const { rows: props } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [
+      bid.proposal_id,
+    ]);
+    const prop = props[0];
+    if (!prop) return res.status(404).json({ error: "Proposal not found" });
+
+    const analysis = await runAgent2OnBid(bid, prop);
+    if (analysis) {
+      await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [
+        JSON.stringify(analysis),
+        id,
+      ]);
+      const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
+      return res.json(toCamel(updated[0]));
+    }
+    return res.status(502).json({ error: "Agent2 failed to produce analysis" });
+  } catch (err) {
+    console.error("analyze bid error:", err);
+    return res.status(500).json({ error: "Agent2 error running analysis" });
+  }
+});
+
+// (Legacy) keep old complete route for compatibility
 app.put("/milestones/:bidId/:index/complete", async (req, res) => {
   try {
     const bidId = req.params.bidId;
@@ -587,7 +697,7 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
 
     const bid = rows[0];
-    const milestones = bid.milestones || [];
+    const milestones = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
     if (!milestones[idx]) return res.status(400).json({ error: "Invalid index" });
 
     milestones[idx].completed = true;
@@ -601,14 +711,22 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
   }
 });
 
-// Proofs
+// -------- Proofs --------
 app.post("/proofs", async (req, res) => {
   try {
     const { bidId, proofCid, description } = req.body;
     const q =
-      "INSERT INTO proofs (bid_id,proof_cid,description) VALUES ($1,$2,$3) RETURNING *";
+      "INSERT INTO proofs (bid_id,proof_cid,description,submitted_at,status) VALUES ($1,$2,$3,NOW(),'pending') RETURNING *";
     const { rows } = await pool.query(q, [bidId, proofCid, description]);
     res.json(toCamel(rows[0]));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+app.get("/proofs", async (_req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM proofs ORDER BY submitted_at DESC NULLS LAST");
+    res.json(mapRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -623,8 +741,50 @@ app.get("/proofs/:bidId", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+app.post("/proofs/:bidId/:milestoneIndex/approve", async (req, res) => {
+  // stub status change if you later store per-proof statuses
+  res.json({ ok: true });
+});
+app.post("/proofs/:bidId/:milestoneIndex/reject", async (req, res) => {
+  res.json({ ok: true });
+});
 
-// Payments
+// -------- Vendor helpers (simple aliases) --------
+app.get("/vendor/bids", async (_req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM bids ORDER BY created_at DESC NULLS LAST, bid_id DESC");
+    res.json(mapRows(rows));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+app.get("/vendor/payments", async (_req, res) => {
+  // Flatten milestones that have paymentTxHash
+  try {
+    const { rows } = await pool.query("SELECT * FROM bids");
+    const out = [];
+    for (const r of rows) {
+      const milestones = Array.isArray(r.milestones) ? r.milestones : JSON.parse(r.milestones || "[]");
+      milestones.forEach((m) => {
+        if (m?.paymentTxHash) {
+          out.push({
+            success: true,
+            transactionHash: m.paymentTxHash,
+            amount: m.amount,
+            currency: r.preferred_stablecoin,
+            toAddress: r.wallet_address,
+            date: m.paymentDate || null,
+          });
+        }
+      });
+    }
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// -------- Payments (legacy) --------
 app.post("/payments/release", async (req, res) => {
   try {
     const { bidId, milestoneIndex } = req.body;
@@ -632,13 +792,11 @@ app.post("/payments/release", async (req, res) => {
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
 
     const bid = rows[0];
-    const milestones = bid.milestones || [];
-    if (!milestones[milestoneIndex])
-      return res.status(400).json({ error: "Invalid milestone" });
+    const milestones = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
+    if (!milestones[milestoneIndex]) return res.status(400).json({ error: "Invalid milestone" });
 
     const ms = milestones[milestoneIndex];
-    if (!ms.completed)
-      return res.status(400).json({ error: "Milestone not completed" });
+    if (!ms.completed) return res.status(400).json({ error: "Milestone not completed" });
 
     const receipt = await blockchainService.sendToken(
       bid.preferred_stablecoin,
@@ -651,11 +809,10 @@ app.post("/payments/release", async (req, res) => {
   }
 });
 
-// IPFS
+// -------- IPFS --------
 app.post("/ipfs/upload-file", async (req, res) => {
   try {
-    if (!req.files || !req.files.file)
-      return res.status(400).json({ error: "No file uploaded" });
+    if (!req.files || !req.files.file) return res.status(400).json({ error: "No file uploaded" });
     const file = req.files.file;
     const result = await pinataUploadFile(file);
     res.json(result);
@@ -663,8 +820,16 @@ app.post("/ipfs/upload-file", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+app.post("/ipfs/upload-json", async (req, res) => {
+  try {
+    const result = await pinataUploadJson(req.body || {});
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-// Start
+// ========== Start ==========
 app.listen(PORT, () => {
   console.log(`[api] Listening on :${PORT}`);
 });
