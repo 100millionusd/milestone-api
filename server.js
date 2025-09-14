@@ -27,9 +27,16 @@ const PINATA_API_KEY = (process.env.PINATA_API_KEY || "").trim();
 const PINATA_SECRET_API_KEY = (process.env.PINATA_SECRET_API_KEY || "").trim();
 const PINATA_GATEWAY = process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud";
 
-const openai = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-  : null;
+// ✅ OpenAI client (supports project-scoped keys)
+const openai = (() => {
+  const key = (process.env.OPENAI_API_KEY || "").trim();
+  if (!key) return null;
+  return new OpenAI({
+    apiKey: key,
+    project: process.env.OPENAI_PROJECT || undefined,      // set if your key starts with sk-proj-
+    organization: process.env.OPENAI_ORG || undefined,     // optional
+  });
+})();
 
 // Blockchain
 const NETWORK = process.env.NETWORK || "sepolia";
