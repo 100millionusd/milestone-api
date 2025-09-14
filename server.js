@@ -227,6 +227,49 @@ async function extractPdfTextFromDoc(doc) {
   return raw.slice(0, 15000); // cap ~15k chars for prompt size
 }
 
+// --- Debug-friendly PDF extractor: tells you if/why the PDF was used/ignored
+async function extractPdfInfoFromDoc(doc) {
+  if (!doc?.url) return { used: false, reason: "no_file" };
+
+  const name = doc.name || "";
+  const isPdfName = /\.pdf($|\?)/i.test(name);
+
+  try {
+    const buf = await fetchAsBuffer(doc.url);
+    const first5 = buf.slice(0, 5).toString(); // "%PDF-" for real PDFs
+    const isPdf = first5 === "%PDF-" || isPdfName || (doc.mimetype || "").toLowerCase().includes("pdf");
+
+    if (!isPdf) {
+      return { used: false, reason: "not_pdf", bytes: buf.length, first5 };
+    }
+
+    let text = "";
+    try {
+      const parsed = await pdfParse(buf);
+      text = (parsed.text || "").replace(/\s+/g, " ").trim();
+    } catch (e) {
+      return { used: false, reason: "pdf_parse_failed", bytes: buf.length, first5, error: String(e).slice(0, 200) };
+    }
+
+    if (!text) {
+      // likely scanned PDF; pdf-parse has no OCR
+      return { used: false, reason: "no_text_extracted", bytes: buf.length, first5 };
+    }
+
+    const capped = text.slice(0, 15000); // ~15k chars to cap prompt
+    return {
+      used: true,
+      text: capped,
+      snippet: capped.slice(0, 400),
+      chars: capped.length,
+      bytes: buf.length,
+      first5,
+    };
+  } catch (e) {
+    return { used: false, reason: "http_error", error: String(e).slice(0, 200) };
+  }
+}
+
 // ========== IPFS ==========
 async function pinataUploadFile(file) {
   if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) throw new Error("Pinata not configured");
@@ -283,11 +326,11 @@ async function runAgent2OnBid(bidRow, proposalRow) {
     : JSON.parse(bidRow.milestones || "[]");
 
   const docObj = coerceJson(bidRow.doc);
-  let pdfText = null;
+  let pdfInfo = { used: false, reason: "no_file" };
   try {
-    pdfText = await extractPdfTextFromDoc(docObj);
+    pdfInfo = await extractPdfInfoFromDoc(docObj);
   } catch (e) {
-    console.warn("PDF parse failed:", e?.message);
+    pdfInfo = { used: false, reason: "extract_exception", error: String(e).slice(0, 200) };
   }
 
   const prompt = `
@@ -305,15 +348,20 @@ Bid:
 - Days: ${bidRow?.days ?? 0}
 - Milestones: ${JSON.stringify(milestones)}
 
-${pdfText ? `Bid PDF (excerpt up to ~15k chars):\n${pdfText}\n` : ""}
+${pdfInfo.used
+  ? `PDF EXTRACT (truncated to ~15k chars). Ground your summary/risks in this when relevant:
+"""${pdfInfo.text}"""
+`
+  : `NO PDF TEXT AVAILABLE (the PDF may be scanned or missing). Base your analysis on the form fields only.
+`}
 
-Return JSON with:
+Return JSON with exactly:
 {
   "summary": string,
   "risks": string[],
   "fit": "low" | "medium" | "high",
   "milestoneNotes": string[],
-  "confidence": number (0..1)
+  "confidence": number
 }
   `.trim();
 
@@ -326,7 +374,24 @@ Return JSON with:
     });
 
     const raw = resp.choices?.[0]?.message?.content || "{}";
-    return JSON.parse(raw);
+    const core = JSON.parse(raw);
+
+    // Attach proof/debug props so you can verify PDF usage from the API
+    return {
+      status: "ready",
+      ...core,
+      pdfUsed: !!pdfInfo.used,
+      pdfChars: pdfInfo.chars || 0,
+      pdfSnippet: pdfInfo.snippet || null,
+      pdfDebug: {
+        url: docObj?.url || null,
+        name: docObj?.name || null,
+        reason: pdfInfo.reason || null,
+        bytes: pdfInfo.bytes || null,
+        first5: pdfInfo.first5 || null,
+        error: pdfInfo.error || null,
+      },
+    };
   } catch (e) {
     console.warn("Agent2 analysis failed:", e?.message);
     return null;
