@@ -33,8 +33,8 @@ const openai = (() => {
   if (!key) return null;
   return new OpenAI({
     apiKey: key,
-    project: process.env.OPENAI_PROJECT || undefined,      // set if your key starts with sk-proj-
-    organization: process.env.OPENAI_ORG || undefined,     // optional
+    project: process.env.OPENAI_PROJECT || undefined,
+    organization: process.env.OPENAI_ORG || undefined,
   });
 })();
 
@@ -237,7 +237,10 @@ async function extractPdfInfoFromDoc(doc) {
   try {
     const buf = await fetchAsBuffer(doc.url);
     const first5 = buf.slice(0, 5).toString(); // "%PDF-" for real PDFs
-    const isPdf = first5 === "%PDF-" || isPdfName || (doc.mimetype || "").toLowerCase().includes("pdf");
+    const isPdf =
+      first5 === "%PDF-" ||
+      isPdfName ||
+      (doc.mimetype || "").toLowerCase().includes("pdf");
 
     if (!isPdf) {
       return { used: false, reason: "not_pdf", bytes: buf.length, first5 };
@@ -248,7 +251,13 @@ async function extractPdfInfoFromDoc(doc) {
       const parsed = await pdfParse(buf);
       text = (parsed.text || "").replace(/\s+/g, " ").trim();
     } catch (e) {
-      return { used: false, reason: "pdf_parse_failed", bytes: buf.length, first5, error: String(e).slice(0, 200) };
+      return {
+        used: false,
+        reason: "pdf_parse_failed",
+        bytes: buf.length,
+        first5,
+        error: String(e).slice(0, 200),
+      };
     }
 
     if (!text) {
@@ -268,6 +277,21 @@ async function extractPdfInfoFromDoc(doc) {
   } catch (e) {
     return { used: false, reason: "http_error", error: String(e).slice(0, 200) };
   }
+}
+
+// Wait up to ~15s for the PDF to be fetchable/extractable (handles gateway propagation)
+async function waitForPdfInfoFromDoc(doc, { maxMs = 15000, stepMs = 1500 } = {}) {
+  const start = Date.now();
+  let last = await extractPdfInfoFromDoc(doc);
+  if (!doc?.url || last.reason === "not_pdf" || last.reason === "no_file") return last;
+
+  while (!last.used && Date.now() - start < maxMs) {
+    // retry only for transient reasons
+    if (!["http_error", "no_text_extracted", "pdf_parse_failed"].includes(last.reason || "")) break;
+    await new Promise((r) => setTimeout(r, stepMs));
+    last = await extractPdfInfoFromDoc(doc);
+  }
+  return last;
 }
 
 // ========== IPFS ==========
@@ -319,7 +343,21 @@ async function pinataUploadJson(data) {
 
 // ========== Agent2 ==========
 async function runAgent2OnBid(bidRow, proposalRow) {
-  if (!openai) return null;
+  // Always return a terminal object (never null) so UI doesn't spin forever
+  if (!openai) {
+    return {
+      status: "error",
+      summary: "OpenAI is not configured.",
+      risks: [],
+      fit: "low",
+      milestoneNotes: [],
+      confidence: 0,
+      pdfUsed: false,
+      pdfChars: 0,
+      pdfSnippet: null,
+      pdfDebug: { reason: "openai_missing" },
+    };
+  }
 
   const milestones = Array.isArray(bidRow.milestones)
     ? bidRow.milestones
@@ -328,7 +366,7 @@ async function runAgent2OnBid(bidRow, proposalRow) {
   const docObj = coerceJson(bidRow.doc);
   let pdfInfo = { used: false, reason: "no_file" };
   try {
-    pdfInfo = await extractPdfInfoFromDoc(docObj);
+    pdfInfo = await waitForPdfInfoFromDoc(docObj); // waits for gateway readiness
   } catch (e) {
     pdfInfo = { used: false, reason: "extract_exception", error: String(e).slice(0, 200) };
   }
@@ -352,7 +390,7 @@ ${pdfInfo.used
   ? `PDF EXTRACT (truncated to ~15k chars). Ground your summary/risks in this when relevant:
 """${pdfInfo.text}"""
 `
-  : `NO PDF TEXT AVAILABLE (the PDF may be scanned or missing). Base your analysis on the form fields only.
+  : `NO PDF TEXT AVAILABLE (file not ready, scanned, or missing). Base your analysis on the form fields only.
 `}
 
 Return JSON with exactly:
@@ -376,7 +414,6 @@ Return JSON with exactly:
     const raw = resp.choices?.[0]?.message?.content || "{}";
     const core = JSON.parse(raw);
 
-    // Attach proof/debug props so you can verify PDF usage from the API
     return {
       status: "ready",
       ...core,
@@ -393,8 +430,18 @@ Return JSON with exactly:
       },
     };
   } catch (e) {
-    console.warn("Agent2 analysis failed:", e?.message);
-    return null;
+    return {
+      status: "error",
+      summary: "Agent2 failed to produce analysis.",
+      risks: [],
+      fit: "low",
+      milestoneNotes: [],
+      confidence: 0,
+      pdfUsed: false,
+      pdfChars: 0,
+      pdfSnippet: null,
+      pdfDebug: { url: docObj?.url || null, reason: "agent2_error", error: String(e).slice(0, 200) },
+    };
   }
 }
 
@@ -589,26 +636,35 @@ app.post("/bids", async (req, res) => {
     const { rows } = await pool.query(insertQ, insertVals);
     const inserted = rows[0];
 
-    // Inline Agent2 analysis (best-effort)
-    try {
-      const { rows: pr } = await pool.query(
-        "SELECT * FROM proposals WHERE proposal_id=$1",
-        [inserted.proposal_id]
-      );
-      const prop = pr[0] || null;
-      if (prop) {
+    // Fire-and-forget Agent2 analysis (don’t block response)
+    (async () => {
+      try {
+        const { rows: pr } = await pool.query(
+          "SELECT * FROM proposals WHERE proposal_id=$1",
+          [inserted.proposal_id]
+        );
+        const prop = pr[0] || null;
+        if (!prop) return;
         const analysis = await runAgent2OnBid(inserted, prop);
-        if (analysis) {
-          await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [
-            JSON.stringify(analysis),
-            inserted.bid_id,
-          ]);
-          inserted.ai_analysis = analysis;
-        }
+        await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [
+          JSON.stringify(analysis),
+          inserted.bid_id,
+        ]);
+      } catch (e) {
+        console.warn("Agent2 post-insert analysis failed:", e?.message);
+        await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [
+          JSON.stringify({
+            status: "error",
+            summary: "Agent2 failed",
+            risks: [],
+            fit: "low",
+            milestoneNotes: [],
+            confidence: 0,
+          }),
+          inserted.bid_id,
+        ]);
       }
-    } catch (e) {
-      console.warn("Agent2 post-insert analysis failed:", e?.message);
-    }
+    })();
 
     return res.status(201).json(toCamel(inserted));
   } catch (err) {
@@ -755,15 +811,12 @@ app.post("/bids/:id/analyze", async (req, res) => {
     if (!prop) return res.status(404).json({ error: "Proposal not found" });
 
     const analysis = await runAgent2OnBid(bid, prop);
-    if (analysis) {
-      await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [
-        JSON.stringify(analysis),
-        id,
-      ]);
-      const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
-      return res.json(toCamel(updated[0]));
-    }
-    return res.status(502).json({ error: "Agent2 failed to produce analysis" });
+    await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [
+      JSON.stringify(analysis),
+      id,
+    ]);
+    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
+    return res.json(toCamel(updated[0]));
   } catch (err) {
     console.error("analyze bid error:", err);
     return res.status(500).json({ error: "Agent2 error running analysis" });
