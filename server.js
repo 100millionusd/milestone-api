@@ -359,6 +359,20 @@ app.patch("/proposals/:id", async (req, res) => {
 });
 
 // Bids
+// Get a single bid by id
+app.get("/bids/:id", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+
+  try {
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id = $1", [id]);
+    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
+    return res.json(toCamel(rows[0]));
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/bids", async (req, res) => {
   try {
     const pid = req.query.proposalId;
