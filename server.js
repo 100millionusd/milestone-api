@@ -362,10 +362,19 @@ app.patch("/proposals/:id", async (req, res) => {
 // Bids
 app.get("/bids", async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM bids WHERE proposal_id=$1", [
-      req.query.proposalId,
-    ]);
-    res.json(mapRows(rows));
+    const pid = req.query.proposalId;
+    if (pid !== undefined && pid !== null && String(pid).trim() !== "") {
+      const { rows } = await pool.query(
+        "SELECT * FROM bids WHERE proposal_id=$1 ORDER BY created_at DESC NULLS LAST, bid_id DESC",
+        [pid]
+      );
+      return res.json(mapRows(rows));
+    } else {
+      const { rows } = await pool.query(
+        "SELECT * FROM bids ORDER BY created_at DESC NULLS LAST, bid_id DESC"
+      );
+      return res.json(mapRows(rows));
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
