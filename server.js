@@ -373,39 +373,74 @@ const bidSchema = Joi.object({
 });
 
 // ==============================
-// Agent2
-// ==============================
-async function runAgent2OnBid(bidRow, proposalRow) {
-  if (!openai) {
-    return {
-      status: "error",
-      summary: "OpenAI is not configured.",
-      risks: [],
-      fit: "low",
-      milestoneNotes: [],
-      confidence: 0,
-      pdfUsed: false,
-      pdfChars: 0,
-      pdfSnippet: null,
-      pdfDebug: { reason: "openai_missing" },
-    };
-  }
+// ========== Agent2 ==========
+async function extractPdfInfoFromDoc(doc) {
+  if (!doc?.url) return { used: false, reason: "no_file" };
 
-  const milestones = Array.isArray(bidRow.milestones)
-    ? bidRow.milestones
-    : JSON.parse(bidRow.milestones || "[]");
+  const name = doc.name || "";
+  const isPdfName = /\.pdf($|\?)/i.test(name);
 
-  const docObj = coerceJson(bidRow.doc);
-  let pdfInfo = { used: false, reason: "no_file" };
   try {
-    pdfInfo = await waitForPdfInfoFromDoc(docObj); // waits for gateway readiness
+    const buf = await fetchAsBuffer(doc.url);
+    const first5 = buf.slice(0, 5).toString(); // "%PDF-"
+    const isPdf =
+      first5 === "%PDF-" ||
+      isPdfName ||
+      (doc.mimetype || "").toLowerCase().includes("pdf");
+
+    if (!isPdf) {
+      return { used: false, reason: "not_pdf", bytes: buf.length, first5 };
+    }
+
+    let text = "";
+    try {
+      const parsed = await pdfParse(buf);
+      text = (parsed.text || "").replace(/\s+/g, " ").trim();
+    } catch (e) {
+      return {
+        used: false,
+        reason: "pdf_parse_failed",
+        bytes: buf.length,
+        first5,
+        error: String(e).slice(0, 200),
+      };
+    }
+
+    if (!text) {
+      return { used: false, reason: "no_text_extracted", bytes: buf.length, first5 };
+    }
+
+    const capped = text.slice(0, 15000);
+    return {
+      used: true,
+      text: capped,
+      snippet: capped.slice(0, 400),
+      chars: capped.length,
+      bytes: buf.length,
+      first5,
+    };
   } catch (e) {
-    pdfInfo = { used: false, reason: "extract_exception", error: String(e).slice(0, 200) };
+    return { used: false, reason: "http_error", error: String(e).slice(0, 200) };
   }
+}
 
-  const prompt = `
-You are Agent2. Analyze this vendor bid for a proposal and return strict JSON.
+async function waitForPdfInfoFromDoc(doc, { maxMs = 15000, stepMs = 1500 } = {}) {
+  const start = Date.now();
+  let last = await extractPdfInfoFromDoc(doc);
+  if (!doc?.url || last.reason === "not_pdf" || last.reason === "no_file") return last;
 
+  while (!last.used && Date.now() - start < maxMs) {
+    if (!["http_error", "no_text_extracted", "pdf_parse_failed"].includes(last.reason || "")) break;
+    await new Promise((r) => setTimeout(r, stepMs));
+    last = await extractPdfInfoFromDoc(doc);
+  }
+  return last;
+}
+
+function buildAgent2Prompt({ bidRow, proposalRow, milestones, pdfInfo, promptOverride }) {
+  const contextBlock = `
+CONTEXT
+-------
 Proposal:
 - Org: ${proposalRow?.org_name || ""}
 - Title: ${proposalRow?.title || ""}
@@ -418,11 +453,75 @@ Bid:
 - Days: ${bidRow?.days ?? 0}
 - Milestones: ${JSON.stringify(milestones)}
 
-${pdfInfo.used ? `PDF EXTRACT (truncated to ~15k chars). Ground your summary/risks in this when relevant:\n"""${pdfInfo.text}"""\n` : `NO PDF TEXT AVAILABLE (file not ready, scanned, or missing). Base your analysis on the form fields only.\n`}
+${pdfInfo.used
+  ? `PDF EXTRACT (truncated):\n"""${pdfInfo.text}"""`
+  : `NO PDF TEXT AVAILABLE (file not ready, scanned, or missing).`}
+`.trim();
 
+  const outputSpec = `
 Return JSON with exactly:
-{"summary":string,"risks":string[],"fit":"low"|"medium"|"high","milestoneNotes":string[],"confidence":number}
-  `.trim();
+{
+  "summary": string,
+  "risks": string[],
+  "fit": "low" | "medium" | "high",
+  "milestoneNotes": string[],
+  "confidence": number
+}
+`.trim();
+
+  if (promptOverride && promptOverride.trim()) {
+    const hasPlaceholder = promptOverride.includes("{{CONTEXT}}");
+    return hasPlaceholder
+      ? promptOverride.replace("{{CONTEXT}}", contextBlock) + "\n\n" + outputSpec
+      : contextBlock + "\n\nADDITIONAL INSTRUCTIONS\n----------------------\n" + promptOverride + "\n\n" + outputSpec;
+  }
+
+  return `
+You are Agent2. Analyze this vendor bid for a proposal and return strict JSON.
+
+${contextBlock}
+
+${outputSpec}
+`.trim();
+}
+
+async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
+  if (!openai) {
+    return {
+      status: "error",
+      summary: "OpenAI is not configured.",
+      risks: [],
+      fit: "low",
+      milestoneNotes: [],
+      confidence: 0,
+      pdfUsed: false,
+      pdfChars: 0,
+      pdfSnippet: null,
+      promptSource: promptOverride ? "override" : "default",
+      promptExcerpt: (promptOverride || "").slice(0, 300),
+      pdfDebug: { reason: "openai_missing" },
+    };
+  }
+
+  const milestones = Array.isArray(bidRow.milestones)
+    ? bidRow.milestones
+    : JSON.parse(bidRow.milestones || "[]");
+
+  const docObj = coerceJson(bidRow.doc);
+  let pdfInfo = { used: false, reason: "no_file" };
+  try {
+    pdfInfo = await waitForPdfInfoFromDoc(docObj);
+  } catch (e) {
+    pdfInfo = { used: false, reason: "extract_exception", error: String(e).slice(0, 200) };
+  }
+
+  const prompt = buildAgent2Prompt({
+    bidRow,
+    proposalRow,
+    milestones,
+    pdfInfo,
+    promptOverride: typeof promptOverride === "string" ? promptOverride : ""
+  });
 
   try {
     const resp = await openai.chat.completions.create({
@@ -441,6 +540,8 @@ Return JSON with exactly:
       pdfUsed: !!pdfInfo.used,
       pdfChars: pdfInfo.chars || 0,
       pdfSnippet: pdfInfo.snippet || null,
+      promptSource: promptOverride ? "override" : "default",
+      promptExcerpt: prompt.slice(0, 300),
       pdfDebug: {
         url: docObj?.url || null,
         name: docObj?.name || null,
@@ -461,6 +562,8 @@ Return JSON with exactly:
       pdfUsed: false,
       pdfChars: 0,
       pdfSnippet: null,
+      promptSource: promptOverride ? "override" : "default",
+      promptExcerpt: (promptOverride || "").slice(0, 300),
       pdfDebug: { url: docObj?.url || null, reason: "agent2_error", error: String(e).slice(0, 200) },
     };
   }
@@ -749,17 +852,25 @@ app.post("/bids/:id/analyze", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
   try {
-    const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ id ]);
+    const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
     if (!bids[0]) return res.status(404).json({ error: "Bid not found" });
     const bid = bids[0];
 
-    const { rows: props } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ bid.proposal_id ]);
+    const { rows: props } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [
+      bid.proposal_id,
+    ]);
     const prop = props[0];
     if (!prop) return res.status(404).json({ error: "Proposal not found" });
 
-    const analysis = await runAgent2OnBid(bid, prop);
-    await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [ JSON.stringify(analysis), id ]);
-    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ id ]);
+    const promptOverride = typeof req.body?.prompt === "string" ? req.body.prompt : "";
+
+    const analysis = await runAgent2OnBid(bid, prop, { promptOverride });
+    await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [
+      JSON.stringify(analysis),
+      id,
+    ]);
+
+    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
     return res.json(toCamel(updated[0]));
   } catch (err) {
     console.error("analyze bid error:", err);
