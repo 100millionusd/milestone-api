@@ -375,13 +375,16 @@ app.post("/bids", async (req, res) => {
   try {
     const { error, value } = bidSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
+
     const q = `INSERT INTO bids (proposal_id,vendor_name,price_usd,price_bol,days,notes,wallet_address,preferred_stablecoin,milestones,doc,status)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending') RETURNING *`;
+
+    // ✅ fallback: if priceBol not provided, mirror priceUSD
     const vals = [
       value.proposalId,
       value.vendorName,
       value.priceUSD,
-      value.priceBol,
+      (value.priceBol ?? value.priceUSD), // <-- key change
       value.days,
       value.notes,
       value.walletAddress,
@@ -389,6 +392,7 @@ app.post("/bids", async (req, res) => {
       JSON.stringify(value.milestones),
       value.doc ? JSON.stringify(value.doc) : null,
     ];
+
     const { rows } = await pool.query(q, vals);
     res.json(toCamel(rows[0]));
   } catch (err) {
