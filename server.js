@@ -678,7 +678,7 @@ app.post("/proposals/:id/approve", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
   try {
-    const { rows } = await pool.query(`UPDATE proposals SET status='approved' WHERE proposal_id=$1 RETURNING *`, [ id ]);
+    const { rows } = await pool.query(`UPDATE proposals SET status='approved' WHERE proposal_id=$1 OR id=$1 RETURNING *`, [ id ]);
     if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
@@ -690,7 +690,7 @@ app.post("/proposals/:id/reject", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
   try {
-    const { rows } = await pool.query(`UPDATE proposals SET status='rejected' WHERE proposal_id=$1 RETURNING *`, [ id ]);
+    const { rows } = await pool.query(`UPDATE proposals SET status='rejected' WHERE proposal_id=$1 OR id=$1 RETURNING *`, [ id ]);
     if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
@@ -811,7 +811,7 @@ app.post("/bids", async (req, res) => {
     const inserted = rows[0];
 
     // Fetch proposal
-    const { rows: pr } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ inserted.proposal_id ]);
+    const { rows: pr } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1 OR id=$1 LIMIT 1", [ inserted.proposal_id ]);
     const prop = pr[0] || null;
 
     // Inline Agent2 analysis with deadline
@@ -910,7 +910,7 @@ app.post("/bids/:id/analyze", async (req, res) => {
     if (!bid) return res.status(404).json({ error: "Bid not found" });
 
     const { rows: [proposal] } = await pool.query(
-      "SELECT * FROM proposals WHERE proposal_id=$1",
+      "SELECT * FROM proposals WHERE proposal_id=$1 OR id=$1 LIMIT 1",
       [bid.proposal_id]
     );
     if (!proposal) return res.status(404).json({ error: "Proposal not found" });
