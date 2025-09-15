@@ -10,15 +10,6 @@
 //   • Inline Agent2 analysis on bid creation (response already includes ai_analysis)
 //   • Manual analyze endpoint for retries
 //
-// Key UX guarantees we enforce here:
-//   1) Creating a bid returns a terminal ai_analysis object in the same response.
-//      That means the frontend does NOT need to refresh to see analysis.
-//   2) When a PDF doc is attached, we wait up to ~12s trying to fetch & parse it.
-//      Regardless of success or failure, the response is terminal
-//      (status: "ready" or "error"), so the UI never shows pending forever.
-//   3) PDF debug fields (pdfUsed, pdfDebug) explain why a PDF was skipped
-//      (e.g., http_error, no_text, parse_failed), which can be surfaced in the UI.
-//
 // Environment variables (commonly used):
 //   PORT                      - default 3000
 //   DATABASE_URL              - Postgres connection string
@@ -31,7 +22,6 @@
 //   USDC_ADDRESS / USDT_ADDRESS
 //   PINATA_API_KEY / PINATA_SECRET_API_KEY
 //   PINATA_GATEWAY_DOMAIN     - gateway domain (default: gateway.pinata.cloud)
-//
 // --------------------------------------------------------------------------------------
 
 require("dotenv").config();
@@ -127,7 +117,6 @@ function coerceJson(val) {
 
 /**
  * Perform a generic HTTP(S) request and return { status, body }.
- * Useful for Pinata as we need raw control over headers and body.
  */
 function sendRequest(method, urlStr, headers = {}, body = null) {
   const u = new URL(urlStr);
@@ -159,8 +148,7 @@ function sendRequest(method, urlStr, headers = {}, body = null) {
  */
 async function fetchAsBuffer(urlStr) {
   return new Promise((resolve, reject) => {
-    const u = new URL(urlStr);
-    const lib = u.protocol === "https:" ? https : http;
+    const lib = urlStr.startsWith("https:") ? https : http;
     const req = lib.get(urlStr, (res) => {
       if (res.statusCode && res.statusCode >= 400) {
         return reject(new Error(`HTTP ${res.statusCode} fetching ${urlStr}`));
@@ -195,7 +183,7 @@ async function extractPdfInfoFromDoc(doc) {
 
   try {
     const buf = await fetchAsBuffer(doc.url);
-    const first5 = buf.slice(0, 5).toString(); // "%PDF-" for real PDFs
+    const first5 = buf.slice(0, 5).toString(); // "%PDF-"
     const isPdf = first5 === "%PDF-" || isPdfName || (doc.mimetype || "").toLowerCase().includes("pdf");
 
     if (!isPdf) {
@@ -217,7 +205,6 @@ async function extractPdfInfoFromDoc(doc) {
     }
 
     if (!text) {
-      // likely a scanned PDF; pdf-parse has no OCR
       return { used: false, reason: "no_text_extracted", bytes: buf.length, first5 };
     }
 
@@ -403,7 +390,6 @@ Bid:
 REQUIREMENTS
 ------------
 - In the "summary" string, include a subsection titled exactly: "PDF Insights".
-- Under "PDF Insights", briefly describe what the PDF contains that is relevant to the bid/evaluation.
 - Quote 1–2 very short excerpts (<= 20 words each) from the PDF if possible.
 - Explain how the PDF content affects feasibility, fit, risks, and milestones.`
     : `
@@ -414,11 +400,11 @@ REQUIREMENTS
   const outputSpec = `
 Return JSON with exactly these keys:
 {
-  "summary": string,   // must include the "PDF Insights" subsection as instructed above
+  "summary": string,
   "risks": string[],
   "fit": "low" | "medium" | "high",
   "milestoneNotes": string[],
-  "confidence": number  // 0..1
+  "confidence": number
 }`.trim();
 
   if (promptOverride && promptOverride.trim()) {
@@ -455,7 +441,7 @@ ${outputSpec}
 function normalizeAnalysisShape(core) {
   const safe = {};
 
-  // summary must be a string
+  // summary
   if (typeof core?.summary === "string") {
     safe.summary = core.summary;
   } else if (core?.summary != null) {
@@ -566,7 +552,7 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
       pdfSnippet: null,
       promptSource: promptOverride ? "override" : "default",
       promptExcerpt: (promptOverride || "").slice(0, 300),
-      pdfDebug: { url: docObj?.url || null, reason: "agent2_error", error: String(e).slice(0, 200) },
+      pdfDebug: { reason: "agent2_error", error: String(e).slice(0, 200) },
     };
   }
 }
@@ -623,9 +609,24 @@ app.get("/test", (_req, res) => res.json({ ok: true }));
 // ==============================
 // Routes — Proposals
 // ==============================
-app.get("/proposals", async (_req, res) => {
+app.get("/proposals", async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM proposals ORDER BY created_at DESC");
+    const status = (req.query.status || "").toLowerCase().trim();
+    const includeArchived = String(req.query.includeArchived || "").toLowerCase();
+
+    let q = "SELECT * FROM proposals";
+    const params = [];
+
+    if (status) {
+      q += " WHERE status=$1";
+      params.push(status);
+    } else if (!["true", "1", "yes"].includes(includeArchived)) {
+      q += " WHERE status != 'archived'";
+    }
+
+    q += " ORDER BY created_at DESC";
+
+    const { rows } = await pool.query(q, params);
     res.json(mapRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -634,7 +635,9 @@ app.get("/proposals", async (_req, res) => {
 
 app.get("/proposals/:id", async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ req.params.id ]);
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+    const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ id ]);
     if (!rows[0]) return res.status(404).json({ error: "not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
@@ -647,8 +650,12 @@ app.post("/proposals", async (req, res) => {
     const { error, value } = proposalSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
 
-    const q = `INSERT INTO proposals (org_name,title,summary,contact,address,city,country,amount_usd,docs,cid,status)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending') RETURNING *`;
+    const q = `
+      INSERT INTO proposals (
+        org_name, title, summary, contact, address, city, country, amount_usd, docs, cid, status
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending')
+      RETURNING proposal_id, org_name, title, summary, contact, address, city, country, amount_usd, docs, cid, status, created_at
+    `;
     const vals = [
       value.orgName,
       value.title,
@@ -668,43 +675,71 @@ app.post("/proposals", async (req, res) => {
   }
 });
 
+// Approve proposal
 app.post("/proposals/:id/approve", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
   try {
-    const { rows } = await pool.query(`UPDATE proposals SET status='approved' WHERE proposal_id=$1 RETURNING *`, [ id ]);
-    if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+    const { rows } = await pool.query(
+      `UPDATE proposals SET status='approved' WHERE proposal_id=$1 RETURNING *`,
+      [id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Error approving proposal:", err);
+    res.status(500).json({ error: "Failed to approve proposal" });
   }
 });
 
+// Reject proposal
 app.post("/proposals/:id/reject", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
   try {
-    const { rows } = await pool.query(`UPDATE proposals SET status='rejected' WHERE proposal_id=$1 RETURNING *`, [ id ]);
-    if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+    const { rows } = await pool.query(
+      `UPDATE proposals SET status='rejected' WHERE proposal_id=$1 RETURNING *`,
+      [id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Error rejecting proposal:", err);
+    res.status(500).json({ error: "Failed to reject proposal" });
   }
 });
 
-app.patch("/proposals/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  const desired = String(req.body?.status || "").toLowerCase();
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-  if (!["approved", "rejected"].includes(desired)) {
-    return res.status(400).json({ error: 'Invalid status; expected "approved" or "rejected"' });
-  }
+// Archive proposal
+app.post("/proposals/:id/archive", async (req, res) => {
   try {
-    const { rows } = await pool.query(`UPDATE proposals SET status=$2 WHERE proposal_id=$1 RETURNING *`, [ id, desired ]);
-    if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+    const { rows } = await pool.query(
+      `UPDATE proposals SET status='archived' WHERE proposal_id=$1 RETURNING *`,
+      [id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Error archiving proposal:", err);
+    res.status(500).json({ error: "Failed to archive proposal" });
+  }
+});
+
+// Delete proposal
+app.delete("/proposals/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+    const { rowCount } = await pool.query(
+      `DELETE FROM proposals WHERE proposal_id=$1`,
+      [id]
+    );
+    if (rowCount === 0) return res.status(404).json({ error: "Proposal not found" });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Error deleting proposal:", err);
+    res.status(500).json({ error: "Failed to delete proposal" });
   }
 });
 
@@ -849,7 +884,7 @@ app.patch("/bids/:id", async (req, res) => {
   }
 });
 
-// Manual analyze/Retry (single, clean implementation)
+// Manual analyze/Retry
 app.post("/bids/:id/analyze", async (req, res) => {
   const bidId = Number(req.params.id);
   if (!Number.isFinite(bidId)) {
@@ -1108,5 +1143,3 @@ app.post("/ipfs/upload-json", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`[api] Listening on :${PORT}`);
 });
-
-
