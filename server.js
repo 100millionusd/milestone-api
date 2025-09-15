@@ -678,84 +678,74 @@ const q = `
 });
 
 app.post("/proposals/:id/approve", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
   try {
-    const { rows } = await pool.query(`UPDATE proposals SET status='approved' WHERE proposal_id=$1 OR id=$1 RETURNING *`, [ id ]);
-    if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
-    res.json(toCamel(rows[0]));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/proposals/:id/reject", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-  try {
-    const { rows } = await pool.query(`UPDATE proposals SET status='rejected' WHERE proposal_id=$1 OR id=$1 RETURNING *`, [ id ]);
-    if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
-    res.json(toCamel(rows[0]));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.patch("/proposals/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  const desired = String(req.body?.status || "").toLowerCase();
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-
-  const ALLOWED = new Set(["approved", "rejected", "pending", "archived"]);
-  if (!ALLOWED.has(desired)) {
-    return res.status(400).json({ error: 'Invalid status; expected "approved", "rejected", "pending", or "archived"' });
-  }
-
-  try {
+    const id = req.params.id;
     const { rows } = await pool.query(
-      `UPDATE proposals SET status=$2 WHERE proposal_id=$1 RETURNING *`,
-      [id, desired]
-    );
-    if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
-    res.json(toCamel(rows[0]));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Archive proposal (soft delete)
-app.post("/proposals/:id/archive", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-  try {
-    const { rows } = await pool.query(
-      `UPDATE proposals SET status='archived' WHERE proposal_id=$1 RETURNING *`,
+      `UPDATE proposals 
+         SET status='approved' 
+       WHERE proposal_id=$1 
+       RETURNING *`,
       [id]
     );
-    if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
-    res.json(toCamel(rows[0]));
+    if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
+    res.json(rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Error approving proposal:", err);
+    res.status(500).json({ error: "Failed to approve proposal" });
   }
 });
 
-// Permanently delete proposal (+ its bids)
-app.delete("/proposals/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-
+// Reject proposal
+app.post("/proposals/:id/reject", async (req, res) => {
   try {
-    await pool.query("BEGIN");
-    // Remove dependent rows first (if you don't have ON DELETE CASCADE)
-    await pool.query("DELETE FROM bids WHERE proposal_id=$1", [id]);
-    const del = await pool.query("DELETE FROM proposals WHERE proposal_id=$1", [id]);
-    await pool.query("COMMIT");
-
-    if (del.rowCount === 0) return res.status(404).json({ error: "Proposal not found" });
-    return res.status(204).send(); // No content
+    const id = req.params.id;
+    const { rows } = await pool.query(
+      `UPDATE proposals 
+         SET status='rejected' 
+       WHERE proposal_id=$1 
+       RETURNING *`,
+      [id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
+    res.json(rows[0]);
   } catch (err) {
-    await pool.query("ROLLBACK");
-    return res.status(500).json({ error: err.message });
+    console.error("Error rejecting proposal:", err);
+    res.status(500).json({ error: "Failed to reject proposal" });
+  }
+});
+
+// Archive proposal
+app.post("/proposals/:id/archive", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { rows } = await pool.query(
+      `UPDATE proposals 
+         SET status='archived' 
+       WHERE proposal_id=$1 
+       RETURNING *`,
+      [id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("Error archiving proposal:", err);
+    res.status(500).json({ error: "Failed to archive proposal" });
+  }
+});
+
+// Delete proposal
+app.delete("/proposals/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { rowCount } = await pool.query(
+      `DELETE FROM proposals WHERE proposal_id=$1`,
+      [id]
+    );
+    if (rowCount === 0) return res.status(404).json({ error: "Proposal not found" });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Error deleting proposal:", err);
+    res.status(500).json({ error: "Failed to delete proposal" });
   }
 });
 
