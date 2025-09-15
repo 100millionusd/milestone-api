@@ -848,7 +848,8 @@ app.patch("/bids/:id", async (req, res) => {
   }
 });
 
-// Manual analyze/Retry with PDF parsing
+// Manual analyze/Retry
+// ==============================
 app.post("/bids/:id/analyze", async (req, res) => {
   const bidId = Number(req.params.id);
   if (!Number.isFinite(bidId)) {
@@ -878,19 +879,17 @@ app.post("/bids/:id/analyze", async (req, res) => {
           url: bid.doc.url,
           name: bid.doc.name,
           bytes: resp.data.byteLength,
-          error: null,
           first5: Buffer.from(resp.data).toString("utf8", 0, 5),
+          error: null,
         };
-
-        // 🔹 Log first 500 chars so you can check in console
-        console.log("PDF extracted text (first 500):", pdfText.slice(0, 500));
+        console.log("PDF extracted (first 500):", pdfText.slice(0, 500));
       } catch (err) {
         console.error("PDF parse failed:", err.message);
         pdfDebug = { url: bid.doc.url, name: bid.doc.name, error: err.message };
       }
     }
 
-    // Build system prompt
+    // Build analysis prompt
     const systemPrompt = `
 You are Agent2. Analyze this vendor bid critically.
 
@@ -908,10 +907,9 @@ ${JSON.stringify(bid.milestones || [], null, 2)}
 ---
 
 IMPORTANT:
-- If PDF contents are provided, you MUST carefully read them and summarize what’s inside.
-- Include a section called "PDF Insights" with details pulled from the PDF.
-- Then assess feasibility, fit, risks, and alignment with the proposal.
-- Always state explicitly whether the PDF text was used or if it was empty/unreadable.
+- If PDF contents are provided, summarize them under "PDF Insights".
+- Assess feasibility, fit, risks, and alignment with the proposal.
+- Always state explicitly whether the PDF text was used.
 
 PDF contents:
 ${pdfText ? pdfText.slice(0, 15000) : "No PDF provided"}
@@ -925,7 +923,6 @@ ${pdfText ? pdfText.slice(0, 15000) : "No PDF provided"}
 
     const reply = completion.choices[0].message.content;
 
-    // Wrap into ai_analysis object
     const analysis = {
       status: "ready",
       summary: reply,
@@ -933,7 +930,6 @@ ${pdfText ? pdfText.slice(0, 15000) : "No PDF provided"}
       pdfDebug,
     };
 
-    // Save to DB
     await pool.query(
       "UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2",
       [JSON.stringify(analysis), bidId]
@@ -945,26 +941,6 @@ ${pdfText ? pdfText.slice(0, 15000) : "No PDF provided"}
     res.status(500).json({ error: "Failed to analyze bid" });
   }
 });
-
-    // If OpenAI isn’t configured, store a terminal error so UI stops spinning
-    if (!openai) {
-      const analysis = {
-        status: "error",
-        summary: "OpenAI not configured.",
-        risks: [],
-        fit: "low",
-        milestoneNotes: [],
-        confidence: 0,
-        pdfUsed: !!pdfText,
-        pdfDebug,
-      };
-      await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [
-        JSON.stringify(analysis),
-        id,
-      ]);
-      const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
-      return res.json(toCamel(updated[0]));
-    }
 
     // Model prompt (forces explicit PDF mention when available)
     const userPrompt = `
