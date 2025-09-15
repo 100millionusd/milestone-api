@@ -850,69 +850,101 @@ app.patch("/bids/:id", async (req, res) => {
 
 // Manual analyze/Retry
 app.post("/bids/:id/analyze", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+  const bidId = Number(req.params.id);
+  if (!Number.isFinite(bidId)) {
+    return res.status(400).json({ error: "Invalid bid id" });
+  }
 
   try {
-    // Load bid
-    const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
-    if (!bids[0]) return res.status(404).json({ error: "Bid not found" });
-    const bid = bids[0];
+    // Fetch bid + proposal
+    const { rows: [bid] } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    if (!bid) return res.status(404).json({ error: "Bid not found" });
 
-    // Load proposal
-    const { rows: props } = await pool.query(
+    const { rows: [proposal] } = await pool.query(
       "SELECT * FROM proposals WHERE proposal_id=$1",
       [bid.proposal_id]
     );
-    const prop = props[0];
-    if (!prop) return res.status(404).json({ error: "Proposal not found" });
+    if (!proposal) return res.status(404).json({ error: "Proposal not found" });
 
-    // Optional override text from client
-    const promptOverride = typeof req.body?.prompt === "string" ? req.body.prompt : "";
-
-    // Parse JSON-ish columns safely
-    const doc = coerceJson(bid.doc);
-    const milestones = Array.isArray(bid.milestones)
-      ? bid.milestones
-      : JSON.parse(bid.milestones || "[]");
-
-    // Try fetch + parse the PDF (if present)
+    // Fetch + parse PDF if attached
     let pdfText = null;
-    let pdfDebug = { url: doc?.url || null, name: doc?.name || null };
-    if (doc?.url) {
+    let pdfDebug = null;
+    if (bid.doc && bid.doc.url) {
       try {
-        const resp = await axios.get(doc.url, {
-          responseType: "arraybuffer",
-          timeout: 15000,
-        });
-        const buf = Buffer.from(resp.data);
-        const first5 = buf.toString("utf8", 0, 5);
-
-        let parsed = null;
-        try {
-          parsed = await pdfParse(buf);
-        } catch (e) {
-          // pdf-parse can fail on scanned PDFs; keep going with debug
-        }
-
-        const text = (parsed?.text || "").replace(/\s+/g, " ").trim();
-        pdfText = text ? text.slice(0, 15000) : null; // cap to keep prompt small
+        const resp = await axios.get(bid.doc.url, { responseType: "arraybuffer" });
+        const parsed = await pdfParse(resp.data);
+        pdfText = parsed.text || "";
         pdfDebug = {
-          url: doc.url,
-          name: doc.name,
-          bytes: buf.length,
-          first5,
-          reason: text ? null : "no_text_extracted",
+          url: bid.doc.url,
+          name: bid.doc.name,
+          bytes: resp.data.byteLength,
+          error: null,
+          first5: Buffer.from(resp.data).toString("utf8", 0, 5),
         };
-      } catch (e) {
-        pdfDebug = {
-          url: doc.url,
-          name: doc.name,
-          error: String(e?.message || e),
-          reason: "http_error",
-        };
+
+        // 🔹 Log first 500 chars so you can check in console
+        console.log("PDF extracted text (first 500):", pdfText.slice(0, 500));
+      } catch (err) {
+        console.error("PDF parse failed:", err.message);
+        pdfDebug = { url: bid.doc.url, name: bid.doc.name, error: err.message };
       }
     }
+
+    // Build system prompt
+    const systemPrompt = `
+You are Agent2. Analyze this vendor bid critically.
+
+Proposal summary:
+${proposal?.summary || "(no summary)"}
+
+Vendor: ${bid.vendor_name}
+Price (USD): ${bid.price_usd}
+Days: ${bid.days}
+Notes: ${bid.notes}
+
+Milestones:
+${JSON.stringify(bid.milestones || [], null, 2)}
+
+---
+
+IMPORTANT:
+- If PDF contents are provided, you MUST carefully read them and summarize what’s inside.
+- Include a section called "PDF Insights" with details pulled from the PDF.
+- Then assess feasibility, fit, risks, and alignment with the proposal.
+- Always state explicitly whether the PDF text was used or if it was empty/unreadable.
+
+PDF contents:
+${pdfText ? pdfText.slice(0, 15000) : "No PDF provided"}
+    `;
+
+    // Call OpenAI
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "system", content: systemPrompt }],
+    });
+
+    const reply = completion.choices[0].message.content;
+
+    // Wrap into ai_analysis object
+    const analysis = {
+      status: "ready",
+      summary: reply,
+      pdfUsed: !!pdfText,
+      pdfDebug,
+    };
+
+    // Save to DB
+    await pool.query(
+      "UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2",
+      [JSON.stringify(analysis), bidId]
+    );
+
+    res.json({ ...bid, aiAnalysis: analysis });
+  } catch (err) {
+    console.error("Analyze error:", err);
+    res.status(500).json({ error: "Failed to analyze bid" });
+  }
+});
 
     // If OpenAI isn’t configured, store a terminal error so UI stops spinning
     if (!openai) {
