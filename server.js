@@ -654,7 +654,8 @@ app.post("/proposals", async (req, res) => {
     if (error) return res.status(400).json({ error: error.message });
 
     const q = `INSERT INTO proposals (org_name,title,summary,contact,address,city,country,amount_usd,docs,cid,status)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending') RETURNING *`;
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending') 
+           RETURNING proposal_id, org_name, title, summary, contact, address, city, country, amount_usd, docs, cid, status, created_at`;
     const vals = [
       value.orgName,
       value.title,
