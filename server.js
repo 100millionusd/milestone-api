@@ -389,35 +389,63 @@ Bid:
 - Vendor: ${bidRow?.vendor_name || ""}
 - PriceUSD: ${bidRow?.price_usd ?? 0}
 - Days: ${bidRow?.days ?? 0}
-- Milestones: ${JSON.stringify(milestones, null, 2)}
-
-${pdfInfo.used
-  ? `PDF EXTRACT (truncated):\n"""${pdfInfo.text}"""`
-  : `NO PDF TEXT AVAILABLE (file not ready, scanned, or missing).`}
+- Notes: ${bidRow?.notes || ""}
+- Milestones: ${JSON.stringify(milestones)}
 `.trim();
 
+  const pdfBlock = pdfInfo.used
+    ? `PDF EXTRACT (truncated to ~15k chars):
+"""${pdfInfo.text}"""`
+    : `NO PDF TEXT AVAILABLE (reason: ${pdfInfo.reason || "unknown"})`;
+
+  const mustInclude = pdfInfo.used
+    ? `
+REQUIREMENTS
+------------
+- In the "summary" string, include a subsection titled exactly: "PDF Insights".
+- Under "PDF Insights", briefly describe what the PDF contains that is relevant to the bid/evaluation.
+- Quote 1–2 very short excerpts (<= 20 words each) from the PDF if possible.
+- Explain how the PDF content affects feasibility, fit, risks, and milestones.`
+    : `
+REQUIREMENTS
+------------
+- In the "summary" string, explicitly state that no PDF text was available/usable and that the analysis did not use PDF contents.`;
+
   const outputSpec = `
-Return JSON with exactly:
+Return JSON with exactly these keys:
 {
-  "summary": string,
+  "summary": string,   // must include the "PDF Insights" subsection as instructed above
   "risks": string[],
   "fit": "low" | "medium" | "high",
   "milestoneNotes": string[],
-  "confidence": number
-}
-`.trim();
+  "confidence": number  // 0..1
+}`.trim();
 
   if (promptOverride && promptOverride.trim()) {
-    const hasPlaceholder = promptOverride.includes("{{CONTEXT}}");
-    return hasPlaceholder
-      ? promptOverride.replace("{{CONTEXT}}", contextBlock) + "\n\n" + outputSpec
-      : contextBlock + "\n\nADDITIONAL INSTRUCTIONS\n----------------------\n" + promptOverride + "\n\n" + outputSpec;
+    const base = `${contextBlock}
+
+${pdfBlock}
+
+${mustInclude}
+
+${outputSpec}`;
+    return promptOverride.includes("{{CONTEXT}}")
+      ? promptOverride.replace("{{CONTEXT}}", base)
+      : `${base}
+
+ADDITIONAL INSTRUCTIONS
+----------------------
+${promptOverride}`;
   }
 
   return `
-You are Agent2. Analyze this vendor bid for a proposal and return strict JSON.
+You are Agent2. Analyze this vendor bid for a proposal and return strict JSON only.
 
 ${contextBlock}
+
+${pdfBlock}
+
+${mustInclude}
 
 ${outputSpec}
 `.trim();
