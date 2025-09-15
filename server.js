@@ -47,6 +47,7 @@ const Joi = require("joi");
 const { Pool } = require("pg");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
+const axios = require("axios");
 
 // ==============================
 // Config
@@ -851,20 +852,137 @@ app.patch("/bids/:id", async (req, res) => {
 app.post("/bids/:id/analyze", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+
   try {
+    // Load bid
     const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
     if (!bids[0]) return res.status(404).json({ error: "Bid not found" });
     const bid = bids[0];
 
-    const { rows: props } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [
-      bid.proposal_id,
-    ]);
+    // Load proposal
+    const { rows: props } = await pool.query(
+      "SELECT * FROM proposals WHERE proposal_id=$1",
+      [bid.proposal_id]
+    );
     const prop = props[0];
     if (!prop) return res.status(404).json({ error: "Proposal not found" });
 
+    // Optional override text from client
     const promptOverride = typeof req.body?.prompt === "string" ? req.body.prompt : "";
 
-    const analysis = await runAgent2OnBid(bid, prop, { promptOverride });
+    // Parse JSON-ish columns safely
+    const doc = coerceJson(bid.doc);
+    const milestones = Array.isArray(bid.milestones)
+      ? bid.milestones
+      : JSON.parse(bid.milestones || "[]");
+
+    // Try fetch + parse the PDF (if present)
+    let pdfText = null;
+    let pdfDebug = { url: doc?.url || null, name: doc?.name || null };
+    if (doc?.url) {
+      try {
+        const resp = await axios.get(doc.url, {
+          responseType: "arraybuffer",
+          timeout: 15000,
+        });
+        const buf = Buffer.from(resp.data);
+        const first5 = buf.toString("utf8", 0, 5);
+
+        let parsed = null;
+        try {
+          parsed = await pdfParse(buf);
+        } catch (e) {
+          // pdf-parse can fail on scanned PDFs; keep going with debug
+        }
+
+        const text = (parsed?.text || "").replace(/\s+/g, " ").trim();
+        pdfText = text ? text.slice(0, 15000) : null; // cap to keep prompt small
+        pdfDebug = {
+          url: doc.url,
+          name: doc.name,
+          bytes: buf.length,
+          first5,
+          reason: text ? null : "no_text_extracted",
+        };
+      } catch (e) {
+        pdfDebug = {
+          url: doc.url,
+          name: doc.name,
+          error: String(e?.message || e),
+          reason: "http_error",
+        };
+      }
+    }
+
+    // If OpenAI isn’t configured, store a terminal error so UI stops spinning
+    if (!openai) {
+      const analysis = {
+        status: "error",
+        summary: "OpenAI not configured.",
+        risks: [],
+        fit: "low",
+        milestoneNotes: [],
+        confidence: 0,
+        pdfUsed: !!pdfText,
+        pdfDebug,
+      };
+      await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [
+        JSON.stringify(analysis),
+        id,
+      ]);
+      const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
+      return res.json(toCamel(updated[0]));
+    }
+
+    // Model prompt (forces explicit PDF mention when available)
+    const userPrompt = `
+You are Agent2. Analyze this vendor bid and return strict JSON with exactly:
+{
+  "summary": string,
+  "risks": string[],
+  "fit": "low" | "medium" | "high",
+  "milestoneNotes": string[],
+  "confidence": number
+}
+
+Requirements:
+- If PDF text is available, cite it explicitly and briefly quote 1–2 short excerpts (<= 20 words).
+- Evaluate feasibility, risks, and alignment with the proposal and milestones.
+- Confidence is a number in [0,1].
+
+Proposal:
+- Org: ${prop.org_name || ""}
+- Title: ${prop.title || ""}
+- Summary: ${prop.summary || ""}
+- BudgetUSD: ${prop.amount_usd ?? 0}
+
+Bid:
+- Vendor: ${bid.vendor_name || ""}
+- PriceUSD: ${bid.price_usd ?? 0}
+- Days: ${bid.days ?? 0}
+- Notes: ${bid.notes || ""}
+- Milestones: ${JSON.stringify(milestones)}
+
+${promptOverride ? `Special instructions:\n${promptOverride}\n` : ""}
+${pdfText ? `PDF TEXT (truncated ~15k chars):\n"""${pdfText}"""` : "NO PDF TEXT AVAILABLE"}
+`.trim();
+
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      messages: [{ role: "user", content: userPrompt }],
+      response_format: { type: "json_object" },
+    });
+
+    const core = JSON.parse(resp.choices?.[0]?.message?.content || "{}");
+    const analysis = {
+      status: "ready",
+      ...core,
+      pdfUsed: !!pdfText,
+      pdfDebug,
+    };
+
+    // Store JSON in ai_analysis
     await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [
       JSON.stringify(analysis),
       id,
