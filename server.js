@@ -870,15 +870,20 @@ app.post("/bids/:id/reject", async (req, res) => {
 app.post("/bids/:id/archive", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+
   try {
     const { rows } = await pool.query(
       `UPDATE bids 
          SET status='archived' 
-       WHERE bid_id=$1 
+       WHERE bid_id=$1 AND (status='completed' OR status='rejected') 
        RETURNING *`,
       [id]
     );
-    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
+    if (!rows[0]) {
+      return res
+        .status(400)
+        .json({ error: "Only completed or rejected bids can be archived (or bid not found)" });
+    }
     return res.json(toCamel(rows[0]));
   } catch (err) {
     console.error("archive bid error", err);
