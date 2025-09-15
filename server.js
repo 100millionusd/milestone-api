@@ -623,26 +623,20 @@ app.get("/test", (_req, res) => res.json({ ok: true }));
 // ==============================
 // Routes — Proposals
 // ==============================
-app.get("/proposals", async (req, res) => {
+app.get("/proposals", async (_req, res) => {
   try {
-    const status = (req.query.status || "").toLowerCase().trim();
-    const includeArchived = String(req.query.includeArchived || "").toLowerCase();
-
-    let q = "SELECT * FROM proposals";
-    const params = [];
-
-    if (status) {
-      q += " WHERE status=$1";
-      params.push(status);
-    } else if (!["true", "1", "yes"].includes(includeArchived)) {
-      // By default, hide archived proposals unless includeArchived=true
-      q += " WHERE status != 'archived'";
-    }
-
-    q += " ORDER BY created_at DESC";
-
-    const { rows } = await pool.query(q, params);
+    const { rows } = await pool.query("SELECT * FROM proposals ORDER BY created_at DESC");
     res.json(mapRows(rows));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/proposals/:id", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ req.params.id ]);
+    if (!rows[0]) return res.status(404).json({ error: "not found" });
+    res.json(toCamel(rows[0]));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -653,11 +647,8 @@ app.post("/proposals", async (req, res) => {
     const { error, value } = proposalSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
 
-const q = `
-  INSERT INTO proposals (
-    org_name, title, summary, contact, address, city, country, amount_usd, docs, cid, status) 
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending')
-  RETURNING proposal_id, org_name, title, summary, contact, address, city, country, amount_usd, docs, cid, status, created_at;
+    const q = `INSERT INTO proposals (org_name,title,summary,contact,address,city,country,amount_usd,docs,cid,status)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending') RETURNING *`;
     const vals = [
       value.orgName,
       value.title,
@@ -678,74 +669,42 @@ const q = `
 });
 
 app.post("/proposals/:id/approve", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
   try {
-    const id = req.params.id;
-    const { rows } = await pool.query(
-      `UPDATE proposals 
-         SET status='approved' 
-       WHERE proposal_id=$1 
-       RETURNING *`,
-      [id]
-    );
-    if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
-    res.json(rows[0]);
+    const { rows } = await pool.query(`UPDATE proposals SET status='approved' WHERE proposal_id=$1 RETURNING *`, [ id ]);
+    if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
+    res.json(toCamel(rows[0]));
   } catch (err) {
-    console.error("Error approving proposal:", err);
-    res.status(500).json({ error: "Failed to approve proposal" });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Reject proposal
 app.post("/proposals/:id/reject", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
   try {
-    const id = req.params.id;
-    const { rows } = await pool.query(
-      `UPDATE proposals 
-         SET status='rejected' 
-       WHERE proposal_id=$1 
-       RETURNING *`,
-      [id]
-    );
-    if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
-    res.json(rows[0]);
+    const { rows } = await pool.query(`UPDATE proposals SET status='rejected' WHERE proposal_id=$1 RETURNING *`, [ id ]);
+    if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
+    res.json(toCamel(rows[0]));
   } catch (err) {
-    console.error("Error rejecting proposal:", err);
-    res.status(500).json({ error: "Failed to reject proposal" });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Archive proposal
-app.post("/proposals/:id/archive", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const { rows } = await pool.query(
-      `UPDATE proposals 
-         SET status='archived' 
-       WHERE proposal_id=$1 
-       RETURNING *`,
-      [id]
-    );
-    if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
-    res.json(rows[0]);
-  } catch (err) {
-    console.error("Error archiving proposal:", err);
-    res.status(500).json({ error: "Failed to archive proposal" });
+app.patch("/proposals/:id", async (req, res) => {
+  const id = Number(req.params.id);
+  const desired = String(req.body?.status || "").toLowerCase();
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+  if (!["approved", "rejected"].includes(desired)) {
+    return res.status(400).json({ error: 'Invalid status; expected "approved" or "rejected"' });
   }
-});
-
-// Delete proposal
-app.delete("/proposals/:id", async (req, res) => {
   try {
-    const id = req.params.id;
-    const { rowCount } = await pool.query(
-      `DELETE FROM proposals WHERE proposal_id=$1`,
-      [id]
-    );
-    if (rowCount === 0) return res.status(404).json({ error: "Proposal not found" });
-    res.json({ success: true });
+    const { rows } = await pool.query(`UPDATE proposals SET status=$2 WHERE proposal_id=$1 RETURNING *`, [ id, desired ]);
+    if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
+    res.json(toCamel(rows[0]));
   } catch (err) {
-    console.error("Error deleting proposal:", err);
-    res.status(500).json({ error: "Failed to delete proposal" });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -804,7 +763,7 @@ app.post("/bids", async (req, res) => {
     const inserted = rows[0];
 
     // Fetch proposal
-    const { rows: pr } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1 OR id=$1 LIMIT 1", [ inserted.proposal_id ]);
+    const { rows: pr } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ inserted.proposal_id ]);
     const prop = pr[0] || null;
 
     // Inline Agent2 analysis with deadline
@@ -903,7 +862,7 @@ app.post("/bids/:id/analyze", async (req, res) => {
     if (!bid) return res.status(404).json({ error: "Bid not found" });
 
     const { rows: [proposal] } = await pool.query(
-      "SELECT * FROM proposals WHERE proposal_id=$1 OR id=$1 LIMIT 1",
+      "SELECT * FROM proposals WHERE proposal_id=$1",
       [bid.proposal_id]
     );
     if (!proposal) return res.status(404).json({ error: "Proposal not found" });
@@ -1149,4 +1108,5 @@ app.post("/ipfs/upload-json", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`[api] Listening on :${PORT}`);
 });
+
 
