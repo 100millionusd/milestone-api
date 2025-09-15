@@ -848,7 +848,7 @@ app.patch("/bids/:id", async (req, res) => {
   }
 });
 
-// Manual analyze/Retry
+// Manual analyze/Retry with PDF parsing
 app.post("/bids/:id/analyze", async (req, res) => {
   const bidId = Number(req.params.id);
   if (!Number.isFinite(bidId)) {
