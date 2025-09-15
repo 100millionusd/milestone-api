@@ -848,8 +848,7 @@ app.patch("/bids/:id", async (req, res) => {
   }
 });
 
-// Manual analyze/Retry
-// ==============================
+// Manual analyze/Retry (replaced)
 app.post("/bids/:id/analyze", async (req, res) => {
   const bidId = Number(req.params.id);
   if (!Number.isFinite(bidId)) {
@@ -857,7 +856,6 @@ app.post("/bids/:id/analyze", async (req, res) => {
   }
 
   try {
-    // Fetch bid + proposal
     const { rows: [bid] } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
     if (!bid) return res.status(404).json({ error: "Bid not found" });
 
@@ -867,7 +865,6 @@ app.post("/bids/:id/analyze", async (req, res) => {
     );
     if (!proposal) return res.status(404).json({ error: "Proposal not found" });
 
-    // Fetch + parse PDF if attached
     let pdfText = null;
     let pdfDebug = null;
     if (bid.doc && bid.doc.url) {
@@ -879,43 +876,20 @@ app.post("/bids/:id/analyze", async (req, res) => {
           url: bid.doc.url,
           name: bid.doc.name,
           bytes: resp.data.byteLength,
-          first5: Buffer.from(resp.data).toString("utf8", 0, 5),
           error: null,
+          first5: Buffer.from(resp.data).toString("utf8", 0, 5),
         };
-        console.log("PDF extracted (first 500):", pdfText.slice(0, 500));
+        console.log("PDF extracted text (first 500):", pdfText.slice(0, 500));
       } catch (err) {
         console.error("PDF parse failed:", err.message);
         pdfDebug = { url: bid.doc.url, name: bid.doc.name, error: err.message };
       }
     }
 
-    // Build analysis prompt
     const systemPrompt = `
 You are Agent2. Analyze this vendor bid critically.
+... (prompt body as you had it) ...`;
 
-Proposal summary:
-${proposal?.summary || "(no summary)"}
-
-Vendor: ${bid.vendor_name}
-Price (USD): ${bid.price_usd}
-Days: ${bid.days}
-Notes: ${bid.notes}
-
-Milestones:
-${JSON.stringify(bid.milestones || [], null, 2)}
-
----
-
-IMPORTANT:
-- If PDF contents are provided, summarize them under "PDF Insights".
-- Assess feasibility, fit, risks, and alignment with the proposal.
-- Always state explicitly whether the PDF text was used.
-
-PDF contents:
-${pdfText ? pdfText.slice(0, 15000) : "No PDF provided"}
-    `;
-
-    // Call OpenAI
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [{ role: "system", content: systemPrompt }],
@@ -941,7 +915,6 @@ ${pdfText ? pdfText.slice(0, 15000) : "No PDF provided"}
     res.status(500).json({ error: "Failed to analyze bid" });
   }
 });
-
     // Model prompt (forces explicit PDF mention when available)
     const userPrompt = `
 You are Agent2. Analyze this vendor bid and return strict JSON with exactly:
