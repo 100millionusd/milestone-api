@@ -47,6 +47,7 @@ const Joi = require("joi");
 const { Pool } = require("pg");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
+const axios = require("axios");
 
 // ==============================
 // Config
@@ -373,8 +374,7 @@ const bidSchema = Joi.object({
 });
 
 // ==============================
-// Agent2 helpers (prompt + normalization)
-// ==============================
+// ========== Agent2 ==========
 function buildAgent2Prompt({ bidRow, proposalRow, milestones, pdfInfo, promptOverride }) {
   const contextBlock = `
 CONTEXT
@@ -389,7 +389,7 @@ Bid:
 - Vendor: ${bidRow?.vendor_name || ""}
 - PriceUSD: ${bidRow?.price_usd ?? 0}
 - Days: ${bidRow?.days ?? 0}
-- Milestones: ${JSON.stringify(milestones, null, 2)}
+- Milestones: ${JSON.stringify(milestones)}
 
 ${pdfInfo.used
   ? `PDF EXTRACT (truncated):\n"""${pdfInfo.text}"""`
@@ -421,39 +421,6 @@ ${contextBlock}
 
 ${outputSpec}
 `.trim();
-}
-
-// Ensures Agent2 fields are safe to render
-function normalizeAnalysisShape(core) {
-  const safe = {};
-
-  // summary must be a string
-  if (typeof core?.summary === "string") {
-    safe.summary = core.summary;
-  } else if (core?.summary != null) {
-    try { safe.summary = JSON.stringify(core.summary, null, 2); }
-    catch { safe.summary = String(core.summary); }
-  } else {
-    safe.summary = "";
-  }
-
-  // risks -> array of strings
-  safe.risks = Array.isArray(core?.risks) ? core.risks.map((r) => String(r)) : [];
-
-  // fit -> one of low|medium|high
-  const fit = String(core?.fit || "").toLowerCase();
-  safe.fit = ["low", "medium", "high"].includes(fit) ? fit : "low";
-
-  // milestoneNotes -> array of strings
-  safe.milestoneNotes = Array.isArray(core?.milestoneNotes)
-    ? core.milestoneNotes.map((m) => String(m))
-    : [];
-
-  // confidence -> clamp [0,1]
-  const conf = Number(core?.confidence);
-  safe.confidence = Number.isFinite(conf) ? Math.max(0, Math.min(1, conf)) : 0;
-
-  return safe;
 }
 
 async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
@@ -503,14 +470,11 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
     });
 
     const raw = resp.choices?.[0]?.message?.content || "{}";
-    let core;
-    try { core = JSON.parse(raw); } catch { core = {}; }
-
-    const safeCore = normalizeAnalysisShape(core);
+    const core = JSON.parse(raw);
 
     return {
       status: "ready",
-      ...safeCore,
+      ...core,
       pdfUsed: !!pdfInfo.used,
       pdfChars: pdfInfo.chars || 0,
       pdfSnippet: pdfInfo.snippet || null,
@@ -821,7 +785,7 @@ app.patch("/bids/:id", async (req, res) => {
   }
 });
 
-// Manual analyze/Retry (single, clean implementation)
+// Manual analyze/Retry with PDF parsing
 app.post("/bids/:id/analyze", async (req, res) => {
   const bidId = Number(req.params.id);
   if (!Number.isFinite(bidId)) {
@@ -839,17 +803,72 @@ app.post("/bids/:id/analyze", async (req, res) => {
     );
     if (!proposal) return res.status(404).json({ error: "Proposal not found" });
 
-    const promptOverride = typeof req.body?.prompt === "string" ? req.body.prompt : "";
+    // Fetch + parse PDF if attached
+    let pdfText = null;
+    let pdfDebug = null;
+    if (bid.doc && bid.doc.url) {
+      try {
+        const resp = await axios.get(bid.doc.url, { responseType: "arraybuffer" });
+        const parsed = await pdfParse(resp.data);
+        pdfText = parsed.text || "";
+        pdfDebug = {
+          url: bid.doc.url,
+          name: bid.doc.name,
+          bytes: resp.data.byteLength,
+          error: null,
+          first5: Buffer.from(resp.data).toString("utf8", 0, 5),
+        };
+        console.log("PDF extracted text (first 500):", pdfText.slice(0, 500));
+      } catch (err) {
+        console.error("PDF parse failed:", err.message);
+        pdfDebug = { url: bid.doc.url, name: bid.doc.name, error: err.message };
+      }
+    }
 
-    const analysis = await runAgent2OnBid(bid, proposal, { promptOverride });
+    // Build system prompt
+    const systemPrompt = `
+You are Agent2. Analyze this vendor bid critically.
 
+Proposal summary:
+${proposal?.summary || "(no summary)"}
+
+Vendor: ${bid.vendor_name}
+Price (USD): ${bid.price_usd}
+Days: ${bid.days}
+Notes: ${bid.notes}
+
+Milestones:
+${JSON.stringify(bid.milestones || [], null, 2)}
+
+---
+If PDF contents are provided, summarize and assess them.
+PDF contents:
+${pdfText ? pdfText.slice(0, 15000) : "No PDF provided"}
+    `;
+
+    // Call OpenAI
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "system", content: systemPrompt }],
+    });
+
+    const reply = completion.choices[0].message.content;
+
+    // Wrap into ai_analysis object
+    const analysis = {
+      status: "ready",
+      summary: reply,
+      pdfUsed: !!pdfText,
+      pdfDebug,
+    };
+
+    // Save to DB
     await pool.query(
       "UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2",
       [JSON.stringify(analysis), bidId]
     );
 
-    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
-    return res.json(toCamel(updated[0]));
+    res.json({ ...bid, aiAnalysis: analysis });
   } catch (err) {
     console.error("Analyze error:", err);
     res.status(500).json({ error: "Failed to analyze bid" });
@@ -978,11 +997,11 @@ app.get("/proofs/:bidId", async (req, res) => {
   }
 });
 
-app.post("/proofs/:bidId/:milestoneIndex/approve", async (_req, res) => {
+app.post("/proofs/:bidId/:milestoneIndex/approve", async (req, res) => {
   // stub status change if you later store per-proof statuses
   res.json({ ok: true });
 });
-app.post("/proofs/:bidId/:milestoneIndex/reject", async (_req, res) => {
+app.post("/proofs/:bidId/:milestoneIndex/reject", async (req, res) => {
   res.json({ ok: true });
 });
 
