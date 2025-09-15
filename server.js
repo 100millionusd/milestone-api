@@ -10,28 +10,15 @@
 //   • Inline Agent2 analysis on bid creation (response already includes ai_analysis)
 //   • Manual analyze endpoint for retries
 //
-// Key UX guarantees we enforce here:
+// Key UX guarantees:
 //   1) Creating a bid returns a terminal ai_analysis object in the same response.
-//      That means the frontend does NOT need to refresh to see analysis.
-//   2) When a PDF doc is attached, we wait up to ~12s trying to fetch & parse it.
-//      Regardless of success or failure, the response is terminal
-//      (status: "ready" or "error"), so the UI never shows pending forever.
-//   3) PDF debug fields (pdfUsed, pdfDebug) explain why a PDF was skipped
-//      (e.g., http_error, no_text, parse_failed), which can be surfaced in the UI.
+//   2) When a PDF is attached, we wait up to ~12s trying to fetch & parse it; response is terminal.
+//   3) PDF debug fields (pdfUsed, pdfDebug) explain why a PDF was skipped.
 //
-// Environment variables (commonly used):
-//   PORT                      - default 3000
-//   DATABASE_URL              - Postgres connection string
-//   CORS_ORIGINS              - comma-separated allowed origins (default: https://lithiumx.netlify.app)
-//   OPENAI_API_KEY            - required for Agent2
-//   OPENAI_PROJECT            - optional OpenAI project id
-//   OPENAI_ORG                - optional OpenAI org id
-//   SEPOLIA_RPC_URL           - Ethereum Sepolia RPC (default publicnode)
-//   PRIVATE_KEY               - Hex private key for token transfers (no 0x is okay)
-//   USDC_ADDRESS / USDT_ADDRESS
-//   PINATA_API_KEY / PINATA_SECRET_API_KEY
-//   PINATA_GATEWAY_DOMAIN     - gateway domain (default: gateway.pinata.cloud)
-//
+// Env:
+//   PORT, DATABASE_URL, CORS_ORIGINS, OPENAI_API_KEY, OPENAI_PROJECT, OPENAI_ORG,
+//   SEPOLIA_RPC_URL, PRIVATE_KEY, USDC_ADDRESS, USDT_ADDRESS,
+//   PINATA_API_KEY, PINATA_SECRET_API_KEY, PINATA_GATEWAY_DOMAIN
 // --------------------------------------------------------------------------------------
 
 require("dotenv").config();
@@ -119,17 +106,14 @@ function mapRows(rows) {
 }
 
 function coerceJson(val) {
-  if (!val) return null;
+  if (val == null) return null;
   if (typeof val === "string") {
     try { return JSON.parse(val); } catch { return null; }
   }
   return val;
 }
 
-/**
- * Perform a generic HTTP(S) request and return { status, body }.
- * Useful for Pinata as we need raw control over headers and body.
- */
+/** HTTP(S) request helper returning { status, body } */
 function sendRequest(method, urlStr, headers = {}, body = null) {
   const u = new URL(urlStr);
   const lib = u.protocol === "https:" ? https : http;
@@ -155,13 +139,10 @@ function sendRequest(method, urlStr, headers = {}, body = null) {
   });
 }
 
-/**
- * Fetch a URL into a Buffer (binary).
- */
+/** Fetch a URL into a Buffer (binary). */
 async function fetchAsBuffer(urlStr) {
   return new Promise((resolve, reject) => {
-    const u = new URL(urlStr);
-    const lib = u.protocol === "https:" ? https : http;
+    const lib = urlStr.startsWith("https:") ? https : http;
     const req = lib.get(urlStr, (res) => {
       if (res.statusCode && res.statusCode >= 400) {
         return reject(new Error(`HTTP ${res.statusCode} fetching ${urlStr}`));
@@ -174,15 +155,13 @@ async function fetchAsBuffer(urlStr) {
   });
 }
 
-/**
- * Promise.race timeout helper that resolves with onTimeout() after ms.
- */
-function withTimeout(p, ms, onTimeout) {
+/** Promise.race timeout helper */
+function withTimeout(promise, ms, onTimeout) {
   let t;
   const timeoutP = new Promise((resolve) => {
-    t = setTimeout(() => resolve(typeof onTimeout === 'function' ? onTimeout() : onTimeout), ms);
+    t = setTimeout(() => resolve(typeof onTimeout === "function" ? onTimeout() : onTimeout), ms);
   });
-  return Promise.race([p, timeoutP]).finally(() => clearTimeout(t));
+  return Promise.race([promise, timeoutP]).finally(() => clearTimeout(t));
 }
 
 // ==============================
@@ -196,7 +175,7 @@ async function extractPdfInfoFromDoc(doc) {
 
   try {
     const buf = await fetchAsBuffer(doc.url);
-    const first5 = buf.slice(0, 5).toString(); // "%PDF-" for real PDFs
+    const first5 = buf.slice(0, 5).toString(); // "%PDF-"
     const isPdf = first5 === "%PDF-" || isPdfName || (doc.mimetype || "").toLowerCase().includes("pdf");
 
     if (!isPdf) {
@@ -218,11 +197,11 @@ async function extractPdfInfoFromDoc(doc) {
     }
 
     if (!text) {
-      // likely a scanned PDF; pdf-parse has no OCR
+      // Scanned PDF (no OCR)
       return { used: false, reason: "no_text_extracted", bytes: buf.length, first5 };
     }
 
-    const capped = text.slice(0, 15000); // ~15k chars cap
+    const capped = text.slice(0, 15000);
     return {
       used: true,
       text: capped,
@@ -236,9 +215,7 @@ async function extractPdfInfoFromDoc(doc) {
   }
 }
 
-/**
- * Retry loop for PDFs (gateway warm-up, transient errors)
- */
+/** Retry loop for PDFs (some gateways need a warm-up) */
 async function waitForPdfInfoFromDoc(doc, { maxMs = 12000, stepMs = 1500 } = {}) {
   const start = Date.now();
   let last = await extractPdfInfoFromDoc(doc);
@@ -257,23 +234,33 @@ async function waitForPdfInfoFromDoc(doc, { maxMs = 12000, stepMs = 1500 } = {})
 // ==============================
 async function pinataUploadFile(file) {
   if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) throw new Error("Pinata not configured");
+
   const form = new FormData();
   const buf = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data);
   form.append("file", buf, { filename: file.name, contentType: file.mimetype });
+
   const { status, body } = await sendRequest(
     "POST",
     "https://api.pinata.cloud/pinning/pinFileToIPFS",
-    { ...form.getHeaders(), pinata_api_key: PINATA_API_KEY, pinata_secret_api_key: PINATA_SECRET_API_KEY, Accept: "application/json" },
+    {
+      ...form.getHeaders(),
+      pinata_api_key: PINATA_API_KEY,
+      pinata_secret_api_key: PINATA_SECRET_API_KEY,
+      Accept: "application/json",
+    },
     form
   );
+
   const json = JSON.parse(body || "{}");
   if (status < 200 || status >= 300) throw new Error(json?.error || "Pinata error");
+
   const cid = json.IpfsHash;
   return { cid, url: `https://${PINATA_GATEWAY}/ipfs/${cid}`, size: file.size, name: file.name };
 }
 
 async function pinataUploadJson(data) {
   if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) throw new Error("Pinata not configured");
+
   const payload = JSON.stringify({ pinataContent: data });
   const { status, body } = await sendRequest(
     "POST",
@@ -287,8 +274,10 @@ async function pinataUploadJson(data) {
     },
     payload
   );
+
   const json = JSON.parse(body || "{}");
   if (status < 200 || status >= 300) throw new Error(json?.error || "Pinata error");
+
   const cid = json.IpfsHash;
   return { cid, url: `https://${PINATA_GATEWAY}/ipfs/${cid}` };
 }
@@ -320,6 +309,7 @@ class BlockchainService {
     const tx = await contract.transfer(toAddress, amt);
     const receipt = await tx.wait();
     if (!receipt.status) throw new Error("Transaction failed");
+
     return { hash: receipt.hash, amount, token: tokenSymbol };
   }
 
@@ -374,70 +364,8 @@ const bidSchema = Joi.object({
 });
 
 // ==============================
-// ========== Agent2 ==========
-async function extractPdfInfoFromDoc(doc) {
-  if (!doc?.url) return { used: false, reason: "no_file" };
-
-  const name = doc.name || "";
-  const isPdfName = /\.pdf($|\?)/i.test(name);
-
-  try {
-    const buf = await fetchAsBuffer(doc.url);
-    const first5 = buf.slice(0, 5).toString(); // "%PDF-"
-    const isPdf =
-      first5 === "%PDF-" ||
-      isPdfName ||
-      (doc.mimetype || "").toLowerCase().includes("pdf");
-
-    if (!isPdf) {
-      return { used: false, reason: "not_pdf", bytes: buf.length, first5 };
-    }
-
-    let text = "";
-    try {
-      const parsed = await pdfParse(buf);
-      text = (parsed.text || "").replace(/\s+/g, " ").trim();
-    } catch (e) {
-      return {
-        used: false,
-        reason: "pdf_parse_failed",
-        bytes: buf.length,
-        first5,
-        error: String(e).slice(0, 200),
-      };
-    }
-
-    if (!text) {
-      return { used: false, reason: "no_text_extracted", bytes: buf.length, first5 };
-    }
-
-    const capped = text.slice(0, 15000);
-    return {
-      used: true,
-      text: capped,
-      snippet: capped.slice(0, 400),
-      chars: capped.length,
-      bytes: buf.length,
-      first5,
-    };
-  } catch (e) {
-    return { used: false, reason: "http_error", error: String(e).slice(0, 200) };
-  }
-}
-
-async function waitForPdfInfoFromDoc(doc, { maxMs = 15000, stepMs = 1500 } = {}) {
-  const start = Date.now();
-  let last = await extractPdfInfoFromDoc(doc);
-  if (!doc?.url || last.reason === "not_pdf" || last.reason === "no_file") return last;
-
-  while (!last.used && Date.now() - start < maxMs) {
-    if (!["http_error", "no_text_extracted", "pdf_parse_failed"].includes(last.reason || "")) break;
-    await new Promise((r) => setTimeout(r, stepMs));
-    last = await extractPdfInfoFromDoc(doc);
-  }
-  return last;
-}
-
+// Agent2 (prompt + runner)
+// ==============================
 function buildAgent2Prompt({ bidRow, proposalRow, milestones, pdfInfo, promptOverride }) {
   const contextBlock = `
 CONTEXT
@@ -452,21 +380,21 @@ Bid:
 - Vendor: ${bidRow?.vendor_name || ""}
 - PriceUSD: ${bidRow?.price_usd ?? 0}
 - Days: ${bidRow?.days ?? 0}
-- Milestones: ${JSON.stringify(milestones)}
+- Milestones: ${JSON.stringify(milestones, null, 2)}
 
 ${pdfInfo.used
-  ? `PDF EXTRACT (truncated):\n"""${pdfInfo.text}"""`
+  ? `PDF EXTRACT (truncated ~15k chars follows). The analysis MUST include a short section titled "PDF Insights":\n"""${pdfInfo.text}"""`
   : `NO PDF TEXT AVAILABLE (file not ready, scanned, or missing).`}
 `.trim();
 
   const outputSpec = `
 Return JSON with exactly:
 {
-  "summary": string,
+  "summary": string,              // include a "PDF Insights" subsection if pdf was used
   "risks": string[],
   "fit": "low" | "medium" | "high",
   "milestoneNotes": string[],
-  "confidence": number
+  "confidence": number            // 0..1
 }
 `.trim();
 
@@ -591,9 +519,9 @@ app.use(express.json({ limit: "20mb" }));
 
 // GET no-cache to make polling deterministic
 app.use((req, res, next) => {
-  if (req.method === 'GET') {
-    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-    res.set('Pragma', 'no-cache');
+  if (req.method === "GET") {
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    res.set("Pragma", "no-cache");
   }
   next();
 });
@@ -633,7 +561,7 @@ app.get("/proposals", async (_req, res) => {
 
 app.get("/proposals/:id", async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ req.params.id ]);
+    const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [req.params.id]);
     if (!rows[0]) return res.status(404).json({ error: "not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
@@ -646,8 +574,10 @@ app.post("/proposals", async (req, res) => {
     const { error, value } = proposalSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
 
-    const q = `INSERT INTO proposals (org_name,title,summary,contact,address,city,country,amount_usd,docs,cid,status)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending') RETURNING *`;
+    const q = `
+      INSERT INTO proposals (org_name,title,summary,contact,address,city,country,amount_usd,docs,cid,status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending')
+      RETURNING *`;
     const vals = [
       value.orgName,
       value.title,
@@ -671,7 +601,10 @@ app.post("/proposals/:id/approve", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
   try {
-    const { rows } = await pool.query(`UPDATE proposals SET status='approved' WHERE proposal_id=$1 RETURNING *`, [ id ]);
+    const { rows } = await pool.query(
+      `UPDATE proposals SET status='approved' WHERE proposal_id=$1 RETURNING *`,
+      [id]
+    );
     if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
@@ -683,7 +616,10 @@ app.post("/proposals/:id/reject", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
   try {
-    const { rows } = await pool.query(`UPDATE proposals SET status='rejected' WHERE proposal_id=$1 RETURNING *`, [ id ]);
+    const { rows } = await pool.query(
+      `UPDATE proposals SET status='rejected' WHERE proposal_id=$1 RETURNING *`,
+      [id]
+    );
     if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
@@ -699,7 +635,10 @@ app.patch("/proposals/:id", async (req, res) => {
     return res.status(400).json({ error: 'Invalid status; expected "approved" or "rejected"' });
   }
   try {
-    const { rows } = await pool.query(`UPDATE proposals SET status=$2 WHERE proposal_id=$1 RETURNING *`, [ id, desired ]);
+    const { rows } = await pool.query(
+      `UPDATE proposals SET status=$2 WHERE proposal_id=$1 RETURNING *`,
+      [id, desired]
+    );
     if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
@@ -714,7 +653,10 @@ app.get("/bids", async (req, res) => {
   try {
     const pid = Number(req.query.proposalId);
     if (Number.isFinite(pid)) {
-      const { rows } = await pool.query("SELECT * FROM bids WHERE proposal_id=$1 ORDER BY bid_id DESC", [ pid ]);
+      const { rows } = await pool.query(
+        "SELECT * FROM bids WHERE proposal_id=$1 ORDER BY bid_id DESC",
+        [pid]
+      );
       return res.json(mapRows(rows));
     } else {
       const { rows } = await pool.query("SELECT * FROM bids ORDER BY bid_id DESC");
@@ -729,7 +671,7 @@ app.get("/bids/:id", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
   try {
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ id ]);
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
     return res.json(toCamel(rows[0]));
   } catch (err) {
@@ -762,24 +704,29 @@ app.post("/bids", async (req, res) => {
     const inserted = rows[0];
 
     // Fetch proposal
-    const { rows: pr } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ inserted.proposal_id ]);
+    const { rows: pr } = await pool.query(
+      "SELECT * FROM proposals WHERE proposal_id=$1",
+      [inserted.proposal_id]
+    );
     const prop = pr[0] || null;
 
     // Inline Agent2 analysis with deadline
     const INLINE_ANALYSIS_DEADLINE_MS = Number(process.env.AGENT2_INLINE_TIMEOUT_MS || 12000);
     const analysis = await withTimeout(
-      prop ? runAgent2OnBid(inserted, prop) : Promise.resolve({
-        status: "error",
-        summary: "Proposal not found for analysis.",
-        risks: [],
-        fit: "low",
-        milestoneNotes: [],
-        confidence: 0,
-        pdfUsed: false,
-        pdfChars: 0,
-        pdfSnippet: null,
-        pdfDebug: { reason: "proposal_missing" },
-      }),
+      prop
+        ? runAgent2OnBid(inserted, prop)
+        : Promise.resolve({
+            status: "error",
+            summary: "Proposal not found for analysis.",
+            risks: [],
+            fit: "low",
+            milestoneNotes: [],
+            confidence: 0,
+            pdfUsed: false,
+            pdfChars: 0,
+            pdfSnippet: null,
+            pdfDebug: { reason: "proposal_missing" },
+          }),
       INLINE_ANALYSIS_DEADLINE_MS,
       () => ({
         status: "error",
@@ -795,7 +742,10 @@ app.post("/bids", async (req, res) => {
       })
     );
 
-    await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [ JSON.stringify(analysis), inserted.bid_id ]);
+    await pool.query(
+      "UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2",
+      [JSON.stringify(analysis), inserted.bid_id]
+    );
     inserted.ai_analysis = analysis;
 
     return res.status(201).json(toCamel(inserted));
@@ -809,7 +759,10 @@ app.post("/bids/:id/approve", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
   try {
-    const { rows } = await pool.query(`UPDATE bids SET status='approved' WHERE bid_id=$1 RETURNING *`, [ id ]);
+    const { rows } = await pool.query(
+      `UPDATE bids SET status='approved' WHERE bid_id=$1 RETURNING *`,
+      [id]
+    );
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
     return res.json(toCamel(rows[0]));
   } catch (err) {
@@ -822,7 +775,10 @@ app.post("/bids/:id/reject", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
   try {
-    const { rows } = await pool.query(`UPDATE bids SET status='rejected' WHERE bid_id=$1 RETURNING *`, [ id ]);
+    const { rows } = await pool.query(
+      `UPDATE bids SET status='rejected' WHERE bid_id=$1 RETURNING *`,
+      [id]
+    );
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
     return res.json(toCamel(rows[0]));
   } catch (err) {
@@ -839,7 +795,10 @@ app.patch("/bids/:id", async (req, res) => {
     return res.status(400).json({ error: 'Invalid status; expected "approved" or "rejected"' });
   }
   try {
-    const { rows } = await pool.query(`UPDATE bids SET status=$2 WHERE bid_id=$1 RETURNING *`, [ id, desired ]);
+    const { rows } = await pool.query(
+      `UPDATE bids SET status=$2 WHERE bid_id=$1 RETURNING *`,
+      [id, desired]
+    );
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
     return res.json(toCamel(rows[0]));
   } catch (err) {
@@ -848,7 +807,9 @@ app.patch("/bids/:id", async (req, res) => {
   }
 });
 
-// Manual analyze/Retry (replaced)
+// ==============================
+// Manual analyze/Retry (uses the same Agent2 runner + PDF logic)
+// ==============================
 app.post("/bids/:id/analyze", async (req, res) => {
   const bidId = Number(req.params.id);
   if (!Number.isFinite(bidId)) {
@@ -865,140 +826,24 @@ app.post("/bids/:id/analyze", async (req, res) => {
     );
     if (!proposal) return res.status(404).json({ error: "Proposal not found" });
 
-    let pdfText = null;
-    let pdfDebug = null;
-    if (bid.doc && bid.doc.url) {
-      try {
-        const resp = await axios.get(bid.doc.url, { responseType: "arraybuffer" });
-        const parsed = await pdfParse(resp.data);
-        pdfText = parsed.text || "";
-        pdfDebug = {
-          url: bid.doc.url,
-          name: bid.doc.name,
-          bytes: resp.data.byteLength,
-          error: null,
-          first5: Buffer.from(resp.data).toString("utf8", 0, 5),
-        };
-        console.log("PDF extracted text (first 500):", pdfText.slice(0, 500));
-      } catch (err) {
-        console.error("PDF parse failed:", err.message);
-        pdfDebug = { url: bid.doc.url, name: bid.doc.name, error: err.message };
-      }
-    }
+    const promptOverride = typeof req.body?.prompt === "string" ? req.body.prompt : "";
 
-    const systemPrompt = `
-You are Agent2. Analyze this vendor bid critically.
-... (prompt body as you had it) ...`;
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "system", content: systemPrompt }],
-    });
-
-    const reply = completion.choices[0].message.content;
-
-    const analysis = {
-      status: "ready",
-      summary: reply,
-      pdfUsed: !!pdfText,
-      pdfDebug,
-    };
-
+    const analysis = await runAgent2OnBid(bid, proposal, { promptOverride });
     await pool.query(
       "UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2",
       [JSON.stringify(analysis), bidId]
     );
 
-    res.json({ ...bid, aiAnalysis: analysis });
-  } catch (err) {
-    console.error("Analyze error:", err);
-    res.status(500).json({ error: "Failed to analyze bid" });
-  }
-});
-    // Model prompt (forces explicit PDF mention when available)
-    const userPrompt = `
-You are Agent2. Analyze this vendor bid and return strict JSON with exactly:
-{
-  "summary": string,
-  "risks": string[],
-  "fit": "low" | "medium" | "high",
-  "milestoneNotes": string[],
-  "confidence": number
-}
-
-Requirements:
-- If PDF text is available, cite it explicitly and briefly quote 1–2 short excerpts (<= 20 words).
-- Evaluate feasibility, risks, and alignment with the proposal and milestones.
-- Confidence is a number in [0,1].
-
-Proposal:
-- Org: ${prop.org_name || ""}
-- Title: ${prop.title || ""}
-- Summary: ${prop.summary || ""}
-- BudgetUSD: ${prop.amount_usd ?? 0}
-
-Bid:
-- Vendor: ${bid.vendor_name || ""}
-- PriceUSD: ${bid.price_usd ?? 0}
-- Days: ${bid.days ?? 0}
-- Notes: ${bid.notes || ""}
-- Milestones: ${JSON.stringify(milestones)}
-
-${promptOverride ? `Special instructions:\n${promptOverride}\n` : ""}
-${pdfText ? `PDF TEXT (truncated ~15k chars):\n"""${pdfText}"""` : "NO PDF TEXT AVAILABLE"}
-`.trim();
-
-    const resp = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0.2,
-      messages: [{ role: "user", content: userPrompt }],
-      response_format: { type: "json_object" },
-    });
-
-    const core = JSON.parse(resp.choices?.[0]?.message?.content || "{}");
-    const analysis = {
-      status: "ready",
-      ...core,
-      pdfUsed: !!pdfText,
-      pdfDebug,
-    };
-
-    // Store JSON in ai_analysis
-    await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [
-      JSON.stringify(analysis),
-      id,
-    ]);
-
-    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
+    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
     return res.json(toCamel(updated[0]));
   } catch (err) {
-    console.error("analyze bid error:", err);
-    return res.status(500).json({ error: "Agent2 error running analysis" });
-  }
-});
-
-// Legacy complete route
-app.put("/milestones/:bidId/:index/complete", async (req, res) => {
-  try {
-    const bidId = req.params.bidId;
-    const idx = parseInt(req.params.index, 10);
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
-    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
-
-    const bid = rows[0];
-    const milestones = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
-    if (!milestones[idx]) return res.status(400).json({ error: "Invalid index" });
-
-    milestones[idx].completed = true;
-    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [ JSON.stringify(milestones), bidId ]);
-    res.json({ success: true, milestones });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Analyze error:", err);
+    return res.status(500).json({ error: "Failed to analyze bid" });
   }
 });
 
 // ==============================
-// Routes — Complete/Pay milestone (frontend-compatible)
+// Routes — Complete/Pay milestone
 // ==============================
 app.post("/bids/:id/complete-milestone", async (req, res) => {
   const bidId = Number(req.params.id);
@@ -1008,21 +853,28 @@ app.post("/bids/:id/complete-milestone", async (req, res) => {
     return res.status(400).json({ error: "Invalid milestoneIndex" });
   }
   try {
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
 
     const bid = rows[0];
-    const milestones = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
-    if (!milestones[milestoneIndex]) return res.status(400).json({ error: "Milestone index out of range" });
+    const milestones = Array.isArray(bid.milestones)
+      ? bid.milestones
+      : JSON.parse(bid.milestones || "[]");
+    if (!milestones[milestoneIndex]) {
+      return res.status(400).json({ error: "Milestone index out of range" });
+    }
 
     const ms = milestones[milestoneIndex];
     ms.completed = true;
     ms.completionDate = new Date().toISOString();
     if (typeof proof === "string" && proof.trim()) ms.proof = proof.trim();
 
-    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [ JSON.stringify(milestones), bidId ]);
+    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [
+      JSON.stringify(milestones),
+      bidId,
+    ]);
 
-    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
+    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
     return res.json(toCamel(updated[0]));
   } catch (err) {
     console.error("complete-milestone error", err);
@@ -1038,12 +890,16 @@ app.post("/bids/:id/pay-milestone", async (req, res) => {
     return res.status(400).json({ error: "Invalid milestoneIndex" });
   }
   try {
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
 
     const bid = rows[0];
-    const milestones = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
-    if (!milestones[milestoneIndex]) return res.status(400).json({ error: "Milestone index out of range" });
+    const milestones = Array.isArray(bid.milestones)
+      ? bid.milestones
+      : JSON.parse(bid.milestones || "[]");
+    if (!milestones[milestoneIndex]) {
+      return res.status(400).json({ error: "Milestone index out of range" });
+    }
 
     const ms = milestones[milestoneIndex];
     if (!ms.completed) return res.status(400).json({ error: "Milestone not completed" });
@@ -1057,9 +913,12 @@ app.post("/bids/:id/pay-milestone", async (req, res) => {
     ms.paymentTxHash = receipt.hash;
     ms.paymentDate = new Date().toISOString();
 
-    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [ JSON.stringify(milestones), bidId ]);
+    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [
+      JSON.stringify(milestones),
+      bidId,
+    ]);
 
-    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
+    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
     return res.json({ success: true, bid: toCamel(updated[0]), receipt });
   } catch (err) {
     console.error("pay-milestone error", err);
@@ -1073,8 +932,11 @@ app.post("/bids/:id/pay-milestone", async (req, res) => {
 app.post("/proofs", async (req, res) => {
   try {
     const { bidId, proofCid, description } = req.body;
-    const q = "INSERT INTO proofs (bid_id,proof_cid,description,submitted_at,status) VALUES ($1,$2,$3,NOW(),'pending') RETURNING *";
-    const { rows } = await pool.query(q, [ bidId, proofCid, description ]);
+    const q = `
+      INSERT INTO proofs (bid_id,proof_cid,description,submitted_at,status)
+      VALUES ($1,$2,$3,NOW(),'pending')
+      RETURNING *`;
+    const { rows } = await pool.query(q, [bidId, proofCid, description]);
     res.json(toCamel(rows[0]));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1092,18 +954,18 @@ app.get("/proofs", async (_req, res) => {
 
 app.get("/proofs/:bidId", async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM proofs WHERE bid_id=$1", [ req.params.bidId ]);
+    const { rows } = await pool.query("SELECT * FROM proofs WHERE bid_id=$1", [req.params.bidId]);
     res.json(mapRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/proofs/:bidId/:milestoneIndex/approve", async (req, res) => {
-  // stub status change if you later store per-proof statuses
+app.post("/proofs/:bidId/:milestoneIndex/approve", async (_req, res) => {
+  // Stub (if you later store per-proof statuses)
   res.json({ ok: true });
 });
-app.post("/proofs/:bidId/:milestoneIndex/reject", async (req, res) => {
+app.post("/proofs/:bidId/:milestoneIndex/reject", async (_req, res) => {
   res.json({ ok: true });
 });
 
@@ -1112,7 +974,9 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", async (req, res) => {
 // ==============================
 app.get("/vendor/bids", async (_req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM bids ORDER BY created_at DESC NULLS LAST, bid_id DESC");
+    const { rows } = await pool.query(
+      "SELECT * FROM bids ORDER BY created_at DESC NULLS LAST, bid_id DESC"
+    );
     res.json(mapRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1146,38 +1010,13 @@ app.get("/vendor/payments", async (_req, res) => {
 });
 
 // ==============================
-// Routes — Payments (legacy)
-// ==============================
-app.post("/payments/release", async (req, res) => {
-  try {
-    const { bidId, milestoneIndex } = req.body;
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
-    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
-
-    const bid = rows[0];
-    const milestones = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
-    if (!milestones[milestoneIndex]) return res.status(400).json({ error: "Invalid milestone" });
-
-    const ms = milestones[milestoneIndex];
-    if (!ms.completed) return res.status(400).json({ error: "Milestone not completed" });
-
-    const receipt = await blockchainService.sendToken(
-      bid.preferred_stablecoin,
-      bid.wallet_address,
-      ms.amount
-    );
-    res.json({ success: true, receipt });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ==============================
 // Routes — IPFS via Pinata
 // ==============================
 app.post("/ipfs/upload-file", async (req, res) => {
   try {
-    if (!req.files || !req.files.file) return res.status(400).json({ error: "No file uploaded" });
+    if (!req.files || !req.files.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
     const file = req.files.file;
     const result = await pinataUploadFile(file);
     res.json(result);
