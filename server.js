@@ -22,6 +22,10 @@
 //   USDC_ADDRESS / USDT_ADDRESS
 //   PINATA_API_KEY / PINATA_SECRET_API_KEY
 //   PINATA_GATEWAY_DOMAIN     - gateway domain (default: gateway.pinata.cloud)
+//   ADMIN_ADDRESSES           - comma-separated admin wallet addresses
+//   JWT_SECRET                - secret for signing auth JWTs
+//   ENFORCE_JWT_ADMIN         - "true" to require admin JWT on admin routes (default false for compatibility)
+//   SCOPE_BIDS_FOR_VENDOR     - "true" to scope GET /bids to caller's address if vendor (default false)
 // --------------------------------------------------------------------------------------
 
 require("dotenv").config();
@@ -37,6 +41,10 @@ const Joi = require("joi");
 const { Pool } = require("pg");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
+
+// 🔐 new: auth utilities
+const cookieParser = require("cookie-parser");
+const jwt = require("jsonwebtoken");
 
 // ==============================
 // Config
@@ -575,6 +583,7 @@ app.use(
 );
 app.use(helmet());
 app.use(express.json({ limit: "20mb" }));
+app.use(cookieParser()); // 🔐 parse JWT cookie
 
 // GET no-cache to make polling deterministic
 app.use((req, res, next) => {
@@ -586,6 +595,118 @@ app.use((req, res, next) => {
 });
 
 app.use(fileUpload({ limits: { fileSize: 50 * 1024 * 1024 } }));
+
+// ==============================
+// 🔐 Auth / Role (secure, non-breaking defaults)
+// ==============================
+const ADMIN_SET = new Set(
+  (process.env.ADMIN_ADDRESSES || "")
+    .split(",")
+    .map((a) => a.trim().toLowerCase())
+    .filter(Boolean)
+);
+const JWT_SECRET = process.env.JWT_SECRET || "dev_fallback_secret_change_me";
+const ENFORCE_JWT_ADMIN = String(process.env.ENFORCE_JWT_ADMIN || "false").toLowerCase() === "true";
+const SCOPE_BIDS_FOR_VENDOR = String(process.env.SCOPE_BIDS_FOR_VENDOR || "false").toLowerCase() === "true";
+
+const nonces = new Map(); // addressLower -> nonce
+
+function norm(a) { return String(a || "").trim().toLowerCase(); }
+function isAdminAddress(addr) { return ADMIN_SET.has(norm(addr)); }
+
+function signJwt(payload, expiresIn = "7d") {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn });
+}
+function verifyJwt(token) {
+  try { return jwt.verify(token, JWT_SECRET); }
+  catch { return null; }
+}
+
+// Attach req.user if cookie is present (optional)
+app.use((req, _res, next) => {
+  const token = req.cookies?.auth_token;
+  if (token) {
+    const user = verifyJwt(token);
+    if (user) req.user = user; // { sub: address, role }
+  }
+  next();
+});
+
+function authRequired(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+  next();
+}
+function requireRole(role) {
+  return (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    if (req.user.role !== role) return res.status(403).json({ error: "Forbidden" });
+    next();
+  };
+}
+// Admin guard that only enforces if ENFORCE_JWT_ADMIN=true
+function adminGuard(req, res, next) {
+  if (!ENFORCE_JWT_ADMIN) return next(); // compatibility mode
+  if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+  next();
+}
+
+// --- Auth endpoints ---
+app.post("/auth/nonce", (req, res) => {
+  const address = norm(req.body?.address);
+  if (!address) return res.status(400).json({ error: "address required" });
+  const nonce = `LithiumX login nonce: ${Math.floor(Math.random() * 1e9)}`;
+  nonces.set(address, nonce);
+  res.json({ nonce });
+});
+
+app.post("/auth/verify", async (req, res) => {
+  const address = norm(req.body?.address);
+  const signature = req.body?.signature;
+  if (!address || !signature) return res.status(400).json({ error: "address and signature required" });
+
+  const nonce = nonces.get(address);
+  if (!nonce) return res.status(400).json({ error: "nonce not found or expired" });
+
+  let recovered;
+  try { recovered = ethers.verifyMessage(nonce, signature); }
+  catch { return res.status(400).json({ error: "invalid signature" }); }
+
+  if (norm(recovered) !== address) {
+    return res.status(401).json({ error: "signature does not match address" });
+  }
+
+  const role = isAdminAddress(address) ? "admin" : "vendor";
+  const token = signJwt({ sub: address, role });
+
+  // Cross-site cookie (Netlify ↔ Railway): SameSite=None + Secure
+  res.cookie("auth_token", token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "none",
+    maxAge: 7 * 24 * 3600 * 1000,
+  });
+
+  nonces.delete(address);
+  res.json({ address, role });
+});
+
+app.get("/auth/role", (req, res) => {
+  const token = req.cookies?.auth_token;
+  const user = token ? verifyJwt(token) : null;
+  if (user) return res.json({ address: user.sub, role: user.role });
+
+  // compatibility fallback (keeps current frontend working)
+  const address = norm(req.query.address);
+  if (!address) return res.json({ role: "guest" });
+  const role = isAdminAddress(address) ? "admin" : "vendor";
+  res.json({ address, role });
+});
+
+app.post("/auth/logout", (req, res) => {
+  res.clearCookie("auth_token");
+  res.json({ ok: true });
+});
 
 // ==============================
 // Routes — Health & Test
@@ -676,7 +797,7 @@ app.post("/proposals", async (req, res) => {
 });
 
 // Approve proposal
-app.post("/proposals/:id/approve", async (req, res) => {
+app.post("/proposals/:id/approve", adminGuard, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
@@ -693,7 +814,7 @@ app.post("/proposals/:id/approve", async (req, res) => {
 });
 
 // Reject proposal
-app.post("/proposals/:id/reject", async (req, res) => {
+app.post("/proposals/:id/reject", adminGuard, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
@@ -710,7 +831,7 @@ app.post("/proposals/:id/reject", async (req, res) => {
 });
 
 // Archive proposal
-app.post("/proposals/:id/archive", async (req, res) => {
+app.post("/proposals/:id/archive", adminGuard, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
@@ -727,7 +848,7 @@ app.post("/proposals/:id/archive", async (req, res) => {
 });
 
 // Delete proposal
-app.delete("/proposals/:id", async (req, res) => {
+app.delete("/proposals/:id", adminGuard, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
@@ -749,6 +870,26 @@ app.delete("/proposals/:id", async (req, res) => {
 app.get("/bids", async (req, res) => {
   try {
     const pid = Number(req.query.proposalId);
+
+    // Optional secure scoping for vendors
+    if (SCOPE_BIDS_FOR_VENDOR && req.user && req.user.role === "vendor") {
+      if (!req.user.sub) return res.status(401).json({ error: "Unauthorized" });
+      if (Number.isFinite(pid)) {
+        const { rows } = await pool.query(
+          "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) AND proposal_id=$2 ORDER BY bid_id DESC",
+          [req.user.sub, pid]
+        );
+        return res.json(mapRows(rows));
+      } else {
+        const { rows } = await pool.query(
+          "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) ORDER BY bid_id DESC",
+          [req.user.sub]
+        );
+        return res.json(mapRows(rows));
+      }
+    }
+
+    // Default (compatibility): unchanged behavior
     if (Number.isFinite(pid)) {
       const { rows } = await pool.query("SELECT * FROM bids WHERE proposal_id=$1 ORDER BY bid_id DESC", [ pid ]);
       return res.json(mapRows(rows));
@@ -841,7 +982,7 @@ app.post("/bids", async (req, res) => {
   }
 });
 
-app.post("/bids/:id/approve", async (req, res) => {
+app.post("/bids/:id/approve", adminGuard, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
   try {
@@ -854,7 +995,7 @@ app.post("/bids/:id/approve", async (req, res) => {
   }
 });
 
-app.post("/bids/:id/reject", async (req, res) => {
+app.post("/bids/:id/reject", adminGuard, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
   try {
@@ -877,14 +1018,14 @@ app.post("/bids/:id/archive", async (req, res) => {
       [id]
     );
     if (!rows.length) return res.status(404).json({ error: "Bid not found" });
-    res.json(rows[0]);
+    res.json(toCamel(rows[0]));
   } catch (err) {
     console.error("Error archiving bid:", err);
     res.status(500).json({ error: "Failed to archive bid" });
   }
 });
 
-app.patch("/bids/:id", async (req, res) => {
+app.patch("/bids/:id", adminGuard, async (req, res) => {
   const id = Number(req.params.id);
   const desired = String(req.body?.status || "").toLowerCase();
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
@@ -902,7 +1043,7 @@ app.patch("/bids/:id", async (req, res) => {
 });
 
 // Manual analyze/Retry
-app.post("/bids/:id/analyze", async (req, res) => {
+app.post("/bids/:id/analyze", adminGuard, async (req, res) => {
   const bidId = Number(req.params.id);
   if (!Number.isFinite(bidId)) {
     return res.status(400).json({ error: "Invalid bid id" });
@@ -989,7 +1130,7 @@ app.post("/bids/:id/complete-milestone", async (req, res) => {
   }
 });
 
-app.post("/bids/:id/pay-milestone", async (req, res) => {
+app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
   const bidId = Number(req.params.id);
   const { milestoneIndex } = req.body || {};
   if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
@@ -1040,7 +1181,7 @@ app.post("/proofs", async (req, res) => {
   }
 });
 
-app.get("/proofs", async (_req, res) => {
+app.get("/proofs", adminGuard, async (_req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM proofs ORDER BY submitted_at DESC NULLS LAST");
     res.json(mapRows(rows));
@@ -1049,7 +1190,7 @@ app.get("/proofs", async (_req, res) => {
   }
 });
 
-app.get("/proofs/:bidId", async (req, res) => {
+app.get("/proofs/:bidId", adminGuard, async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM proofs WHERE bid_id=$1", [ req.params.bidId ]);
     res.json(mapRows(rows));
@@ -1058,11 +1199,11 @@ app.get("/proofs/:bidId", async (req, res) => {
   }
 });
 
-app.post("/proofs/:bidId/:milestoneIndex/approve", async (_req, res) => {
+app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (_req, res) => {
   // stub status change if you later store per-proof statuses
   res.json({ ok: true });
 });
-app.post("/proofs/:bidId/:milestoneIndex/reject", async (_req, res) => {
+app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (_req, res) => {
   res.json({ ok: true });
 });
 
@@ -1107,7 +1248,7 @@ app.get("/vendor/payments", async (_req, res) => {
 // ==============================
 // Routes — Payments (legacy)
 // ==============================
-app.post("/payments/release", async (req, res) => {
+app.post("/payments/release", adminGuard, async (req, res) => {
   try {
     const { bidId, milestoneIndex } = req.body;
     const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
@@ -1159,4 +1300,6 @@ app.post("/ipfs/upload-json", async (req, res) => {
 // ==============================
 app.listen(PORT, () => {
   console.log(`[api] Listening on :${PORT}`);
+  console.log(`[api] Admin enforcement: ${ENFORCE_JWT_ADMIN ? "ON" : "OFF"}`);
+  console.log(`[api] Vendor scoping:    ${SCOPE_BIDS_FOR_VENDOR ? "ON" : "OFF"}`);
 });
