@@ -10,6 +10,15 @@
 //   • Inline Agent2 analysis on bid creation (response already includes ai_analysis)
 //   • Manual analyze endpoint for retries
 //
+// Key UX guarantees we enforce here:
+//   1) Creating a bid returns a terminal ai_analysis object in the same response.
+//      That means the frontend does NOT need to refresh to see analysis.
+//   2) When a PDF doc is attached, we wait up to ~12s trying to fetch & parse it.
+//      Regardless of success or failure, the response is terminal
+//      (status: "ready" or "error"), so the UI never shows pending forever.
+//   3) PDF debug fields (pdfUsed, pdfDebug) explain why a PDF was skipped
+//      (e.g., http_error, no_text, parse_failed), which can be surfaced in the UI.
+//
 // Environment variables (commonly used):
 //   PORT                      - default 3000
 //   DATABASE_URL              - Postgres connection string
@@ -22,10 +31,7 @@
 //   USDC_ADDRESS / USDT_ADDRESS
 //   PINATA_API_KEY / PINATA_SECRET_API_KEY
 //   PINATA_GATEWAY_DOMAIN     - gateway domain (default: gateway.pinata.cloud)
-//   ADMIN_ADDRESSES           - comma-separated admin wallet addresses
-//   JWT_SECRET                - secret for signing auth JWTs
-//   ENFORCE_JWT_ADMIN         - "true" to require admin JWT on admin routes (default false for compatibility)
-//   SCOPE_BIDS_FOR_VENDOR     - "true" to scope GET /bids to caller's address if vendor (default false)
+//
 // --------------------------------------------------------------------------------------
 
 require("dotenv").config();
@@ -41,10 +47,7 @@ const Joi = require("joi");
 const { Pool } = require("pg");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
-
-// 🔐 new: auth utilities
-const cookieParser = require("cookie-parser");
-const jwt = require("jsonwebtoken");
+const axios = require("axios");
 
 // ==============================
 // Config
@@ -125,6 +128,7 @@ function coerceJson(val) {
 
 /**
  * Perform a generic HTTP(S) request and return { status, body }.
+ * Useful for Pinata as we need raw control over headers and body.
  */
 function sendRequest(method, urlStr, headers = {}, body = null) {
   const u = new URL(urlStr);
@@ -156,7 +160,8 @@ function sendRequest(method, urlStr, headers = {}, body = null) {
  */
 async function fetchAsBuffer(urlStr) {
   return new Promise((resolve, reject) => {
-    const lib = urlStr.startsWith("https:") ? https : http;
+    const u = new URL(urlStr);
+    const lib = u.protocol === "https:" ? https : http;
     const req = lib.get(urlStr, (res) => {
       if (res.statusCode && res.statusCode >= 400) {
         return reject(new Error(`HTTP ${res.statusCode} fetching ${urlStr}`));
@@ -191,7 +196,7 @@ async function extractPdfInfoFromDoc(doc) {
 
   try {
     const buf = await fetchAsBuffer(doc.url);
-    const first5 = buf.slice(0, 5).toString(); // "%PDF-"
+    const first5 = buf.slice(0, 5).toString(); // "%PDF-" for real PDFs
     const isPdf = first5 === "%PDF-" || isPdfName || (doc.mimetype || "").toLowerCase().includes("pdf");
 
     if (!isPdf) {
@@ -213,6 +218,7 @@ async function extractPdfInfoFromDoc(doc) {
     }
 
     if (!text) {
+      // likely a scanned PDF; pdf-parse has no OCR
       return { used: false, reason: "no_text_extracted", bytes: buf.length, first5 };
     }
 
@@ -368,8 +374,70 @@ const bidSchema = Joi.object({
 });
 
 // ==============================
-// Agent2 helpers (prompt + normalization)
-// ==============================
+// ========== Agent2 ==========
+async function extractPdfInfoFromDoc(doc) {
+  if (!doc?.url) return { used: false, reason: "no_file" };
+
+  const name = doc.name || "";
+  const isPdfName = /\.pdf($|\?)/i.test(name);
+
+  try {
+    const buf = await fetchAsBuffer(doc.url);
+    const first5 = buf.slice(0, 5).toString(); // "%PDF-"
+    const isPdf =
+      first5 === "%PDF-" ||
+      isPdfName ||
+      (doc.mimetype || "").toLowerCase().includes("pdf");
+
+    if (!isPdf) {
+      return { used: false, reason: "not_pdf", bytes: buf.length, first5 };
+    }
+
+    let text = "";
+    try {
+      const parsed = await pdfParse(buf);
+      text = (parsed.text || "").replace(/\s+/g, " ").trim();
+    } catch (e) {
+      return {
+        used: false,
+        reason: "pdf_parse_failed",
+        bytes: buf.length,
+        first5,
+        error: String(e).slice(0, 200),
+      };
+    }
+
+    if (!text) {
+      return { used: false, reason: "no_text_extracted", bytes: buf.length, first5 };
+    }
+
+    const capped = text.slice(0, 15000);
+    return {
+      used: true,
+      text: capped,
+      snippet: capped.slice(0, 400),
+      chars: capped.length,
+      bytes: buf.length,
+      first5,
+    };
+  } catch (e) {
+    return { used: false, reason: "http_error", error: String(e).slice(0, 200) };
+  }
+}
+
+async function waitForPdfInfoFromDoc(doc, { maxMs = 15000, stepMs = 1500 } = {}) {
+  const start = Date.now();
+  let last = await extractPdfInfoFromDoc(doc);
+  if (!doc?.url || last.reason === "not_pdf" || last.reason === "no_file") return last;
+
+  while (!last.used && Date.now() - start < maxMs) {
+    if (!["http_error", "no_text_extracted", "pdf_parse_failed"].includes(last.reason || "")) break;
+    await new Promise((r) => setTimeout(r, stepMs));
+    last = await extractPdfInfoFromDoc(doc);
+  }
+  return last;
+}
+
 function buildAgent2Prompt({ bidRow, proposalRow, milestones, pdfInfo, promptOverride }) {
   const contextBlock = `
 CONTEXT
@@ -384,98 +452,38 @@ Bid:
 - Vendor: ${bidRow?.vendor_name || ""}
 - PriceUSD: ${bidRow?.price_usd ?? 0}
 - Days: ${bidRow?.days ?? 0}
-- Notes: ${bidRow?.notes || ""}
 - Milestones: ${JSON.stringify(milestones)}
+
+${pdfInfo.used
+  ? `PDF EXTRACT (truncated):\n"""${pdfInfo.text}"""`
+  : `NO PDF TEXT AVAILABLE (file not ready, scanned, or missing).`}
 `.trim();
 
-  const pdfBlock = pdfInfo.used
-    ? `PDF EXTRACT (truncated to ~15k chars):
-"""${pdfInfo.text}"""`
-    : `NO PDF TEXT AVAILABLE (reason: ${pdfInfo.reason || "unknown"})`;
-
-  const mustInclude = pdfInfo.used
-    ? `
-REQUIREMENTS
-------------
-- In the "summary" string, include a subsection titled exactly: "PDF Insights".
-- Quote 1–2 very short excerpts (<= 20 words each) from the PDF if possible.
-- Explain how the PDF content affects feasibility, fit, risks, and milestones.`
-    : `
-REQUIREMENTS
-------------
-- In the "summary" string, explicitly state that no PDF text was available/usable and that the analysis did not use PDF contents.`;
-
   const outputSpec = `
-Return JSON with exactly these keys:
+Return JSON with exactly:
 {
   "summary": string,
   "risks": string[],
   "fit": "low" | "medium" | "high",
   "milestoneNotes": string[],
   "confidence": number
-}`.trim();
+}
+`.trim();
 
   if (promptOverride && promptOverride.trim()) {
-    const base = `${contextBlock}
-
-${pdfBlock}
-
-${mustInclude}
-
-${outputSpec}`;
-    return promptOverride.includes("{{CONTEXT}}")
-      ? promptOverride.replace("{{CONTEXT}}", base)
-      : `${base}
-
-ADDITIONAL INSTRUCTIONS
-----------------------
-${promptOverride}`;
+    const hasPlaceholder = promptOverride.includes("{{CONTEXT}}");
+    return hasPlaceholder
+      ? promptOverride.replace("{{CONTEXT}}", contextBlock) + "\n\n" + outputSpec
+      : contextBlock + "\n\nADDITIONAL INSTRUCTIONS\n----------------------\n" + promptOverride + "\n\n" + outputSpec;
   }
 
   return `
-You are Agent2. Analyze this vendor bid for a proposal and return strict JSON only.
+You are Agent2. Analyze this vendor bid for a proposal and return strict JSON.
 
 ${contextBlock}
 
-${pdfBlock}
-
-${mustInclude}
-
 ${outputSpec}
 `.trim();
-}
-
-// Ensures Agent2 fields are safe to render
-function normalizeAnalysisShape(core) {
-  const safe = {};
-
-  // summary
-  if (typeof core?.summary === "string") {
-    safe.summary = core.summary;
-  } else if (core?.summary != null) {
-    try { safe.summary = JSON.stringify(core.summary, null, 2); }
-    catch { safe.summary = String(core.summary); }
-  } else {
-    safe.summary = "";
-  }
-
-  // risks -> array of strings
-  safe.risks = Array.isArray(core?.risks) ? core.risks.map((r) => String(r)) : [];
-
-  // fit -> one of low|medium|high
-  const fit = String(core?.fit || "").toLowerCase();
-  safe.fit = ["low", "medium", "high"].includes(fit) ? fit : "low";
-
-  // milestoneNotes -> array of strings
-  safe.milestoneNotes = Array.isArray(core?.milestoneNotes)
-    ? core.milestoneNotes.map((m) => String(m))
-    : [];
-
-  // confidence -> clamp [0,1]
-  const conf = Number(core?.confidence);
-  safe.confidence = Number.isFinite(conf) ? Math.max(0, Math.min(1, conf)) : 0;
-
-  return safe;
 }
 
 async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
@@ -525,14 +533,11 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
     });
 
     const raw = resp.choices?.[0]?.message?.content || "{}";
-    let core;
-    try { core = JSON.parse(raw); } catch { core = {}; }
-
-    const safeCore = normalizeAnalysisShape(core);
+    const core = JSON.parse(raw);
 
     return {
       status: "ready",
-      ...safeCore,
+      ...core,
       pdfUsed: !!pdfInfo.used,
       pdfChars: pdfInfo.chars || 0,
       pdfSnippet: pdfInfo.snippet || null,
@@ -560,7 +565,7 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
       pdfSnippet: null,
       promptSource: promptOverride ? "override" : "default",
       promptExcerpt: (promptOverride || "").slice(0, 300),
-      pdfDebug: { reason: "agent2_error", error: String(e).slice(0, 200) },
+      pdfDebug: { url: docObj?.url || null, reason: "agent2_error", error: String(e).slice(0, 200) },
     };
   }
 }
@@ -583,7 +588,6 @@ app.use(
 );
 app.use(helmet());
 app.use(express.json({ limit: "20mb" }));
-app.use(cookieParser()); // 🔐 parse JWT cookie
 
 // GET no-cache to make polling deterministic
 app.use((req, res, next) => {
@@ -595,172 +599,6 @@ app.use((req, res, next) => {
 });
 
 app.use(fileUpload({ limits: { fileSize: 50 * 1024 * 1024 } }));
-
-// ==============================
-// 🔐 Auth / Role (secure, non-breaking defaults)
-// ==============================
-const ADMIN_SET = new Set(
-  (process.env.ADMIN_ADDRESSES || "")
-    .split(",")
-    .map((a) => a.trim().toLowerCase())
-    .filter(Boolean)
-);
-const JWT_SECRET = process.env.JWT_SECRET || "dev_fallback_secret_change_me";
-const ENFORCE_JWT_ADMIN = String(process.env.ENFORCE_JWT_ADMIN || "false").toLowerCase() === "true";
-const SCOPE_BIDS_FOR_VENDOR = String(process.env.SCOPE_BIDS_FOR_VENDOR || "false").toLowerCase() === "true";
-
-const nonces = new Map(); // addressLower -> nonce
-
-function norm(a) { return String(a || "").trim().toLowerCase(); }
-function isAdminAddress(addr) { return ADMIN_SET.has(norm(addr)); }
-
-function signJwt(payload, expiresIn = "7d") {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn });
-}
-function verifyJwt(token) {
-  try { return jwt.verify(token, JWT_SECRET); }
-  catch { return null; }
-}
-
-// Attach req.user if cookie is present (optional)
-app.use((req, _res, next) => {
-  const token = req.cookies?.auth_token;
-  if (token) {
-    const user = verifyJwt(token);
-    if (user) req.user = user; // { sub: address, role }
-  }
-  next();
-});
-
-// 🔐 NEW: Also accept Authorization: Bearer <token>
-app.use((req, _res, next) => {
-  if (!req.user) {
-    const auth = req.get("authorization") || "";
-    const m = auth.match(/^bearer\s+(.+)$/i);
-    if (m) {
-      const user = verifyJwt(m[1]);
-      if (user) req.user = user; // { sub, role }
-    }
-  }
-  next();
-});
-
-function authRequired(req, res, next) {
-  if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-  next();
-}
-function requireRole(role) {
-  return (req, res, next) => {
-    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-    if (req.user.role !== role) return res.status(403).json({ error: "Forbidden" });
-    next();
-  };
-}
-// Admin guard that only enforces if ENFORCE_JWT_ADMIN=true
-function adminGuard(req, res, next) {
-  if (!ENFORCE_JWT_ADMIN) return next(); // compatibility mode
-  if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Forbidden" });
-  next();
-}
-
-// --- Auth endpoints ---
-// (existing) POST /auth/nonce
-app.post("/auth/nonce", (req, res) => {
-  const address = norm(req.body?.address);
-  if (!address) return res.status(400).json({ error: "address required" });
-  const nonce = `LithiumX login nonce: ${Math.floor(Math.random() * 1e9)}`;
-  nonces.set(address, nonce);
-  res.json({ nonce });
-});
-
-// (existing) POST /auth/verify — cookie mode
-app.post("/auth/verify", async (req, res) => {
-  const address = norm(req.body?.address);
-  const signature = req.body?.signature;
-  if (!address || !signature) return res.status(400).json({ error: "address and signature required" });
-
-  const nonce = nonces.get(address);
-  if (!nonce) return res.status(400).json({ error: "nonce not found or expired" });
-
-  let recovered;
-  try { recovered = ethers.verifyMessage(nonce, signature); }
-  catch { return res.status(400).json({ error: "invalid signature" }); }
-
-  if (norm(recovered) !== address) {
-    return res.status(401).json({ error: "signature does not match address" });
-  }
-
-  const role = isAdminAddress(address) ? "admin" : "vendor";
-  const token = signJwt({ sub: address, role });
-
-  // Cross-site cookie (Netlify ↔ Railway): SameSite=None + Secure
-  res.cookie("auth_token", token, {
-    httpOnly: true,
-    secure: true,
-    sameSite: "none",
-    maxAge: 7 * 24 * 3600 * 1000,
-  });
-
-  nonces.delete(address);
-  res.json({ address, role });
-});
-
-// 🔁 NEW: Compat for frontend — GET /auth/nonce?address=0x...
-app.get("/auth/nonce", (req, res) => {
-  const address = norm(req.query.address);
-  if (!address) return res.status(400).json({ error: "address required" });
-  const nonce = `LithiumX login nonce: ${Math.floor(Math.random() * 1e9)}`;
-  nonces.set(address, nonce);
-  res.json({ nonce });
-});
-
-// 🔁 NEW: Compat for frontend — POST /auth/login -> { token, role }
-app.post("/auth/login", async (req, res) => {
-  const address = norm(req.body?.address);
-  const signature = req.body?.signature;
-  if (!address || !signature) return res.status(400).json({ error: "address and signature required" });
-
-  const nonce = nonces.get(address);
-  if (!nonce) return res.status(400).json({ error: "nonce not found or expired" });
-
-  let recovered;
-  try { recovered = ethers.verifyMessage(nonce, signature); }
-  catch { return res.status(400).json({ error: "invalid signature" }); }
-
-  if (norm(recovered) !== address) return res.status(401).json({ error: "signature does not match address" });
-
-  const role = isAdminAddress(address) ? "admin" : "vendor";
-  const token = signJwt({ sub: address, role });
-
-  // Also set cookie to support cookie-based calls
-  res.cookie("auth_token", token, {
-    httpOnly: true,
-    secure: true,
-    sameSite: "none",
-    maxAge: 7 * 24 * 3600 * 1000,
-  });
-
-  nonces.delete(address);
-  res.json({ token, role });
-});
-
-app.get("/auth/role", (req, res) => {
-  const token = req.cookies?.auth_token;
-  const user = token ? verifyJwt(token) : null;
-  if (user) return res.json({ address: user.sub, role: user.role });
-
-  // compatibility fallback (keeps current frontend working)
-  const address = norm(req.query.address);
-  if (!address) return res.json({ role: "guest" });
-  const role = isAdminAddress(address) ? "admin" : "vendor";
-  res.json({ address, role });
-});
-
-app.post("/auth/logout", (req, res) => {
-  res.clearCookie("auth_token");
-  res.json({ ok: true });
-});
 
 // ==============================
 // Routes — Health & Test
@@ -784,24 +622,9 @@ app.get("/test", (_req, res) => res.json({ ok: true }));
 // ==============================
 // Routes — Proposals
 // ==============================
-app.get("/proposals", async (req, res) => {
+app.get("/proposals", async (_req, res) => {
   try {
-    const status = (req.query.status || "").toLowerCase().trim();
-    const includeArchived = String(req.query.includeArchived || "").toLowerCase();
-
-    let q = "SELECT * FROM proposals";
-    const params = [];
-
-    if (status) {
-      q += " WHERE status=$1";
-      params.push(status);
-    } else if (!["true", "1", "yes"].includes(includeArchived)) {
-      q += " WHERE status != 'archived'";
-    }
-
-    q += " ORDER BY created_at DESC";
-
-    const { rows } = await pool.query(q, params);
+    const { rows } = await pool.query("SELECT * FROM proposals ORDER BY created_at DESC");
     res.json(mapRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -810,9 +633,7 @@ app.get("/proposals", async (req, res) => {
 
 app.get("/proposals/:id", async (req, res) => {
   try {
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-    const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ id ]);
+    const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ req.params.id ]);
     if (!rows[0]) return res.status(404).json({ error: "not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
@@ -825,12 +646,8 @@ app.post("/proposals", async (req, res) => {
     const { error, value } = proposalSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
 
-    const q = `
-      INSERT INTO proposals (
-        org_name, title, summary, contact, address, city, country, amount_usd, docs, cid, status
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending')
-      RETURNING proposal_id, org_name, title, summary, contact, address, city, country, amount_usd, docs, cid, status, created_at
-    `;
+    const q = `INSERT INTO proposals (org_name,title,summary,contact,address,city,country,amount_usd,docs,cid,status)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending') RETURNING *`;
     const vals = [
       value.orgName,
       value.title,
@@ -850,71 +667,43 @@ app.post("/proposals", async (req, res) => {
   }
 });
 
-// Approve proposal
-app.post("/proposals/:id/approve", adminGuard, async (req, res) => {
+app.post("/proposals/:id/approve", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
   try {
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-    const { rows } = await pool.query(
-      `UPDATE proposals SET status='approved' WHERE proposal_id=$1 RETURNING *`,
-      [id]
-    );
-    if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
+    const { rows } = await pool.query(`UPDATE proposals SET status='approved' WHERE proposal_id=$1 RETURNING *`, [ id ]);
+    if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
-    console.error("Error approving proposal:", err);
-    res.status(500).json({ error: "Failed to approve proposal" });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Reject proposal
-app.post("/proposals/:id/reject", adminGuard, async (req, res) => {
+app.post("/proposals/:id/reject", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
   try {
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-    const { rows } = await pool.query(
-      `UPDATE proposals SET status='rejected' WHERE proposal_id=$1 RETURNING *`,
-      [id]
-    );
-    if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
+    const { rows } = await pool.query(`UPDATE proposals SET status='rejected' WHERE proposal_id=$1 RETURNING *`, [ id ]);
+    if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
-    console.error("Error rejecting proposal:", err);
-    res.status(500).json({ error: "Failed to reject proposal" });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Archive proposal
-app.post("/proposals/:id/archive", adminGuard, async (req, res) => {
+app.patch("/proposals/:id", async (req, res) => {
+  const id = Number(req.params.id);
+  const desired = String(req.body?.status || "").toLowerCase();
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+  if (!["approved", "rejected"].includes(desired)) {
+    return res.status(400).json({ error: 'Invalid status; expected "approved" or "rejected"' });
+  }
   try {
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-    const { rows } = await pool.query(
-      `UPDATE proposals SET status='archived' WHERE proposal_id=$1 RETURNING *`,
-      [id]
-    );
-    if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
+    const { rows } = await pool.query(`UPDATE proposals SET status=$2 WHERE proposal_id=$1 RETURNING *`, [ id, desired ]);
+    if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
-    console.error("Error archiving proposal:", err);
-    res.status(500).json({ error: "Failed to archive proposal" });
-  }
-});
-
-// Delete proposal
-app.delete("/proposals/:id", adminGuard, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-    const { rowCount } = await pool.query(
-      `DELETE FROM proposals WHERE proposal_id=$1`,
-      [id]
-    );
-    if (rowCount === 0) return res.status(404).json({ error: "Proposal not found" });
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Error deleting proposal:", err);
-    res.status(500).json({ error: "Failed to delete proposal" });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -924,30 +713,6 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
 app.get("/bids", async (req, res) => {
   try {
     const pid = Number(req.query.proposalId);
-
-    // NEW: secure scoping when flag ON and caller is not admin
-    const role = (req.user?.role || "guest").toLowerCase();
-    const caller = (req.user?.sub || "").toLowerCase();
-
-    if (SCOPE_BIDS_FOR_VENDOR && role !== "admin") {
-      if (!caller) return res.status(401).json({ error: "Unauthorized" });
-
-      if (Number.isFinite(pid)) {
-        const { rows } = await pool.query(
-          "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) AND proposal_id=$2 ORDER BY bid_id DESC",
-          [caller, pid]
-        );
-        return res.json(mapRows(rows));
-      } else {
-        const { rows } = await pool.query(
-          "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) ORDER BY bid_id DESC",
-          [caller]
-        );
-        return res.json(mapRows(rows));
-      }
-    }
-
-    // Admin or flag OFF: existing behavior
     if (Number.isFinite(pid)) {
       const { rows } = await pool.query("SELECT * FROM bids WHERE proposal_id=$1 ORDER BY bid_id DESC", [ pid ]);
       return res.json(mapRows(rows));
@@ -966,20 +731,7 @@ app.get("/bids/:id", async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ id ]);
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
-
-    const bid = rows[0];
-    const role = (req.user?.role || "guest").toLowerCase();
-    const caller = (req.user?.sub || "").toLowerCase();
-
-    // NEW: enforce ownership when flag ON and not admin
-    if (SCOPE_BIDS_FOR_VENDOR && role !== "admin") {
-      if (!caller) return res.status(401).json({ error: "Unauthorized" });
-      if ((bid.wallet_address || "").toLowerCase() !== caller) {
-        return res.status(403).json({ error: "Forbidden" });
-      }
-    }
-
-    return res.json(toCamel(bid));
+    return res.json(toCamel(rows[0]));
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -1053,7 +805,7 @@ app.post("/bids", async (req, res) => {
   }
 });
 
-app.post("/bids/:id/approve", adminGuard, async (req, res) => {
+app.post("/bids/:id/approve", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
   try {
@@ -1066,7 +818,7 @@ app.post("/bids/:id/approve", adminGuard, async (req, res) => {
   }
 });
 
-app.post("/bids/:id/reject", adminGuard, async (req, res) => {
+app.post("/bids/:id/reject", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
   try {
@@ -1079,24 +831,7 @@ app.post("/bids/:id/reject", adminGuard, async (req, res) => {
   }
 });
 
-app.post("/bids/:id/archive", adminGuard, async (req, res) => {
-  const { id } = req.params;
-  try {
-    const { rows } = await pool.query(
-      `UPDATE bids SET status = 'archived'
-       WHERE bid_id = $1
-       RETURNING *`,
-      [id]
-    );
-    if (!rows.length) return res.status(404).json({ error: "Bid not found" });
-    res.json(toCamel(rows[0]));
-  } catch (err) {
-    console.error("Error archiving bid:", err);
-    res.status(500).json({ error: "Failed to archive bid" });
-  }
-});
-
-app.patch("/bids/:id", adminGuard, async (req, res) => {
+app.patch("/bids/:id", async (req, res) => {
   const id = Number(req.params.id);
   const desired = String(req.body?.status || "").toLowerCase();
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
@@ -1114,7 +849,8 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
 });
 
 // Manual analyze/Retry
-app.post("/bids/:id/analyze", adminGuard, async (req, res) => {
+// ==============================
+app.post("/bids/:id/analyze", async (req, res) => {
   const bidId = Number(req.params.id);
   if (!Number.isFinite(bidId)) {
     return res.status(400).json({ error: "Invalid bid id" });
@@ -1131,20 +867,140 @@ app.post("/bids/:id/analyze", adminGuard, async (req, res) => {
     );
     if (!proposal) return res.status(404).json({ error: "Proposal not found" });
 
-    const promptOverride = typeof req.body?.prompt === "string" ? req.body.prompt : "";
+    // Fetch + parse PDF if attached
+    let pdfText = null;
+    let pdfDebug = null;
+    if (bid.doc && bid.doc.url) {
+      try {
+        const resp = await axios.get(bid.doc.url, { responseType: "arraybuffer" });
+        const parsed = await pdfParse(resp.data);
+        pdfText = parsed.text || "";
+        pdfDebug = {
+          url: bid.doc.url,
+          name: bid.doc.name,
+          bytes: resp.data.byteLength,
+          first5: Buffer.from(resp.data).toString("utf8", 0, 5),
+          error: null,
+        };
+        console.log("PDF extracted (first 500):", pdfText.slice(0, 500));
+      } catch (err) {
+        console.error("PDF parse failed:", err.message);
+        pdfDebug = { url: bid.doc.url, name: bid.doc.name, error: err.message };
+      }
+    }
 
-    const analysis = await runAgent2OnBid(bid, proposal, { promptOverride });
+    // Build analysis prompt
+    const systemPrompt = `
+You are Agent2. Analyze this vendor bid critically.
+
+Proposal summary:
+${proposal?.summary || "(no summary)"}
+
+Vendor: ${bid.vendor_name}
+Price (USD): ${bid.price_usd}
+Days: ${bid.days}
+Notes: ${bid.notes}
+
+Milestones:
+${JSON.stringify(bid.milestones || [], null, 2)}
+
+---
+
+IMPORTANT:
+- If PDF contents are provided, summarize them under "PDF Insights".
+- Assess feasibility, fit, risks, and alignment with the proposal.
+- Always state explicitly whether the PDF text was used.
+
+PDF contents:
+${pdfText ? pdfText.slice(0, 15000) : "No PDF provided"}
+    `;
+
+    // Call OpenAI
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "system", content: systemPrompt }],
+    });
+
+    const reply = completion.choices[0].message.content;
+
+    const analysis = {
+      status: "ready",
+      summary: reply,
+      pdfUsed: !!pdfText,
+      pdfDebug,
+    };
 
     await pool.query(
       "UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2",
       [JSON.stringify(analysis), bidId]
     );
 
-    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
-    return res.json(toCamel(updated[0]));
+    res.json({ ...bid, aiAnalysis: analysis });
   } catch (err) {
     console.error("Analyze error:", err);
     res.status(500).json({ error: "Failed to analyze bid" });
+  }
+});
+
+    // Model prompt (forces explicit PDF mention when available)
+    const userPrompt = `
+You are Agent2. Analyze this vendor bid and return strict JSON with exactly:
+{
+  "summary": string,
+  "risks": string[],
+  "fit": "low" | "medium" | "high",
+  "milestoneNotes": string[],
+  "confidence": number
+}
+
+Requirements:
+- If PDF text is available, cite it explicitly and briefly quote 1–2 short excerpts (<= 20 words).
+- Evaluate feasibility, risks, and alignment with the proposal and milestones.
+- Confidence is a number in [0,1].
+
+Proposal:
+- Org: ${prop.org_name || ""}
+- Title: ${prop.title || ""}
+- Summary: ${prop.summary || ""}
+- BudgetUSD: ${prop.amount_usd ?? 0}
+
+Bid:
+- Vendor: ${bid.vendor_name || ""}
+- PriceUSD: ${bid.price_usd ?? 0}
+- Days: ${bid.days ?? 0}
+- Notes: ${bid.notes || ""}
+- Milestones: ${JSON.stringify(milestones)}
+
+${promptOverride ? `Special instructions:\n${promptOverride}\n` : ""}
+${pdfText ? `PDF TEXT (truncated ~15k chars):\n"""${pdfText}"""` : "NO PDF TEXT AVAILABLE"}
+`.trim();
+
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      messages: [{ role: "user", content: userPrompt }],
+      response_format: { type: "json_object" },
+    });
+
+    const core = JSON.parse(resp.choices?.[0]?.message?.content || "{}");
+    const analysis = {
+      status: "ready",
+      ...core,
+      pdfUsed: !!pdfText,
+      pdfDebug,
+    };
+
+    // Store JSON in ai_analysis
+    await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [
+      JSON.stringify(analysis),
+      id,
+    ]);
+
+    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
+    return res.json(toCamel(updated[0]));
+  } catch (err) {
+    console.error("analyze bid error:", err);
+    return res.status(500).json({ error: "Agent2 error running analysis" });
   }
 });
 
@@ -1201,7 +1057,7 @@ app.post("/bids/:id/complete-milestone", async (req, res) => {
   }
 });
 
-app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
+app.post("/bids/:id/pay-milestone", async (req, res) => {
   const bidId = Number(req.params.id);
   const { milestoneIndex } = req.body || {};
   if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
@@ -1252,7 +1108,7 @@ app.post("/proofs", async (req, res) => {
   }
 });
 
-app.get("/proofs", adminGuard, async (_req, res) => {
+app.get("/proofs", async (_req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM proofs ORDER BY submitted_at DESC NULLS LAST");
     res.json(mapRows(rows));
@@ -1261,7 +1117,7 @@ app.get("/proofs", adminGuard, async (_req, res) => {
   }
 });
 
-app.get("/proofs/:bidId", adminGuard, async (req, res) => {
+app.get("/proofs/:bidId", async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM proofs WHERE bid_id=$1", [ req.params.bidId ]);
     res.json(mapRows(rows));
@@ -1270,49 +1126,21 @@ app.get("/proofs/:bidId", adminGuard, async (req, res) => {
   }
 });
 
-app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (_req, res) => {
+app.post("/proofs/:bidId/:milestoneIndex/approve", async (req, res) => {
   // stub status change if you later store per-proof statuses
   res.json({ ok: true });
 });
-app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (_req, res) => {
+app.post("/proofs/:bidId/:milestoneIndex/reject", async (req, res) => {
   res.json({ ok: true });
 });
 
 // ==============================
 // Routes — Vendor helpers
 // ==============================
-app.get("/vendor/bids", async (req, res) => {
+app.get("/vendor/bids", async (_req, res) => {
   try {
-    const role = (req.user?.role || "guest").toLowerCase();
-    const caller = (req.user?.sub || "").toLowerCase();
-
-    if (role === "admin") {
-      const { rows } = await pool.query("SELECT * FROM bids ORDER BY created_at DESC NULLS LAST, bid_id DESC");
-      return res.json(mapRows(rows));
-    }
-
-    // Scope for vendors/guests; require auth when scoping is on
-    if (SCOPE_BIDS_FOR_VENDOR) {
-      if (!caller) return res.status(401).json({ error: "Unauthorized" });
-      const { rows } = await pool.query(
-        "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) ORDER BY created_at DESC NULLS LAST, bid_id DESC",
-        [caller]
-      );
-      return res.json(mapRows(rows));
-    }
-
-    // Flag OFF: safest default is still to scope to caller if present
-    if (caller) {
-      const { rows } = await pool.query(
-        "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) ORDER BY created_at DESC NULLS LAST, bid_id DESC",
-        [caller]
-      );
-      return res.json(mapRows(rows));
-    }
-
-    // If completely unauthenticated and flag OFF, preserve legacy behavior
     const { rows } = await pool.query("SELECT * FROM bids ORDER BY created_at DESC NULLS LAST, bid_id DESC");
-    return res.json(mapRows(rows));
+    res.json(mapRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1347,7 +1175,7 @@ app.get("/vendor/payments", async (_req, res) => {
 // ==============================
 // Routes — Payments (legacy)
 // ==============================
-app.post("/payments/release", adminGuard, async (req, res) => {
+app.post("/payments/release", async (req, res) => {
   try {
     const { bidId, milestoneIndex } = req.body;
     const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
@@ -1399,6 +1227,4 @@ app.post("/ipfs/upload-json", async (req, res) => {
 // ==============================
 app.listen(PORT, () => {
   console.log(`[api] Listening on :${PORT}`);
-  console.log(`[api] Admin enforcement: ${ENFORCE_JWT_ADMIN ? "ON" : "OFF"}`);
-  console.log(`[api] Vendor scoping:    ${SCOPE_BIDS_FOR_VENDOR ? "ON" : "OFF"}`);
 });
