@@ -664,6 +664,37 @@ function adminGuard(req, res, next) {
   next();
 }
 
+// 🔐 NEW: Allow admin OR the vendor who owns the bid
+async function allowBidOwnerOrAdmin(req, res, next) {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+
+  try {
+    const { rows } = await pool.query(
+      "SELECT wallet_address FROM bids WHERE bid_id=$1",
+      [id]
+    );
+    const row = rows[0];
+    if (!row) return res.status(404).json({ error: "Bid not found" });
+
+    const bidOwner = String(row.wallet_address || "").toLowerCase();
+    const user = req.user;
+
+    if (user?.role === "admin") return next(); // admin always ok
+
+    if (!user) return res.status(401).json({ error: "Unauthorized" });
+    if (user.role !== "vendor") return res.status(403).json({ error: "Forbidden" });
+    if (String(user.sub || "").toLowerCase() !== bidOwner) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    return next();
+  } catch (err) {
+    console.error("allowBidOwnerOrAdmin error:", err);
+    return res.status(500).json({ error: "Internal error" });
+  }
+}
+
 // --- Auth endpoints ---
 // (existing) POST /auth/nonce
 app.post("/auth/nonce", (req, res) => {
@@ -1079,7 +1110,8 @@ app.post("/bids/:id/reject", adminGuard, async (req, res) => {
   }
 });
 
-app.post("/bids/:id/archive", adminGuard, async (req, res) => {
+// 🔐 UPDATED — vendors can archive their own bids; admins can archive any
+app.post("/bids/:id/archive", allowBidOwnerOrAdmin, async (req, res) => {
   const { id } = req.params;
   try {
     const { rows } = await pool.query(
@@ -1171,7 +1203,8 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
 // ==============================
 // Routes — Complete/Pay milestone (frontend-compatible)
 // ==============================
-app.post("/bids/:id/complete-milestone", async (req, res) => {
+// 🔐 UPDATED — owner-or-admin can mark a milestone complete
+app.post("/bids/:id/complete-milestone", allowBidOwnerOrAdmin, async (req, res) => {
   const bidId = Number(req.params.id);
   const { milestoneIndex, proof } = req.body || {};
   if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
