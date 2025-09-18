@@ -1261,55 +1261,55 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
 // Routes — Proofs (robust, with Agent2)
 // ==============================
 app.post("/proofs", async (req, res) => {
+  // Accept legacy & new shapes
+  const schema = Joi.object({
+    bidId: Joi.number().integer().required(),
+    milestoneIndex: Joi.number().integer().min(0).required(),
+    // legacy:
+    proof: Joi.string().allow(""),
+    // new:
+    title: Joi.string().allow(""),
+    description: Joi.string().allow(""),
+    files: Joi.array()
+      .items(Joi.object({ name: Joi.string().allow(""), url: Joi.string().uri().required() }))
+      .default([]),
+    // accept either name from the client
+    prompt: Joi.string().allow(""),
+    vendorPrompt: Joi.string().allow(""),
+  });
+
+  const { error, value } = schema.validate(req.body || {}, { abortEarly: false });
+  if (error) return res.status(400).json({ error: error.message });
+
+  const { bidId, milestoneIndex } = value;
+
   try {
-    // Accept both legacy & new shapes
-    // legacy: { bidId, milestoneIndex, proof }  (string with text + links)
-    // new:    { bidId, milestoneIndex, title, description, files:[{name,url}], prompt? }
-    const schema = Joi.object({
-      bidId: Joi.number().integer().required(),
-      milestoneIndex: Joi.number().integer().min(0).required(),
-      // legacy field:
-      proof: Joi.string().allow(""),
-      // new fields:
-      title: Joi.string().allow(""),
-      description: Joi.string().allow(""),
-      files: Joi.array().items(
-        Joi.object({
-          name: Joi.string().allow(""),
-          url: Joi.string().uri().required(),
-        })
-      ).default([]),
-      prompt: Joi.string().allow(""),
-    });
-
-    const { error, value } = schema.validate(req.body || {}, { abortEarly: false });
-    if (error) return res.status(400).json({ error: error.message });
-
-    const { bidId, milestoneIndex } = value;
-
-    // Load the bid to enrich vendor info and validate milestone range
-    const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
+    // 1) Ensure bid exists
+    const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
     if (!bids[0]) return res.status(404).json({ error: "Bid not found" });
     const bid = bids[0];
 
+    // 2) Ensure milestoneIndex is valid
     const milestones = Array.isArray(bid.milestones)
       ? bid.milestones
       : JSON.parse(bid.milestones || "[]");
     if (!milestones[milestoneIndex]) {
-      return res.status(400).json({ error: "Invalid milestoneIndex" });
+      return res.status(400).json({ error: "Invalid milestoneIndex for this bid" });
     }
 
-    // Normalize proof fields
+    // 3) Normalize proof fields
     const files = Array.isArray(value.files) ? value.files : [];
     const legacyText = (value.proof || "").trim();
     const description = (value.description || legacyText || "").trim();
     const title = (value.title || `Proof for Milestone ${milestoneIndex + 1}`).trim();
+    const vendorPrompt = (value.vendorPrompt || value.prompt || "").trim();
 
-    // Insert proof row first (status 'pending')
+    // 4) Insert proof row (pending)
     const insertQ = `
       INSERT INTO proofs
-      (bid_id, milestone_index, vendor_name, wallet_address, title, description, files, status, submitted_at, vendor_prompt)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,'pending', NOW(), $8)
+        (bid_id, milestone_index, vendor_name, wallet_address, title, description, files, status, submitted_at, vendor_prompt, updated_at)
+      VALUES
+        ($1,$2,$3,$4,$5,$6,$7,'pending', NOW(), $8, NOW())
       RETURNING *`;
     const insertVals = [
       bidId,
@@ -1319,89 +1319,105 @@ app.post("/proofs", async (req, res) => {
       title,
       description,
       JSON.stringify(files),
-      value.prompt || null,
+      vendorPrompt || null,
     ];
     const { rows: pr } = await pool.query(insertQ, insertVals);
     let proofRow = pr[0];
 
-    // Optionally run Agent2 on the proof (run if any content present)
+    // 5) Try Agent2 analysis (non-fatal)
     let analysis = null;
-    if (openai && (value.prompt || description || files.length)) {
-      const proofContext = `
-You are Agent2. Evaluate a vendor's submitted proof of work for a single milestone.
-Return strict JSON with:
+    try {
+      if (openai && (vendorPrompt || description || files.length)) {
+        // pull proposal for context
+        const { rows: prj } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [
+          bid.proposal_id || bid.proposalId,
+        ]);
+        const proposal = prj[0] || null;
+
+        const basePrompt = `
+You are Agent2. Evaluate a vendor's submitted proof for a specific milestone.
+
+Return strict JSON:
 {
   "summary": string,
-  "risks": string[],
+  "evidence": string[],
+  "gaps": string[],
   "fit": "low" | "medium" | "high",
-  "milestoneNotes": string[],
   "confidence": number
 }
 
-CONTEXT
--------
-Bid:
-- Vendor: ${bid.vendor_name || bid.vendorName || ""}
-- Wallet: ${bid.wallet_address || bid.walletAddress || ""}
-- Token:  ${bid.preferred_stablecoin || bid.preferredStablecoin || ""}
-- Milestone Index: ${milestoneIndex}
+Context:
+- Proposal: ${proposal?.title || "(unknown)"} (${proposal?.org_name || "(unknown)"})
+- Milestone: ${milestones[milestoneIndex]?.name || "(unknown)"} — $${milestones[milestoneIndex]?.amount ?? "?"}
+- Vendor: ${bid.vendor_name || bid.vendorName || "(unknown)"}
 
-Proof:
-- Title: ${title}
-- Description (truncated): ${(description || "").slice(0, 2000)}
+Proof title: ${title}
+Proof description (truncated):
+"""${description.slice(0, 2000)}"""
 
-Files (links):
-${files.map(f => `- ${f.name || "file"}: ${f.url}`).join("\n")}
-`.trim();
+Files:
+${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
+        `.trim();
 
-      const prompt = value.prompt
-        ? `${value.prompt}\n\n---\n${proofContext}`
-        : proofContext;
+        const fullPrompt = vendorPrompt ? `${vendorPrompt}\n\n---\n${basePrompt}` : basePrompt;
 
-      try {
         const resp = await openai.chat.completions.create({
           model: "gpt-4o-mini",
           temperature: 0.2,
-          messages: [{ role: "user", content: prompt }],
+          messages: [{ role: "user", content: fullPrompt }],
           response_format: { type: "json_object" },
         });
-        const raw = resp.choices?.[0]?.message?.content || "{}";
-        let core;
-        try { core = JSON.parse(raw); } catch { core = {}; }
-        analysis = normalizeAnalysisShape(core);
-      } catch (e) {
-        console.error("Agent2 proof analysis error:", e);
+
+        try {
+          const raw = resp.choices?.[0]?.message?.content || "{}";
+          analysis = JSON.parse(raw);
+        } catch {
+          analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
+        }
+      } else {
         analysis = {
-          summary: "Agent2 failed to analyze this proof.",
-          risks: [],
+          summary: "OpenAI not configured; no automatic proof analysis.",
+          evidence: [],
+          gaps: [],
           fit: "low",
-          milestoneNotes: [],
           confidence: 0,
         };
       }
+    } catch (e) {
+      console.error("Agent2 proof analysis error:", e);
+      analysis = { summary: "Agent2 failed during analysis.", evidence: [], gaps: [], fit: "low", confidence: 0 };
     }
 
-    if (analysis) {
-      await pool.query(
-        "UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2",
-        [ JSON.stringify(analysis), proofRow.proof_id ]
-      );
-      const { rows: pr2 } = await pool.query("SELECT * FROM proofs WHERE proof_id=$1", [ proofRow.proof_id ]);
-      proofRow = pr2[0];
+    // 6) Save analysis (best-effort)
+    try {
+      await pool.query("UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2", [
+        JSON.stringify(analysis),
+        proofRow.proof_id,
+      ]);
+      proofRow.ai_analysis = analysis;
+    } catch (e) {
+      console.error("Failed to save ai_analysis for proof:", e);
     }
 
-    // (Optional) also stamp the proof text onto the milestone for quick view
+    // 7) Also stamp a simple proof note back to the bid milestone for quick view
     const ms = milestones;
     ms[milestoneIndex] = {
       ...(ms[milestoneIndex] || {}),
-      proof: description || legacyText || (files.length ? `Files:\n${files.map(f=>f.url).join("\n")}` : ""),
+      proof:
+        description ||
+        (files.length ? `Files:\n${files.map((f) => f.url).join("\n")}` : "") ||
+        legacyText,
     };
-    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [ JSON.stringify(ms), bidId ]);
+    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(ms), bidId]);
 
-    return res.json(toCamel(proofRow));
+    // 8) Done
+    return res.status(201).json(toCamel(proofRow));
   } catch (err) {
     console.error("POST /proofs error:", err);
-    return res.status(500).json({ error: "Failed to submit proof" });
+    // return a safe 400 with guidance
+    return res
+      .status(400)
+      .json({ error: "Invalid /proofs request. Check bidId, milestoneIndex, and payload format." });
   }
 });
 
