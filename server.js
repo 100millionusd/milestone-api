@@ -24,8 +24,10 @@
 //   PINATA_GATEWAY_DOMAIN     - gateway domain (default: gateway.pinata.cloud)
 //   ADMIN_ADDRESSES           - comma-separated admin wallet addresses
 //   JWT_SECRET                - secret for signing auth JWTs
-//   ENFORCE_JWT_ADMIN         - "true" to require admin JWT on admin routes (default false for compatibility)
+//   ENFORCE_JWT_ADMIN         - "true" to require admin JWT on admin routes (default false)
 //   SCOPE_BIDS_FOR_VENDOR     - "true" to scope GET /bids to caller's address if vendor (default false)
+//   AGENT2_INLINE_TIMEOUT_MS  - inline analysis timeout (default 12000ms)
+//   AGENT2_PROMPT_CAP         - cap stored prompt length (default 20000 chars)
 // --------------------------------------------------------------------------------------
 
 require("dotenv").config();
@@ -42,7 +44,7 @@ const { Pool } = require("pg");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
 
-// 🔐 new: auth utilities
+// 🔐 auth utilities
 const cookieParser = require("cookie-parser");
 const jwt = require("jsonwebtoken");
 
@@ -110,11 +112,9 @@ function toCamel(row) {
   }
   return out;
 }
-
 function mapRows(rows) {
   return rows.map(toCamel);
 }
-
 function coerceJson(val) {
   if (!val) return null;
   if (typeof val === "string") {
@@ -123,9 +123,7 @@ function coerceJson(val) {
   return val;
 }
 
-/**
- * Perform a generic HTTP(S) request and return { status, body }.
- */
+/** Generic HTTP(S) request */
 function sendRequest(method, urlStr, headers = {}, body = null) {
   const u = new URL(urlStr);
   const lib = u.protocol === "https:" ? https : http;
@@ -151,9 +149,7 @@ function sendRequest(method, urlStr, headers = {}, body = null) {
   });
 }
 
-/**
- * Fetch a URL into a Buffer (binary).
- */
+/** Fetch a URL into a Buffer */
 async function fetchAsBuffer(urlStr) {
   return new Promise((resolve, reject) => {
     const lib = urlStr.startsWith("https:") ? https : http;
@@ -169,9 +165,7 @@ async function fetchAsBuffer(urlStr) {
   });
 }
 
-/**
- * Promise.race timeout helper that resolves with onTimeout() after ms.
- */
+/** Promise.race timeout helper */
 function withTimeout(p, ms, onTimeout) {
   let t;
   const timeoutP = new Promise((resolve) => {
@@ -181,7 +175,7 @@ function withTimeout(p, ms, onTimeout) {
 }
 
 // ==============================
-// PDF Extraction (debug-friendly with retries)
+// PDF Extraction (with retries)
 // ==============================
 async function extractPdfInfoFromDoc(doc) {
   if (!doc?.url) return { used: false, reason: "no_file" };
@@ -230,9 +224,6 @@ async function extractPdfInfoFromDoc(doc) {
   }
 }
 
-/**
- * Retry loop for PDFs (gateway warm-up, transient errors)
- */
 async function waitForPdfInfoFromDoc(doc, { maxMs = 12000, stepMs = 1500 } = {}) {
   const start = Date.now();
   let last = await extractPdfInfoFromDoc(doc);
@@ -492,6 +483,8 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
       pdfSnippet: null,
       promptSource: promptOverride ? "override" : "default",
       promptExcerpt: (promptOverride || "").slice(0, 300),
+      // include prompt for visibility when override was supplied
+      prompt: promptOverride || null,
       pdfDebug: { reason: "openai_missing" },
     };
   }
@@ -516,6 +509,9 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
     promptOverride: typeof promptOverride === "string" ? promptOverride : ""
   });
 
+  const PROMPT_CAP = Number(process.env.AGENT2_PROMPT_CAP || 20000);
+  const promptCapped = typeof prompt === "string" ? prompt.slice(0, PROMPT_CAP) : "";
+
   try {
     const resp = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -537,7 +533,9 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
       pdfChars: pdfInfo.chars || 0,
       pdfSnippet: pdfInfo.snippet || null,
       promptSource: promptOverride ? "override" : "default",
-      promptExcerpt: prompt.slice(0, 300),
+      promptExcerpt: promptCapped.slice(0, 300),
+      // include full (capped) prompt so admin can inspect
+      prompt: promptCapped,
       pdfDebug: {
         url: docObj?.url || null,
         name: docObj?.name || null,
@@ -560,6 +558,7 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
       pdfSnippet: null,
       promptSource: promptOverride ? "override" : "default",
       promptExcerpt: (promptOverride || "").slice(0, 300),
+      prompt: promptOverride || null,
       pdfDebug: { reason: "agent2_error", error: String(e).slice(0, 200) },
     };
   }
@@ -597,7 +596,7 @@ app.use((req, res, next) => {
 app.use(fileUpload({ limits: { fileSize: 50 * 1024 * 1024 } }));
 
 // ==============================
-// 🔐 Auth / Role (secure, non-breaking defaults)
+// 🔐 Auth / Role (secure defaults)
 // ==============================
 const ADMIN_SET = new Set(
   (process.env.ADMIN_ADDRESSES || "")
@@ -632,7 +631,7 @@ app.use((req, _res, next) => {
   next();
 });
 
-// 🔐 NEW: Also accept Authorization: Bearer <token>
+// Also accept Authorization: Bearer <token>
 app.use((req, _res, next) => {
   if (!req.user) {
     const auth = req.get("authorization") || "";
@@ -664,39 +663,17 @@ function adminGuard(req, res, next) {
   next();
 }
 
-// 🔐 NEW: Allow admin OR the vendor who owns the bid
-async function allowBidOwnerOrAdmin(req, res, next) {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
-
-  try {
-    const { rows } = await pool.query(
-      "SELECT wallet_address FROM bids WHERE bid_id=$1",
-      [id]
-    );
-    const row = rows[0];
-    if (!row) return res.status(404).json({ error: "Bid not found" });
-
-    const bidOwner = String(row.wallet_address || "").toLowerCase();
-    const user = req.user;
-
-    if (user?.role === "admin") return next(); // admin always ok
-
-    if (!user) return res.status(401).json({ error: "Unauthorized" });
-    if (user.role !== "vendor") return res.status(403).json({ error: "Forbidden" });
-    if (String(user.sub || "").toLowerCase() !== bidOwner) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
-
-    return next();
-  } catch (err) {
-    console.error("allowBidOwnerOrAdmin error:", err);
-    return res.status(500).json({ error: "Internal error" });
-  }
-}
-
 // --- Auth endpoints ---
-// (existing) POST /auth/nonce
+// (compat) GET /auth/nonce?address=0x...
+app.get("/auth/nonce", (req, res) => {
+  const address = norm(req.query.address);
+  if (!address) return res.status(400).json({ error: "address required" });
+  const nonce = `LithiumX login nonce: ${Math.floor(Math.random() * 1e9)}`;
+  nonces.set(address, nonce);
+  res.json({ nonce });
+});
+
+// POST /auth/nonce with JSON body { address }
 app.post("/auth/nonce", (req, res) => {
   const address = norm(req.body?.address);
   if (!address) return res.status(400).json({ error: "address required" });
@@ -705,7 +682,7 @@ app.post("/auth/nonce", (req, res) => {
   res.json({ nonce });
 });
 
-// (existing) POST /auth/verify — cookie mode
+// (cookie mode) POST /auth/verify -> sets cookie
 app.post("/auth/verify", async (req, res) => {
   const address = norm(req.body?.address);
   const signature = req.body?.signature;
@@ -718,14 +695,11 @@ app.post("/auth/verify", async (req, res) => {
   try { recovered = ethers.verifyMessage(nonce, signature); }
   catch { return res.status(400).json({ error: "invalid signature" }); }
 
-  if (norm(recovered) !== address) {
-    return res.status(401).json({ error: "signature does not match address" });
-  }
+  if (norm(recovered) !== address) return res.status(401).json({ error: "signature does not match address" });
 
   const role = isAdminAddress(address) ? "admin" : "vendor";
   const token = signJwt({ sub: address, role });
 
-  // Cross-site cookie (Netlify ↔ Railway): SameSite=None + Secure
   res.cookie("auth_token", token, {
     httpOnly: true,
     secure: true,
@@ -737,16 +711,7 @@ app.post("/auth/verify", async (req, res) => {
   res.json({ address, role });
 });
 
-// 🔁 NEW: Compat for frontend — GET /auth/nonce?address=0x...
-app.get("/auth/nonce", (req, res) => {
-  const address = norm(req.query.address);
-  if (!address) return res.status(400).json({ error: "address required" });
-  const nonce = `LithiumX login nonce: ${Math.floor(Math.random() * 1e9)}`;
-  nonces.set(address, nonce);
-  res.json({ nonce });
-});
-
-// 🔁 NEW: Compat for frontend — POST /auth/login -> { token, role }
+// (token mode) POST /auth/login -> { token, role } + cookie
 app.post("/auth/login", async (req, res) => {
   const address = norm(req.body?.address);
   const signature = req.body?.signature;
@@ -764,7 +729,6 @@ app.post("/auth/login", async (req, res) => {
   const role = isAdminAddress(address) ? "admin" : "vendor";
   const token = signJwt({ sub: address, role });
 
-  // Also set cookie to support cookie-based calls
   res.cookie("auth_token", token, {
     httpOnly: true,
     secure: true,
@@ -776,12 +740,13 @@ app.post("/auth/login", async (req, res) => {
   res.json({ token, role });
 });
 
+// Role helper
 app.get("/auth/role", (req, res) => {
   const token = req.cookies?.auth_token;
   const user = token ? verifyJwt(token) : null;
   if (user) return res.json({ address: user.sub, role: user.role });
 
-  // compatibility fallback (keeps current frontend working)
+  // compatibility fallback
   const address = norm(req.query.address);
   if (!address) return res.json({ role: "guest" });
   const role = isAdminAddress(address) ? "admin" : "vendor";
@@ -851,6 +816,7 @@ app.get("/proposals/:id", async (req, res) => {
   }
 });
 
+// Anyone can create proposals
 app.post("/proposals", async (req, res) => {
   try {
     const { error, value } = proposalSchema.validate(req.body);
@@ -881,7 +847,7 @@ app.post("/proposals", async (req, res) => {
   }
 });
 
-// Approve proposal
+// Approve/Reject/Archive/Delete proposals — admin only (when enforced)
 app.post("/proposals/:id/approve", adminGuard, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -890,15 +856,13 @@ app.post("/proposals/:id/approve", adminGuard, async (req, res) => {
       `UPDATE proposals SET status='approved' WHERE proposal_id=$1 RETURNING *`,
       [id]
     );
-    if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
+    if (!rows.length) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
-    console.error("Error approving proposal:", err);
     res.status(500).json({ error: "Failed to approve proposal" });
   }
 });
 
-// Reject proposal
 app.post("/proposals/:id/reject", adminGuard, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -907,15 +871,13 @@ app.post("/proposals/:id/reject", adminGuard, async (req, res) => {
       `UPDATE proposals SET status='rejected' WHERE proposal_id=$1 RETURNING *`,
       [id]
     );
-    if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
+    if (!rows.length) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
-    console.error("Error rejecting proposal:", err);
     res.status(500).json({ error: "Failed to reject proposal" });
   }
 });
 
-// Archive proposal
 app.post("/proposals/:id/archive", adminGuard, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -924,27 +886,21 @@ app.post("/proposals/:id/archive", adminGuard, async (req, res) => {
       `UPDATE proposals SET status='archived' WHERE proposal_id=$1 RETURNING *`,
       [id]
     );
-    if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
+    if (!rows.length) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
-    console.error("Error archiving proposal:", err);
     res.status(500).json({ error: "Failed to archive proposal" });
   }
 });
 
-// Delete proposal
 app.delete("/proposals/:id", adminGuard, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-    const { rowCount } = await pool.query(
-      `DELETE FROM proposals WHERE proposal_id=$1`,
-      [id]
-    );
-    if (rowCount === 0) return res.status(404).json({ error: "Proposal not found" });
+    const { rowCount } = await pool.query(`DELETE FROM proposals WHERE proposal_id=$1`, [id]);
+    if (!rowCount) return res.status(404).json({ error: "Proposal not found" });
     res.json({ success: true });
   } catch (err) {
-    console.error("Error deleting proposal:", err);
     res.status(500).json({ error: "Failed to delete proposal" });
   }
 });
@@ -956,7 +912,7 @@ app.get("/bids", async (req, res) => {
   try {
     const pid = Number(req.query.proposalId);
 
-    // NEW: secure scoping when flag ON and caller is not admin
+    // Secure scoping when flag ON and caller is not admin
     const role = (req.user?.role || "guest").toLowerCase();
     const caller = (req.user?.sub || "").toLowerCase();
 
@@ -1002,7 +958,7 @@ app.get("/bids/:id", async (req, res) => {
     const role = (req.user?.role || "guest").toLowerCase();
     const caller = (req.user?.sub || "").toLowerCase();
 
-    // NEW: enforce ownership when flag ON and not admin
+    // Enforce ownership when flag ON and not admin
     if (SCOPE_BIDS_FOR_VENDOR && role !== "admin") {
       if (!caller) return res.status(401).json({ error: "Unauthorized" });
       if ((bid.wallet_address || "").toLowerCase() !== caller) {
@@ -1092,7 +1048,6 @@ app.post("/bids/:id/approve", adminGuard, async (req, res) => {
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
     return res.json(toCamel(rows[0]));
   } catch (err) {
-    console.error("approve bid error", err);
     return res.status(500).json({ error: "Internal error approving bid" });
   }
 });
@@ -1105,29 +1060,47 @@ app.post("/bids/:id/reject", adminGuard, async (req, res) => {
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
     return res.json(toCamel(rows[0]));
   } catch (err) {
-    console.error("reject bid error", err);
     return res.status(500).json({ error: "Internal error rejecting bid" });
   }
 });
 
-// 🔐 UPDATED — vendors can archive their own bids; admins can archive any
-app.post("/bids/:id/archive", allowBidOwnerOrAdmin, async (req, res) => {
-  const { id } = req.params;
+// Allow admin OR owning vendor to archive a bid
+app.post("/bids/:id/archive", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+
   try {
-    const { rows } = await pool.query(
-      `UPDATE bids SET status = 'archived'
-       WHERE bid_id = $1
-       RETURNING *`,
-      [id]
-    );
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ id ]);
     if (!rows.length) return res.status(404).json({ error: "Bid not found" });
-    res.json(toCamel(rows[0]));
+    const bid = rows[0];
+
+    const role = (req.user?.role || "guest").toLowerCase();
+    const caller = (req.user?.sub || "").toLowerCase();
+
+    const isAdmin = role === "admin";
+    const isOwner = caller && (bid.wallet_address || "").toLowerCase() === caller;
+
+    // If admin enforcement is ON, require admin OR owner
+    if (ENFORCE_JWT_ADMIN && !(isAdmin || isOwner)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    // If admin enforcement is OFF, still prevent randoms from archiving others' bids
+    if (!caller || !(isAdmin || isOwner)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const { rows: updated } = await pool.query(
+      `UPDATE bids SET status = 'archived' WHERE bid_id=$1 RETURNING *`,
+      [ id ]
+    );
+    return res.json(toCamel(updated[0]));
   } catch (err) {
     console.error("Error archiving bid:", err);
-    res.status(500).json({ error: "Failed to archive bid" });
+    return res.status(500).json({ error: "Failed to archive bid" });
   }
 });
 
+// Admin-only status patch (approved|rejected)
 app.patch("/bids/:id", adminGuard, async (req, res) => {
   const id = Number(req.params.id);
   const desired = String(req.body?.status || "").toLowerCase();
@@ -1140,12 +1113,11 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
     return res.json(toCamel(rows[0]));
   } catch (err) {
-    console.error("patch bid status error", err);
     return res.status(500).json({ error: "Internal error updating bid status" });
   }
 });
 
-// Manual analyze/Retry
+// Manual analyze/Retry — admin only (when enforced)
 app.post("/bids/:id/analyze", adminGuard, async (req, res) => {
   const bidId = Number(req.params.id);
   if (!Number.isFinite(bidId)) {
@@ -1153,24 +1125,17 @@ app.post("/bids/:id/analyze", adminGuard, async (req, res) => {
   }
 
   try {
-    // Fetch bid + proposal
     const { rows: [bid] } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
     if (!bid) return res.status(404).json({ error: "Bid not found" });
 
-    const { rows: [proposal] } = await pool.query(
-      "SELECT * FROM proposals WHERE proposal_id=$1",
-      [bid.proposal_id]
-    );
+    const { rows: [proposal] } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [bid.proposal_id]);
     if (!proposal) return res.status(404).json({ error: "Proposal not found" });
 
     const promptOverride = typeof req.body?.prompt === "string" ? req.body.prompt : "";
 
     const analysis = await runAgent2OnBid(bid, proposal, { promptOverride });
 
-    await pool.query(
-      "UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2",
-      [JSON.stringify(analysis), bidId]
-    );
+    await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [JSON.stringify(analysis), bidId]);
 
     const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
     return res.json(toCamel(updated[0]));
@@ -1201,10 +1166,9 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
 });
 
 // ==============================
-// Routes — Complete/Pay milestone (frontend-compatible)
+// Routes — Complete/Pay milestone
 // ==============================
-// 🔐 UPDATED — owner-or-admin can mark a milestone complete
-app.post("/bids/:id/complete-milestone", allowBidOwnerOrAdmin, async (req, res) => {
+app.post("/bids/:id/complete-milestone", async (req, res) => {
   const bidId = Number(req.params.id);
   const { milestoneIndex, proof } = req.body || {};
   if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
