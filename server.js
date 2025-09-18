@@ -1266,16 +1266,21 @@ app.post("/proofs", async (req, res) => {
     bidId: Joi.number().integer().required(),
     milestoneIndex: Joi.number().integer().min(0).required(),
     // legacy:
-    proof: Joi.string().allow(""),
+    proof: Joi.string().allow("").optional(),
     // new:
-    title: Joi.string().allow(""),
-    description: Joi.string().allow(""),
+    title: Joi.string().allow("").optional(),
+    description: Joi.string().allow("").optional(),
     files: Joi.array()
       .items(Joi.object({ name: Joi.string().allow(""), url: Joi.string().uri().required() }))
-      .default([]),
+      .default([])
+      .optional(),
     // accept either name from the client
-    prompt: Joi.string().allow(""),
-    vendorPrompt: Joi.string().allow(""),
+    prompt: Joi.string().allow("").optional(),
+    vendorPrompt: Joi.string().allow("").optional(),
+  })
+  .or('proof', 'description') // Require either proof OR description
+  .messages({
+    'object.missing': 'Must provide either proof (legacy) or description (new format)'
   });
 
   const { error, value } = schema.validate(req.body || {}, { abortEarly: false });
