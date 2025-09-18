@@ -5,10 +5,10 @@
 //   • Express endpoints for proposals, bids, proofs, payments, vendor helpers
 //   • Blockchain token transfers (USDC/USDT on Sepolia)
 //   • IPFS uploads via Pinata (file + JSON)
-//   • Agent2 bid analysis powered by OpenAI with PDF extraction + retries
+//   • Agent2 analysis (bids + proofs) powered by OpenAI with PDF extraction + retries
 //   • Strong GET no-cache headers so polling always sees fresh data
-//   • Inline Agent2 analysis on bid creation (response already includes ai_analysis)
-//   • Manual analyze endpoint for retries
+//   • Inline Agent2 analysis on bid/proof creation
+//   • Manual analyze endpoints for retries
 //
 // Environment variables (commonly used):
 //   PORT                      - default 3000
@@ -42,7 +42,7 @@ const { Pool } = require("pg");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
 
-// 🔐 auth utilities
+// 🔐 auth utils
 const cookieParser = require("cookie-parser");
 const jwt = require("jsonwebtoken");
 
@@ -98,6 +98,21 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+// --- Optional one-time schema drift protection ---
+(async () => {
+  try {
+    await pool.query("ALTER TABLE proofs ADD COLUMN IF NOT EXISTS ai_analysis JSONB");
+  } catch (e) {
+    console.warn("[db] ensure proofs.ai_analysis failed (ok if already present):", e.message);
+  }
+  try {
+    // Add a numeric id if missing (without PK to avoid conflicts with existing PKs)
+    await pool.query("ALTER TABLE proofs ADD COLUMN IF NOT EXISTS proof_id BIGSERIAL");
+  } catch (e) {
+    console.warn("[db] ensure proofs.proof_id failed (ok if already present):", e.message);
+  }
+})();
+
 // ==============================
 // Utilities
 // ==============================
@@ -110,8 +125,9 @@ function toCamel(row) {
   }
   return out;
 }
-function mapRows(rows) { return rows.map(toCamel); }
-
+function mapRows(rows) {
+  return rows.map(toCamel);
+}
 function coerceJson(val) {
   if (!val) return null;
   if (typeof val === "string") {
@@ -119,8 +135,6 @@ function coerceJson(val) {
   }
   return val;
 }
-
-/** Generic HTTP(S) request; returns { status, body } */
 function sendRequest(method, urlStr, headers = {}, body = null) {
   const u = new URL(urlStr);
   const lib = u.protocol === "https:" ? https : http;
@@ -145,8 +159,6 @@ function sendRequest(method, urlStr, headers = {}, body = null) {
     } else req.end();
   });
 }
-
-/** Fetch a URL into a Buffer (binary). */
 async function fetchAsBuffer(urlStr) {
   return new Promise((resolve, reject) => {
     const lib = urlStr.startsWith("https:") ? https : http;
@@ -161,8 +173,6 @@ async function fetchAsBuffer(urlStr) {
     req.on("error", reject);
   });
 }
-
-/** Promise.race timeout helper that resolves with onTimeout() after ms. */
 function withTimeout(p, ms, onTimeout) {
   let t;
   const timeoutP = new Promise((resolve) => {
@@ -172,7 +182,7 @@ function withTimeout(p, ms, onTimeout) {
 }
 
 // ==============================
-/** PDF Extraction (debug-friendly with retries) */
+// PDF Extraction (debug-friendly with retries)
 // ==============================
 async function extractPdfInfoFromDoc(doc) {
   if (!doc?.url) return { used: false, reason: "no_file" };
@@ -220,8 +230,6 @@ async function extractPdfInfoFromDoc(doc) {
     return { used: false, reason: "http_error", error: String(e).slice(0, 200) };
   }
 }
-
-/** Retry loop for PDFs (gateway warm-up, transient errors) */
 async function waitForPdfInfoFromDoc(doc, { maxMs = 12000, stepMs = 1500 } = {}) {
   const start = Date.now();
   let last = await extractPdfInfoFromDoc(doc);
@@ -254,7 +262,6 @@ async function pinataUploadFile(file) {
   const cid = json.IpfsHash;
   return { cid, url: `https://${PINATA_GATEWAY}/ipfs/${cid}`, size: file.size, name: file.name };
 }
-
 async function pinataUploadJson(data) {
   if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) throw new Error("Pinata not configured");
   const payload = JSON.stringify({ pinataContent: data });
@@ -315,7 +322,6 @@ class BlockchainService {
     return parseFloat(ethers.formatUnits(balance, decimals));
   }
 }
-
 const blockchainService = new BlockchainService();
 
 // ==============================
@@ -357,7 +363,7 @@ const bidSchema = Joi.object({
 });
 
 // ==============================
-// Agent2 helpers (prompt + normalization)
+// Agent2 helpers (bids) — prompt + normalization
 // ==============================
 function buildAgent2Prompt({ bidRow, proposalRow, milestones, pdfInfo, promptOverride }) {
   const contextBlock = `
@@ -555,6 +561,132 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
 }
 
 // ==============================
+// Agent2 helpers (proofs)
+// ==============================
+function buildAgent2ProofPrompt({ proposalRow, bidRow, proofRow, pdfSnippets }) {
+  const proposalPart = proposalRow ? `
+Proposal:
+- Org: ${proposalRow.org_name || ""}
+- Title: ${proposalRow.title || ""}
+- Summary: ${proposalRow.summary || ""}
+- BudgetUSD: ${proposalRow.amount_usd ?? 0}` : "";
+
+  const bidPart = bidRow ? `
+Bid:
+- Vendor: ${bidRow.vendor_name || ""}
+- PriceUSD: ${bidRow.price_usd ?? 0}
+- Days: ${bidRow.days ?? 0}
+- Milestones: ${bidRow.milestones ? JSON.stringify(bidRow.milestones) : "[]"}` : "";
+
+  const proofPart = `
+Proof:
+- Description: ${proofRow?.description || ""}
+- Files: ${proofRow?.files ? JSON.stringify(proofRow.files.map(f => ({name: f.name, url: f.url, type: f.mimetype || ""}))) : "[]"}
+- PDF Extracts (truncated): ${pdfSnippets.length ? JSON.stringify(pdfSnippets.slice(0, 2)) : "[]"}
+`.trim();
+
+  return `
+You are Agent2. Evaluate whether the submitted proof sufficiently demonstrates completion of the claimed work.
+
+Return strict JSON with exactly these keys:
+{
+  "summary": string,
+  "risks": string[],
+  "fit": "low" | "medium" | "high",
+  "milestoneNotes": string[],
+  "confidence": number
+}
+
+Use the following CONTEXT:
+${proposalPart}
+
+${bidPart}
+
+${proofPart}
+`.trim();
+}
+
+function normalizeProofAnalysis(core) {
+  return normalizeAnalysisShape(core);
+}
+
+async function runAgent2OnProof({ proofRow, bidRow, proposalRow }) {
+  if (!openai) {
+    return {
+      status: "error",
+      summary: "OpenAI is not configured.",
+      risks: [],
+      fit: "low",
+      milestoneNotes: [],
+      confidence: 0,
+      pdfUsed: false,
+      pdfChars: 0,
+      pdfSnippet: null,
+      proofDebug: { reason: "openai_missing" },
+    };
+  }
+
+  // Collect PDF text for attached files (if any)
+  const files = Array.isArray(proofRow?.files) ? proofRow.files : [];
+  const pdfs = files.filter(f =>
+    /\.pdf($|\?)/i.test(f?.name || f?.url || "") || (f?.mimetype || "").toLowerCase().includes("pdf")
+  );
+
+  const snippets = [];
+  for (const f of pdfs.slice(0, 2)) { // cap to 2 for speed
+    try {
+      const info = await waitForPdfInfoFromDoc({ url: f.url, name: f.name, mimetype: f.mimetype });
+      if (info?.used) {
+        snippets.push({ name: f.name, snippet: info.snippet, chars: info.chars });
+      }
+    } catch (e) {
+      // ignore individual failures
+    }
+  }
+
+  const prompt = buildAgent2ProofPrompt({
+    proposalRow,
+    bidRow,
+    proofRow,
+    pdfSnippets: snippets.map(s => s.snippet).filter(Boolean)
+  });
+
+  try {
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+    });
+
+    const raw = resp.choices?.[0]?.message?.content || "{}";
+    let core;
+    try { core = JSON.parse(raw); } catch { core = {}; }
+
+    const safe = normalizeProofAnalysis(core);
+    // Annotate debug flags
+    safe.pdfUsed = snippets.length > 0;
+    safe.pdfChars = snippets.reduce((acc, s) => acc + (s.chars || 0), 0);
+    safe.pdfSnippet = snippets[0]?.snippet || null;
+
+    return { status: "ready", ...safe };
+  } catch (e) {
+    return {
+      status: "error",
+      summary: "Agent2 failed to analyze proof.",
+      risks: [],
+      fit: "low",
+      milestoneNotes: [],
+      confidence: 0,
+      pdfUsed: snippets.length > 0,
+      pdfChars: snippets.reduce((acc, s) => acc + (s.chars || 0), 0),
+      pdfSnippet: snippets[0]?.snippet || null,
+      proofDebug: { error: String(e).slice(0, 200) },
+    };
+  }
+}
+
+// ==============================
 // Express app
 // ==============================
 const app = express();
@@ -586,7 +718,7 @@ app.use((req, res, next) => {
 app.use(fileUpload({ limits: { fileSize: 50 * 1024 * 1024 } }));
 
 // ==============================
-// 🔐 Auth / Role (secure, non-breaking defaults)
+// 🔐 Auth / Role
 // ==============================
 const ADMIN_SET = new Set(
   (process.env.ADMIN_ADDRESSES || "")
@@ -621,7 +753,7 @@ app.use((req, _res, next) => {
   next();
 });
 
-// 🔐 Also accept Authorization: Bearer <token>
+// 🔐 Accept Authorization: Bearer <token> too
 app.use((req, _res, next) => {
   if (!req.user) {
     const auth = req.get("authorization") || "";
@@ -653,9 +785,11 @@ function adminGuard(req, res, next) {
   next();
 }
 
-// NEW: Admin OR Bid Owner guard (always enforced for sensitive routes like analyze)
+// Admin-or-owner (BID)
 async function adminOrBidOwnerGuard(req, res, next) {
+  // Admins always allowed
   if (req.user?.role === 'admin') return next();
+  // Must be logged in as vendor
   if (!req.user?.sub) return res.status(401).json({ error: 'Unauthorized' });
 
   const bidId = Number(req.params.id);
@@ -674,6 +808,35 @@ async function adminOrBidOwnerGuard(req, res, next) {
   }
 }
 
+// Admin-or-owner (PROOF)
+async function adminOrProofOwnerGuard(req, res, next) {
+  try {
+    if (req.user?.role === "admin") return next();
+    if (!req.user?.sub) return res.status(401).json({ error: "Unauthorized" });
+
+    const proofId = Number(req.params.id);
+    if (!Number.isFinite(proofId)) return res.status(400).json({ error: "Invalid proof id" });
+
+    const q = `
+      SELECT b.wallet_address
+      FROM proofs p
+      JOIN bids b ON b.bid_id = p.bid_id
+      WHERE p.proof_id = $1
+    `;
+    const { rows } = await pool.query(q, [proofId]);
+    if (!rows[0]) return res.status(404).json({ error: "Proof not found" });
+
+    const owner = (rows[0].wallet_address || "").toLowerCase();
+    if (owner !== (req.user.sub || "").toLowerCase()) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    next();
+  } catch (e) {
+    console.error("adminOrProofOwnerGuard error:", e);
+    res.status(500).json({ error: "Internal error" });
+  }
+}
+
 // --- Auth endpoints ---
 app.post("/auth/nonce", (req, res) => {
   const address = norm(req.body?.address);
@@ -682,8 +845,15 @@ app.post("/auth/nonce", (req, res) => {
   nonces.set(address, nonce);
   res.json({ nonce });
 });
+// Compat GET /auth/nonce?address=0x...
+app.get("/auth/nonce", (req, res) => {
+  const address = norm(req.query.address);
+  if (!address) return res.status(400).json({ error: "address required" });
+  const nonce = `LithiumX login nonce: ${Math.floor(Math.random() * 1e9)}`;
+  nonces.set(address, nonce);
+  res.json({ nonce });
+});
 
-// Cookie-mode verify
 app.post("/auth/verify", async (req, res) => {
   const address = norm(req.body?.address);
   const signature = req.body?.signature;
@@ -703,7 +873,6 @@ app.post("/auth/verify", async (req, res) => {
   const role = isAdminAddress(address) ? "admin" : "vendor";
   const token = signJwt({ sub: address, role });
 
-  // Cross-site cookie (Netlify ↔ Railway): SameSite=None + Secure
   res.cookie("auth_token", token, {
     httpOnly: true,
     secure: true,
@@ -715,16 +884,7 @@ app.post("/auth/verify", async (req, res) => {
   res.json({ address, role });
 });
 
-// Frontend-compat nonce as GET
-app.get("/auth/nonce", (req, res) => {
-  const address = norm(req.query.address);
-  if (!address) return res.status(400).json({ error: "address required" });
-  const nonce = `LithiumX login nonce: ${Math.floor(Math.random() * 1e9)}`;
-  nonces.set(address, nonce);
-  res.json({ nonce });
-});
-
-// Frontend-compat login (returns {token, role} and also sets cookie)
+// Compat POST /auth/login -> { token, role } + cookie
 app.post("/auth/login", async (req, res) => {
   const address = norm(req.body?.address);
   const signature = req.body?.signature;
@@ -828,7 +988,6 @@ app.get("/proposals/:id", async (req, res) => {
   }
 });
 
-// Public: everyone can create proposals
 app.post("/proposals", async (req, res) => {
   try {
     const { error, value } = proposalSchema.validate(req.body);
@@ -859,7 +1018,7 @@ app.post("/proposals", async (req, res) => {
   }
 });
 
-// Admin-only (when ENFORCE_JWT_ADMIN=true)
+// Approve proposal
 app.post("/proposals/:id/approve", adminGuard, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -876,6 +1035,7 @@ app.post("/proposals/:id/approve", adminGuard, async (req, res) => {
   }
 });
 
+// Reject proposal
 app.post("/proposals/:id/reject", adminGuard, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -892,6 +1052,7 @@ app.post("/proposals/:id/reject", adminGuard, async (req, res) => {
   }
 });
 
+// Archive proposal
 app.post("/proposals/:id/archive", adminGuard, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -908,6 +1069,7 @@ app.post("/proposals/:id/archive", adminGuard, async (req, res) => {
   }
 });
 
+// Delete proposal
 app.delete("/proposals/:id", adminGuard, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -931,7 +1093,7 @@ app.get("/bids", async (req, res) => {
   try {
     const pid = Number(req.query.proposalId);
 
-    // Secure scoping when flag ON and caller is not admin
+    // secure scoping when flag ON and caller is not admin
     const role = (req.user?.role || "guest").toLowerCase();
     const caller = (req.user?.sub || "").toLowerCase();
 
@@ -953,7 +1115,7 @@ app.get("/bids", async (req, res) => {
       }
     }
 
-    // Admin or flag OFF: existing behavior
+    // Admin or flag OFF: default behavior
     if (Number.isFinite(pid)) {
       const { rows } = await pool.query("SELECT * FROM bids WHERE proposal_id=$1 ORDER BY bid_id DESC", [ pid ]);
       return res.json(mapRows(rows));
@@ -972,12 +1134,12 @@ app.get("/bids/:id", async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ id ]);
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
-    const bid = rows[0];
 
+    const bid = rows[0];
     const role = (req.user?.role || "guest").toLowerCase();
     const caller = (req.user?.sub || "").toLowerCase();
 
-    // Enforce ownership when scoping is ON and not admin
+    // enforce ownership when flag ON and not admin
     if (SCOPE_BIDS_FOR_VENDOR && role !== "admin") {
       if (!caller) return res.status(401).json({ error: "Unauthorized" });
       if ((bid.wallet_address || "").toLowerCase() !== caller) {
@@ -1085,20 +1247,41 @@ app.post("/bids/:id/reject", adminGuard, async (req, res) => {
   }
 });
 
-app.post("/bids/:id/archive", adminGuard, async (req, res) => {
-  const { id } = req.params;
+// Admin OR Owner (vendor) archiving with safeguards
+app.post("/bids/:id/archive", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+
   try {
-    const { rows } = await pool.query(
-      `UPDATE bids SET status = 'archived'
-       WHERE bid_id = $1
-       RETURNING *`,
-      [id]
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ id ]);
+    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
+    const bid = rows[0];
+
+    const callerRole = (req.user?.role || "guest").toLowerCase();
+    const callerAddr = (req.user?.sub || "").toLowerCase();
+    const ownerAddr = (bid.wallet_address || "").toLowerCase();
+
+    if (callerRole !== "admin") {
+      if (!callerAddr) return res.status(401).json({ error: "Unauthorized" });
+      if (callerAddr !== ownerAddr) return res.status(403).json({ error: "Forbidden" });
+
+      // Vendor owner: allow archive if either not approved OR fully completed
+      const milestones = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
+      const allDone = milestones.length ? milestones.every((m) => m?.completed) : (bid.status === "completed");
+      const allowed = (bid.status !== "approved") || allDone;
+      if (!allowed) {
+        return res.status(403).json({ error: "Forbidden: cannot archive an in-progress approved bid" });
+      }
+    }
+
+    const { rows: updated } = await pool.query(
+      `UPDATE bids SET status='archived' WHERE bid_id=$1 RETURNING *`,
+      [ id ]
     );
-    if (!rows.length) return res.status(404).json({ error: "Bid not found" });
-    res.json(toCamel(rows[0]));
+    return res.json(toCamel(updated[0]));
   } catch (err) {
     console.error("Error archiving bid:", err);
-    res.status(500).json({ error: "Failed to archive bid" });
+    return res.status(500).json({ error: "Failed to archive bid" });
   }
 });
 
@@ -1119,12 +1302,10 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
   }
 });
 
-// Manual analyze/Retry — NOW: admin OR bid owner
+// Manual analyze/Retry — Admin OR Bid Owner
 app.post("/bids/:id/analyze", adminOrBidOwnerGuard, async (req, res) => {
   const bidId = Number(req.params.id);
-  if (!Number.isFinite(bidId)) {
-    return res.status(400).json({ error: "Invalid bid id" });
-  }
+  if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
 
   try {
     // Fetch bid + proposal
@@ -1245,15 +1426,66 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
 });
 
 // ==============================
-// Routes — Proofs
+// Routes — Proofs (with Agent2 analysis)
 // ==============================
 app.post("/proofs", async (req, res) => {
   try {
-    const { bidId, proofCid, description } = req.body;
-    const q = "INSERT INTO proofs (bid_id,proof_cid,description,submitted_at,status) VALUES ($1,$2,$3,NOW(),'pending') RETURNING *";
+    const { bidId, proofCid, description, files } = req.body || {};
+    const q = `
+      INSERT INTO proofs (bid_id,proof_cid,description,submitted_at,status)
+      VALUES ($1,$2,$3,NOW(),'pending')
+      RETURNING *
+    `;
     const { rows } = await pool.query(q, [ bidId, proofCid, description ]);
-    res.json(toCamel(rows[0]));
+    const inserted = rows[0];
+
+    // attach files just for analysis (not persisted here)
+    inserted.files = Array.isArray(files) ? files : [];
+
+    // Fetch bid & proposal for context
+    const { rows: [bidRow] } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    const { rows: [proposalRow] } = bidRow
+      ? await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [bidRow.proposal_id])
+      : { rows: [null] };
+
+    // Inline Agent2 proof analysis (time-boxed)
+    const INLINE_ANALYSIS_DEADLINE_MS = Number(process.env.AGENT2_INLINE_TIMEOUT_MS || 12000);
+    const analysis = await withTimeout(
+      runAgent2OnProof({ proofRow: inserted, bidRow, proposalRow }),
+      INLINE_ANALYSIS_DEADLINE_MS,
+      () => ({
+        status: "error",
+        summary: "Agent2 timed out during proof analysis.",
+        risks: [],
+        fit: "low",
+        milestoneNotes: [],
+        confidence: 0,
+        pdfUsed: false
+      })
+    );
+
+    // Try to save into proofs.ai_analysis
+    try {
+      let saved = false;
+      if (inserted.proof_id != null) {
+        const r = await pool.query("UPDATE proofs SET ai_analysis=$1 WHERE proof_id=$2", [ JSON.stringify(analysis), inserted.proof_id ]);
+        saved = r.rowCount > 0;
+      }
+      if (!saved) {
+        await pool.query(
+          "UPDATE proofs SET ai_analysis=$1 WHERE bid_id=$2 AND submitted_at=$3 AND (proof_cid IS NOT DISTINCT FROM $4)",
+          [ JSON.stringify(analysis), inserted.bid_id, inserted.submitted_at, inserted.proof_cid ]
+        );
+      }
+      inserted.ai_analysis = analysis;
+    } catch (e) {
+      console.warn("[proofs] Could not persist ai_analysis (column/keys missing?):", e.message);
+      inserted.ai_analysis = analysis;
+    }
+
+    res.json(toCamel(inserted));
   } catch (err) {
+    console.error("POST /proofs error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1269,15 +1501,49 @@ app.get("/proofs", adminGuard, async (_req, res) => {
 
 app.get("/proofs/:bidId", adminGuard, async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM proofs WHERE bid_id=$1", [ req.params.bidId ]);
+    const { rows } = await pool.query("SELECT * FROM proofs WHERE bid_id=$1 ORDER BY submitted_at DESC NULLS LAST", [ req.params.bidId ]);
     res.json(mapRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// Manual re-run (admin or proof owner)
+app.post("/proofs/:id/analyze", adminOrProofOwnerGuard, async (req, res) => {
+  const proofId = Number(req.params.id);
+  if (!Number.isFinite(proofId)) return res.status(400).json({ error: "Invalid proof id" });
+
+  try {
+    const { rows: [proof] } = await pool.query("SELECT * FROM proofs WHERE proof_id=$1", [proofId]);
+    if (!proof) return res.status(404).json({ error: "Proof not found" });
+
+    // Provide files optionally from request to enrich context
+    const files = Array.isArray(req.body?.files) ? req.body.files : [];
+    proof.files = files;
+
+    const { rows: [bidRow] } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [proof.bid_id]);
+    const { rows: [proposalRow] } = bidRow
+      ? await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [bidRow.proposal_id])
+      : { rows: [null] };
+
+    const analysis = await runAgent2OnProof({ proofRow: proof, bidRow, proposalRow });
+
+    try {
+      await pool.query("UPDATE proofs SET ai_analysis=$1 WHERE proof_id=$2", [ JSON.stringify(analysis), proofId ]);
+    } catch (e) {
+      console.warn("[proofs] Could not persist ai_analysis (column missing?):", e.message);
+    }
+
+    const { rows: updated } = await pool.query("SELECT * FROM proofs WHERE proof_id=$1", [ proofId ]);
+    res.json(toCamel(updated[0]));
+  } catch (err) {
+    console.error("Analyze proof error:", err);
+    res.status(500).json({ error: "Failed to analyze proof" });
+  }
+});
+
+// Admin actions (stubs remain)
 app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (_req, res) => {
-  // stub status change if you later store per-proof statuses
   res.json({ ok: true });
 });
 app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (_req, res) => {
@@ -1307,7 +1573,7 @@ app.get("/vendor/bids", async (req, res) => {
       return res.json(mapRows(rows));
     }
 
-    // Flag OFF: scope to caller if present; else legacy behavior
+    // Flag OFF: safest default is still to scope to caller if present
     if (caller) {
       const { rows } = await pool.query(
         "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) ORDER BY created_at DESC NULLS LAST, bid_id DESC",
@@ -1316,6 +1582,7 @@ app.get("/vendor/bids", async (req, res) => {
       return res.json(mapRows(rows));
     }
 
+    // If completely unauthenticated and flag OFF, preserve legacy behavior
     const { rows } = await pool.query("SELECT * FROM bids ORDER BY created_at DESC NULLS LAST, bid_id DESC");
     return res.json(mapRows(rows));
   } catch (err) {
@@ -1324,6 +1591,7 @@ app.get("/vendor/bids", async (req, res) => {
 });
 
 app.get("/vendor/payments", async (_req, res) => {
+  // Flatten milestones that have paymentTxHash
   try {
     const { rows } = await pool.query("SELECT * FROM bids");
     const out = [];
