@@ -1133,37 +1133,48 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
 });
 
 // Manual analyze/Retry (admin or bid owner)
-app.post("/bids/:id/analyze", adminOrBidOwnerGuard, async (req, res) => {
-  const bidId = Number(req.params.id);
-  if (!Number.isFinite(bidId)) {
-    return res.status(400).json({ error: "Invalid bid id" });
+// 🔒 Guard: only allow POST/OPTIONS; block/log everything else
+app.all('/bids/:id/analyze', (req, res, next) => {
+  if (req.method === 'POST') return next();
+  if (req.method === 'OPTIONS') {
+    res.set('Allow', 'POST, OPTIONS');
+    return res.sendStatus(204);
   }
+  const ua = req.get('user-agent') || 'unknown';
+  const ref = req.get('referer') || 'none';
+  console.warn(`[UNEXPECTED ${req.method}] /bids/${req.params.id}/analyze  UA="${ua}"  Referer="${ref}"`);
+  res.set('Allow', 'POST, OPTIONS');
+  return res.status(405).json({ error: 'Method Not Allowed. Use POST /bids/:id/analyze.' });
+});
+
+app.post('/bids/:id/analyze', adminOrBidOwnerGuard, async (req, res) => {
+  const bidId = Number(req.params.id);
+  if (!Number.isFinite(bidId)) return res.status(400).json({ error: 'Invalid bid id' });
 
   try {
     // Fetch bid + proposal
-    const { rows: [bid] } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
-    if (!bid) return res.status(404).json({ error: "Bid not found" });
+    const { rows: [bid] } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [bidId]);
+    if (!bid) return res.status(404).json({ error: 'Bid not found' });
 
     const { rows: [proposal] } = await pool.query(
-      "SELECT * FROM proposals WHERE proposal_id=$1",
+      'SELECT * FROM proposals WHERE proposal_id=$1',
       [bid.proposal_id]
     );
-    if (!proposal) return res.status(404).json({ error: "Proposal not found" });
+    if (!proposal) return res.status(404).json({ error: 'Proposal not found' });
 
-    const promptOverride = typeof req.body?.prompt === "string" ? req.body.prompt : "";
-
+    const promptOverride = typeof req.body?.prompt === 'string' ? req.body.prompt : '';
     const analysis = await runAgent2OnBid(bid, proposal, { promptOverride });
 
-    await pool.query(
-      "UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2",
-      [JSON.stringify(analysis), bidId]
-    );
+    await pool.query('UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2', [
+      JSON.stringify(analysis),
+      bidId,
+    ]);
 
-    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    const { rows: updated } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [bidId]);
     return res.json(toCamel(updated[0]));
   } catch (err) {
-    console.error("Analyze error:", err);
-    res.status(500).json({ error: "Failed to analyze bid" });
+    console.error('Analyze error:', err);
+    return res.status(500).json({ error: 'Failed to analyze bid' });
   }
 });
 
