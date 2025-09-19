@@ -1151,7 +1151,7 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
   const bidId = Number(req.params.id);
   if (!Number.isFinite(bidId)) return res.status(400).json({ error: 'Invalid bid id' });
 
-  const userMessages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+  const userMessages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
 
   // SSE headers
   res.set({
@@ -1159,7 +1159,7 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
     'Cache-Control': 'no-cache, no-transform',
     'Connection': 'keep-alive',
   });
-  res.flushHeaders?.();
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
   try {
     const { rows: [bid] } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [bidId]);
@@ -1169,8 +1169,8 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
     if (!proposal) { res.write(`data: ERROR Proposal not found\n\n`); res.write(`data: [DONE]\n\n`); return res.end(); }
 
     const ai = coerceJson(bid.ai_analysis);
-    const context = `
-You are Agent2 for LithiumX.
+    const context =
+`You are Agent2 for LithiumX.
 
 Proposal:
 - Org: ${proposal.org_name || ""}
@@ -1187,14 +1187,13 @@ Bid:
 Existing Analysis:
 ${ai ? JSON.stringify(ai).slice(0, 4000) : "(none)"}
 
-Answer the user's question about this bid/proposal. Keep it concise.
-`.trim();
+Answer the user's question about this bid/proposal. Keep it concise.`;
 
     const msgs = [
       { role: 'system', content: context },
-      ...userMessages.map((m: any) => ({
-        role: m?.role === 'assistant' ? 'assistant' : 'user',
-        content: String(m?.content || ''),
+      ...userMessages.map((m) => ({
+        role: m && m.role === 'assistant' ? 'assistant' : 'user',
+        content: String((m && m.content) || ''),
       })),
     ];
 
@@ -1206,7 +1205,7 @@ Answer the user's question about this bid/proposal. Keep it concise.
     });
 
     for await (const part of stream) {
-      const token = part?.choices?.[0]?.delta?.content || '';
+      const token = part && part.choices && part.choices[0] && part.choices[0].delta && part.choices[0].delta.content || '';
       if (token) res.write(`data: ${token}\n\n`);
     }
     res.write(`data: [DONE]\n\n`);
