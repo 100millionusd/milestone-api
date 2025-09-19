@@ -1133,6 +1133,90 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
 });
 
 // Manual analyze/Retry (admin or bid owner)
+// --- Bid Chat (SSE) ---------------------------------------------------------
+// Allow POST/OPTIONS only
+app.all('/bids/:id/chat', (req, res, next) => {
+  if (req.method === 'POST') return next();
+  if (req.method === 'OPTIONS') {
+    res.set('Allow', 'POST, OPTIONS');
+    return res.sendStatus(204);
+  }
+  res.set('Allow', 'POST, OPTIONS');
+  return res.status(405).json({ error: 'Method Not Allowed. Use POST /bids/:id/chat.' });
+});
+
+app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
+  if (!openai) return res.status(503).json({ error: 'OpenAI not configured' });
+
+  const bidId = Number(req.params.id);
+  if (!Number.isFinite(bidId)) return res.status(400).json({ error: 'Invalid bid id' });
+
+  const userMessages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+
+  // SSE headers
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+  });
+  res.flushHeaders?.();
+
+  try {
+    const { rows: [bid] } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [bidId]);
+    if (!bid) { res.write(`data: ERROR Bid not found\n\n`); res.write(`data: [DONE]\n\n`); return res.end(); }
+
+    const { rows: [proposal] } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
+    if (!proposal) { res.write(`data: ERROR Proposal not found\n\n`); res.write(`data: [DONE]\n\n`); return res.end(); }
+
+    const ai = coerceJson(bid.ai_analysis);
+    const context = `
+You are Agent2 for LithiumX.
+
+Proposal:
+- Org: ${proposal.org_name || ""}
+- Title: ${proposal.title || ""}
+- Summary: ${proposal.summary || ""}
+- BudgetUSD: ${proposal.amount_usd ?? 0}
+
+Bid:
+- Vendor: ${bid.vendor_name || ""}
+- PriceUSD: ${bid.price_usd ?? 0}
+- Days: ${bid.days ?? 0}
+- Notes: ${bid.notes || ""}
+
+Existing Analysis:
+${ai ? JSON.stringify(ai).slice(0, 4000) : "(none)"}
+
+Answer the user's question about this bid/proposal. Keep it concise.
+`.trim();
+
+    const msgs = [
+      { role: 'system', content: context },
+      ...userMessages.map((m: any) => ({
+        role: m?.role === 'assistant' ? 'assistant' : 'user',
+        content: String(m?.content || ''),
+      })),
+    ];
+
+    const stream = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.2,
+      messages: msgs,
+      stream: true,
+    });
+
+    for await (const part of stream) {
+      const token = part?.choices?.[0]?.delta?.content || '';
+      if (token) res.write(`data: ${token}\n\n`);
+    }
+    res.write(`data: [DONE]\n\n`);
+    res.end();
+  } catch (err) {
+    console.error('Chat error:', err);
+    try { res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`); res.write(`data: [DONE]\n\n`); res.end(); } catch {}
+  }
+});
+
 // 🔒 Guard: only allow POST/OPTIONS; block/log everything else
 app.all('/bids/:id/analyze', (req, res, next) => {
   if (req.method === 'POST') return next();
