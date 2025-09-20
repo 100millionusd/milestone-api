@@ -1546,6 +1546,105 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (_req, res) 
   res.json({ ok: true });
 });
 
+// Re-run Agent2 on a single proof (admin only)
+app.all('/proofs/:id/analyze', (req, res, next) => {
+  if (req.method === 'POST') return next();
+  if (req.method === 'OPTIONS') {
+    res.set('Allow', 'POST, OPTIONS');
+    return res.sendStatus(204);
+  }
+  res.set('Allow', 'POST, OPTIONS');
+  return res.status(405).json({ error: 'Method Not Allowed. Use POST /proofs/:id/analyze.' });
+});
+
+app.post('/proofs/:id/analyze', adminGuard, async (req, res) => {
+  const proofId = Number(req.params.id);
+  if (!Number.isFinite(proofId)) return res.status(400).json({ error: 'Invalid proof id' });
+
+  try {
+    // 1) Load proof
+    const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
+    const proof = pr[0];
+    if (!proof) return res.status(404).json({ error: 'Proof not found' });
+
+    // 2) Load bid + proposal for context
+    const { rows: br } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [proof.bid_id]);
+    const bid = br[0];
+    if (!bid) return res.status(404).json({ error: 'Bid not found for proof' });
+
+    const { rows: por } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
+    const proposal = por[0] || null;
+
+    // 3) Build prompt
+    const vendorPrompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
+    const files = Array.isArray(proof.files) ? proof.files : (typeof proof.files === 'string' ? JSON.parse(proof.files || '[]') : []);
+    const description = String(proof.description || '').slice(0, 2000);
+
+    const basePrompt = `
+You are Agent2. Evaluate a vendor's submitted proof for a specific milestone.
+
+Return strict JSON:
+{
+  "summary": string,
+  "evidence": string[],
+  "gaps": string[],
+  "fit": "low" | "medium" | "high",
+  "confidence": number
+}
+
+Context:
+- Proposal: ${proposal?.title || "(unknown)"} (${proposal?.org_name || "(unknown)"})
+- Milestone: ${(Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]"))[proof.milestone_index]?.name || "(unknown)"} — $${(Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]"))[proof.milestone_index]?.amount ?? "?"}
+- Vendor: ${bid.vendor_name || "(unknown)"}
+
+Proof title: ${proof.title || "(untitled)"}
+Proof description (truncated):
+"""${description}"""
+
+Files:
+${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
+    `.trim();
+
+    const fullPrompt = vendorPrompt ? `${vendorPrompt}\n\n---\n${basePrompt}` : basePrompt;
+
+    // 4) Run OpenAI (or fallback)
+    let analysis;
+    if (!openai) {
+      analysis = {
+        summary: "OpenAI not configured; no automatic proof analysis.",
+        evidence: [],
+        gaps: [],
+        fit: "low",
+        confidence: 0,
+      };
+    } else {
+      const resp = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        temperature: 0.2,
+        messages: [{ role: "user", content: fullPrompt }],
+        response_format: { type: "json_object" },
+      });
+
+      try {
+        const raw = resp.choices?.[0]?.message?.content || "{}";
+        analysis = JSON.parse(raw);
+      } catch {
+        analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
+      }
+    }
+
+    // 5) Save & return
+    const { rows: upd } = await pool.query(
+      'UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2 RETURNING *',
+      [JSON.stringify(analysis), proofId]
+    );
+    return res.json(toCamel(upd[0]));
+  } catch (e) {
+    console.error('proof analyze error:', e);
+    return res.status(500).json({ error: 'Failed to analyze proof' });
+  }
+});
+
 // ==============================
 // Routes — Vendor helpers
 // ==============================
