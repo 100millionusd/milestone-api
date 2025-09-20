@@ -1712,6 +1712,40 @@ app.get("/vendor/payments", async (_req, res) => {
 });
 
 // ==============================
+// Routes — Admin helpers
+// ==============================
+app.get('/admin/vendors', adminGuard, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        COALESCE(vendor_name,'') AS vendor_name,
+        COALESCE(wallet_address,'') AS wallet_address,
+        COUNT(*)::int AS bids_count,
+        MAX(created_at) AS last_bid_at,
+        COALESCE(
+          SUM(CASE WHEN status IN ('approved','completed') THEN price_usd ELSE 0 END),
+          0
+        )::numeric AS total_awarded_usd
+      FROM bids
+      GROUP BY vendor_name, wallet_address
+      ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
+    `);
+
+    const out = rows.map(r => ({
+      vendorName: r.vendor_name,
+      walletAddress: r.wallet_address,
+      bidsCount: Number(r.bids_count) || 0,
+      lastBidAt: r.last_bid_at,
+      totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+    }));
+    res.json(out);
+  } catch (e) {
+    console.error('admin/vendors error', e);
+    res.status(500).json({ error: 'Failed to list vendors' });
+  }
+});
+
+// ==============================
 // Routes — Payments (legacy)
 // ==============================
 app.post("/payments/release", adminGuard, async (req, res) => {
