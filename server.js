@@ -1715,29 +1715,92 @@ app.get("/vendor/payments", async (_req, res) => {
 // Routes — Admin helpers
 // ==============================
 app.get('/admin/vendors', adminGuard, async (req, res) => {
+  // Try enriched (joins vendor_profiles). If it fails (table missing), fall back to stats-only.
+  const enrichedSql = `
+    SELECT
+      COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
+      LOWER(b.wallet_address)                                        AS wallet_address,
+      COUNT(*)::int                                                  AS bids_count,
+      MAX(b.created_at)                                              AS last_bid_at,
+      COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
+                        THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd,
+      -- profile fields (may be NULL if no profile row)
+      vp.company_name,
+      vp.contact_name,
+      vp.email,
+      vp.phone,
+      vp.website,
+      vp.address_line1 AS address1,
+      vp.address_line2 AS address2,
+      vp.city,
+      vp.state,
+      vp.postal_code,
+      vp.country,
+      vp.notes
+    FROM bids b
+    LEFT JOIN vendor_profiles vp
+      ON LOWER(vp.wallet_address) = LOWER(b.wallet_address)
+    GROUP BY wallet_address, vp.company_name, vp.contact_name, vp.email, vp.phone, vp.website,
+             vp.address_line1, vp.address_line2, vp.city, vp.state, vp.postal_code, vp.country, vp.notes
+    ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
+  `;
+
+  const statsOnlySql = `
+    SELECT
+      COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
+      LOWER(b.wallet_address)                                        AS wallet_address,
+      COUNT(*)::int                                                  AS bids_count,
+      MAX(b.created_at)                                              AS last_bid_at,
+      COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
+                        THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd,
+      NULL::text  AS company_name,
+      NULL::text  AS contact_name,
+      NULL::text  AS email,
+      NULL::text  AS phone,
+      NULL::text  AS website,
+      NULL::text  AS address1,
+      NULL::text  AS address2,
+      NULL::text  AS city,
+      NULL::text  AS state,
+      NULL::text  AS postal_code,
+      NULL::text  AS country,
+      NULL::text  AS notes
+    FROM bids b
+    GROUP BY wallet_address
+    ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
+  `;
+
   try {
-    const { rows } = await pool.query(`
-      SELECT
-        COALESCE(vendor_name,'') AS vendor_name,
-        COALESCE(wallet_address,'') AS wallet_address,
-        COUNT(*)::int AS bids_count,
-        MAX(created_at) AS last_bid_at,
-        COALESCE(
-          SUM(CASE WHEN status IN ('approved','completed') THEN price_usd ELSE 0 END),
-          0
-        )::numeric AS total_awarded_usd
-      FROM bids
-      GROUP BY vendor_name, wallet_address
-      ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
-    `);
+    let rows;
+    try {
+      // Try enriched (will fail if vendor_profiles table doesn’t exist)
+      rows = (await pool.query(enrichedSql)).rows;
+    } catch {
+      rows = (await pool.query(statsOnlySql)).rows;
+    }
 
     const out = rows.map(r => ({
-      vendorName: r.vendor_name,
-      walletAddress: r.wallet_address,
+      vendorName: r.company_name || r.vendor_name || '',
+      walletAddress: r.wallet_address || '',
       bidsCount: Number(r.bids_count) || 0,
       lastBidAt: r.last_bid_at,
       totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+      profile: {
+        companyName: r.company_name || null,
+        contactName: r.contact_name || null,
+        email: r.email || null,
+        phone: r.phone || null,
+        website: r.website || null,
+        address1: r.address1 || null,
+        address2: r.address2 || null,
+        city: r.city || null,
+        state: r.state || null,
+        postalCode: r.postal_code || null,
+        country: r.country || null,
+        notes: r.notes || null,
+      },
     }));
+
     res.json(out);
   } catch (e) {
     console.error('admin/vendors error', e);
