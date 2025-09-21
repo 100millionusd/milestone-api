@@ -100,7 +100,7 @@ const pool = new Pool({
 });
 
 // ==============================
-// DB bootstrap — vendor_profiles (create if missing)
+/** DB bootstrap — vendor_profiles (create if missing) */
 // ==============================
 (async () => {
   try {
@@ -138,11 +138,7 @@ function toCamel(row) {
   }
   return out;
 }
-
-function mapRows(rows) {
-  return rows.map(toCamel);
-}
-
+function mapRows(rows) { return rows.map(toCamel); }
 function coerceJson(val) {
   if (!val) return null;
   if (typeof val === "string") {
@@ -151,29 +147,7 @@ function coerceJson(val) {
   return val;
 }
 
-// NEW: consistent display string for address column (handles JSON or plain text)
-function formatAddressDisplay(addressCol) {
-  if (!addressCol) return '';
-  if (typeof addressCol === 'object' && addressCol !== null) {
-    const { line1 = '', city = '', postalCode = '', country = '' } = addressCol;
-    return [line1, city, postalCode, country].filter(Boolean).join(', ');
-  }
-  if (typeof addressCol === 'string') {
-    try {
-      const obj = JSON.parse(addressCol);
-      if (obj && typeof obj === 'object') {
-        const { line1 = '', city = '', postalCode = '', country = '' } = obj;
-        return [line1, city, postalCode, country].filter(Boolean).join(', ');
-      }
-    } catch {}
-    return addressCol.trim();
-  }
-  return String(addressCol || '').trim();
-}
-
-/**
- * Perform a generic HTTP(S) request and return { status, body }.
- */
+/** Generic HTTP(S) request returning { status, body } */
 function sendRequest(method, urlStr, headers = {}, body = null) {
   const u = new URL(urlStr);
   const lib = u.protocol === "https:" ? https : http;
@@ -199,9 +173,7 @@ function sendRequest(method, urlStr, headers = {}, body = null) {
   });
 }
 
-/**
- * Fetch a URL into a Buffer (binary).
- */
+/** Fetch a URL into a Buffer */
 async function fetchAsBuffer(urlStr) {
   return new Promise((resolve, reject) => {
     const lib = urlStr.startsWith("https:") ? https : http;
@@ -217,9 +189,7 @@ async function fetchAsBuffer(urlStr) {
   });
 }
 
-/**
- * Promise.race timeout helper that resolves with onTimeout() after ms.
- */
+/** Promise.race timeout helper */
 function withTimeout(p, ms, onTimeout) {
   let t;
   const timeoutP = new Promise((resolve) => {
@@ -233,59 +203,34 @@ function withTimeout(p, ms, onTimeout) {
 // ==============================
 async function extractPdfInfoFromDoc(doc) {
   if (!doc?.url) return { used: false, reason: "no_file" };
-
   const name = doc.name || "";
   const isPdfName = /\.pdf($|\?)/i.test(name);
-
   try {
     const buf = await fetchAsBuffer(doc.url);
     const first5 = buf.slice(0, 5).toString(); // "%PDF-"
     const isPdf = first5 === "%PDF-" || isPdfName || (doc.mimetype || "").toLowerCase().includes("pdf");
-
     if (!isPdf) {
       return { used: false, reason: "not_pdf", bytes: buf.length, first5 };
     }
-
     let text = "";
     try {
       const parsed = await pdfParse(buf);
       text = (parsed.text || "").replace(/\s+/g, " ").trim();
     } catch (e) {
-      return {
-        used: false,
-        reason: "pdf_parse_failed",
-        bytes: buf.length,
-        first5,
-        error: String(e).slice(0, 200),
-      };
+      return { used: false, reason: "pdf_parse_failed", bytes: buf.length, first5, error: String(e).slice(0, 200) };
     }
-
-    if (!text) {
-      return { used: false, reason: "no_text_extracted", bytes: buf.length, first5 };
-    }
-
-    const capped = text.slice(0, 15000); // ~15k chars cap
-    return {
-      used: true,
-      text: capped,
-      snippet: capped.slice(0, 400),
-      chars: capped.length,
-      bytes: buf.length,
-      first5,
-    };
+    if (!text) return { used: false, reason: "no_text_extracted", bytes: buf.length, first5 };
+    const capped = text.slice(0, 15000);
+    return { used: true, text: capped, snippet: capped.slice(0, 400), chars: capped.length, bytes: buf.length, first5 };
   } catch (e) {
     return { used: false, reason: "http_error", error: String(e).slice(0, 200) };
   }
 }
 
-/**
- * Retry loop for PDFs (gateway warm-up, transient errors)
- */
 async function waitForPdfInfoFromDoc(doc, { maxMs = 12000, stepMs = 1500 } = {}) {
   const start = Date.now();
   let last = await extractPdfInfoFromDoc(doc);
   if (!doc?.url || last.reason === "not_pdf" || last.reason === "no_file") return last;
-
   while (!last.used && Date.now() - start < maxMs) {
     if (!["http_error", "no_text_extracted", "pdf_parse_failed"].includes(last.reason || "")) break;
     await new Promise((r) => setTimeout(r, stepMs));
@@ -680,7 +625,7 @@ app.use((req, _res, next) => {
   next();
 });
 
-// 🔐 NEW: Also accept Authorization: Bearer <token>
+// 🔐 Also accept Authorization: Bearer <token>
 app.use((req, _res, next) => {
   if (!req.user) {
     const auth = req.get("authorization") || "";
@@ -712,7 +657,7 @@ function adminGuard(req, res, next) {
   next();
 }
 
-// NEW: Admin or bid owner guard (for /bids/:id/analyze etc.)
+// Admin or bid owner guard (for /bids/:id/analyze/chat)
 async function adminOrBidOwnerGuard(req, res, next) {
   if (req.user?.role === 'admin') return next();
   if (!req.user?.sub) return res.status(401).json({ error: 'Unauthorized' });
@@ -1209,9 +1154,7 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
   }
 });
 
-// Manual analyze/Retry (admin or bid owner)
 // --- Bid Chat (SSE) ---------------------------------------------------------
-// Allow POST/OPTIONS only
 app.all('/bids/:id/chat', (req, res, next) => {
   if (req.method === 'POST') return next();
   if (req.method === 'OPTIONS') {
@@ -1725,7 +1668,6 @@ ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
 // ==============================
 // Routes — Vendor profile (fill once, used in Admin Vendors)
 // ==============================
-// 1) Make schema tolerant (accept string OR object; website any string)
 const profileSchema = Joi.object({
   vendorName: Joi.string().min(2).max(140).required(),
   email: Joi.string().email().allow(''),
@@ -1742,7 +1684,6 @@ const profileSchema = Joi.object({
   website: Joi.string().allow(''),
 });
 
-// 2) GET: return the object shape your UI expects
 app.get('/vendor/profile', authRequired, async (req, res) => {
   try {
     const wallet = String(req.user?.sub || '').toLowerCase();
@@ -1756,6 +1697,7 @@ app.get('/vendor/profile', authRequired, async (req, res) => {
     if (!rows[0]) return res.json(null);
 
     const r = rows[0];
+    // try to parse address as JSON; otherwise treat as single-line
     let parsed = null;
     try { parsed = JSON.parse(r.address || ''); } catch {}
     const address =
@@ -1764,7 +1706,7 @@ app.get('/vendor/profile', authRequired, async (req, res) => {
             line1: parsed.line1 || '',
             city: parsed.city || '',
             country: parsed.country || '',
-            postalCode: parsed.postalCode || '',
+            postalCode: parsed.postalCode || parsed.postal_code || '',
           }
         : {
             line1: r.address || '',
@@ -1787,15 +1729,16 @@ app.get('/vendor/profile', authRequired, async (req, res) => {
   }
 });
 
-// 3) POST: accept object or string; store flat display + JSON when provided
 app.post('/vendor/profile', authRequired, async (req, res) => {
   const wallet = String(req.user?.sub || '').toLowerCase();
   const { error, value } = profileSchema.validate(req.body || {}, { abortEarly: false });
   if (error) return res.status(400).json({ error: error.message });
 
+  // normalize website (add https:// if missing)
   const rawWebsite = (value.website || '').trim();
   const website = rawWebsite && !/^https?:\/\//i.test(rawWebsite) ? `https://${rawWebsite}` : rawWebsite;
 
+  // normalize address: if object, keep JSON + also a flat display line
   let addressText = '';
   let addressJson = null;
 
@@ -1814,6 +1757,7 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
       .join(', ');
   }
 
+  // store address as JSON if object given; otherwise plain text
   const addressToStore = addressJson ? JSON.stringify(addressJson) : addressText;
 
   try {
@@ -1833,6 +1777,7 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
       [wallet, value.vendorName, value.email || null, value.phone || null, addressToStore, website || null]
     );
 
+    // echo back using the same GET shape
     const r = rows[0];
     let parsed = null;
     try { parsed = JSON.parse(r.address || ''); } catch {}
@@ -1842,7 +1787,7 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
             line1: parsed.line1 || '',
             city: parsed.city || '',
             country: parsed.country || '',
-            postalCode: parsed.postalCode || '',
+            postalCode: parsed.postalCode || parsed.postal_code || '',
           }
         : {
             line1: r.address || '',
@@ -1934,11 +1879,12 @@ app.get("/vendor/payments", async (_req, res) => {
 // ==============================
 // Routes — Admin helpers
 // ==============================
-/* ---------- ADMIN: list bids (optional filter by vendor wallet) ----------
-   GET /admin/bids
-   GET /admin/bids?vendorWallet=0xabc...
-   Returns: { items, total, page, pageSize }
-*/
+
+/** ADMIN: list bids (optional filter by vendor wallet)
+ *  GET /admin/bids
+ *  GET /admin/bids?vendorWallet=0xabc...
+ *  Returns: { items, total, page, pageSize }
+ */
 app.get('/admin/bids', adminGuard, async (req, res) => {
   try {
     const vendorWallet = (String(req.query.vendorWallet || '').toLowerCase()) || null;
@@ -1991,20 +1937,9 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
   }
 });
 
-/**
- * GET /admin/vendors
- * Returns array of:
- * {
- *   vendorName, walletAddress, bidsCount, lastBidAt, totalAwardedUSD,
- *   // duplicated top-level contact fields for compatibility:
- *   email, phone, website, address,
- *   // plus nested profile object (preferred by UI):
- *   profile: { companyName, email, phone, website, address1, ... }
- * }
- * Includes vendors with bids AND vendors who only have a profile.
- */
+/** ADMIN: list vendors (with or without bids), include email/address at top-level and inside profile */
 app.get('/admin/vendors', adminGuard, async (req, res) => {
-  const sql = `
+  const enrichedSql = `
     WITH agg AS (
       SELECT
         LOWER(b.wallet_address)                                        AS wallet_address,
@@ -2017,126 +1952,92 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       GROUP BY LOWER(b.wallet_address)
     )
     SELECT
-      COALESCE(a.wallet_address, LOWER(vp.wallet_address)) AS wallet_address,
-      a.vendor_name                                        AS agg_vendor_name,
+      a.vendor_name,
+      a.wallet_address,
       a.bids_count,
       a.last_bid_at,
       a.total_awarded_usd,
-      vp.vendor_name                                       AS profile_vendor_name,
-      vp.email,
-      vp.phone,
-      vp.website,
-      vp.address                                           AS address_raw,
-      vp.updated_at                                        AS profile_updated_at
+      vp.vendor_name AS profile_vendor_name,
+      vp.email       AS email_raw,
+      vp.phone       AS phone_raw,
+      vp.website     AS website_raw,
+      vp.address     AS address_raw
     FROM agg a
-    FULL OUTER JOIN vendor_profiles vp
+    LEFT JOIN vendor_profiles vp
       ON LOWER(vp.wallet_address) = a.wallet_address
-    ORDER BY COALESCE(a.last_bid_at, vp.updated_at) DESC NULLS LAST,
-             COALESCE(vp.vendor_name, a.vendor_name) ASC
+    UNION ALL
+    -- include vendors that have profile but no bids yet
+    SELECT
+      COALESCE(vp.vendor_name,'')          AS vendor_name,
+      LOWER(vp.wallet_address)             AS wallet_address,
+      0                                    AS bids_count,
+      NULL::timestamptz                    AS last_bid_at,
+      0::numeric                           AS total_awarded_usd,
+      vp.vendor_name                       AS profile_vendor_name,
+      vp.email                             AS email_raw,
+      vp.phone                             AS phone_raw,
+      vp.website                           AS website_raw,
+      vp.address                           AS address_raw
+    FROM vendor_profiles vp
+    WHERE NOT EXISTS (
+      SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
+    )
+    ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
   `;
 
   try {
-    const { rows } = await pool.query(sql);
+    const { rows } = await pool.query(enrichedSql);
 
- const out = rows.map(r => {
-  // Make a displayable one-line address even if DB holds JSON
-  const address = (() => {
-    const raw = r.address1 || null;
-    if (!raw) return null;
-    try {
-      const obj = JSON.parse(raw);
-      if (obj && typeof obj === 'object') {
-        const pc = obj.postal_code || obj.postalCode;
-        return [obj.line1, obj.city, pc, obj.country].filter(Boolean).join(', ');
+    const out = rows.map(r => {
+      // parse address (JSON or plain text)
+      let addrObj = null;
+      if (r.address_raw) {
+        try { addrObj = JSON.parse(r.address_raw); } catch { addrObj = null; }
       }
-    } catch {}
-    return raw; // already a string
-  })();
+      const flatAddress = addrObj && typeof addrObj === 'object'
+        ? [addrObj.line1, addrObj.city, addrObj.postalCode || addrObj.postal_code, addrObj.country].filter(Boolean).join(', ')
+        : (r.address_raw || null);
 
-  return {
-    vendorName: r.profile_vendor_name || r.vendor_name || '',
-    walletAddress: r.wallet_address || '',
-    bidsCount: Number(r.bids_count) || 0,
-    lastBidAt: r.last_bid_at,
-    totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+      const email = (r.email_raw || null);
+      const phone = (r.phone_raw || null);
+      const website = (r.website_raw || null);
 
-    // 🔁 top-level fields for UI compatibility
-    email: r.email ?? null,
-    phone: r.phone ?? null,
-    website: r.website ?? null,
-    address,
+      return {
+        vendorName: r.profile_vendor_name || r.vendor_name || '',
+        walletAddress: r.wallet_address || '',
+        bidsCount: Number(r.bids_count) || 0,
+        lastBidAt: r.last_bid_at,
+        totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-    // keep the nested profile shape too
-    profile: {
-      companyName: r.profile_vendor_name ?? null,
-      contactName: null,
-      email: r.email ?? null,
-      phone: r.phone ?? null,
-      website: r.website ?? null,
-      address,                 // <- single-line address used by UI
-      address1: r.address1 ?? null,
-      address2: r.address2 ?? null,
-      city: r.city ?? null,
-      state: r.state ?? null,
-      postalCode: r.postal_code ?? null,
-      country: r.country ?? null,
-      notes: r.notes ?? null,
-    },
-  };
-});
+        // ⬇️ top-level duplicates for frontend variants
+        email,
+        phone,
+        website,
+        address: flatAddress,
+
+        // nested profile object (existing UI reads from here)
+        profile: {
+          companyName: r.profile_vendor_name ?? (r.vendor_name || null),
+          contactName: null,
+          email,
+          phone,
+          website,
+          address: flatAddress,         // plain "address" string for UI label
+          address1: addrObj?.line1 ?? flatAddress ?? null,
+          address2: null,
+          city: addrObj?.city ?? null,
+          state: null,
+          postalCode: (addrObj?.postalCode || addrObj?.postal_code) ?? null,
+          country: addrObj?.country ?? null,
+          notes: null,
+        },
+      };
+    });
 
     res.json(out);
   } catch (e) {
     console.error('admin/vendors error', e);
     res.status(500).json({ error: 'Failed to list vendors' });
-  }
-});
-
-// (Bonus) Admin can fetch a single vendor profile by wallet (useful if UI needs it)
-app.get('/admin/vendor/profile/:wallet', adminGuard, async (req, res) => {
-  try {
-    const wallet = String(req.params.wallet || '').toLowerCase();
-    if (!wallet) return res.status(400).json({ error: 'wallet required' });
-
-    const { rows } = await pool.query(
-      `SELECT wallet_address, vendor_name, email, phone, address, website, updated_at
-       FROM vendor_profiles
-       WHERE LOWER(wallet_address)=LOWER($1)`,
-      [wallet]
-    );
-
-    if (!rows[0]) return res.status(404).json({ error: 'not found' });
-
-    const r = rows[0];
-    let parsed = null;
-    try { parsed = JSON.parse(r.address || ''); } catch {}
-    const address =
-      parsed && typeof parsed === 'object'
-        ? {
-            line1: parsed.line1 || '',
-            city: parsed.city || '',
-            country: parsed.country || '',
-            postalCode: parsed.postalCode || '',
-          }
-        : {
-            line1: r.address || '',
-            city: '',
-            country: '',
-            postalCode: '',
-          };
-
-    res.json({
-      walletAddress: r.wallet_address,
-      vendorName: r.vendor_name || '',
-      email: r.email || '',
-      phone: r.phone || '',
-      website: r.website || '',
-      address,
-      updatedAt: r.updated_at,
-    });
-  } catch (e) {
-    console.error('GET /admin/vendor/profile/:wallet error:', e);
-    res.status(500).json({ error: 'Failed to load vendor profile' });
   }
 });
 
