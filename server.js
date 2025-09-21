@@ -1922,14 +1922,12 @@ app.get("/vendor/payments", async (_req, res) => {
 // ==============================
 // Routes — Admin helpers
 // ==============================
-/**
- * GET /admin/vendors
- * Returns array of:
- * {
- *   vendorName, walletAddress, bidsCount, lastBidAt, totalAwardedUSD,
- *   profile: { email, phone, address, website }
- * }
- */
+
+/* ---------- ADMIN: list bids (optional filter by vendor wallet) ----------
+   GET /admin/bids
+   GET /admin/bids?vendorWallet=0xabc...
+   Returns: { items, total, page, pageSize }
+*/
 app.get('/admin/bids', adminGuard, async (req, res) => {
   try {
     const vendorWallet = (String(req.query.vendorWallet || '').toLowerCase()) || null;
@@ -1982,13 +1980,17 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
   }
 });
 
-/* ---------- ADMIN: list bids (optional filter by vendor wallet) ----------
-   GET /admin/bids
-   GET /admin/bids?vendorWallet=0xabc...
-   Returns: { items, total, page, pageSize }
-*/
+/**
+ * ---------- ADMIN: Vendors (show even vendors with 0 bids) ----------
+ * GET /admin/vendors
+ * Returns array of:
+ * {
+ *   vendorName, walletAddress, bidsCount, lastBidAt, totalAwardedUSD,
+ *   profile: { companyName, email, phone, website, address1, address2, city, state, postalCode, country, notes }
+ * }
+ */
 app.get('/admin/vendors', adminGuard, async (req, res) => {
-  const enrichedSql = `
+  const sql = `
     WITH agg AS (
       SELECT
         LOWER(b.wallet_address)                                        AS wallet_address,
@@ -2001,71 +2003,58 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       GROUP BY LOWER(b.wallet_address)
     )
     SELECT
-      a.vendor_name,
-      a.wallet_address,
-      a.bids_count,
-      a.last_bid_at,
-      a.total_awarded_usd,
-      vp.vendor_name AS profile_vendor_name,
-      vp.email,
-      vp.phone,
-      vp.website,
-      vp.address AS address1,
-      NULL::text AS address2,
-      NULL::text AS city,
-      NULL::text AS state,
-      NULL::text AS postal_code,
-      NULL::text AS country,
-      NULL::text AS notes
-    FROM agg a
-    LEFT JOIN vendor_profiles vp
+      COALESCE(LOWER(vp.wallet_address), a.wallet_address) AS wallet_address,
+      COALESCE(vp.vendor_name, a.vendor_name, '')          AS vendor_name,
+      COALESCE(a.bids_count, 0)                            AS bids_count,
+      a.last_bid_at                                        AS last_bid_at,
+      COALESCE(a.total_awarded_usd, 0)                     AS total_awarded_usd,
+      vp.email, vp.phone, vp.website, vp.address
+    FROM vendor_profiles vp
+    FULL OUTER JOIN agg a
       ON LOWER(vp.wallet_address) = a.wallet_address
-    ORDER BY a.last_bid_at DESC NULLS LAST, a.vendor_name ASC
-  `;
-
-  const statsOnlySql = `
-    SELECT
-      COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
-      LOWER(b.wallet_address)                                        AS wallet_address,
-      COUNT(*)::int                                                  AS bids_count,
-      MAX(b.created_at)                                              AS last_bid_at,
-      COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
-                        THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd
-    FROM bids b
-    GROUP BY LOWER(b.wallet_address)
     ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
   `;
 
   try {
-    let rows;
-    try {
-      rows = (await pool.query(enrichedSql)).rows;
-    } catch (e) {
-      console.warn('[admin/vendors] enriched query failed, falling back:', String(e).slice(0,200));
-      rows = (await pool.query(statsOnlySql)).rows;
-    }
+    const { rows } = await pool.query(sql);
 
-    const out = rows.map(r => ({
-      vendorName: r.profile_vendor_name || r.vendor_name || '',
-      walletAddress: r.wallet_address || '',
-      bidsCount: Number(r.bids_count) || 0,
-      lastBidAt: r.last_bid_at,
-      totalAwardedUSD: Number(r.total_awarded_usd) || 0,
-      profile: {
-        companyName: r.profile_vendor_name ?? null, // keep shape expected by UI
-        contactName: null,
-        email: r.email ?? null,
-        phone: r.phone ?? null,
-        website: r.website ?? null,
-        address1: r.address1 ?? null,
-        address2: r.address2 ?? null,
-        city: r.city ?? null,
-        state: r.state ?? null,
-        postalCode: r.postal_code ?? null,
-        country: r.country ?? null,
-        notes: r.notes ?? null,
-      },
-    }));
+    const out = rows.map(r => {
+      // Parse address if JSON; otherwise treat as single line
+      let addr = null;
+      if (typeof r.address === 'string' && r.address.trim()) {
+        try { addr = JSON.parse(r.address); } catch { addr = null; }
+      }
+      const address1 = addr && typeof addr === 'object'
+        ? (addr.line1 || '')
+        : (r.address || null);
+
+      const city       = addr && typeof addr === 'object' ? (addr.city || null)       : null;
+      const state      = addr && typeof addr === 'object' ? (addr.state || null)      : null;
+      const postalCode = addr && typeof addr === 'object' ? (addr.postalCode || null) : null;
+      const country    = addr && typeof addr === 'object' ? (addr.country || null)    : null;
+
+      return {
+        vendorName: r.vendor_name || '',
+        walletAddress: r.wallet_address || '',
+        bidsCount: Number(r.bids_count) || 0,
+        lastBidAt: r.last_bid_at || null,
+        totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+        profile: {
+          companyName: r.vendor_name || null,
+          contactName: null,
+          email: r.email ?? null,
+          phone: r.phone ?? null,
+          website: r.website ?? null,
+          address1: address1,
+          address2: null,
+          city,
+          state,
+          postalCode,
+          country,
+          notes: null,
+        },
+      };
+    });
 
     res.json(out);
   } catch (e) {
