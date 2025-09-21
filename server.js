@@ -1834,12 +1834,12 @@ app.get("/vendor/payments", async (_req, res) => {
  *   profile: { email, phone, address, website }
  * }
  */
-app.get('/admin/vendors', adminGuard, async (_req, res) => {
-  const sql = `
+app.get('/admin/vendors', adminGuard, async (req, res) => {
+  const enrichedSql = `
     WITH agg AS (
       SELECT
         LOWER(b.wallet_address)                                        AS wallet_address,
-        COALESCE(MAX(b.vendor_name),'')                                AS vendor_name_from_bids,
+        COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
         COUNT(*)::int                                                  AS bids_count,
         MAX(b.created_at)                                              AS last_bid_at,
         COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
@@ -1849,36 +1849,65 @@ app.get('/admin/vendors', adminGuard, async (_req, res) => {
     )
     SELECT
       a.wallet_address,
-      a.vendor_name_from_bids,
+      a.vendor_name                           AS agg_vendor_name,
       a.bids_count,
       a.last_bid_at,
       a.total_awarded_usd,
-      vp.vendor_name  AS profile_vendor_name,
+      vp.vendor_name                          AS profile_vendor_name,
       vp.email,
       vp.phone,
-      vp.address,
-      vp.website
+      vp.website,
+      vp.address                              AS address1
     FROM agg a
     LEFT JOIN vendor_profiles vp
       ON LOWER(vp.wallet_address) = a.wallet_address
-    ORDER BY a.last_bid_at DESC NULLS LAST, a.vendor_name_from_bids ASC
+    ORDER BY a.last_bid_at DESC NULLS LAST, COALESCE(vp.vendor_name, a.vendor_name) ASC
+  `;
+
+  const statsOnlySql = `
+    SELECT
+      LOWER(b.wallet_address)                                        AS wallet_address,
+      COALESCE(MAX(b.vendor_name),'')                                AS agg_vendor_name,
+      COUNT(*)::int                                                  AS bids_count,
+      MAX(b.created_at)                                              AS last_bid_at,
+      COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
+                        THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd
+    FROM bids b
+    GROUP BY LOWER(b.wallet_address)
+    ORDER BY last_bid_at DESC NULLS LAST, agg_vendor_name ASC
   `;
 
   try {
-    const { rows } = await pool.query(sql);
+    let rows;
+    try {
+      rows = (await pool.query(enrichedSql)).rows;
+    } catch (e) {
+      console.warn('[admin/vendors] enriched query failed, falling back:', String(e).slice(0,200));
+      rows = (await pool.query(statsOnlySql)).rows;
+    }
+
     const out = rows.map(r => ({
-      vendorName: r.profile_vendor_name || r.vendor_name_from_bids || '',
+      vendorName: r.profile_vendor_name || r.agg_vendor_name || '',
       walletAddress: r.wallet_address || '',
       bidsCount: Number(r.bids_count) || 0,
-      lastBidAt: r.last_bid_at,
+      lastBidAt: r.last_bid_at || null,
       totalAwardedUSD: Number(r.total_awarded_usd) || 0,
       profile: {
+        companyName: r.profile_vendor_name ?? null, // keep UI shape
+        contactName: null,
         email: r.email ?? null,
         phone: r.phone ?? null,
-        address: r.address ?? null,
         website: r.website ?? null,
+        address1: r.address1 ?? null,
+        address2: null,
+        city: null,
+        state: null,
+        postalCode: null,
+        country: null,
+        notes: null,
       },
     }));
+
     res.json(out);
   } catch (e) {
     console.error('admin/vendors error', e);
