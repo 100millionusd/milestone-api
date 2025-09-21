@@ -1923,11 +1923,7 @@ app.get("/vendor/payments", async (_req, res) => {
 // Routes — Admin helpers
 // ==============================
 
-/* ---------- ADMIN: list bids (optional filter by vendor wallet) ----------
-   GET /admin/bids
-   GET /admin/bids?vendorWallet=0xabc...
-   Returns: { items, total, page, pageSize }
-*/
+// ---------- ADMIN: list bids (optional filter by vendor wallet) ----------
 app.get('/admin/bids', adminGuard, async (req, res) => {
   try {
     const vendorWallet = (String(req.query.vendorWallet || '').toLowerCase()) || null;
@@ -1980,77 +1976,103 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
   }
 });
 
-/**
- * ---------- ADMIN: Vendors (show even vendors with 0 bids) ----------
- * GET /admin/vendors
- * Returns array of:
- * {
- *   vendorName, walletAddress, bidsCount, lastBidAt, totalAwardedUSD,
- *   profile: { companyName, email, phone, website, address1, address2, city, state, postalCode, country, notes }
- * }
- */
+// ---------- ADMIN: vendors list (shows profile details; includes zero-bid vendors) ----------
 app.get('/admin/vendors', adminGuard, async (req, res) => {
   const sql = `
-    WITH agg AS (
+    WITH wallets AS (
+      SELECT LOWER(wallet_address) AS wallet_address FROM vendor_profiles
+      UNION
+      SELECT LOWER(wallet_address) AS wallet_address FROM bids
+    ),
+    agg AS (
       SELECT
-        LOWER(b.wallet_address)                                        AS wallet_address,
-        COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
-        COUNT(*)::int                                                  AS bids_count,
-        MAX(b.created_at)                                              AS last_bid_at,
+        LOWER(b.wallet_address)                                    AS wallet_address,
+        COALESCE(MAX(b.vendor_name),'')                            AS vendor_name,
+        COUNT(*)::int                                              AS bids_count,
+        MAX(b.created_at)                                          AS last_bid_at,
         COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
-                          THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd
+                          THEN b.price_usd ELSE 0 END),0)::numeric AS total_awarded_usd
       FROM bids b
       GROUP BY LOWER(b.wallet_address)
     )
     SELECT
-      COALESCE(LOWER(vp.wallet_address), a.wallet_address) AS wallet_address,
-      COALESCE(vp.vendor_name, a.vendor_name, '')          AS vendor_name,
-      COALESCE(a.bids_count, 0)                            AS bids_count,
-      a.last_bid_at                                        AS last_bid_at,
-      COALESCE(a.total_awarded_usd, 0)                     AS total_awarded_usd,
-      vp.email, vp.phone, vp.website, vp.address
-    FROM vendor_profiles vp
-    FULL OUTER JOIN agg a
-      ON LOWER(vp.wallet_address) = a.wallet_address
-    ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
+      w.wallet_address,
+      a.vendor_name            AS agg_vendor_name,
+      a.bids_count,
+      a.last_bid_at,
+      a.total_awarded_usd,
+      vp.vendor_name           AS profile_vendor_name,
+      vp.email,
+      vp.phone,
+      vp.website,
+      vp.address               AS address_raw
+    FROM wallets w
+    LEFT JOIN agg a
+      ON a.wallet_address = w.wallet_address
+    LEFT JOIN vendor_profiles vp
+      ON LOWER(vp.wallet_address) = w.wallet_address
+    ORDER BY a.last_bid_at DESC NULLS LAST,
+             COALESCE(vp.vendor_name, a.vendor_name, w.wallet_address) ASC
   `;
 
   try {
     const { rows } = await pool.query(sql);
 
     const out = rows.map(r => {
-      // Parse address if JSON; otherwise treat as single line
-      let addr = null;
-      if (typeof r.address === 'string' && r.address.trim()) {
-        try { addr = JSON.parse(r.address); } catch { addr = null; }
+      // address: maybe JSON string, maybe plain text, maybe null
+      let aObj = null;
+      let displayAddress = null;
+      if (r.address_raw) {
+        const s = String(r.address_raw || '').trim();
+        if (s.startsWith('{')) {
+          try { aObj = JSON.parse(s); } catch {}
+        }
+        if (aObj && typeof aObj === 'object') {
+          displayAddress = [aObj.line1 || '', aObj.city || '', aObj.postalCode || '', aObj.country || '']
+            .filter(Boolean).join(', ') || null;
+        } else {
+          displayAddress = s || null;
+        }
       }
-      const address1 = addr && typeof addr === 'object'
-        ? (addr.line1 || '')
-        : (r.address || null);
 
-      const city       = addr && typeof addr === 'object' ? (addr.city || null)       : null;
-      const state      = addr && typeof addr === 'object' ? (addr.state || null)      : null;
-      const postalCode = addr && typeof addr === 'object' ? (addr.postalCode || null) : null;
-      const country    = addr && typeof addr === 'object' ? (addr.country || null)    : null;
+      const vendorName = r.profile_vendor_name || r.agg_vendor_name || '';
+      const walletAddress = r.wallet_address || '';
 
       return {
-        vendorName: r.vendor_name || '',
-        walletAddress: r.wallet_address || '',
+        vendorName,
+        walletAddress,
         bidsCount: Number(r.bids_count) || 0,
         lastBidAt: r.last_bid_at || null,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+
+        // convenience top-level fields (some UIs read these directly)
+        email: r.email ?? null,
+        phone: r.phone ?? null,
+        website: r.website ?? null,
+        address1: displayAddress,
+        city: aObj?.city ?? null,
+        postalCode: aObj?.postalCode ?? null,
+        country: aObj?.country ?? null,
+        address: aObj ? {
+          line1: aObj.line1 || null,
+          city: aObj.city || null,
+          postalCode: aObj.postalCode || null,
+          country: aObj.country || null,
+        } : (displayAddress ? { line1: displayAddress, city: null, postalCode: null, country: null } : null),
+
+        // legacy/expected nested structure
         profile: {
-          companyName: r.vendor_name || null,
+          companyName: r.profile_vendor_name ?? vendorName ?? null,
           contactName: null,
           email: r.email ?? null,
           phone: r.phone ?? null,
           website: r.website ?? null,
-          address1: address1,
+          address1: displayAddress,
           address2: null,
-          city,
-          state,
-          postalCode,
-          country,
+          city: aObj?.city ?? null,
+          state: null,
+          postalCode: aObj?.postalCode ?? null,
+          country: aObj?.country ?? null,
           notes: null,
         },
       };
@@ -2058,7 +2080,7 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
 
     res.json(out);
   } catch (e) {
-    console.error('admin/vendors error', e);
+    console.error('GET /admin/vendors error:', e);
     res.status(500).json({ error: 'Failed to list vendors' });
   }
 });
