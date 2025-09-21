@@ -1989,50 +1989,58 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
     const { rows } = await pool.query(enrichedSql);
 
     const out = rows.map(r => {
-      // parse address (JSON or plain text)
-      let addrObj = null;
-      if (r.address_raw) {
-        try { addrObj = JSON.parse(r.address_raw); } catch { addrObj = null; }
-      }
-      const flatAddress = addrObj && typeof addrObj === 'object'
-        ? [addrObj.line1, addrObj.city, addrObj.postalCode || addrObj.postal_code, addrObj.country].filter(Boolean).join(', ')
-        : (r.address_raw || null);
+  // address can be JSON or plain text
+  let addrObj = null;
+  if (r.address_raw) {
+    try { addrObj = JSON.parse(r.address_raw); } catch { addrObj = null; }
+  }
+  const flatAddress = addrObj && typeof addrObj === 'object'
+    ? [addrObj.line1, addrObj.city, addrObj.postalCode || addrObj.postal_code, addrObj.country]
+        .filter(Boolean).join(', ')
+    : (r.address_raw || null);
 
-      const email = (r.email_raw || null);
-      const phone = (r.phone_raw || null);
-      const website = (r.website_raw || null);
+  const email   = r.email_raw   || null;
+  const phone   = r.phone_raw   || null;
+  const website = r.website_raw || null;
 
-      return {
-        vendorName: r.profile_vendor_name || r.vendor_name || '',
-        walletAddress: r.wallet_address || '',
-        bidsCount: Number(r.bids_count) || 0,
-        lastBidAt: r.last_bid_at,
-        totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+  return {
+    vendorName: r.profile_vendor_name || r.vendor_name || '',
+    walletAddress: r.wallet_address || '',
+    bidsCount: Number(r.bids_count) || 0,
+    lastBidAt: r.last_bid_at,
+    totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // ⬇️ top-level duplicates for frontend variants
-        email,
-        phone,
-        website,
-        address: flatAddress,
+    // ---- Top-level fields (multiple aliases so UI always finds them)
+    email,
+    contact: email,                 // alias
+    contactEmail: email,            // alias (some UIs use this)
+    phone,
+    website,
+    address: flatAddress,           // alias
+    address1: flatAddress,          // alias
+    addressLine1: flatAddress,      // alias
 
-        // nested profile object (existing UI reads from here)
-        profile: {
-          companyName: r.profile_vendor_name ?? (r.vendor_name || null),
-          contactName: null,
-          email,
-          phone,
-          website,
-          address: flatAddress,         // plain "address" string for UI label
-          address1: addrObj?.line1 ?? flatAddress ?? null,
-          address2: null,
-          city: addrObj?.city ?? null,
-          state: null,
-          postalCode: (addrObj?.postalCode || addrObj?.postal_code) ?? null,
-          country: addrObj?.country ?? null,
-          notes: null,
-        },
-      };
-    });
+    // ---- Nested profile (also with aliases)
+    profile: {
+      companyName: r.profile_vendor_name ?? (r.vendor_name || null),
+      contactName: null,
+      email,                        // profile.email
+      contact: email,               // profile.contact
+      contactEmail: email,          // profile.contactEmail
+      phone,
+      website,
+      address: flatAddress,         // plain string for display
+      address1: addrObj?.line1 ?? flatAddress ?? null,
+      addressLine1: addrObj?.line1 ?? flatAddress ?? null,
+      address2: null,
+      city: addrObj?.city ?? null,
+      state: null,
+      postalCode: (addrObj?.postalCode || addrObj?.postal_code) ?? null,
+      country: addrObj?.country ?? null,
+      notes: null,
+    },
+  };
+});
 
     res.json(out);
   } catch (e) {
