@@ -1834,84 +1834,55 @@ app.get("/vendor/payments", async (_req, res) => {
  *   profile: { email, phone, address, website }
  * }
  */
-app.get('/admin/vendors', adminGuard, async (req, res) => {
-  const enrichedSql = `
-    WITH agg AS (
-      SELECT
-        LOWER(b.wallet_address)                                        AS wallet_address,
-        COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
-        COUNT(*)::int                                                  AS bids_count,
-        MAX(b.created_at)                                              AS last_bid_at,
-        COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
-                          THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd
-      FROM bids b
-      GROUP BY LOWER(b.wallet_address)
-    )
-    SELECT
-      a.wallet_address,
-      a.vendor_name                           AS agg_vendor_name,
-      a.bids_count,
-      a.last_bid_at,
-      a.total_awarded_usd,
-      vp.vendor_name                          AS profile_vendor_name,
-      vp.email,
-      vp.phone,
-      vp.website,
-      vp.address                              AS address1
-    FROM agg a
-    LEFT JOIN vendor_profiles vp
-      ON LOWER(vp.wallet_address) = a.wallet_address
-    ORDER BY a.last_bid_at DESC NULLS LAST, COALESCE(vp.vendor_name, a.vendor_name) ASC
-  `;
-
-  const statsOnlySql = `
-    SELECT
-      LOWER(b.wallet_address)                                        AS wallet_address,
-      COALESCE(MAX(b.vendor_name),'')                                AS agg_vendor_name,
-      COUNT(*)::int                                                  AS bids_count,
-      MAX(b.created_at)                                              AS last_bid_at,
-      COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
-                        THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd
-    FROM bids b
-    GROUP BY LOWER(b.wallet_address)
-    ORDER BY last_bid_at DESC NULLS LAST, agg_vendor_name ASC
-  `;
-
+app.get('/admin/bids', adminGuard, async (req, res) => {
   try {
-    let rows;
-    try {
-      rows = (await pool.query(enrichedSql)).rows;
-    } catch (e) {
-      console.warn('[admin/vendors] enriched query failed, falling back:', String(e).slice(0,200));
-      rows = (await pool.query(statsOnlySql)).rows;
-    }
+    const vendorWallet = (String(req.query.vendorWallet || '').toLowerCase()) || null;
+    const page  = Math.max(1, parseInt(String(req.query.page ?? '1'), 10));
+    const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? '100'), 10)));
+    const offset = (page - 1) * limit;
 
-    const out = rows.map(r => ({
-      vendorName: r.profile_vendor_name || r.agg_vendor_name || '',
-      walletAddress: r.wallet_address || '',
-      bidsCount: Number(r.bids_count) || 0,
-      lastBidAt: r.last_bid_at || null,
-      totalAwardedUSD: Number(r.total_awarded_usd) || 0,
-      profile: {
-        companyName: r.profile_vendor_name ?? null, // keep UI shape
-        contactName: null,
-        email: r.email ?? null,
-        phone: r.phone ?? null,
-        website: r.website ?? null,
-        address1: r.address1 ?? null,
-        address2: null,
-        city: null,
-        state: null,
-        postalCode: null,
-        country: null,
-        notes: null,
-      },
+    const listSql = `
+      SELECT
+        b.bid_id,
+        b.proposal_id,
+        LOWER(b.wallet_address) AS vendor_wallet,
+        b.vendor_name,
+        b.price_usd,
+        b.status,
+        b.created_at,
+        COALESCE(p.title, 'Untitled Project') AS project_title
+      FROM bids b
+      LEFT JOIN proposals p ON p.proposal_id = b.proposal_id
+      WHERE ($1::text IS NULL OR LOWER(b.wallet_address) = $1)
+      ORDER BY b.created_at DESC NULLS LAST, b.bid_id DESC
+      LIMIT $2 OFFSET $3
+    `;
+    const countSql = `
+      SELECT COUNT(*)::int AS cnt
+      FROM bids b
+      WHERE ($1::text IS NULL OR LOWER(b.wallet_address) = $1)
+    `;
+
+    const [list, count] = await Promise.all([
+      pool.query(listSql, [vendorWallet, limit, offset]),
+      pool.query(countSql, [vendorWallet]),
+    ]);
+
+    const items = list.rows.map(r => ({
+      id: r.bid_id,
+      projectId: r.proposal_id,
+      projectTitle: r.project_title,
+      vendorWallet: r.vendor_wallet,
+      vendorName: r.vendor_name,
+      amountUSD: r.price_usd,
+      status: r.status,
+      createdAt: new Date(r.created_at).toISOString(),
     }));
 
-    res.json(out);
+    res.json({ items, total: count.rows[0].cnt, page, pageSize: limit });
   } catch (e) {
-    console.error('admin/vendors error', e);
-    res.status(500).json({ error: 'Failed to list vendors' });
+    console.error('GET /admin/bids error:', e);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
