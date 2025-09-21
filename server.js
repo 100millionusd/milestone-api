@@ -2038,40 +2038,52 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
   try {
     const { rows } = await pool.query(sql);
 
-    const out = rows.map(r => {
-      const vendorName = r.profile_vendor_name || r.agg_vendor_name || '';
-      const addrDisplay = formatAddressDisplay(r.address_raw);
+ const out = rows.map(r => {
+  // Make a displayable one-line address even if DB holds JSON
+  const address = (() => {
+    const raw = r.address1 || null;
+    if (!raw) return null;
+    try {
+      const obj = JSON.parse(raw);
+      if (obj && typeof obj === 'object') {
+        const pc = obj.postal_code || obj.postalCode;
+        return [obj.line1, obj.city, pc, obj.country].filter(Boolean).join(', ');
+      }
+    } catch {}
+    return raw; // already a string
+  })();
 
-      return {
-        vendorName,
-        walletAddress: r.wallet_address || '',
-        bidsCount: Number(r.bids_count) || 0,
-        lastBidAt: r.last_bid_at || r.profile_updated_at || null,
-        totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+  return {
+    vendorName: r.profile_vendor_name || r.vendor_name || '',
+    walletAddress: r.wallet_address || '',
+    bidsCount: Number(r.bids_count) || 0,
+    lastBidAt: r.last_bid_at,
+    totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // duplicate top-level contact fields for compatibility with older UI
-        email: r.email ?? null,
-        phone: r.phone ?? null,
-        website: r.website ?? null,
-        address: addrDisplay || null,
+    // 🔁 top-level fields for UI compatibility
+    email: r.email ?? null,
+    phone: r.phone ?? null,
+    website: r.website ?? null,
+    address,
 
-        // structured profile (preferred by newer UI)
-        profile: {
-          companyName: vendorName || null,
-          contactName: null,
-          email: r.email ?? null,
-          phone: r.phone ?? null,
-          website: r.website ?? null,
-          address1: addrDisplay || null,
-          address2: null,
-          city: null,
-          state: null,
-          postalCode: null,
-          country: null,
-          notes: null,
-        },
-      };
-    });
+    // keep the nested profile shape too
+    profile: {
+      companyName: r.profile_vendor_name ?? null,
+      contactName: null,
+      email: r.email ?? null,
+      phone: r.phone ?? null,
+      website: r.website ?? null,
+      address,                 // <- single-line address used by UI
+      address1: r.address1 ?? null,
+      address2: r.address2 ?? null,
+      city: r.city ?? null,
+      state: r.state ?? null,
+      postalCode: r.postal_code ?? null,
+      country: r.country ?? null,
+      notes: r.notes ?? null,
+    },
+  };
+});
 
     res.json(out);
   } catch (e) {
