@@ -749,6 +749,21 @@ app.post("/auth/verify", async (req, res) => {
     maxAge: 7 * 24 * 3600 * 1000,
   });
 
+  // ⬇️ Auto-seed vendor_profiles row (non-fatal if it fails)
+  try {
+    const w = (address || '').toLowerCase();
+    if (w) {
+      await pool.query(
+        `INSERT INTO vendor_profiles (wallet_address, vendor_name, created_at, updated_at)
+         VALUES ($1, $2, NOW(), NOW())
+         ON CONFLICT (wallet_address) DO NOTHING`,
+        [w, '']
+      );
+    }
+  } catch (e) {
+    console.warn('profile auto-seed failed (non-fatal):', String(e).slice(0,200));
+  }
+
   nonces.delete(address);
   res.json({ address, role });
 });
@@ -786,6 +801,21 @@ app.post("/auth/login", async (req, res) => {
     sameSite: "none",
     maxAge: 7 * 24 * 3600 * 1000,
   });
+
+  // ⬇️ Auto-seed vendor_profiles row (non-fatal if it fails)
+  try {
+    const w = (address || '').toLowerCase();
+    if (w) {
+      await pool.query(
+        `INSERT INTO vendor_profiles (wallet_address, vendor_name, created_at, updated_at)
+         VALUES ($1, $2, NOW(), NOW())
+         ON CONFLICT (wallet_address) DO NOTHING`,
+        [w, '']
+      );
+    }
+  } catch (e) {
+    console.warn('profile auto-seed failed (non-fatal):', String(e).slice(0,200));
+  }
 
   nonces.delete(address);
   res.json({ token, role });
@@ -1796,13 +1826,20 @@ app.get("/vendor/payments", async (_req, res) => {
 // ==============================
 // Routes — Admin helpers
 // ==============================
-app.get('/admin/vendors', adminGuard, async (req, res) => {
-  // Aggregate first, then join profile
-  const enrichedSql = `
+/**
+ * GET /admin/vendors
+ * Returns array of:
+ * {
+ *   vendorName, walletAddress, bidsCount, lastBidAt, totalAwardedUSD,
+ *   profile: { email, phone, address, website }
+ * }
+ */
+app.get('/admin/vendors', adminGuard, async (_req, res) => {
+  const sql = `
     WITH agg AS (
       SELECT
         LOWER(b.wallet_address)                                        AS wallet_address,
-        COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
+        COALESCE(MAX(b.vendor_name),'')                                AS vendor_name_from_bids,
         COUNT(*)::int                                                  AS bids_count,
         MAX(b.created_at)                                              AS last_bid_at,
         COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
@@ -1811,73 +1848,37 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       GROUP BY LOWER(b.wallet_address)
     )
     SELECT
-      a.vendor_name,
       a.wallet_address,
+      a.vendor_name_from_bids,
       a.bids_count,
       a.last_bid_at,
       a.total_awarded_usd,
-      vp.company_name,
-      vp.contact_name,
+      vp.vendor_name  AS profile_vendor_name,
       vp.email,
       vp.phone,
-      vp.website,
-      vp.address_line1 AS address1,
-      vp.address_line2 AS address2,
-      vp.city,
-      vp.state,
-      vp.postal_code,
-      vp.country,
-      vp.notes
+      vp.address,
+      vp.website
     FROM agg a
     LEFT JOIN vendor_profiles vp
       ON LOWER(vp.wallet_address) = a.wallet_address
-    ORDER BY a.last_bid_at DESC NULLS LAST, a.vendor_name ASC
-  `;
-
-  const statsOnlySql = `
-    SELECT
-      COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
-      LOWER(b.wallet_address)                                        AS wallet_address,
-      COUNT(*)::int                                                  AS bids_count,
-      MAX(b.created_at)                                              AS last_bid_at,
-      COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
-                        THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd
-    FROM bids b
-    GROUP BY LOWER(b.wallet_address)
-    ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
+    ORDER BY a.last_bid_at DESC NULLS LAST, a.vendor_name_from_bids ASC
   `;
 
   try {
-    let rows;
-    try {
-      rows = (await pool.query(enrichedSql)).rows;
-    } catch (e) {
-      console.warn('[admin/vendors] enriched query failed, falling back:', String(e).slice(0,200));
-      rows = (await pool.query(statsOnlySql)).rows;
-    }
-
+    const { rows } = await pool.query(sql);
     const out = rows.map(r => ({
-      vendorName: r.vendor_name || r.company_name || '',
+      vendorName: r.profile_vendor_name || r.vendor_name_from_bids || '',
       walletAddress: r.wallet_address || '',
       bidsCount: Number(r.bids_count) || 0,
       lastBidAt: r.last_bid_at,
       totalAwardedUSD: Number(r.total_awarded_usd) || 0,
       profile: {
-        companyName: r.company_name ?? null,
-        contactName: r.contact_name ?? null,
         email: r.email ?? null,
         phone: r.phone ?? null,
+        address: r.address ?? null,
         website: r.website ?? null,
-        address1: r.address1 ?? null,
-        address2: r.address2 ?? null,
-        city: r.city ?? null,
-        state: r.state ?? null,
-        postalCode: r.postal_code ?? null,
-        country: r.country ?? null,
-        notes: r.notes ?? null,
       },
     }));
-
     res.json(out);
   } catch (e) {
     console.error('admin/vendors error', e);
