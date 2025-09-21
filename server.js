@@ -100,6 +100,33 @@ const pool = new Pool({
 });
 
 // ==============================
+// DB bootstrap — vendor_profiles (create if missing)
+// ==============================
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS vendor_profiles (
+        wallet_address  text PRIMARY KEY,
+        vendor_name     text NOT NULL,
+        email           text,
+        phone           text,
+        address         text,
+        website         text,
+        created_at      timestamptz NOT NULL DEFAULT now(),
+        updated_at      timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_vendor_profiles_name
+      ON vendor_profiles (lower(vendor_name));
+    `);
+    console.log('[db] vendor_profiles ready');
+  } catch (e) {
+    console.error('vendor_profiles init failed:', e);
+  }
+})();
+
+// ==============================
 // Utilities
 // ==============================
 function toCamel(row) {
@@ -1646,6 +1673,61 @@ ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
 });
 
 // ==============================
+// Routes — Vendor profile (fill once, used in Admin Vendors)
+// ==============================
+const profileSchema = Joi.object({
+  vendorName: Joi.string().min(2).max(140).required(),
+  email: Joi.string().email().allow(''),
+  phone: Joi.string().allow(''),
+  address: Joi.string().allow(''),
+  website: Joi.string().uri({ allowRelative: false }).allow(''),
+});
+
+app.get('/vendor/profile', authRequired, async (req, res) => {
+  try {
+    const wallet = String(req.user?.sub || '').toLowerCase();
+    const { rows } = await pool.query(
+      `SELECT wallet_address, vendor_name, email, phone, address, website
+       FROM vendor_profiles
+       WHERE lower(wallet_address)=lower($1)`,
+      [wallet]
+    );
+    res.json(rows[0] ? toCamel(rows[0]) : null);
+  } catch (e) {
+    console.error('GET /vendor/profile error:', e);
+    res.status(500).json({ error: 'Failed to load profile' });
+  }
+});
+
+app.post('/vendor/profile', authRequired, async (req, res) => {
+  const wallet = String(req.user?.sub || '').toLowerCase();
+  const { error, value } = profileSchema.validate(req.body || {}, { abortEarly: false });
+  if (error) return res.status(400).json({ error: error.message });
+
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO vendor_profiles
+         (wallet_address, vendor_name, email, phone, address, website, created_at, updated_at)
+       VALUES
+         ($1,$2,$3,$4,$5,$6, now(), now())
+       ON CONFLICT (wallet_address) DO UPDATE SET
+         vendor_name = EXCLUDED.vendor_name,
+         email       = EXCLUDED.email,
+         phone       = EXCLUDED.phone,
+         address     = EXCLUDED.address,
+         website     = EXCLUDED.website,
+         updated_at  = now()
+       RETURNING wallet_address, vendor_name, email, phone, address, website`,
+      [wallet, value.vendorName, value.email || null, value.phone || null, value.address || null, value.website || null]
+    );
+    res.json(toCamel(rows[0]));
+  } catch (e) {
+    console.error('POST /vendor/profile error:', e);
+    res.status(500).json({ error: 'Failed to save profile' });
+  }
+});
+
+// ==============================
 // Routes — Vendor helpers
 // ==============================
 app.get("/vendor/bids", async (req, res) => {
@@ -1715,92 +1797,48 @@ app.get("/vendor/payments", async (_req, res) => {
 // Routes — Admin helpers
 // ==============================
 app.get('/admin/vendors', adminGuard, async (req, res) => {
-  // Try enriched (joins vendor_profiles). If it fails (table missing), fall back to stats-only.
-  const enrichedSql = `
-    SELECT
-      COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
-      LOWER(b.wallet_address)                                        AS wallet_address,
-      COUNT(*)::int                                                  AS bids_count,
-      MAX(b.created_at)                                              AS last_bid_at,
-      COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
-                        THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd,
-      -- profile fields (may be NULL if no profile row)
-      vp.company_name,
-      vp.contact_name,
-      vp.email,
-      vp.phone,
-      vp.website,
-      vp.address_line1 AS address1,
-      vp.address_line2 AS address2,
-      vp.city,
-      vp.state,
-      vp.postal_code,
-      vp.country,
-      vp.notes
-    FROM bids b
-    LEFT JOIN vendor_profiles vp
-      ON LOWER(vp.wallet_address) = LOWER(b.wallet_address)
-    GROUP BY wallet_address, vp.company_name, vp.contact_name, vp.email, vp.phone, vp.website,
-             vp.address_line1, vp.address_line2, vp.city, vp.state, vp.postal_code, vp.country, vp.notes
-    ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
-  `;
-
-  const statsOnlySql = `
-    SELECT
-      COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
-      LOWER(b.wallet_address)                                        AS wallet_address,
-      COUNT(*)::int                                                  AS bids_count,
-      MAX(b.created_at)                                              AS last_bid_at,
-      COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
-                        THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd,
-      NULL::text  AS company_name,
-      NULL::text  AS contact_name,
-      NULL::text  AS email,
-      NULL::text  AS phone,
-      NULL::text  AS website,
-      NULL::text  AS address1,
-      NULL::text  AS address2,
-      NULL::text  AS city,
-      NULL::text  AS state,
-      NULL::text  AS postal_code,
-      NULL::text  AS country,
-      NULL::text  AS notes
-    FROM bids b
-    GROUP BY wallet_address
-    ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
-  `;
-
   try {
-    let rows;
-    try {
-      // Try enriched (will fail if vendor_profiles table doesn’t exist)
-      rows = (await pool.query(enrichedSql)).rows;
-    } catch {
-      rows = (await pool.query(statsOnlySql)).rows;
-    }
+    const { rows } = await pool.query(`
+      WITH agg AS (
+        SELECT
+          COALESCE(wallet_address,'') AS wallet_address,
+          COALESCE(vendor_name,'')    AS vendor_name,
+          COUNT(*)::int               AS bids_count,
+          MAX(created_at)             AS last_bid_at,
+          COALESCE(
+            SUM(CASE WHEN status IN ('approved','completed') THEN price_usd ELSE 0 END),
+            0
+          )::numeric                  AS total_awarded_usd
+        FROM bids
+        GROUP BY wallet_address, vendor_name
+      )
+      SELECT
+        a.vendor_name,
+        a.wallet_address,
+        a.bids_count,
+        a.last_bid_at,
+        a.total_awarded_usd,
+        vp.email,
+        vp.phone,
+        vp.address,
+        vp.website
+      FROM agg a
+      LEFT JOIN vendor_profiles vp
+        ON lower(vp.wallet_address) = lower(a.wallet_address)
+      ORDER BY a.last_bid_at DESC NULLS LAST, a.vendor_name ASC
+    `);
 
     const out = rows.map(r => ({
-      vendorName: r.company_name || r.vendor_name || '',
-      walletAddress: r.wallet_address || '',
+      vendorName: r.vendor_name,
+      walletAddress: r.wallet_address,
       bidsCount: Number(r.bids_count) || 0,
       lastBidAt: r.last_bid_at,
       totalAwardedUSD: Number(r.total_awarded_usd) || 0,
-      profile: {
-        companyName: r.company_name || null,
-        contactName: r.contact_name || null,
-        email: r.email || null,
-        phone: r.phone || null,
-        website: r.website || null,
-        address1: r.address1 || null,
-        address2: r.address2 || null,
-        city: r.city || null,
-        state: r.state || null,
-        postalCode: r.postal_code || null,
-        country: r.country || null,
-        notes: r.notes || null,
-      },
+      email: r.email || null,
+      phone: r.phone || null,
+      address: r.address || null,
+      website: r.website || null,
     }));
-
     res.json(out);
   } catch (e) {
     console.error('admin/vendors error', e);
