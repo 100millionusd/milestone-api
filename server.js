@@ -1745,6 +1745,63 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
   }
 });
 
+/* ---------- ADMIN: list bids (optional filter by vendor wallet) ----------
+   GET /admin/bids
+   GET /admin/bids?vendorWallet=0xabc...
+   Returns: { items, total, page, pageSize }
+*/
+app.get('/admin/bids', adminGuard, async (req, res) => {
+  try {
+    const vendorWallet = (String(req.query.vendorWallet || '').toLowerCase()) || null;
+    const page  = Math.max(1, parseInt(String(req.query.page ?? '1'), 10));
+    const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? '100'), 10)));
+    const offset = (page - 1) * limit;
+
+    const listSql = `
+      SELECT
+        b.bid_id,
+        b.proposal_id,
+        LOWER(b.wallet_address) AS vendor_wallet,
+        b.vendor_name,
+        b.price_usd,
+        b.status,
+        b.created_at,
+        COALESCE(p.title, 'Untitled Project') AS project_title
+      FROM bids b
+      LEFT JOIN proposals p ON p.proposal_id = b.proposal_id
+      WHERE ($1::text IS NULL OR LOWER(b.wallet_address) = $1)
+      ORDER BY b.created_at DESC NULLS LAST, b.bid_id DESC
+      LIMIT $2 OFFSET $3
+    `;
+    const countSql = `
+      SELECT COUNT(*)::int AS cnt
+      FROM bids b
+      WHERE ($1::text IS NULL OR LOWER(b.wallet_address) = $1)
+    `;
+
+    const [list, count] = await Promise.all([
+      pool.query(listSql, [vendorWallet, limit, offset]),
+      pool.query(countSql, [vendorWallet]),
+    ]);
+
+    const items = list.rows.map(r => ({
+      id: r.bid_id,
+      projectId: r.proposal_id,
+      projectTitle: r.project_title,
+      vendorWallet: r.vendor_wallet,
+      vendorName: r.vendor_name,
+      amountUSD: r.price_usd,
+      status: r.status,
+      createdAt: new Date(r.created_at).toISOString(),
+    }));
+
+    res.json({ items, total: count.rows[0].cnt, page, pageSize: limit });
+  } catch (e) {
+    console.error('GET /admin/bids error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ==============================
 // Routes — Payments (legacy)
 // ==============================
