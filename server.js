@@ -151,6 +151,26 @@ function coerceJson(val) {
   return val;
 }
 
+// NEW: consistent display string for address column (handles JSON or plain text)
+function formatAddressDisplay(addressCol) {
+  if (!addressCol) return '';
+  if (typeof addressCol === 'object' && addressCol !== null) {
+    const { line1 = '', city = '', postalCode = '', country = '' } = addressCol;
+    return [line1, city, postalCode, country].filter(Boolean).join(', ');
+  }
+  if (typeof addressCol === 'string') {
+    try {
+      const obj = JSON.parse(addressCol);
+      if (obj && typeof obj === 'object') {
+        const { line1 = '', city = '', postalCode = '', country = '' } = obj;
+        return [line1, city, postalCode, country].filter(Boolean).join(', ');
+      }
+    } catch {}
+    return addressCol.trim();
+  }
+  return String(addressCol || '').trim();
+}
+
 /**
  * Perform a generic HTTP(S) request and return { status, body }.
  */
@@ -1736,7 +1756,6 @@ app.get('/vendor/profile', authRequired, async (req, res) => {
     if (!rows[0]) return res.json(null);
 
     const r = rows[0];
-    // try to parse address as JSON; otherwise treat as single-line
     let parsed = null;
     try { parsed = JSON.parse(r.address || ''); } catch {}
     const address =
@@ -1768,18 +1787,15 @@ app.get('/vendor/profile', authRequired, async (req, res) => {
   }
 });
 
-// 3) POST: accept object or string; store a single line for admin list,
-//    but ALSO store the raw object JSON when provided (so we can parse later)
+// 3) POST: accept object or string; store flat display + JSON when provided
 app.post('/vendor/profile', authRequired, async (req, res) => {
   const wallet = String(req.user?.sub || '').toLowerCase();
   const { error, value } = profileSchema.validate(req.body || {}, { abortEarly: false });
   if (error) return res.status(400).json({ error: error.message });
 
-  // normalize website (add https:// if missing)
   const rawWebsite = (value.website || '').trim();
   const website = rawWebsite && !/^https?:\/\//i.test(rawWebsite) ? `https://${rawWebsite}` : rawWebsite;
 
-  // normalize address: if object, keep JSON + also a flat display line
   let addressText = '';
   let addressJson = null;
 
@@ -1798,9 +1814,6 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
       .join(', ');
   }
 
-  // store address as:
-  // - text in the "address" column (used by Admin Vendors)
-  // - if we had an object, store its JSON string in the same column (so GET can parse it back)
   const addressToStore = addressJson ? JSON.stringify(addressJson) : addressText;
 
   try {
@@ -1820,7 +1833,6 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
       [wallet, value.vendorName, value.email || null, value.phone || null, addressToStore, website || null]
     );
 
-    // echo back using the same GET shape
     const r = rows[0];
     let parsed = null;
     try { parsed = JSON.parse(r.address || ''); } catch {}
@@ -1922,8 +1934,11 @@ app.get("/vendor/payments", async (_req, res) => {
 // ==============================
 // Routes — Admin helpers
 // ==============================
-
-// ---------- ADMIN: list bids (optional filter by vendor wallet) ----------
+/* ---------- ADMIN: list bids (optional filter by vendor wallet) ----------
+   GET /admin/bids
+   GET /admin/bids?vendorWallet=0xabc...
+   Returns: { items, total, page, pageSize }
+*/
 app.get('/admin/bids', adminGuard, async (req, res) => {
   try {
     const vendorWallet = (String(req.query.vendorWallet || '').toLowerCase()) || null;
@@ -1976,103 +1991,83 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
   }
 });
 
-// ---------- ADMIN: vendors list (shows profile details; includes zero-bid vendors) ----------
+/**
+ * GET /admin/vendors
+ * Returns array of:
+ * {
+ *   vendorName, walletAddress, bidsCount, lastBidAt, totalAwardedUSD,
+ *   // duplicated top-level contact fields for compatibility:
+ *   email, phone, website, address,
+ *   // plus nested profile object (preferred by UI):
+ *   profile: { companyName, email, phone, website, address1, ... }
+ * }
+ * Includes vendors with bids AND vendors who only have a profile.
+ */
 app.get('/admin/vendors', adminGuard, async (req, res) => {
   const sql = `
-    WITH wallets AS (
-      SELECT LOWER(wallet_address) AS wallet_address FROM vendor_profiles
-      UNION
-      SELECT LOWER(wallet_address) AS wallet_address FROM bids
-    ),
-    agg AS (
+    WITH agg AS (
       SELECT
-        LOWER(b.wallet_address)                                    AS wallet_address,
-        COALESCE(MAX(b.vendor_name),'')                            AS vendor_name,
-        COUNT(*)::int                                              AS bids_count,
-        MAX(b.created_at)                                          AS last_bid_at,
+        LOWER(b.wallet_address)                                        AS wallet_address,
+        COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
+        COUNT(*)::int                                                  AS bids_count,
+        MAX(b.created_at)                                              AS last_bid_at,
         COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
-                          THEN b.price_usd ELSE 0 END),0)::numeric AS total_awarded_usd
+                          THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd
       FROM bids b
       GROUP BY LOWER(b.wallet_address)
     )
     SELECT
-      w.wallet_address,
-      a.vendor_name            AS agg_vendor_name,
+      COALESCE(a.wallet_address, LOWER(vp.wallet_address)) AS wallet_address,
+      a.vendor_name                                        AS agg_vendor_name,
       a.bids_count,
       a.last_bid_at,
       a.total_awarded_usd,
-      vp.vendor_name           AS profile_vendor_name,
+      vp.vendor_name                                       AS profile_vendor_name,
       vp.email,
       vp.phone,
       vp.website,
-      vp.address               AS address_raw
-    FROM wallets w
-    LEFT JOIN agg a
-      ON a.wallet_address = w.wallet_address
-    LEFT JOIN vendor_profiles vp
-      ON LOWER(vp.wallet_address) = w.wallet_address
-    ORDER BY a.last_bid_at DESC NULLS LAST,
-             COALESCE(vp.vendor_name, a.vendor_name, w.wallet_address) ASC
+      vp.address                                           AS address_raw,
+      vp.updated_at                                        AS profile_updated_at
+    FROM agg a
+    FULL OUTER JOIN vendor_profiles vp
+      ON LOWER(vp.wallet_address) = a.wallet_address
+    ORDER BY COALESCE(a.last_bid_at, vp.updated_at) DESC NULLS LAST,
+             COALESCE(vp.vendor_name, a.vendor_name) ASC
   `;
 
   try {
     const { rows } = await pool.query(sql);
 
     const out = rows.map(r => {
-      // address: maybe JSON string, maybe plain text, maybe null
-      let aObj = null;
-      let displayAddress = null;
-      if (r.address_raw) {
-        const s = String(r.address_raw || '').trim();
-        if (s.startsWith('{')) {
-          try { aObj = JSON.parse(s); } catch {}
-        }
-        if (aObj && typeof aObj === 'object') {
-          displayAddress = [aObj.line1 || '', aObj.city || '', aObj.postalCode || '', aObj.country || '']
-            .filter(Boolean).join(', ') || null;
-        } else {
-          displayAddress = s || null;
-        }
-      }
-
       const vendorName = r.profile_vendor_name || r.agg_vendor_name || '';
-      const walletAddress = r.wallet_address || '';
+      const addrDisplay = formatAddressDisplay(r.address_raw);
 
       return {
         vendorName,
-        walletAddress,
+        walletAddress: r.wallet_address || '',
         bidsCount: Number(r.bids_count) || 0,
-        lastBidAt: r.last_bid_at || null,
+        lastBidAt: r.last_bid_at || r.profile_updated_at || null,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // convenience top-level fields (some UIs read these directly)
+        // duplicate top-level contact fields for compatibility with older UI
         email: r.email ?? null,
         phone: r.phone ?? null,
         website: r.website ?? null,
-        address1: displayAddress,
-        city: aObj?.city ?? null,
-        postalCode: aObj?.postalCode ?? null,
-        country: aObj?.country ?? null,
-        address: aObj ? {
-          line1: aObj.line1 || null,
-          city: aObj.city || null,
-          postalCode: aObj.postalCode || null,
-          country: aObj.country || null,
-        } : (displayAddress ? { line1: displayAddress, city: null, postalCode: null, country: null } : null),
+        address: addrDisplay || null,
 
-        // legacy/expected nested structure
+        // structured profile (preferred by newer UI)
         profile: {
-          companyName: r.profile_vendor_name ?? vendorName ?? null,
+          companyName: vendorName || null,
           contactName: null,
           email: r.email ?? null,
           phone: r.phone ?? null,
           website: r.website ?? null,
-          address1: displayAddress,
+          address1: addrDisplay || null,
           address2: null,
-          city: aObj?.city ?? null,
+          city: null,
           state: null,
-          postalCode: aObj?.postalCode ?? null,
-          country: aObj?.country ?? null,
+          postalCode: null,
+          country: null,
           notes: null,
         },
       };
@@ -2080,8 +2075,56 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
 
     res.json(out);
   } catch (e) {
-    console.error('GET /admin/vendors error:', e);
+    console.error('admin/vendors error', e);
     res.status(500).json({ error: 'Failed to list vendors' });
+  }
+});
+
+// (Bonus) Admin can fetch a single vendor profile by wallet (useful if UI needs it)
+app.get('/admin/vendor/profile/:wallet', adminGuard, async (req, res) => {
+  try {
+    const wallet = String(req.params.wallet || '').toLowerCase();
+    if (!wallet) return res.status(400).json({ error: 'wallet required' });
+
+    const { rows } = await pool.query(
+      `SELECT wallet_address, vendor_name, email, phone, address, website, updated_at
+       FROM vendor_profiles
+       WHERE LOWER(wallet_address)=LOWER($1)`,
+      [wallet]
+    );
+
+    if (!rows[0]) return res.status(404).json({ error: 'not found' });
+
+    const r = rows[0];
+    let parsed = null;
+    try { parsed = JSON.parse(r.address || ''); } catch {}
+    const address =
+      parsed && typeof parsed === 'object'
+        ? {
+            line1: parsed.line1 || '',
+            city: parsed.city || '',
+            country: parsed.country || '',
+            postalCode: parsed.postalCode || '',
+          }
+        : {
+            line1: r.address || '',
+            city: '',
+            country: '',
+            postalCode: '',
+          };
+
+    res.json({
+      walletAddress: r.wallet_address,
+      vendorName: r.vendor_name || '',
+      email: r.email || '',
+      phone: r.phone || '',
+      website: r.website || '',
+      address,
+      updatedAt: r.updated_at,
+    });
+  } catch (e) {
+    console.error('GET /admin/vendor/profile/:wallet error:', e);
+    res.status(500).json({ error: 'Failed to load vendor profile' });
   }
 });
 
