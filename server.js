@@ -1705,14 +1705,24 @@ ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
 // ==============================
 // Routes — Vendor profile (fill once, used in Admin Vendors)
 // ==============================
+// 1) Make schema tolerant (accept string OR object; website any string)
 const profileSchema = Joi.object({
   vendorName: Joi.string().min(2).max(140).required(),
   email: Joi.string().email().allow(''),
   phone: Joi.string().allow(''),
-  address: Joi.string().allow(''),
-  website: Joi.string().uri({ allowRelative: false }).allow(''),
+  address: Joi.alternatives().try(
+    Joi.string().allow(''),
+    Joi.object({
+      line1: Joi.string().allow(''),
+      city: Joi.string().allow(''),
+      country: Joi.string().allow(''),
+      postalCode: Joi.string().allow(''),
+    })
+  ).default(''),
+  website: Joi.string().allow(''),
 });
 
+// 2) GET: return the object shape your UI expects
 app.get('/vendor/profile', authRequired, async (req, res) => {
   try {
     const wallet = String(req.user?.sub || '').toLowerCase();
@@ -1722,17 +1732,76 @@ app.get('/vendor/profile', authRequired, async (req, res) => {
        WHERE lower(wallet_address)=lower($1)`,
       [wallet]
     );
-    res.json(rows[0] ? toCamel(rows[0]) : null);
+
+    if (!rows[0]) return res.json(null);
+
+    const r = rows[0];
+    // try to parse address as JSON; otherwise treat as single-line
+    let parsed = null;
+    try { parsed = JSON.parse(r.address || ''); } catch {}
+    const address =
+      parsed && typeof parsed === 'object'
+        ? {
+            line1: parsed.line1 || '',
+            city: parsed.city || '',
+            country: parsed.country || '',
+            postalCode: parsed.postalCode || '',
+          }
+        : {
+            line1: r.address || '',
+            city: '',
+            country: '',
+            postalCode: '',
+          };
+
+    return res.json({
+      walletAddress: r.wallet_address,
+      vendorName: r.vendor_name || '',
+      email: r.email || '',
+      phone: r.phone || '',
+      website: r.website || '',
+      address,
+    });
   } catch (e) {
     console.error('GET /vendor/profile error:', e);
     res.status(500).json({ error: 'Failed to load profile' });
   }
 });
 
+// 3) POST: accept object or string; store a single line for admin list,
+//    but ALSO store the raw object JSON when provided (so we can parse later)
 app.post('/vendor/profile', authRequired, async (req, res) => {
   const wallet = String(req.user?.sub || '').toLowerCase();
   const { error, value } = profileSchema.validate(req.body || {}, { abortEarly: false });
   if (error) return res.status(400).json({ error: error.message });
+
+  // normalize website (add https:// if missing)
+  const rawWebsite = (value.website || '').trim();
+  const website = rawWebsite && !/^https?:\/\//i.test(rawWebsite) ? `https://${rawWebsite}` : rawWebsite;
+
+  // normalize address: if object, keep JSON + also a flat display line
+  let addressText = '';
+  let addressJson = null;
+
+  if (typeof value.address === 'string') {
+    addressText = value.address.trim();
+  } else if (value.address && typeof value.address === 'object') {
+    const a = value.address;
+    addressJson = {
+      line1: String(a.line1 || ''),
+      city: String(a.city || ''),
+      postalCode: String(a.postalCode || ''),
+      country: String(a.country || ''),
+    };
+    addressText = [addressJson.line1, addressJson.city, addressJson.postalCode, addressJson.country]
+      .filter(Boolean)
+      .join(', ');
+  }
+
+  // store address as:
+  // - text in the "address" column (used by Admin Vendors)
+  // - if we had an object, store its JSON string in the same column (so GET can parse it back)
+  const addressToStore = addressJson ? JSON.stringify(addressJson) : addressText;
 
   try {
     const { rows } = await pool.query(
@@ -1748,9 +1817,36 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
          website     = EXCLUDED.website,
          updated_at  = now()
        RETURNING wallet_address, vendor_name, email, phone, address, website`,
-      [wallet, value.vendorName, value.email || null, value.phone || null, value.address || null, value.website || null]
+      [wallet, value.vendorName, value.email || null, value.phone || null, addressToStore, website || null]
     );
-    res.json(toCamel(rows[0]));
+
+    // echo back using the same GET shape
+    const r = rows[0];
+    let parsed = null;
+    try { parsed = JSON.parse(r.address || ''); } catch {}
+    const address =
+      parsed && typeof parsed === 'object'
+        ? {
+            line1: parsed.line1 || '',
+            city: parsed.city || '',
+            country: parsed.country || '',
+            postalCode: parsed.postalCode || '',
+          }
+        : {
+            line1: r.address || '',
+            city: '',
+            country: '',
+            postalCode: '',
+          };
+
+    res.json({
+      walletAddress: r.wallet_address,
+      vendorName: r.vendor_name || '',
+      email: r.email || '',
+      phone: r.phone || '',
+      website: r.website || '',
+      address,
+    });
   } catch (e) {
     console.error('POST /vendor/profile error:', e);
     res.status(500).json({ error: 'Failed to save profile' });
