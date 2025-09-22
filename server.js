@@ -1951,7 +1951,7 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       FROM bids b
       GROUP BY LOWER(b.wallet_address)
     )
-    -- Vendors who have bids
+    -- vendors who have bids
     SELECT
       a.vendor_name                               AS vendor_name,
       a.wallet_address                            AS wallet_address,
@@ -1969,7 +1969,7 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
 
     UNION ALL
 
-    -- Profiles with no bids yet
+    -- profiles that have no bids yet
     SELECT
       COALESCE(vp.vendor_name,'')                 AS vendor_name,
       LOWER(vp.wallet_address)                    AS wallet_address,
@@ -1991,94 +1991,74 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
   try {
     const { rows } = await pool.query(sql);
 
-    const clean = (s) =>
-      typeof s === 'string' ? (s.trim() === '' ? null : s.trim()) : (s ?? null);
+    const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
     const out = rows.map((r) => {
-      // ---------- Normalize address (supports JSON or plain text) ----------
-      const raw = r.address_raw || '';
+      // Parse address; can be JSON OR plain text
       let addrObj = null;
-      if (raw) { try { addrObj = JSON.parse(raw); } catch {} }
+      if (r.address_raw && r.address_raw.trim().startsWith('{')) {
+        try { addrObj = JSON.parse(r.address_raw); } catch { addrObj = null; }
+      }
 
-      const address1   = clean(addrObj?.line1 ?? addrObj?.address1 ?? (addrObj ? null : raw));
-      const city       = clean(addrObj?.city);
-      const state      = clean(addrObj?.state ?? addrObj?.region ?? addrObj?.province);
-      const postalCode = clean(addrObj?.postalCode ?? addrObj?.postal_code ?? addrObj?.zip);
-      const country    = clean(addrObj?.country);
+      const structured = addrObj && typeof addrObj === 'object'
+        ? {
+            line1: norm(addrObj.line1) || null,
+            city: norm(addrObj.city) || null,
+            state: norm(addrObj.state) || null,
+            postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code) || null,
+            country: norm(addrObj.country) || null,
+          }
+        : {
+            line1: norm(r.address_raw) || null,
+            city: null,
+            state: null,
+            postalCode: null,
+            country: null,
+          };
 
-      const flatAddress =
-        [address1, city, postalCode, country].filter(Boolean).join(', ') || null;
+      const flatAddress = [structured.line1, structured.city, structured.postalCode, structured.country]
+        .filter(Boolean)
+        .join(', ') || null;
 
-      // ---------- Contact fields ----------
-      const email   = clean(r.email);
-      const phone   = clean(r.phone);
-      const website = clean(r.website);
+      const email   = norm(r.email);
+      const phone   = norm(r.phone);
+      const website = norm(r.website);
 
       return {
-        // identity & stats
         vendorName: r.profile_vendor_name || r.vendor_name || '',
         walletAddress: r.wallet_address || '',
         bidsCount: Number(r.bids_count) || 0,
         lastBidAt: r.last_bid_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // top-level (list view paths often read these)
+        // top-level fields used by Admin UI
         email,
-        contactEmail: email,        // alias some UIs use
         phone,
         website,
-        address: flatAddress,       // human-readable single line
-        address1,                   // alias most “address” cells use
-        addressLine1: address1,     // extra alias
-        city,
-        state,
-        postalCode,
-        country,
+        address: flatAddress,             // ← string
+        address1: structured.line1,
+        city: structured.city,
+        state: structured.state,
+        postalCode: structured.postalCode,
+        country: structured.country,
 
-        // nested profile (detail panes/legacy)
+        // nested profile (keep both string and structured for future)
         profile: {
-  companyName: r.profile_vendor_name ?? (r.vendor_name || null),
-  contactName: null,
-  email,
-  contactEmail: email,
-  phone,
-  website,
-
-  // what the UI expects to render:
-  address: flatAddress,                 // <-- string for display
-
-  // keep structured form but under a different key
-  addressStructured: {
-    line1: structured.line1 || null,
-    city: structured.city || null,
-    state: null,
-    postalCode: structured.postalCode || null,
-    country: structured.country || null,
-  },
-
-  // extras / fallbacks
-  addressText: flatAddress,
-  address1: structured.line1 || flatAddress || null,
-  address2: null,
-  city: structured.city || null,
-  state: null,
-  postalCode: structured.postalCode || null,
-  country: structured.country || null,
-  notes: null,
-},
-
-        // optional extra container (some codepaths use contact.address.*)
-        contact: {
+          companyName: r.profile_vendor_name ?? (r.vendor_name || null),
+          contactName: null,
           email,
           phone,
-          address: {
-            line1: address1 || flatAddress || null,
-            city,
-            state,
-            postalCode,
-            country,
-          },
-          addressText: flatAddress,
+          website,
+          address: flatAddress,           // ← string (important for UI)
+          addressText: flatAddress,       // helper alias
+          address1: structured.line1,
+          address2: null,
+          city: structured.city,
+          state: structured.state,
+          postalCode: structured.postalCode,
+          country: structured.country,
+          addressStructured: structured,  // keep the object too
+          notes: null,
         },
       };
     });
