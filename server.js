@@ -1940,52 +1940,35 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
 /** ADMIN: list vendors (with or without bids), include email/address at top-level and inside profile */
 app.get('/admin/vendors', adminGuard, async (req, res) => {
   const sql = `
-    WITH agg AS (
+    WITH bid_aggregates AS (
       SELECT
-        LOWER(b.wallet_address)                                        AS wallet_address,
-        COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
-        COUNT(*)::int                                                  AS bids_count,
-        MAX(b.created_at)                                              AS last_bid_at,
-        COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
-                          THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd
+        LOWER(b.wallet_address) AS wallet_address,
+        COALESCE(MAX(b.vendor_name), '') AS vendor_name,
+        COUNT(*)::int AS bids_count,
+        MAX(b.created_at) AS last_bid_at,
+        COALESCE(SUM(CASE WHEN b.status IN ('approved','completed') 
+                         THEN b.price_usd ELSE 0 END), 0)::numeric AS total_awarded_usd
       FROM bids b
       GROUP BY LOWER(b.wallet_address)
     )
-    -- Vendors who have bids
     SELECT
-      a.vendor_name                               AS vendor_name,
-      a.wallet_address                            AS wallet_address,
-      a.bids_count                                AS bids_count,
-      a.last_bid_at                               AS last_bid_at,
-      a.total_awarded_usd                         AS total_awarded_usd,
-      vp.vendor_name                              AS profile_vendor_name,
-      vp.email                                    AS email,
-      vp.phone                                    AS phone,
-      vp.website                                  AS website,
-      vp.address                                  AS address
-    FROM agg a
-    LEFT JOIN vendor_profiles vp
-      ON LOWER(vp.wallet_address) = a.wallet_address
-
-    UNION ALL
-
-    -- Profiles with no bids yet
-    SELECT
-      COALESCE(vp.vendor_name,'')                 AS vendor_name,
-      LOWER(vp.wallet_address)                    AS wallet_address,
-      0                                           AS bids_count,
-      NULL::timestamptz                           AS last_bid_at,
-      0::numeric                                  AS total_awarded_usd,
-      vp.vendor_name                              AS profile_vendor_name,
-      vp.email                                    AS email,
-      vp.phone                                    AS phone,
-      vp.website                                  AS website,
-      vp.address                                  AS address
+      COALESCE(ba.vendor_name, vp.vendor_name, '') AS vendor_name,
+      LOWER(COALESCE(ba.wallet_address, vp.wallet_address)) AS wallet_address,
+      COALESCE(ba.bids_count, 0) AS bids_count,
+      ba.last_bid_at,
+      COALESCE(ba.total_awarded_usd, 0) AS total_awarded_usd,
+      vp.vendor_name AS profile_vendor_name,
+      vp.email,
+      vp.phone,
+      vp.website,
+      vp.address,
+      vp.email_raw,
+      vp.phone_raw,
+      vp.website_raw,
+      vp.address_raw
     FROM vendor_profiles vp
-    WHERE NOT EXISTS (
-      SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
-    )
-    ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
+    LEFT JOIN bid_aggregates ba ON LOWER(vp.wallet_address) = ba.wallet_address
+    ORDER BY ba.last_bid_at DESC NULLS LAST, vendor_name ASC
   `;
 
   try {
