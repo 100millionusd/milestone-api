@@ -2105,9 +2105,53 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
   }
 });
 
+app.post('/admin/vendors/:wallet/archive', adminGuard, async (req, res) => {
+  try {
+    const wallet = String(req.params.wallet || '').toLowerCase();
+    if (!wallet) return res.status(400).json({ error: 'wallet required' });
+
+    // Ensure a row exists, then set archived=true
+    const { rows } = await pool.query(
+      `INSERT INTO vendor_profiles (wallet_address, vendor_name, archived, created_at, updated_at)
+         VALUES ($1, '', true, now(), now())
+       ON CONFLICT (wallet_address) DO UPDATE SET
+         archived = true,
+         updated_at = now()
+       RETURNING wallet_address, vendor_name, archived, updated_at`,
+      [wallet]
+    );
+
+    res.json({ ok: true, walletAddress: rows[0].wallet_address, archived: rows[0].archived });
+  } catch (e) {
+    console.error('POST /admin/vendors/:wallet/archive error', e);
+    res.status(500).json({ error: 'Failed to archive vendor' });
+  }
+});
+
+/** ADMIN: Delete a vendor profile by wallet (bids remain) */
+app.delete('/admin/vendors/:wallet', adminGuard, async (req, res) => {
+  try {
+    const wallet = String(req.params.wallet || '').toLowerCase();
+    if (!wallet) return res.status(400).json({ error: 'wallet required' });
+
+    const { rowCount } = await pool.query(
+      `DELETE FROM vendor_profiles WHERE lower(wallet_address) = $1`,
+      [wallet]
+    );
+    if (rowCount === 0) return res.status(404).json({ error: 'Vendor profile not found' });
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error('DELETE /admin/vendors/:wallet error', e);
+    res.status(500).json({ error: 'Failed to delete vendor' });
+  }
+});
+
 /** ADMIN: list vendors (with or without bids), normalized email + rich address (street + house no + city + postal + country) */
 app.get('/admin/vendors', adminGuard, async (req, res) => {
-  const sql = `
+  const includeArchived = ['true','1','yes'].includes(String(req.query.includeArchived || '').toLowerCase());
+
+  const sqlBase = `
     WITH agg AS (
       SELECT
         LOWER(b.wallet_address)                                        AS wallet_address,
@@ -2130,7 +2174,8 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       vp.email                                    AS email,
       vp.phone                                    AS phone,
       vp.website                                  AS website,
-      vp.address                                  AS address_raw
+      vp.address                                  AS address_raw,
+      vp.archived                                 AS archived
     FROM agg a
     LEFT JOIN vendor_profiles vp
       ON LOWER(vp.wallet_address) = a.wallet_address
@@ -2148,20 +2193,26 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       vp.email                                    AS email,
       vp.phone                                    AS phone,
       vp.website                                  AS website,
-      vp.address                                  AS address_raw
+      vp.address                                  AS address_raw,
+      vp.archived                                 AS archived
     FROM vendor_profiles vp
     WHERE NOT EXISTS (
       SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
     )
-    ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
   `;
+
+  let sql = `SELECT * FROM (${sqlBase}) s`;
+  if (!includeArchived) {
+    sql += ` WHERE COALESCE(s.archived, false) = false`;
+  }
+  sql += ` ORDER BY s.last_bid_at DESC NULLS LAST, s.vendor_name ASC`;
 
   try {
     const { rows } = await pool.query(sql);
     const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
     const out = rows.map((r) => {
-      // address may be JSON or plain text
+      // address_raw can be JSON or plain text — normalize to parts
       let addrObj = null;
       if (r.address_raw && r.address_raw.trim().startsWith('{')) {
         try { addrObj = JSON.parse(r.address_raw); } catch { addrObj = null; }
@@ -2184,39 +2235,11 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
           };
 
       const flat = [parts.line1, parts.city, parts.postalCode, parts.country]
-        .filter(Boolean)
-        .join(', ') || null;
+        .filter(Boolean).join(', ') || null;
 
       const email   = norm(r.email);
       const phone   = norm(r.phone);
       const website = norm(r.website);
-
-      // If normalizeProfile() exists, use it to compute rich variants. Otherwise minimal fallback.
-      const normP = (typeof normalizeProfile === 'function')
-        ? normalizeProfile({
-            email, phone, website,
-            address: addrObj || r.address_raw || null,
-            address_text: flat,
-          })
-        : {
-            email, phone, website,
-            address: {
-              line1: parts.line1, city: parts.city, state: parts.state,
-              postalCode: parts.postalCode, country: parts.country
-            },
-            addressText: flat, addressFormatted: flat, addressDisplay: flat
-          };
-
-      // --- NEW: explicit "street + house number" line ---
-      const streetLine =
-        (normP.address && normP.address.line1) ||
-        parts.line1 ||
-        (
-          flat &&
-          /\d/.test((flat.split(',')[0] || '').trim())
-            ? flat.split(',')[0].trim()
-            : null
-        );
 
       return {
         // core
@@ -2232,17 +2255,17 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
         phone,
         website,
 
-        // address fields
-        street: streetLine, // <-- explicit street + number
-        address1: streetLine,            // alias kept for existing UI
-        addressLine1: streetLine,        // alias kept for existing UI
-        address: normP.addressDisplay || normP.addressFormatted || normP.addressText || flat || null,
-        city: (normP.address && normP.address.city) || parts.city,
-        state: (normP.address && normP.address.state) || parts.state,
-        postalCode: (normP.address && normP.address.postalCode) || parts.postalCode,
-        country: (normP.address && normP.address.country) || parts.country,
+        // address (full + parts + explicit street)
+        address: flat,
+        street: parts.line1 || null,          // <-- explicit street + number
+        address1: parts.line1 || flat,
+        addressLine1: parts.line1 || flat,
+        city: parts.city,
+        state: parts.state,
+        postalCode: parts.postalCode,
+        country: parts.country,
 
-        // nested profile (for consumers expecting a block)
+        // nested copies (optional)
         profile: {
           companyName: r.profile_vendor_name ?? (r.vendor_name || null),
           contactName: null,
@@ -2250,32 +2273,33 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
           contactEmail: email,
           phone,
           website,
-          address: normP.addressDisplay || normP.addressFormatted || normP.addressText || flat || null,
-          addressText: normP.addressText || flat || null,
-          street: streetLine,                 // expose here too
-          address1: streetLine,               // alias
+          address: flat,
+          addressText: flat,
+          street: parts.line1 || null,
+          address1: parts.line1 || flat,
           address2: null,
-          city: (normP.address && normP.address.city) || parts.city,
-          state: (normP.address && normP.address.state) || parts.state,
-          postalCode: (normP.address && normP.address.postalCode) || parts.postalCode,
-          country: (normP.address && normP.address.country) || parts.country,
+          city: parts.city,
+          state: parts.state,
+          postalCode: parts.postalCode,
+          country: parts.country,
           notes: null,
         },
 
-        // convenience block
         contact: {
           email,
           phone,
-          street: streetLine,
-          address: normP.addressDisplay || normP.addressFormatted || normP.addressText || flat || null,
-          addressText: normP.addressText || flat || null,
+          street: parts.line1 || null,
+          address: flat,
+          addressText: flat,
         },
+
+        archived: !!r.archived,
       };
     });
 
     res.json(out);
   } catch (e) {
-    console.error('admin/vendors error', e);
+    console.error('GET /admin/vendors error', e);
     res.status(500).json({ error: 'Failed to list vendors' });
   }
 });
