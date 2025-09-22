@@ -1940,98 +1940,106 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
 /** ADMIN: list vendors (with or without bids), include email/address at top-level and inside profile */
 app.get('/admin/vendors', adminGuard, async (req, res) => {
   const sql = `
-    WITH bid_aggregates AS (
+    WITH agg AS (
       SELECT
-        LOWER(b.wallet_address) AS wallet_address,
-        COALESCE(MAX(b.vendor_name), '') AS vendor_name,
-        COUNT(*)::int AS bids_count,
-        MAX(b.created_at) AS last_bid_at,
-        COALESCE(SUM(CASE WHEN b.status IN ('approved','completed') 
-                         THEN b.price_usd ELSE 0 END), 0)::numeric AS total_awarded_usd
+        LOWER(b.wallet_address)                                        AS wallet_address,
+        COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
+        COUNT(*)::int                                                  AS bids_count,
+        MAX(b.created_at)                                              AS last_bid_at,
+        COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
+                          THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd
       FROM bids b
       GROUP BY LOWER(b.wallet_address)
     )
+    -- Vendors who have bids
     SELECT
-      COALESCE(ba.vendor_name, vp.vendor_name, '') AS vendor_name,
-      LOWER(COALESCE(ba.wallet_address, vp.wallet_address)) AS wallet_address,
-      COALESCE(ba.bids_count, 0) AS bids_count,
-      ba.last_bid_at,
-      COALESCE(ba.total_awarded_usd, 0) AS total_awarded_usd,
-      vp.vendor_name AS profile_vendor_name,
-      vp.email,
-      vp.phone,
-      vp.website,
-      vp.address,
-      vp.email_raw,
-      vp.phone_raw,
-      vp.website_raw,
-      vp.address_raw
+      a.vendor_name                               AS vendor_name,
+      a.wallet_address                            AS wallet_address,
+      a.bids_count                                AS bids_count,
+      a.last_bid_at                               AS last_bid_at,
+      a.total_awarded_usd                         AS total_awarded_usd,
+      vp.vendor_name                              AS profile_vendor_name,
+      vp.email                                    AS email,
+      vp.phone                                    AS phone,
+      vp.website                                  AS website,
+      vp.address                                  AS address_raw
+    FROM agg a
+    LEFT JOIN vendor_profiles vp
+      ON LOWER(vp.wallet_address) = a.wallet_address
+
+    UNION ALL
+
+    -- Profiles with no bids yet
+    SELECT
+      COALESCE(vp.vendor_name,'')                 AS vendor_name,
+      LOWER(vp.wallet_address)                    AS wallet_address,
+      0                                           AS bids_count,
+      NULL::timestamptz                           AS last_bid_at,
+      0::numeric                                  AS total_awarded_usd,
+      vp.vendor_name                              AS profile_vendor_name,
+      vp.email                                    AS email,
+      vp.phone                                    AS phone,
+      vp.website                                  AS website,
+      vp.address                                  AS address_raw
     FROM vendor_profiles vp
-    LEFT JOIN bid_aggregates ba ON LOWER(vp.wallet_address) = ba.wallet_address
-    ORDER BY ba.last_bid_at DESC NULLS LAST, vendor_name ASC
+    WHERE NOT EXISTS (
+      SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
+    )
+    ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
   `;
 
   try {
     const { rows } = await pool.query(sql);
 
     const out = rows.map((r) => {
-      // tolerate either alias style (email vs email_raw) and (address vs address_raw)
-      const rawEmail   = r.email   ?? r.email_raw   ?? null;
-      const rawPhone   = r.phone   ?? r.phone_raw   ?? null;
-      const rawWebsite = r.website ?? r.website_raw ?? null;
-      const rawAddr    = r.address ?? r.address_raw ?? null;
+      const clean = (s) =>
+        typeof s === 'string' && s.trim() !== '' ? s.trim() : null;
 
-      // parse address: JSON or plain text
+      // address_raw can be JSON or plain text
       let addrObj = null;
-      if (rawAddr && typeof rawAddr === 'string') {
-        try { addrObj = JSON.parse(rawAddr); } catch { /* plain string */ }
+      if (r.address_raw) {
+        try { addrObj = JSON.parse(r.address_raw); } catch {}
       }
 
-      const structured = (addrObj && typeof addrObj === 'object')
-        ? {
-            line1: (addrObj.line1 || '').trim(),
-            city: (addrObj.city || '').trim(),
-            postalCode: (addrObj.postalCode || addrObj.postal_code || '').trim(),
-            country: (addrObj.country || '').trim(),
-          }
-        : {
-            line1: (rawAddr || '').trim(),
-            city: '',
-            postalCode: '',
-            country: '',
-          };
+      const address1   = clean(addrObj?.line1 ?? addrObj?.address1 ?? (addrObj ? null : r.address_raw));
+      const city       = clean(addrObj?.city);
+      const postalCode = clean(addrObj?.postalCode ?? addrObj?.postal_code ?? addrObj?.zip);
+      const country    = clean(addrObj?.country);
+      const addressStr = [address1, city, postalCode, country].filter(Boolean).join(', ') || null;
 
-      const flatAddress = [structured.line1, structured.city, structured.postalCode, structured.country]
-        .filter(Boolean)
-        .join(', ') || null;
+      const email   = clean(r.email);
+      const phone   = clean(r.phone);
+      const website = clean(r.website);
 
       return {
+        // top-level (list uses these)
         vendorName: r.profile_vendor_name || r.vendor_name || '',
         walletAddress: r.wallet_address || '',
         bidsCount: Number(r.bids_count) || 0,
         lastBidAt: r.last_bid_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // top-level fields used by the Admin UI badges/columns
-        email: rawEmail || null,
-        phone: rawPhone || null,
-        website: rawWebsite || null,
-        address: flatAddress,   // <- this powers the "Address:" line
+        // make these impossible to miss
+        email,
+        phone,
+        website,
+        address: addressStr,
 
-        // nested profile for detailed drawer/cards
+        // nested for detail pane and older UI paths
         profile: {
           companyName: r.profile_vendor_name ?? (r.vendor_name || null),
           contactName: null,
-          email: rawEmail || null,
-          phone: rawPhone || null,
-          website: rawWebsite || null,
-          address: flatAddress,
-          address1: structured.line1 || null,
+          email,
+          contactEmail: email,      // <-- some UIs look for this key
+          phone,
+          website,
+          address: addressStr,      // human-readable line
+          address1,
           address2: null,
-          city: structured.city || null,
+          city,
           state: null,
-          postalCode: structured.postalCode || null,
-          country: structured.country || null,
+          postalCode,
+          country,
           notes: null,
         },
       };
