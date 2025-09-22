@@ -1988,16 +1988,25 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
   try {
     const { rows } = await pool.query(enrichedSql);
 
-    const out = rows.map(r => {
-  // address can be JSON or plain text
+  const out = rows.map(r => {
+  // Parse address (JSON or plain text)
   let addrObj = null;
   if (r.address_raw) {
     try { addrObj = JSON.parse(r.address_raw); } catch { addrObj = null; }
   }
-  const flatAddress = addrObj && typeof addrObj === 'object'
-    ? [addrObj.line1, addrObj.city, addrObj.postalCode || addrObj.postal_code, addrObj.country]
-        .filter(Boolean).join(', ')
-    : (r.address_raw || null);
+
+  const normalizedObj = addrObj && typeof addrObj === 'object'
+    ? {
+        line1: addrObj.line1 || '',
+        city: addrObj.city || '',
+        postalCode: addrObj.postalCode || addrObj.postal_code || '',
+        country: addrObj.country || '',
+      }
+    : { line1: (r.address_raw || '') };
+
+  const flatAddress = [normalizedObj.line1, normalizedObj.city, normalizedObj.postalCode, normalizedObj.country]
+    .filter(Boolean)
+    .join(', ') || null;
 
   const email   = r.email_raw   || null;
   const phone   = r.phone_raw   || null;
@@ -2010,33 +2019,35 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
     lastBidAt: r.last_bid_at,
     totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-    // ---- Top-level fields (multiple aliases so UI always finds them)
+    // Top-level (flat + aliases)
     email,
-    contact: email,                 // alias
-    contactEmail: email,            // alias (some UIs use this)
     phone,
     website,
-    address: flatAddress,           // alias
-    address1: flatAddress,          // alias
-    addressLine1: flatAddress,      // alias
+    address: flatAddress,
+    address1: normalizedObj.line1 || flatAddress || null,
+    addressLine1: normalizedObj.line1 || flatAddress || null,
+    addressText: flatAddress,
+    location: flatAddress,
 
-    // ---- Nested profile (also with aliases)
+    // Nested profile (object + flat for any UI)
     profile: {
       companyName: r.profile_vendor_name ?? (r.vendor_name || null),
       contactName: null,
-      email,                        // profile.email
-      contact: email,               // profile.contact
-      contactEmail: email,          // profile.contactEmail
+      email,
       phone,
       website,
-      address: flatAddress,         // plain string for display
-      address1: addrObj?.line1 ?? flatAddress ?? null,
-      addressLine1: addrObj?.line1 ?? flatAddress ?? null,
-      address2: null,
-      city: addrObj?.city ?? null,
+
+      // <-- many UIs read this:
+      address: normalizedObj,                 // { line1, city, postalCode, country }
+
+      // also provide flat strings/aliases
+      addressText: flatAddress,
+      address1: normalizedObj.line1 || flatAddress || null,
+      addressLine1: normalizedObj.line1 || flatAddress || null,
+      city: normalizedObj.city || null,
       state: null,
-      postalCode: (addrObj?.postalCode || addrObj?.postal_code) ?? null,
-      country: addrObj?.country ?? null,
+      postalCode: normalizedObj.postalCode || null,
+      country: normalizedObj.country || null,
       notes: null,
     },
   };
