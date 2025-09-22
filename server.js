@@ -1962,7 +1962,7 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       vp.email                                    AS email,
       vp.phone                                    AS phone,
       vp.website                                  AS website,
-      vp.address                                  AS address_raw
+      vp.address                                  AS address
     FROM agg a
     LEFT JOIN vendor_profiles vp
       ON LOWER(vp.wallet_address) = a.wallet_address
@@ -1980,7 +1980,7 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       vp.email                                    AS email,
       vp.phone                                    AS phone,
       vp.website                                  AS website,
-      vp.address                                  AS address_raw
+      vp.address                                  AS address
     FROM vendor_profiles vp
     WHERE NOT EXISTS (
       SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
@@ -1992,54 +1992,58 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
     const { rows } = await pool.query(sql);
 
     const out = rows.map((r) => {
-      // normalize strings: convert "" -> null so UI won’t treat empty as “value”
-      const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
+      // tolerate either alias style (email vs email_raw) and (address vs address_raw)
+      const rawEmail   = r.email   ?? r.email_raw   ?? null;
+      const rawPhone   = r.phone   ?? r.phone_raw   ?? null;
+      const rawWebsite = r.website ?? r.website_raw ?? null;
+      const rawAddr    = r.address ?? r.address_raw ?? null;
 
-      // address_raw may be JSON ({"line1","city","postalCode","country"}) OR plain text
+      // parse address: JSON or plain text
       let addrObj = null;
-      if (r.address_raw) {
-        try { addrObj = JSON.parse(r.address_raw); } catch { /* plain text */ }
+      if (rawAddr && typeof rawAddr === 'string') {
+        try { addrObj = JSON.parse(rawAddr); } catch { /* plain string */ }
       }
+
       const structured = (addrObj && typeof addrObj === 'object')
         ? {
-            line1: norm(addrObj.line1) || '',
-            city: norm(addrObj.city) || '',
-            postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code) || '',
-            country: norm(addrObj.country) || '',
+            line1: (addrObj.line1 || '').trim(),
+            city: (addrObj.city || '').trim(),
+            postalCode: (addrObj.postalCode || addrObj.postal_code || '').trim(),
+            country: (addrObj.country || '').trim(),
           }
-        : { line1: norm(r.address_raw) || '' };
+        : {
+            line1: (rawAddr || '').trim(),
+            city: '',
+            postalCode: '',
+            country: '',
+          };
 
       const flatAddress = [structured.line1, structured.city, structured.postalCode, structured.country]
         .filter(Boolean)
         .join(', ') || null;
 
-      const email   = norm(r.email);
-      const phone   = norm(r.phone);
-      const website = norm(r.website);
-
       return {
-        // core
         vendorName: r.profile_vendor_name || r.vendor_name || '',
         walletAddress: r.wallet_address || '',
         bidsCount: Number(r.bids_count) || 0,
         lastBidAt: r.last_bid_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // *** top-level fields that the Admin UI is reading ***
-        email,
-        phone,
-        website,
-        address: flatAddress,
+        // top-level fields used by the Admin UI badges/columns
+        email: rawEmail || null,
+        phone: rawPhone || null,
+        website: rawWebsite || null,
+        address: flatAddress,   // <- this powers the "Address:" line
 
-        // nested profile for components that still expect it
+        // nested profile for detailed drawer/cards
         profile: {
           companyName: r.profile_vendor_name ?? (r.vendor_name || null),
           contactName: null,
-          email,
-          phone,
-          website,
-          address: flatAddress,   // string for display
-          address1: structured.line1 || flatAddress || null,
+          email: rawEmail || null,
+          phone: rawPhone || null,
+          website: rawWebsite || null,
+          address: flatAddress,
+          address1: structured.line1 || null,
           address2: null,
           city: structured.city || null,
           state: null,
