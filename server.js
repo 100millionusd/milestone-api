@@ -1990,75 +1990,87 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
 
   try {
     const { rows } = await pool.query(sql);
-
     const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
     const out = rows.map((r) => {
-      // Parse address; can be JSON OR plain text
+      // address_raw can be JSON or plain text — normalize to string + keep parts
       let addrObj = null;
       if (r.address_raw && r.address_raw.trim().startsWith('{')) {
         try { addrObj = JSON.parse(r.address_raw); } catch { addrObj = null; }
       }
 
-      const structured = addrObj && typeof addrObj === 'object'
+      const parts = addrObj && typeof addrObj === 'object'
         ? {
-            line1: norm(addrObj.line1) || null,
-            city: norm(addrObj.city) || null,
-            state: norm(addrObj.state) || null,
-            postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code) || null,
-            country: norm(addrObj.country) || null,
+            line1: norm(addrObj.line1),
+            city: norm(addrObj.city),
+            state: norm(addrObj.state),
+            postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code),
+            country: norm(addrObj.country),
           }
         : {
-            line1: norm(r.address_raw) || null,
+            line1: norm(r.address_raw),
             city: null,
             state: null,
             postalCode: null,
             country: null,
           };
 
-      const flatAddress = [structured.line1, structured.city, structured.postalCode, structured.country]
-        .filter(Boolean)
-        .join(', ') || null;
+      const flat = [parts.line1, parts.city, parts.postalCode, parts.country].filter(Boolean).join(', ') || null;
 
       const email   = norm(r.email);
       const phone   = norm(r.phone);
       const website = norm(r.website);
 
       return {
+        // core
         vendorName: r.profile_vendor_name || r.vendor_name || '',
         walletAddress: r.wallet_address || '',
         bidsCount: Number(r.bids_count) || 0,
         lastBidAt: r.last_bid_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // top-level fields used by Admin UI
+        // ---- Top-level fields the UI might read ----
         email,
+        contactEmail: email,                 // alias
         phone,
         website,
-        address: flatAddress,             // ← string
-        address1: structured.line1,
-        city: structured.city,
-        state: structured.state,
-        postalCode: structured.postalCode,
-        country: structured.country,
 
-        // nested profile (keep both string and structured for future)
+        address: flat,                       // preferred string
+        address1: parts.line1 || flat,       // aliases
+        addressLine1: parts.line1 || flat,
+        city: parts.city,
+        state: parts.state,
+        postalCode: parts.postalCode,
+        country: parts.country,
+
+        // ---- Nested profile (keep both string + parts) ----
         profile: {
           companyName: r.profile_vendor_name ?? (r.vendor_name || null),
           contactName: null,
           email,
+          contactEmail: email,              // alias
           phone,
           website,
-          address: flatAddress,           // ← string (important for UI)
-          addressText: flatAddress,       // helper alias
-          address1: structured.line1,
+
+          // IMPORTANT: string here (not object)
+          address: flat,
+          addressText: flat,
+
+          address1: parts.line1 || flat,
           address2: null,
-          city: structured.city,
-          state: structured.state,
-          postalCode: structured.postalCode,
-          country: structured.country,
-          addressStructured: structured,  // keep the object too
+          city: parts.city,
+          state: parts.state,
+          postalCode: parts.postalCode,
+          country: parts.country,
           notes: null,
+        },
+
+        // Optional convenience block
+        contact: {
+          email,
+          phone,
+          address: flat,
+          addressText: flat,
         },
       };
     });
