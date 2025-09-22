@@ -178,8 +178,16 @@ function normalizeProfile(profileRaw) {
   };
   if (!profileRaw) return out;
 
-  const addrObj = toObj(profileRaw.address) || toObj(profileRaw.address_json) || null;
+  // Accept several possible containers for an address object
+  const addrObj =
+    toObj(profileRaw.address) ||
+    toObj(profileRaw.address_json) ||
+    toObj(profileRaw.location) ||
+    toObj(profileRaw.addr) ||
+    toObj(profileRaw.addressObj) ||
+    null;
 
+  // Flatten both the whole profile row and the parsed address object
   const flat = flatten(profileRaw).concat(flatten(addrObj, 'address'));
   const flatMap = new Map(flat.map(([p, v]) => [p, v]));
   const pick = (...keys) => {
@@ -192,11 +200,13 @@ function normalizeProfile(profileRaw) {
     return null;
   };
 
-  // --- Email (broad + deep) ---
+  // -------- EMAIL (broad + deep) ----------
   const emailRe = /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i;
-  let email = pick('email','email_address','emailaddress','primary_email',
-                   'contact.email','contact.email_address','contactEmail',
-                   'business_email','work_email','owner_email');
+  let email = pick(
+    'email','email_address','emailaddress','primary_email',
+    'contact.email','contact.email_address','contactEmail',
+    'business_email','work_email','owner_email'
+  );
   if (!email) {
     const arr = pick('emails','contact.emails');
     if (Array.isArray(arr)) {
@@ -215,42 +225,85 @@ function normalizeProfile(profileRaw) {
     }
   }
 
-  // --- Phone / Website ---
+  // -------- PHONE / WEBSITE ----------
   const phone   = pick('phone','phone_number','contact.phone','contact.phone_number','mobile','contact.mobile');
   const website = pick('website','url','site','homepage','contact.website','contact.url');
 
-  // --- Address parts (try many shapes) ---
-  const street  = pick('street','street1','street_name','streetname','road','road_name','address.street','address.street1','address.street_name','address.streetname');
-  const houseNo = pick('house_number','housenumber','houseNo','house_no','number','no','address.house_number','address.housenumber','address.number','address.no');
+  // -------- ADDRESS PARTS (now with many more synonyms) ----------
+  // direct line1
+  let line1 = pick(
+    'address1','addr1','line1','line_1','address_line1','address_line_1','addressline1','addr_line1',
+    'address.address1','address.addr1','address.line1','address.line_1','address.address_line1','address.addressline1','address.addr_line1'
+  );
 
-  let line1 = pick('address1','addr1','line1','address_line1','address_line_1',
-                   'address.address1','address.addr1','address.line1','address.address_line1');
-  if (!line1 && (street || houseNo)) line1 = [street, houseNo].filter(Boolean).join(' ').trim() || null;
+  // street name variants
+  const street = pick(
+    'street','street1','streetname','street_name','streetName',
+    'road','road_name','roadname','strasse','straße','str',
+    'address.street','address.street1','address.streetname','address.street_name','address.streetName',
+    'address.road','address.road_name','address.roadname','address.strasse','address.straße','address.str'
+  );
 
+  // house/number variants
+  const houseNo = pick(
+    'house_number','housenumber','houseNo','house_no','houseNumber','house_num','houseno',
+    'nr','no','numero','num','hausnummer','hausnr','hnr',
+    'address.house_number','address.housenumber','address.houseNo','address.house_no','address.houseNumber','address.house_num','address.houseno',
+    'address.nr','address.no','address.numero','address.num','address.hausnummer','address.hausnr','address.hnr'
+  );
+
+  if (!line1 && (street || houseNo)) {
+    line1 = [street, houseNo].filter(Boolean).join(' ').replace(/\s+/g,' ').trim() || null;
+  }
+
+  // city / state / postal / country (synonyms)
   const city       = pick('city','town','locality','address.city','address.town','address.locality');
   const state      = pick('state','region','province','county','address.state','address.region','address.province','address.county');
   const postalCode = pick('postalcode','postal_code','postcode','zip','zip_code','address.postalcode','address.postal_code','address.postcode','address.zip','address.zip_code');
   const country    = pick('country','country_code','address.country','address.country_code');
-  const explicitText = pick('address_text','addresstext','address.freeform','address.text');
 
+  // explicit free-text variants we keep as-is
+  const explicitText =
+    pick('address_text','addresstext','address.freeform','address.text') ||
+    (typeof profileRaw.address === 'string' ? profileRaw.address.trim() : null);
+
+  // --- Fallback: derive line1 from free-text if it *looks* like a street (contains a number) ---
+  if (!line1 && explicitText) {
+    const firstSeg = explicitText.split(',')[0].trim();
+    if (/\d/.test(firstSeg) && firstSeg.length >= 4) {
+      line1 = firstSeg;
+    }
+  }
+
+  // Build formatted & display strings
   const parts = [];
   if (line1) parts.push(line1);
   const cityState = [city, state].filter(Boolean).join(', ');
   if (cityState) parts.push(cityState);
   if (postalCode) parts.push(postalCode);
   if (country) parts.push(country);
-  const formatted = parts.join(', ');
+  const formatted = parts.join(', ') || null;
+
+  // Prefer richer (has line1) or longer computed string; otherwise fall back to explicit text
   const display = (line1 || (formatted && (!explicitText || formatted.length > explicitText.length)))
-    ? (formatted || null)
+    ? (formatted || explicitText || null)
     : (explicitText || null);
 
   out.email = email || null;
   out.phone = phone || null;
   out.website = website || null;
-  out.address = { line1: line1 || null, city: city || null, state: state || null, postalCode: postalCode || null, country: country || null };
+
+  out.address = {
+    line1: line1 || null,
+    city: city || null,
+    state: state || null,
+    postalCode: postalCode || null,
+    country: country || null
+  };
   out.addressText = explicitText || null;
   out.addressFormatted = formatted || null;
   out.addressDisplay = display || null;
+
   return out;
 }
 
