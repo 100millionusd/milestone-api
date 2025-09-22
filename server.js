@@ -100,7 +100,7 @@ const pool = new Pool({
 });
 
 // ==============================
-/** DB bootstrap — vendor_profiles (create if missing) */
+// DB bootstrap — vendor_profiles (create if missing)
 // ==============================
 (async () => {
   try {
@@ -147,55 +147,111 @@ function coerceJson(val) {
   return val;
 }
 
-/** Generic HTTP(S) request returning { status, body } */
-function sendRequest(method, urlStr, headers = {}, body = null) {
-  const u = new URL(urlStr);
-  const lib = u.protocol === "https:" ? https : http;
-  const options = {
-    method,
-    hostname: u.hostname,
-    port: u.port || (u.protocol === "https:" ? 443 : 80),
-    path: u.pathname + u.search,
-    headers,
+/* ===========================
+   Admin Vendors helpers (ADDED)
+   - robust email detection
+   - rich address builder (street + houseNo + city + postal + country)
+   =========================== */
+function toObj(val) {
+  if (!val) return null;
+  if (typeof val === 'object') return val;
+  if (typeof val === 'string') {
+    try { const j = JSON.parse(val); return j && typeof j === 'object' ? j : { text: val }; }
+    catch { return { text: val }; }
+  }
+  return null;
+}
+function flatten(obj, prefix = '', acc = []) {
+  if (!obj || typeof obj !== 'object') return acc;
+  for (const [k, v] of Object.entries(obj)) {
+    const p = prefix ? `${prefix}.${k}` : k;
+    acc.push([p.toLowerCase(), v]);
+    if (v && typeof v === 'object') flatten(v, p, acc);
+  }
+  return acc;
+}
+function normalizeProfile(profileRaw) {
+  const out = {
+    email: null, phone: null, website: null,
+    address: { line1: null, city: null, state: null, postalCode: null, country: null },
+    addressText: null, addressFormatted: null, addressDisplay: null
   };
-  return new Promise((resolve, reject) => {
-    const req = lib.request(options, (res) => {
-      let data = "";
-      res.setEncoding("utf8");
-      res.on("data", (c) => (data += c));
-      res.on("end", () => resolve({ status: res.statusCode || 0, body: data }));
-    });
-    req.on("error", reject);
-    if (body) {
-      if (typeof body.pipe === "function") body.pipe(req);
-      else { req.write(body); req.end(); }
-    } else req.end();
-  });
-}
+  if (!profileRaw) return out;
 
-/** Fetch a URL into a Buffer */
-async function fetchAsBuffer(urlStr) {
-  return new Promise((resolve, reject) => {
-    const lib = urlStr.startsWith("https:") ? https : http;
-    const req = lib.get(urlStr, (res) => {
-      if (res.statusCode && res.statusCode >= 400) {
-        return reject(new Error(`HTTP ${res.statusCode} fetching ${urlStr}`));
+  const addrObj = toObj(profileRaw.address) || toObj(profileRaw.address_json) || null;
+
+  const flat = flatten(profileRaw).concat(flatten(addrObj, 'address'));
+  const flatMap = new Map(flat.map(([p, v]) => [p, v]));
+  const pick = (...keys) => {
+    for (const k of keys) {
+      const v = flatMap.get(k.toLowerCase());
+      if (v !== undefined && v !== null && `${v}`.trim() !== '') {
+        return typeof v === 'string' ? v.trim() : v;
       }
-      const chunks = [];
-      res.on("data", (d) => chunks.push(d));
-      res.on("end", () => resolve(Buffer.concat(chunks)));
-    });
-    req.on("error", reject);
-  });
-}
+    }
+    return null;
+  };
 
-/** Promise.race timeout helper */
-function withTimeout(p, ms, onTimeout) {
-  let t;
-  const timeoutP = new Promise((resolve) => {
-    t = setTimeout(() => resolve(typeof onTimeout === 'function' ? onTimeout() : onTimeout), ms);
-  });
-  return Promise.race([p, timeoutP]).finally(() => clearTimeout(t));
+  // --- Email (broad + deep) ---
+  const emailRe = /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i;
+  let email = pick('email','email_address','emailaddress','primary_email',
+                   'contact.email','contact.email_address','contactEmail',
+                   'business_email','work_email','owner_email');
+  if (!email) {
+    const arr = pick('emails','contact.emails');
+    if (Array.isArray(arr)) {
+      for (const e of arr) {
+        let s = typeof e === 'string' ? e : (e && typeof e.value === 'string' ? e.value : null);
+        if (s) { s = s.replace(/^mailto:/i,'').trim(); if (emailRe.test(s)) { email = s; break; } }
+      }
+    }
+  }
+  if (!email) {
+    for (const v of flatMap.values()) {
+      if (typeof v === 'string') {
+        const s = v.replace(/^mailto:/i,'').trim();
+        if (emailRe.test(s)) { email = s; break; }
+      }
+    }
+  }
+
+  // --- Phone / Website ---
+  const phone   = pick('phone','phone_number','contact.phone','contact.phone_number','mobile','contact.mobile');
+  const website = pick('website','url','site','homepage','contact.website','contact.url');
+
+  // --- Address parts (try many shapes) ---
+  const street  = pick('street','street1','street_name','streetname','road','road_name','address.street','address.street1','address.street_name','address.streetname');
+  const houseNo = pick('house_number','housenumber','houseNo','house_no','number','no','address.house_number','address.housenumber','address.number','address.no');
+
+  let line1 = pick('address1','addr1','line1','address_line1','address_line_1',
+                   'address.address1','address.addr1','address.line1','address.address_line1');
+  if (!line1 && (street || houseNo)) line1 = [street, houseNo].filter(Boolean).join(' ').trim() || null;
+
+  const city       = pick('city','town','locality','address.city','address.town','address.locality');
+  const state      = pick('state','region','province','county','address.state','address.region','address.province','address.county');
+  const postalCode = pick('postalcode','postal_code','postcode','zip','zip_code','address.postalcode','address.postal_code','address.postcode','address.zip','address.zip_code');
+  const country    = pick('country','country_code','address.country','address.country_code');
+  const explicitText = pick('address_text','addresstext','address.freeform','address.text');
+
+  const parts = [];
+  if (line1) parts.push(line1);
+  const cityState = [city, state].filter(Boolean).join(', ');
+  if (cityState) parts.push(cityState);
+  if (postalCode) parts.push(postalCode);
+  if (country) parts.push(country);
+  const formatted = parts.join(', ');
+  const display = (line1 || (formatted && (!explicitText || formatted.length > explicitText.length)))
+    ? (formatted || null)
+    : (explicitText || null);
+
+  out.email = email || null;
+  out.phone = phone || null;
+  out.website = website || null;
+  out.address = { line1: line1 || null, city: city || null, state: state || null, postalCode: postalCode || null, country: country || null };
+  out.addressText = explicitText || null;
+  out.addressFormatted = formatted || null;
+  out.addressDisplay = display || null;
+  return out;
 }
 
 // ==============================
@@ -279,6 +335,65 @@ async function pinataUploadJson(data) {
   const cid = json.IpfsHash;
   return { cid, url: `https://${PINATA_GATEWAY}/ipfs/${cid}` };
 }
+
+// ==============================
+// HTTP helpers
+// ==============================
+/** Generic HTTP(S) request returning { status, body } */
+function sendRequest(method, urlStr, headers = {}, body = null) {
+  const u = new URL(urlStr);
+  const lib = u.protocol === "https:" ? https : http;
+  const options = {
+    method,
+    hostname: u.hostname,
+    port: u.port || (u.protocol === "https:" ? 443 : 80),
+    path: u.pathname + u.search,
+    headers,
+  };
+  return new Promise((resolve, reject) => {
+    const req = lib.request(options, (res) => {
+      let data = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => (data += c));
+      res.on("end", () => resolve({ status: res.statusCode || 0, body: data }));
+    });
+    req.on("error", reject);
+    if (body) {
+      if (typeof body.pipe === "function") body.pipe(req);
+      else { req.write(body); req.end(); }
+    } else req.end();
+  });
+}
+
+/** Fetch a URL into a Buffer */
+async function fetchAsBuffer(urlStr) {
+  return new Promise((resolve, reject) => {
+    const lib = urlStr.startsWith("https:") ? https : http;
+    const req = lib.get(urlStr, (res) => {
+      if (res.statusCode && res.statusCode >= 400) {
+        return reject(new Error(`HTTP ${res.statusCode} fetching ${urlStr}`));
+      }
+      const chunks = [];
+      res.on("data", (d) => chunks.push(d));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+    });
+    req.on("error", reject);
+  });
+}
+
+/** Promise.race timeout helper */
+function withTimeout(p, ms, onTimeout) {
+  let t;
+  const timeoutP = new Promise((resolve) => {
+    t = setTimeout(() => resolve(typeof onTimeout === 'function' ? onTimeout() : onTimeout), ms);
+  });
+  return Promise.race([p, timeoutP]).finally(() => clearTimeout(t));
+}
+
+// ==============================
+// PDF Extraction (debug-friendly with retries)
+// (functions already above)
+// ==============================
 
 // ==============================
 // Blockchain service
@@ -913,7 +1028,7 @@ app.post("/proposals/:id/reject", adminGuard, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-    const { rows } = await pool.query(
+  const { rows } = await pool.query(
       `UPDATE proposals SET status='rejected' WHERE proposal_id=$1 RETURNING *`,
       [id]
     );
@@ -1932,146 +2047,82 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
 
     res.json({ items, total: count.rows[0].cnt, page, pageSize: limit });
   } catch (e) {
-    console.error('GET /admin/bids error:', e);
+    console.error('GET /admin/bids error', e);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-/** ADMIN: list vendors (with or without bids), include email/address at top-level and inside profile */
+/** ADMIN: list vendors (with or without bids), normalized email + rich address (street + house no + city + postal + country) */
 app.get('/admin/vendors', adminGuard, async (req, res) => {
-  const sql = `
-    WITH agg AS (
-      SELECT
-        LOWER(b.wallet_address)                                        AS wallet_address,
-        COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
-        COUNT(*)::int                                                  AS bids_count,
-        MAX(b.created_at)                                              AS last_bid_at,
-        COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
-                          THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd
-      FROM bids b
-      GROUP BY LOWER(b.wallet_address)
-    )
-    -- vendors who have bids
-    SELECT
-      a.vendor_name                               AS vendor_name,
-      a.wallet_address                            AS wallet_address,
-      a.bids_count                                AS bids_count,
-      a.last_bid_at                               AS last_bid_at,
-      a.total_awarded_usd                         AS total_awarded_usd,
-      vp.vendor_name                              AS profile_vendor_name,
-      vp.email                                    AS email,
-      vp.phone                                    AS phone,
-      vp.website                                  AS website,
-      vp.address                                  AS address_raw
-    FROM agg a
-    LEFT JOIN vendor_profiles vp
-      ON LOWER(vp.wallet_address) = a.wallet_address
-
-    UNION ALL
-
-    -- profiles that have no bids yet
-    SELECT
-      COALESCE(vp.vendor_name,'')                 AS vendor_name,
-      LOWER(vp.wallet_address)                    AS wallet_address,
-      0                                           AS bids_count,
-      NULL::timestamptz                           AS last_bid_at,
-      0::numeric                                  AS total_awarded_usd,
-      vp.vendor_name                              AS profile_vendor_name,
-      vp.email                                    AS email,
-      vp.phone                                    AS phone,
-      vp.website                                  AS website,
-      vp.address                                  AS address_raw
-    FROM vendor_profiles vp
-    WHERE NOT EXISTS (
-      SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
-    )
-    ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
-  `;
-
   try {
+    res.set('Cache-Control','no-store');
+
+    const sql = `
+      WITH agg AS (
+        SELECT
+          LOWER(b.wallet_address)                                   AS wallet,
+          COALESCE(MAX(b.vendor_name),'')                            AS vendor_name,
+          COUNT(*)::int                                              AS bids_count,
+          MAX(b.created_at)                                          AS last_bid_at,
+          COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
+                            THEN b.price_usd ELSE 0 END),0)::numeric AS total_awarded_usd
+        FROM bids b
+        GROUP BY LOWER(b.wallet_address)
+      ),
+      base AS (
+        SELECT LOWER(wallet_address) AS wallet FROM vendor_profiles
+        UNION
+        SELECT LOWER(wallet_address) AS wallet FROM bids
+      )
+      SELECT
+        COALESCE(agg.vendor_name, vp.vendor_name, '') AS vendor_name,
+        base.wallet                                   AS wallet_address,
+        COALESCE(agg.bids_count, 0)::int              AS bids_count,
+        agg.last_bid_at                                AS last_bid_at,
+        COALESCE(agg.total_awarded_usd, 0)::numeric    AS total_awarded_usd,
+        CASE WHEN vp.wallet_address IS NOT NULL
+             THEN row_to_json(vp) ELSE NULL END        AS profile_raw
+      FROM base
+      LEFT JOIN agg ON agg.wallet = base.wallet
+      LEFT JOIN vendor_profiles vp ON LOWER(vp.wallet_address) = base.wallet
+      ORDER BY agg.last_bid_at DESC NULLS LAST, vendor_name ASC
+    `;
+
     const { rows } = await pool.query(sql);
-    const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
-    const out = rows.map((r) => {
-      // address_raw can be JSON or plain text — normalize to string + keep parts
-      let addrObj = null;
-      if (r.address_raw && r.address_raw.trim().startsWith('{')) {
-        try { addrObj = JSON.parse(r.address_raw); } catch { addrObj = null; }
-      }
-
-      const parts = addrObj && typeof addrObj === 'object'
-        ? {
-            line1: norm(addrObj.line1),
-            city: norm(addrObj.city),
-            state: norm(addrObj.state),
-            postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code),
-            country: norm(addrObj.country),
-          }
-        : {
-            line1: norm(r.address_raw),
-            city: null,
-            state: null,
-            postalCode: null,
-            country: null,
-          };
-
-      const flat = [parts.line1, parts.city, parts.postalCode, parts.country].filter(Boolean).join(', ') || null;
-
-      const email   = norm(r.email);
-      const phone   = norm(r.phone);
-      const website = norm(r.website);
-
+    const out = rows.map(r => {
+      const normP = normalizeProfile(r.profile_raw || null);
       return {
-        // core
-        vendorName: r.profile_vendor_name || r.vendor_name || '',
+        vendorName: r.vendor_name || '',
         walletAddress: r.wallet_address || '',
         bidsCount: Number(r.bids_count) || 0,
         lastBidAt: r.last_bid_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // ---- Top-level fields the UI might read ----
-        email,
-        contactEmail: email,                 // alias
-        phone,
-        website,
+        // top-level mirrors the UI reads
+        email: normP.email,
+        contactEmail: normP.email, // alias kept for compatibility
+        phone: normP.phone,
+        website: normP.website,
 
-        address: flat,                       // preferred string
-        address1: parts.line1 || flat,       // aliases
-        addressLine1: parts.line1 || flat,
-        city: parts.city,
-        state: parts.state,
-        postalCode: parts.postalCode,
-        country: parts.country,
+        // richest display address (includes street + house no if present)
+        address: normP.addressDisplay || null,
+        address1: normP.address?.line1 || null,       // aliases maintained
+        addressLine1: normP.address?.line1 || null,
+        city: normP.address?.city || null,
+        state: normP.address?.state || null,
+        postalCode: normP.address?.postalCode || null,
+        country: normP.address?.country || null,
 
-        // ---- Nested profile (keep both string + parts) ----
+        // full profile block for detail views
         profile: {
-          companyName: r.profile_vendor_name ?? (r.vendor_name || null),
-          contactName: null,
-          email,
-          contactEmail: email,              // alias
-          phone,
-          website,
-
-          // IMPORTANT: string here (not object)
-          address: flat,
-          addressText: flat,
-
-          address1: parts.line1 || flat,
-          address2: null,
-          city: parts.city,
-          state: parts.state,
-          postalCode: parts.postalCode,
-          country: parts.country,
-          notes: null,
-        },
-
-        // Optional convenience block
-        contact: {
-          email,
-          phone,
-          address: flat,
-          addressText: flat,
-        },
+          email: normP.email,
+          phone: normP.phone,
+          website: normP.website,
+          addressText: normP.addressText,           // raw text if stored
+          addressFormatted: normP.addressFormatted, // computed full string
+          address: normP.address                    // structured parts
+        }
       };
     });
 
@@ -2098,42 +2149,33 @@ app.get('/admin/vendor-profiles-raw', adminGuard, async (req, res) => {
   }
 });
 
-// --- DEBUG: probe address presence (raw/parsed/flat)
+// --- DEBUG: normalized probe (email + rich address as API sees them)
 app.get('/admin/vendors/_probe', adminGuard, async (req, res) => {
   try {
+    res.set('Cache-Control','no-store');
     const { rows } = await pool.query(`
-      SELECT LOWER(vp.wallet_address) AS wallet_address,
-             vp.vendor_name, vp.email, vp.phone, vp.website, vp.address, vp.updated_at
+      SELECT wallet_address, row_to_json(vp) AS profile_raw
       FROM vendor_profiles vp
-      ORDER BY vp.updated_at DESC
-      LIMIT 50
+      ORDER BY COALESCE(vp.updated_at, vp.created_at) DESC NULLS LAST
+      LIMIT 25
     `);
 
-    const out = rows.map(r => {
-      let obj = null;
-      try { obj = JSON.parse(r.address || ''); } catch {}
-      const flat = obj && typeof obj === 'object'
-        ? [obj.line1, obj.city, obj.postalCode || obj.postal_code, obj.country].filter(Boolean).join(', ')
-        : (r.address || '');
+    const sample = rows.map(r => {
+      const norm = normalizeProfile(r.profile_raw);
       return {
-        wallet: r.wallet_address,
-        email: r.email || null,
-        phone: r.phone || null,
-        website: r.website || null,
-        address_raw: r.address || null,
-        address_obj: obj || null,
-        address_flat: flat || null,
-        flags: {
-          has_raw: !!(r.address && r.address.trim()),
-          has_obj: !!(obj && (obj.line1 || obj.city || obj.country || obj.postalCode || obj.postal_code)),
-          has_flat: !!(flat && flat.trim())
-        }
+        walletAddress: r.wallet_address,
+        email: norm.email,
+        phone: norm.phone,
+        website: norm.website,
+        address: norm.addressDisplay,
+        address1: norm.address?.line1 || null,
+        profile: norm
       };
     });
 
-    res.json({ count: out.length, sample: out });
+    res.json(sample);
   } catch (e) {
-    console.error('vendors _probe err', e);
+    console.error('vendors/_probe error', e);
     res.status(500).json({ error: 'probe failed' });
   }
 });
