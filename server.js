@@ -1951,34 +1951,36 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       FROM bids b
       GROUP BY LOWER(b.wallet_address)
     )
+    -- Vendors who have bids
     SELECT
-      a.vendor_name,
-      a.wallet_address,
-      a.bids_count,
-      a.last_bid_at,
-      a.total_awarded_usd,
-      vp.vendor_name AS profile_vendor_name,
-      vp.email       AS email,
-      vp.phone       AS phone,
-      vp.website     AS website,
-      vp.address     AS address_raw
+      a.vendor_name                               AS vendor_name,
+      a.wallet_address                            AS wallet_address,
+      a.bids_count                                AS bids_count,
+      a.last_bid_at                               AS last_bid_at,
+      a.total_awarded_usd                         AS total_awarded_usd,
+      vp.vendor_name                              AS profile_vendor_name,
+      vp.email                                    AS email,
+      vp.phone                                    AS phone,
+      vp.website                                  AS website,
+      vp.address                                  AS address_raw
     FROM agg a
     LEFT JOIN vendor_profiles vp
       ON LOWER(vp.wallet_address) = a.wallet_address
 
     UNION ALL
 
+    -- Profiles with no bids yet
     SELECT
-      COALESCE(vp.vendor_name,'')          AS vendor_name,
-      LOWER(vp.wallet_address)             AS wallet_address,
-      0                                    AS bids_count,
-      NULL::timestamptz                    AS last_bid_at,
-      0::numeric                           AS total_awarded_usd,
-      vp.vendor_name                       AS profile_vendor_name,
-      vp.email                             AS email,
-      vp.phone                             AS phone,
-      vp.website                           AS website,
-      vp.address                           AS address_raw
+      COALESCE(vp.vendor_name,'')                 AS vendor_name,
+      LOWER(vp.wallet_address)                    AS wallet_address,
+      0                                           AS bids_count,
+      NULL::timestamptz                           AS last_bid_at,
+      0::numeric                                  AS total_awarded_usd,
+      vp.vendor_name                              AS profile_vendor_name,
+      vp.email                                    AS email,
+      vp.phone                                    AS phone,
+      vp.website                                  AS website,
+      vp.address                                  AS address_raw
     FROM vendor_profiles vp
     WHERE NOT EXISTS (
       SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
@@ -1989,65 +1991,91 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
   try {
     const { rows } = await pool.query(sql);
 
-    const clean = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
+    const clean = (s) =>
+      typeof s === 'string' ? (s.trim() === '' ? null : s.trim()) : (s ?? null);
 
     const out = rows.map((r) => {
-      // address_raw may be JSON or plain string. Build both a flat string and structured fields.
+      // ---------- Normalize address (supports JSON or plain text) ----------
+      const raw = r.address_raw || '';
       let addrObj = null;
-      if (r.address_raw) { try { addrObj = JSON.parse(r.address_raw); } catch {} }
+      if (raw) { try { addrObj = JSON.parse(raw); } catch {} }
 
-      const address1   = clean(addrObj?.line1 ?? addrObj?.address1 ?? (addrObj ? null : r.address_raw));
+      const address1   = clean(addrObj?.line1 ?? addrObj?.address1 ?? (addrObj ? null : raw));
       const city       = clean(addrObj?.city);
+      const state      = clean(addrObj?.state ?? addrObj?.region ?? addrObj?.province);
       const postalCode = clean(addrObj?.postalCode ?? addrObj?.postal_code ?? addrObj?.zip);
       const country    = clean(addrObj?.country);
-      const flatAddr   = [address1, city, postalCode, country].filter(Boolean).join(', ') || null;
 
+      const flatAddress =
+        [address1, city, postalCode, country].filter(Boolean).join(', ') || null;
+
+      // ---------- Contact fields ----------
       const email   = clean(r.email);
       const phone   = clean(r.phone);
       const website = clean(r.website);
 
       return {
-        // core identity & stats
+        // identity & stats
         vendorName: r.profile_vendor_name || r.vendor_name || '',
         walletAddress: r.wallet_address || '',
         bidsCount: Number(r.bids_count) || 0,
         lastBidAt: r.last_bid_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // TOP-LEVEL fields (list view usually reads these)
+        // top-level (list view paths often read these)
         email,
-        contactEmail: email,   // <-- alias many UIs look for
+        contactEmail: email,        // alias some UIs use
         phone,
         website,
-        address: flatAddr,     // human-readable single line
-        address1,              // <-- alias many UIs look for
+        address: flatAddress,       // human-readable single line
+        address1,                   // alias most “address” cells use
+        addressLine1: address1,     // extra alias
         city,
+        state,
         postalCode,
         country,
 
-        // NESTED profile (detail panes / legacy code paths)
+        // nested profile (detail panes/legacy)
         profile: {
           companyName: r.profile_vendor_name ?? (r.vendor_name || null),
           contactName: null,
           email,
-          contactEmail: email, // <-- alias
+          contactEmail: email,      // alias
           phone,
           website,
-          address: flatAddr,   // string
-          address1: address1 || flatAddr || null, // ensure something is present
+
+          // provide BOTH object + string to satisfy any renderer
+          address: {
+            line1: address1 || flatAddress || null,
+            city,
+            state,
+            postalCode,
+            country,
+          },
+          addressText: flatAddress, // string variant for UIs that expect text
+
+          // flattened fields too (some components look here)
+          address1: address1 || flatAddress || null,
           address2: null,
           city,
-          state: null,
+          state,
           postalCode,
           country,
           notes: null,
         },
 
-        // Optional extra container some UIs expect
+        // optional extra container (some codepaths use contact.address.*)
         contact: {
           email,
           phone,
-          address: { line1: address1 || flatAddr || null, city, postalCode, country }
+          address: {
+            line1: address1 || flatAddress || null,
+            city,
+            state,
+            postalCode,
+            country,
+          },
+          addressText: flatAddress,
         },
       };
     });
