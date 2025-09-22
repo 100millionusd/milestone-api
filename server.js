@@ -2107,75 +2107,158 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
 
 /** ADMIN: list vendors (with or without bids), normalized email + rich address (street + house no + city + postal + country) */
 app.get('/admin/vendors', adminGuard, async (req, res) => {
-  try {
-    res.set('Cache-Control','no-store');
-
-    const sql = `
-      WITH agg AS (
-        SELECT
-          LOWER(b.wallet_address)                                   AS wallet,
-          COALESCE(MAX(b.vendor_name),'')                            AS vendor_name,
-          COUNT(*)::int                                              AS bids_count,
-          MAX(b.created_at)                                          AS last_bid_at,
-          COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
-                            THEN b.price_usd ELSE 0 END),0)::numeric AS total_awarded_usd
-        FROM bids b
-        GROUP BY LOWER(b.wallet_address)
-      ),
-      base AS (
-        SELECT LOWER(wallet_address) AS wallet FROM vendor_profiles
-        UNION
-        SELECT LOWER(wallet_address) AS wallet FROM bids
-      )
+  const sql = `
+    WITH agg AS (
       SELECT
-        COALESCE(agg.vendor_name, vp.vendor_name, '') AS vendor_name,
-        base.wallet                                   AS wallet_address,
-        COALESCE(agg.bids_count, 0)::int              AS bids_count,
-        agg.last_bid_at                                AS last_bid_at,
-        COALESCE(agg.total_awarded_usd, 0)::numeric    AS total_awarded_usd,
-        CASE WHEN vp.wallet_address IS NOT NULL
-             THEN row_to_json(vp) ELSE NULL END        AS profile_raw
-      FROM base
-      LEFT JOIN agg ON agg.wallet = base.wallet
-      LEFT JOIN vendor_profiles vp ON LOWER(vp.wallet_address) = base.wallet
-      ORDER BY agg.last_bid_at DESC NULLS LAST, vendor_name ASC
-    `;
+        LOWER(b.wallet_address)                                        AS wallet_address,
+        COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
+        COUNT(*)::int                                                  AS bids_count,
+        MAX(b.created_at)                                              AS last_bid_at,
+        COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
+                          THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd
+      FROM bids b
+      GROUP BY LOWER(b.wallet_address)
+    )
+    -- vendors who have bids
+    SELECT
+      a.vendor_name                               AS vendor_name,
+      a.wallet_address                            AS wallet_address,
+      a.bids_count                                AS bids_count,
+      a.last_bid_at                               AS last_bid_at,
+      a.total_awarded_usd                         AS total_awarded_usd,
+      vp.vendor_name                              AS profile_vendor_name,
+      vp.email                                    AS email,
+      vp.phone                                    AS phone,
+      vp.website                                  AS website,
+      vp.address                                  AS address_raw
+    FROM agg a
+    LEFT JOIN vendor_profiles vp
+      ON LOWER(vp.wallet_address) = a.wallet_address
 
+    UNION ALL
+
+    -- profiles that have no bids yet
+    SELECT
+      COALESCE(vp.vendor_name,'')                 AS vendor_name,
+      LOWER(vp.wallet_address)                    AS wallet_address,
+      0                                           AS bids_count,
+      NULL::timestamptz                           AS last_bid_at,
+      0::numeric                                  AS total_awarded_usd,
+      vp.vendor_name                              AS profile_vendor_name,
+      vp.email                                    AS email,
+      vp.phone                                    AS phone,
+      vp.website                                  AS website,
+      vp.address                                  AS address_raw
+    FROM vendor_profiles vp
+    WHERE NOT EXISTS (
+      SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
+    )
+    ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
+  `;
+
+  try {
     const { rows } = await pool.query(sql);
+    const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
-    const out = rows.map(r => {
-      const normP = normalizeProfile(r.profile_raw || null);
+    const out = rows.map((r) => {
+      // Parse address (may be JSON or plain text)
+      let addrObj = null;
+      if (r.address_raw && r.address_raw.trim().startsWith('{')) {
+        try { addrObj = JSON.parse(r.address_raw); } catch { addrObj = null; }
+      }
+
+      const parts = addrObj && typeof addrObj === 'object'
+        ? {
+            line1: norm(addrObj.line1),
+            city: norm(addrObj.city),
+            state: norm(addrObj.state),
+            postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code),
+            country: norm(addrObj.country),
+          }
+        : {
+            line1: norm(r.address_raw),
+            city: null,
+            state: null,
+            postalCode: null,
+            country: null,
+          };
+
+      const flat = [parts.line1, parts.city, parts.postalCode, parts.country]
+        .filter(Boolean)
+        .join(', ') || null;
+
+      const email   = norm(r.email);
+      const phone   = norm(r.phone);
+      const website = norm(r.website);
+
+      // Use normalizeProfile if present to get the richest display variants
+      const normP = (typeof normalizeProfile === 'function')
+        ? normalizeProfile({
+            email, phone, website,
+            address: addrObj || r.address_raw || null,
+            address_text: flat,
+          })
+        : {
+            email, phone, website,
+            address: {
+              line1: parts.line1, city: parts.city, state: parts.state,
+              postalCode: parts.postalCode, country: parts.country
+            },
+            addressText: flat, addressFormatted: flat, addressDisplay: flat
+          };
+
       return {
-        vendorName: r.vendor_name || '',
+        // core
+        vendorName: r.profile_vendor_name || r.vendor_name || '',
         walletAddress: r.wallet_address || '',
         bidsCount: Number(r.bids_count) || 0,
         lastBidAt: r.last_bid_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // top-level mirrors the UI reads
-        email: normP.email,
-        contactEmail: normP.email, // alias kept for compatibility
-        phone: normP.phone,
-        website: normP.website,
+        // ---- Top-level fields the UI might read ----
+        email,
+        contactEmail: email,                 // alias
+        phone,
+        website,
 
-        // richest display address (includes street + house no if present)
-        address: normP.addressDisplay || null,
-        address1: normP.address?.line1 || null,       // aliases maintained
-        addressLine1: normP.address?.line1 || null,
-        city: normP.address?.city || null,
-        state: normP.address?.state || null,
-        postalCode: normP.address?.postalCode || null,
-        country: normP.address?.country || null,
+        // richest display address (includes street + house number if present)
+        address: normP.addressDisplay || normP.addressFormatted || normP.addressText || flat || null,
+        address1: (normP.address && normP.address.line1) || parts.line1 || flat || null,
+        addressLine1: (normP.address && normP.address.line1) || parts.line1 || flat || null,
+        city: (normP.address && normP.address.city) || parts.city,
+        state: (normP.address && normP.address.state) || parts.state,
+        postalCode: (normP.address && normP.address.postalCode) || parts.postalCode,
+        country: (normP.address && normP.address.country) || parts.country,
 
-        // full profile block for detail views
+        // ---- Nested profile (keep both string + parts) ----
         profile: {
-          email: normP.email,
-          phone: normP.phone,
-          website: normP.website,
-          addressText: normP.addressText,           // raw text if stored
-          addressFormatted: normP.addressFormatted, // computed full string
-          address: normP.address                    // structured parts
-        }
+          companyName: r.profile_vendor_name ?? (r.vendor_name || null),
+          contactName: null,
+          email,
+          contactEmail: email,              // alias
+          phone,
+          website,
+
+          // Use the same rich fallbacks for display
+          address: normP.addressDisplay || normP.addressFormatted || normP.addressText || flat || null,
+          addressText: normP.addressText || flat || null,
+
+          address1: (normP.address && normP.address.line1) || parts.line1 || flat || null,
+          address2: null,
+          city: (normP.address && normP.address.city) || parts.city,
+          state: (normP.address && normP.address.state) || parts.state,
+          postalCode: (normP.address && normP.address.postalCode) || parts.postalCode,
+          country: (normP.address && normP.address.country) || parts.country,
+          notes: null,
+        },
+
+        // Optional convenience block
+        contact: {
+          email,
+          phone,
+          address: normP.addressDisplay || normP.addressFormatted || normP.addressText || flat || null,
+          addressText: normP.addressText || flat || null,
+        },
       };
     });
 
@@ -2183,22 +2266,6 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
   } catch (e) {
     console.error('admin/vendors error', e);
     res.status(500).json({ error: 'Failed to list vendors' });
-  }
-});
-
-// --- DEBUG: raw vendor_profiles so we can see what's actually stored
-app.get('/admin/vendor-profiles-raw', adminGuard, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT wallet_address, vendor_name, email, phone, website, address, updated_at
-      FROM vendor_profiles
-      ORDER BY updated_at DESC
-      LIMIT 50
-    `);
-    res.json(rows);
-  } catch (e) {
-    console.error('raw profiles error', e);
-    res.status(500).json({ error: 'raw profiles failed' });
   }
 });
 
