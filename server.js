@@ -1951,101 +1951,101 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       FROM bids b
       GROUP BY LOWER(b.wallet_address)
     )
-    -- Vendors with bids
+    -- Vendors who have bids
     SELECT
       a.vendor_name                               AS vendor_name,
-      a.wallet_address                             AS wallet_address,
-      a.bids_count                                 AS bids_count,
-      a.last_bid_at                                AS last_bid_at,
-      a.total_awarded_usd                          AS total_awarded_usd,
-      vp.vendor_name                               AS profile_vendor_name,
-      vp.email                                     AS email,
-      vp.phone                                     AS phone,
-      vp.website                                   AS website,
-      vp.address                                   AS address_raw
+      a.wallet_address                            AS wallet_address,
+      a.bids_count                                AS bids_count,
+      a.last_bid_at                               AS last_bid_at,
+      a.total_awarded_usd                         AS total_awarded_usd,
+      vp.vendor_name                              AS profile_vendor_name,
+      vp.email                                    AS email,
+      vp.phone                                    AS phone,
+      vp.website                                  AS website,
+      vp.address                                  AS address_raw
     FROM agg a
     LEFT JOIN vendor_profiles vp
       ON LOWER(vp.wallet_address) = a.wallet_address
 
     UNION ALL
 
-    -- Vendors with profile but no bids yet
+    -- Profiles with no bids yet
     SELECT
-      COALESCE(vp.vendor_name,'')                  AS vendor_name,
-      LOWER(vp.wallet_address)                     AS wallet_address,
-      0                                            AS bids_count,
-      NULL::timestamptz                            AS last_bid_at,
-      0::numeric                                   AS total_awarded_usd,
-      vp.vendor_name                               AS profile_vendor_name,
-      vp.email                                     AS email,
-      vp.phone                                     AS phone,
-      vp.website                                   AS website,
-      vp.address                                   AS address_raw
+      COALESCE(vp.vendor_name,'')                 AS vendor_name,
+      LOWER(vp.wallet_address)                    AS wallet_address,
+      0                                           AS bids_count,
+      NULL::timestamptz                           AS last_bid_at,
+      0::numeric                                  AS total_awarded_usd,
+      vp.vendor_name                              AS profile_vendor_name,
+      vp.email                                    AS email,
+      vp.phone                                    AS phone,
+      vp.website                                  AS website,
+      vp.address                                  AS address_raw
     FROM vendor_profiles vp
     WHERE NOT EXISTS (
       SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
     )
-
     ORDER BY last_bid_at DESC NULLS LAST, vendor_name ASC
   `;
 
   try {
     const { rows } = await pool.query(sql);
 
-    const out = rows.map(r => {
-      // Parse address JSON if present; otherwise treat as plain text
+    const out = rows.map((r) => {
+      // normalize strings: convert "" -> null so UI won’t treat empty as “value”
+      const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
+
+      // address_raw may be JSON ({"line1","city","postalCode","country"}) OR plain text
       let addrObj = null;
       if (r.address_raw) {
-        try { addrObj = JSON.parse(r.address_raw); } catch { addrObj = null; }
+        try { addrObj = JSON.parse(r.address_raw); } catch { /* plain text */ }
       }
-      const normalizedObj = addrObj && typeof addrObj === 'object'
+      const structured = (addrObj && typeof addrObj === 'object')
         ? {
-            line1: addrObj.line1 || '',
-            city: addrObj.city || '',
-            postalCode: addrObj.postalCode || addrObj.postal_code || '',
-            country: addrObj.country || '',
+            line1: norm(addrObj.line1) || '',
+            city: norm(addrObj.city) || '',
+            postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code) || '',
+            country: norm(addrObj.country) || '',
           }
-        : { line1: (r.address_raw || '') };
+        : { line1: norm(r.address_raw) || '' };
 
-      const flatAddress = [normalizedObj.line1, normalizedObj.city, normalizedObj.postalCode, normalizedObj.country]
+      const flatAddress = [structured.line1, structured.city, structured.postalCode, structured.country]
         .filter(Boolean)
         .join(', ') || null;
 
-      const email   = r.email   || null;
-      const phone   = r.phone   || null;
-      const website = r.website || null;
+      const email   = norm(r.email);
+      const phone   = norm(r.phone);
+      const website = norm(r.website);
 
       return {
+        // core
         vendorName: r.profile_vendor_name || r.vendor_name || '',
         walletAddress: r.wallet_address || '',
         bidsCount: Number(r.bids_count) || 0,
         lastBidAt: r.last_bid_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // Top-level fields some UI components read
+        // *** top-level fields that the Admin UI is reading ***
         email,
         phone,
         website,
         address: flatAddress,
 
-        // Nested profile – keep string at .address because many UIs expect that
+        // nested profile for components that still expect it
         profile: {
           companyName: r.profile_vendor_name ?? (r.vendor_name || null),
           contactName: null,
           email,
           phone,
           website,
-          address: flatAddress,          // <-- string for display
-          address1: normalizedObj.line1 || flatAddress || null,
+          address: flatAddress,   // string for display
+          address1: structured.line1 || flatAddress || null,
           address2: null,
-          city: normalizedObj.city || null,
+          city: structured.city || null,
           state: null,
-          postalCode: normalizedObj.postalCode || null,
-          country: normalizedObj.country || null,
+          postalCode: structured.postalCode || null,
+          country: structured.country || null,
           notes: null,
-
-          // Optional: also expose structured address if some UI wants it
-          addressObj: normalizedObj,
         },
       };
     });
