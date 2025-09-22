@@ -2161,7 +2161,7 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
     const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
     const out = rows.map((r) => {
-      // Parse address (may be JSON or plain text)
+      // address may be JSON or plain text
       let addrObj = null;
       if (r.address_raw && r.address_raw.trim().startsWith('{')) {
         try { addrObj = JSON.parse(r.address_raw); } catch { addrObj = null; }
@@ -2191,7 +2191,7 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       const phone   = norm(r.phone);
       const website = norm(r.website);
 
-      // Use normalizeProfile if present to get the richest display variants
+      // If normalizeProfile() exists, use it to compute rich variants. Otherwise minimal fallback.
       const normP = (typeof normalizeProfile === 'function')
         ? normalizeProfile({
             email, phone, website,
@@ -2207,6 +2207,17 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
             addressText: flat, addressFormatted: flat, addressDisplay: flat
           };
 
+      // --- NEW: explicit "street + house number" line ---
+      const streetLine =
+        (normP.address && normP.address.line1) ||
+        parts.line1 ||
+        (
+          flat &&
+          /\d/.test((flat.split(',')[0] || '').trim())
+            ? flat.split(',')[0].trim()
+            : null
+        );
+
       return {
         // core
         vendorName: r.profile_vendor_name || r.vendor_name || '',
@@ -2215,35 +2226,34 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
         lastBidAt: r.last_bid_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // ---- Top-level fields the UI might read ----
+        // contact
         email,
-        contactEmail: email,                 // alias
+        contactEmail: email,
         phone,
         website,
 
-        // richest display address (includes street + house number if present)
+        // address fields
+        street: streetLine, // <-- explicit street + number
+        address1: streetLine,            // alias kept for existing UI
+        addressLine1: streetLine,        // alias kept for existing UI
         address: normP.addressDisplay || normP.addressFormatted || normP.addressText || flat || null,
-        address1: (normP.address && normP.address.line1) || parts.line1 || flat || null,
-        addressLine1: (normP.address && normP.address.line1) || parts.line1 || flat || null,
         city: (normP.address && normP.address.city) || parts.city,
         state: (normP.address && normP.address.state) || parts.state,
         postalCode: (normP.address && normP.address.postalCode) || parts.postalCode,
         country: (normP.address && normP.address.country) || parts.country,
 
-        // ---- Nested profile (keep both string + parts) ----
+        // nested profile (for consumers expecting a block)
         profile: {
           companyName: r.profile_vendor_name ?? (r.vendor_name || null),
           contactName: null,
           email,
-          contactEmail: email,              // alias
+          contactEmail: email,
           phone,
           website,
-
-          // Use the same rich fallbacks for display
           address: normP.addressDisplay || normP.addressFormatted || normP.addressText || flat || null,
           addressText: normP.addressText || flat || null,
-
-          address1: (normP.address && normP.address.line1) || parts.line1 || flat || null,
+          street: streetLine,                 // expose here too
+          address1: streetLine,               // alias
           address2: null,
           city: (normP.address && normP.address.city) || parts.city,
           state: (normP.address && normP.address.state) || parts.state,
@@ -2252,10 +2262,11 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
           notes: null,
         },
 
-        // Optional convenience block
+        // convenience block
         contact: {
           email,
           phone,
+          street: streetLine,
           address: normP.addressDisplay || normP.addressFormatted || normP.addressText || flat || null,
           addressText: normP.addressText || flat || null,
         },
@@ -2266,37 +2277,6 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
   } catch (e) {
     console.error('admin/vendors error', e);
     res.status(500).json({ error: 'Failed to list vendors' });
-  }
-});
-
-// --- DEBUG: normalized probe (email + rich address as API sees them)
-app.get('/admin/vendors/_probe', adminGuard, async (req, res) => {
-  try {
-    res.set('Cache-Control','no-store');
-    const { rows } = await pool.query(`
-      SELECT wallet_address, row_to_json(vp) AS profile_raw
-      FROM vendor_profiles vp
-      ORDER BY COALESCE(vp.updated_at, vp.created_at) DESC NULLS LAST
-      LIMIT 25
-    `);
-
-    const sample = rows.map(r => {
-      const norm = normalizeProfile(r.profile_raw);
-      return {
-        walletAddress: r.wallet_address,
-        email: norm.email,
-        phone: norm.phone,
-        website: norm.website,
-        address: norm.addressDisplay,
-        address1: norm.address?.line1 || null,
-        profile: norm
-      };
-    });
-
-    res.json(sample);
-  } catch (e) {
-    console.error('vendors/_probe error', e);
-    res.status(500).json({ error: 'probe failed' });
   }
 });
 
