@@ -2037,32 +2037,35 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
 
         // nested profile (detail panes/legacy)
         profile: {
-          companyName: r.profile_vendor_name ?? (r.vendor_name || null),
-          contactName: null,
-          email,
-          contactEmail: email,      // alias
-          phone,
-          website,
+  companyName: r.profile_vendor_name ?? (r.vendor_name || null),
+  contactName: null,
+  email,
+  contactEmail: email,
+  phone,
+  website,
 
-          // provide BOTH object + string to satisfy any renderer
-          address: {
-            line1: address1 || flatAddress || null,
-            city,
-            state,
-            postalCode,
-            country,
-          },
-          addressText: flatAddress, // string variant for UIs that expect text
+  // what the UI expects to render:
+  address: flatAddress,                 // <-- string for display
 
-          // flattened fields too (some components look here)
-          address1: address1 || flatAddress || null,
-          address2: null,
-          city,
-          state,
-          postalCode,
-          country,
-          notes: null,
-        },
+  // keep structured form but under a different key
+  addressStructured: {
+    line1: structured.line1 || null,
+    city: structured.city || null,
+    state: null,
+    postalCode: structured.postalCode || null,
+    country: structured.country || null,
+  },
+
+  // extras / fallbacks
+  addressText: flatAddress,
+  address1: structured.line1 || flatAddress || null,
+  address2: null,
+  city: structured.city || null,
+  state: null,
+  postalCode: structured.postalCode || null,
+  country: structured.country || null,
+  notes: null,
+},
 
         // optional extra container (some codepaths use contact.address.*)
         contact: {
