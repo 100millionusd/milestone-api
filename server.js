@@ -2087,6 +2087,62 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
   }
 });
 
+// --- DEBUG: raw vendor_profiles so we can see what's actually stored
+app.get('/admin/vendor-profiles-raw', adminGuard, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT wallet_address, vendor_name, email, phone, website, address, updated_at
+      FROM vendor_profiles
+      ORDER BY updated_at DESC
+      LIMIT 50
+    `);
+    res.json(rows);
+  } catch (e) {
+    console.error('raw profiles error', e);
+    res.status(500).json({ error: 'raw profiles failed' });
+  }
+});
+
+// --- DEBUG: probe address presence (raw/parsed/flat)
+app.get('/admin/vendors/_probe', adminGuard, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT LOWER(vp.wallet_address) AS wallet_address,
+             vp.vendor_name, vp.email, vp.phone, vp.website, vp.address, vp.updated_at
+      FROM vendor_profiles vp
+      ORDER BY vp.updated_at DESC
+      LIMIT 50
+    `);
+
+    const out = rows.map(r => {
+      let obj = null;
+      try { obj = JSON.parse(r.address || ''); } catch {}
+      const flat = obj && typeof obj === 'object'
+        ? [obj.line1, obj.city, obj.postalCode || obj.postal_code, obj.country].filter(Boolean).join(', ')
+        : (r.address || '');
+      return {
+        wallet: r.wallet_address,
+        email: r.email || null,
+        phone: r.phone || null,
+        website: r.website || null,
+        address_raw: r.address || null,
+        address_obj: obj || null,
+        address_flat: flat || null,
+        flags: {
+          has_raw: !!(r.address && r.address.trim()),
+          has_obj: !!(obj && (obj.line1 || obj.city || obj.country || obj.postalCode || obj.postal_code)),
+          has_flat: !!(flat && flat.trim())
+        }
+      };
+    });
+
+    res.json({ count: out.length, sample: out });
+  } catch (e) {
+    console.error('vendors _probe err', e);
+    res.status(500).json({ error: 'probe failed' });
+  }
+});
+
 // ==============================
 // Routes — Payments (legacy)
 // ==============================
