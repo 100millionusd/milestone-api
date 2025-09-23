@@ -112,14 +112,21 @@ const pool = new Pool({
         phone           text,
         address         text,
         website         text,
+        archived        boolean NOT NULL DEFAULT false,  -- NEW
         created_at      timestamptz NOT NULL DEFAULT now(),
         updated_at      timestamptz NOT NULL DEFAULT now()
       );
     `);
+
+    // In case the table already existed without the column
+    await pool.query(`ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS archived boolean NOT NULL DEFAULT false;`);
+
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_vendor_profiles_name
       ON vendor_profiles (lower(vendor_name));
     `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_vendor_profiles_archived ON vendor_profiles (archived);`);
+
     console.log('[db] vendor_profiles ready');
   } catch (e) {
     console.error('vendor_profiles init failed:', e);
@@ -1302,6 +1309,19 @@ app.post("/bids/:id/archive", adminGuard, async (req, res) => {
   } catch (err) {
     console.error("Error archiving bid:", err);
     res.status(500).json({ error: "Failed to archive bid" });
+  }
+});
+
+app.delete("/bids/:id", adminGuard, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+  try {
+    const { rowCount } = await pool.query(`DELETE FROM bids WHERE bid_id=$1`, [id]);
+    if (rowCount === 0) return res.status(404).json({ error: "Bid not found" });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("delete bid error", err);
+    return res.status(500).json({ error: "Failed to delete bid" });
   }
 });
 
