@@ -1370,14 +1370,79 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
   try {
+    // Load bid + proposal
     const { rows: [bid] } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [bidId]);
     if (!bid) { res.write(`data: ERROR Bid not found\n\n`); res.write(`data: [DONE]\n\n`); return res.end(); }
 
     const { rows: [proposal] } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
     if (!proposal) { res.write(`data: ERROR Proposal not found\n\n`); res.write(`data: [DONE]\n\n`); return res.end(); }
 
+    // Load latest proofs for this bid
+    const { rows: proofRows } = await pool.query(
+      'SELECT * FROM proofs WHERE bid_id=$1 ORDER BY submitted_at DESC NULLS LAST LIMIT 5',
+      [bidId]
+    );
+
+    // Normalize + (best-effort) PDF extraction for each proof
+    const proofsCtx = [];
+    for (const pr of proofRows) {
+      const files = Array.isArray(pr.files)
+        ? pr.files
+        : (typeof pr.files === 'string' ? JSON.parse(pr.files || '[]') : []);
+      const desc = String(pr.description || '').slice(0, 2000);
+      const title = String(pr.title || `Proof for milestone ${Number(pr.milestone_index) + 1}`);
+
+      // Try extract text from the first obvious PDF
+      let pdfNote = 'No PDF detected.';
+      const pdfFile = files.find(f => {
+        const n = (f?.name || f?.url || '').toLowerCase();
+        return n.endsWith('.pdf') || n.includes('.pdf?');
+      });
+
+      if (pdfFile && pdfFile.url) {
+        try {
+          const info = await withTimeout(
+            waitForPdfInfoFromDoc({ url: pdfFile.url, name: pdfFile.name || 'attachment.pdf', mimetype: 'application/pdf' }),
+            8000,
+            () => ({ used: false, reason: 'timeout' })
+          );
+          if (info.used) {
+            // keep it compact to not blow the prompt
+            const txt = (info.text || '').slice(0, 6000);
+            pdfNote = `PDF EXTRACT (truncated): """${txt}"""`;
+          } else {
+            pdfNote = `No PDF text available (reason: ${info.reason || 'unknown'})`;
+          }
+        } catch (e) {
+          pdfNote = `PDF extraction failed (${String(e).slice(0,120)})`;
+        }
+      }
+
+      proofsCtx.push({
+        milestoneIndex: pr.milestone_index,
+        title,
+        description: desc,
+        files,
+        pdfNote,
+      });
+    }
+
+    // Build chat context with **bid + proofs**
     const ai = coerceJson(bid.ai_analysis);
-    const context =
+    const proofsBlock = proofsCtx.length
+      ? proofsCtx.map((p, i) => {
+          const filesList = (p.files || []).map(f => `- ${f.name || 'file'}: ${f.url}`).join('\n') || '(none)';
+          return `
+Proof #${i + 1} — Milestone ${Number(p.milestoneIndex) + 1}: ${p.title}
+Description (truncated):
+"""${p.description}"""
+Files:
+${filesList}
+${p.pdfNote}`.trim();
+        }).join('\n\n')
+      : '(no proofs submitted for this bid)';
+
+    const systemContext =
 `You are Agent2 for LithiumX.
 
 Proposal:
@@ -1392,13 +1457,20 @@ Bid:
 - Days: ${bid.days ?? 0}
 - Notes: ${bid.notes || ""}
 
-Existing Analysis:
-${ai ? JSON.stringify(ai).slice(0, 4000) : "(none)"}
+Existing Bid Analysis (may omit proofs):
+${ai ? JSON.stringify(ai).slice(0, 2000) : "(none)"}
 
-Answer the user's question about this bid/proposal. Keep it concise.`;
+Submitted Proofs (latest first):
+${proofsBlock}
+
+Instruction:
+- Answer questions about BOTH the bid and its submitted proofs.
+- If the user asks about “the proof”, “attachment”, or “PDF”, base your answer on the Proofs section above.
+- If a PDF extract was available, use it; otherwise clearly say that no usable PDF text was available.
+- Be concise.`;
 
     const msgs = [
-      { role: 'system', content: context },
+      { role: 'system', content: systemContext },
       ...userMessages.map((m) => ({
         role: m && m.role === 'assistant' ? 'assistant' : 'user',
         content: String((m && m.content) || ''),
@@ -1413,7 +1485,7 @@ Answer the user's question about this bid/proposal. Keep it concise.`;
     });
 
     for await (const part of stream) {
-      const token = part && part.choices && part.choices[0] && part.choices[0].delta && part.choices[0].delta.content || '';
+      const token = part?.choices?.[0]?.delta?.content || '';
       if (token) res.write(`data: ${token}\n\n`);
     }
     res.write(`data: [DONE]\n\n`);
