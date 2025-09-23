@@ -2148,6 +2148,26 @@ app.post('/admin/vendors/:wallet/archive', adminGuard, async (req, res) => {
   }
 });
 
+// Unarchive a vendor (admin)
+app.post('/admin/vendors/:wallet/unarchive', adminGuard, async (req, res) => {
+  try {
+    const wallet = String(req.params.wallet || '').toLowerCase();
+    if (!wallet) return res.status(400).json({ error: 'wallet required' });
+    const { rows } = await pool.query(
+      `UPDATE vendor_profiles
+         SET archived=false, updated_at=now()
+       WHERE lower(wallet_address)=lower($1)
+       RETURNING wallet_address, archived`,
+      [wallet]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Vendor profile not found' });
+    res.json({ ok: true, walletAddress: rows[0].wallet_address, archived: rows[0].archived });
+  } catch (e) {
+    console.error('POST /admin/vendors/:wallet/unarchive error', e);
+    res.status(500).json({ error: 'Failed to unarchive vendor' });
+  }
+});
+
 /** ADMIN: Delete a vendor profile by wallet (bids remain) */
 app.delete('/admin/vendors/:wallet', adminGuard, async (req, res) => {
   try {
