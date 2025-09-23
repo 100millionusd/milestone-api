@@ -134,6 +134,31 @@ const pool = new Pool({
 })();
 
 // ==============================
+// DB bootstrap — proposals owner fields (create if missing)
+// ==============================
+(async () => {
+  try {
+    // Add columns if they don't exist
+    await pool.query(`
+      ALTER TABLE proposals
+        ADD COLUMN IF NOT EXISTS owner_wallet text,
+        ADD COLUMN IF NOT EXISTS owner_email  text,
+        ADD COLUMN IF NOT EXISTS updated_at   timestamptz NOT NULL DEFAULT now();
+    `);
+
+    // Helpful index for "my proposals"
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_proposals_owner_wallet
+      ON proposals (lower(owner_wallet));
+    `);
+
+    console.log('[db] proposals owner fields ready');
+  } catch (e) {
+    console.error('proposals owner fields init failed:', e);
+  }
+})();
+
+// ==============================
 // Utilities
 // ==============================
 function toCamel(row) {
@@ -511,7 +536,21 @@ const proposalSchema = Joi.object({
   amountUSD: Joi.number().min(0).default(0),
   docs: Joi.array().default([]),
   cid: Joi.string().allow(""),
+  ownerEmail: Joi.string().email().allow(""), // ✅ NEW (optional)
 });
+
+const proposalUpdateSchema = Joi.object({
+  orgName: Joi.string().min(2).max(160),
+  title: Joi.string().min(2).max(200),
+  summary: Joi.string(),
+  contact: Joi.string().email().allow(""),
+  address: Joi.string().allow(""),
+  city: Joi.string().allow(""),
+  country: Joi.string().allow(""),
+  amountUSD: Joi.number().min(0),
+  docs: Joi.array(),
+  ownerEmail: Joi.string().email().allow(""),
+}).min(1);
 
 const bidSchema = Joi.object({
   proposalId: Joi.number().integer().required(),
@@ -853,6 +892,26 @@ async function adminOrBidOwnerGuard(req, res, next) {
   }
 }
 
+async function adminOrProposalOwnerGuard(req, res, next) {
+  if (req.user?.role === 'admin') return next();
+
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid proposal id' });
+  if (!req.user?.sub) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const { rows } = await pool.query('SELECT owner_wallet FROM proposals WHERE proposal_id=$1', [id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Proposal not found' });
+    const owner = (rows[0].owner_wallet || '').toLowerCase();
+    if (owner !== (req.user.sub || '').toLowerCase()) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    return next();
+  } catch (e) {
+    return res.status(500).json({ error: 'Internal error' });
+  }
+}
+
 // --- Auth endpoints ---
 app.post("/auth/nonce", (req, res) => {
   const address = norm(req.body?.address);
@@ -1024,6 +1083,32 @@ app.get("/proposals", async (req, res) => {
   }
 });
 
+// List proposals owned by the current user
+app.get("/proposals/mine", authRequired, async (req, res) => {
+  try {
+    const includeArchived = String(req.query.includeArchived || "").toLowerCase();
+    const wallet = String(req.user?.sub || "").toLowerCase();
+    if (!wallet) return res.status(401).json({ error: "Unauthorized" });
+
+    let q = `
+      SELECT * FROM proposals
+      WHERE lower(owner_wallet) = lower($1)
+    `;
+    const params = [wallet];
+
+    if (!["true", "1", "yes"].includes(includeArchived)) {
+      q += ` AND status != 'archived'`;
+    }
+
+    q += ` ORDER BY created_at DESC`;
+
+    const { rows } = await pool.query(q, params);
+    res.json(mapRows(rows));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/proposals/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -1041,11 +1126,18 @@ app.post("/proposals", async (req, res) => {
     const { error, value } = proposalSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
 
+    // If the submitter is logged in (Web3Auth wallet), capture owner wallet + optional email
+    const ownerWallet = (req.user?.sub || null);
+    const ownerEmail  = (value.ownerEmail || null);
+
     const q = `
       INSERT INTO proposals (
-        org_name, title, summary, contact, address, city, country, amount_usd, docs, cid, status
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending')
-      RETURNING proposal_id, org_name, title, summary, contact, address, city, country, amount_usd, docs, cid, status, created_at
+        org_name, title, summary, contact, address, city, country, amount_usd, docs, cid, status,
+        owner_wallet, owner_email, updated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',
+                $11,$12, NOW())
+      RETURNING proposal_id, org_name, title, summary, contact, address, city, country,
+                amount_usd, docs, cid, status, created_at, owner_wallet, owner_email, updated_at
     `;
     const vals = [
       value.orgName,
@@ -1058,11 +1150,71 @@ app.post("/proposals", async (req, res) => {
       value.amountUSD,
       JSON.stringify(value.docs || []),
       value.cid,
+      ownerWallet,
+      ownerEmail,
     ];
+
     const { rows } = await pool.query(q, vals);
     res.json(toCamel(rows[0]));
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Owner/Admin can edit a proposal (partial)
+app.patch("/proposals/:id", adminOrProposalOwnerGuard, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid proposal id" });
+
+    const { error, value } = proposalUpdateSchema.validate(req.body || {}, { abortEarly: false });
+    if (error) return res.status(400).json({ error: error.message });
+
+    // Map JS keys -> DB columns
+    const map = {
+      orgName: 'org_name',
+      title: 'title',
+      summary: 'summary',
+      contact: 'contact',
+      address: 'address',
+      city: 'city',
+      country: 'country',
+      amountUSD: 'amount_usd',
+      ownerEmail: 'owner_email',
+      docs: 'docs',
+    };
+
+    const sets = [];
+    const vals = [];
+    let i = 1;
+
+    for (const [k, v] of Object.entries(value)) {
+      const col = map[k];
+      if (!col) continue;
+      if (k === 'docs') {
+        sets.push(`${col}=$${i++}`);
+        vals.push(JSON.stringify(v || []));
+      } else {
+        sets.push(`${col}=$${i++}`);
+        vals.push(v);
+      }
+    }
+
+    if (sets.length === 0) return res.status(400).json({ error: "No valid fields to update" });
+
+    // Always bump updated_at
+    sets.push(`updated_at=NOW()`);
+
+    const sql = `UPDATE proposals SET ${sets.join(', ')} WHERE proposal_id=$${i} RETURNING *`;
+    vals.push(id);
+
+    const { rows } = await pool.query(sql, vals);
+    if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
+
+    res.json(toCamel(rows[0]));
+  } catch (err) {
+    console.error("PATCH /proposals/:id error", err);
+    res.status(500).json({ error: "Failed to update proposal" });
   }
 });
 
@@ -1904,10 +2056,20 @@ ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
   }
 });
 
-app.get("/proofs", adminGuard, async (_req, res) => {
+app.get("/proofs", adminGuard, async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM proofs ORDER BY submitted_at DESC NULLS LAST");
-    res.json(mapRows(rows));
+    const bidId = Number(req.query.bidId);
+    if (Number.isFinite(bidId)) {
+      const { rows } = await pool.query(
+        "SELECT * FROM proofs WHERE bid_id=$1 ORDER BY submitted_at DESC NULLS LAST",
+        [ bidId ]
+      );
+      return res.json(mapRows(rows));
+    }
+    const { rows } = await pool.query(
+      "SELECT * FROM proofs ORDER BY submitted_at DESC NULLS LAST"
+    );
+    return res.json(mapRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
