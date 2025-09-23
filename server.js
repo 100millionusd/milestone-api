@@ -1424,6 +1424,110 @@ Answer the user's question about this bid/proposal. Keep it concise.`;
   }
 });
 
+// --- Agent2 Chat about a PROOF (uses bid + proof + extracted PDF text) -----
+app.post('/agent2/chat', adminGuard, async (req, res) => {
+  try {
+    const { bidId: rawBidId, proofId: rawProofId, message } = req.body || {};
+    if (!message) return res.status(400).json({ error: 'Missing message' });
+
+    // Load proof if provided (and derive bidId if needed)
+    const proofId = Number(rawProofId);
+    let proof = null;
+    if (Number.isFinite(proofId)) {
+      const { rows } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
+      proof = rows[0] || null;
+    }
+
+    let bidId = Number(rawBidId);
+    if (!Number.isFinite(bidId) && proof) bidId = Number(proof.bid_id);
+
+    if (!Number.isFinite(bidId)) {
+      return res.status(400).json({ error: 'Provide bidId or a proofId that belongs to a bid' });
+    }
+
+    // Load bid + proposal for context
+    const { rows: br } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [bidId]);
+    const bid = br[0];
+    if (!bid) return res.status(404).json({ error: 'Bid not found' });
+
+    const { rows: pr } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
+    const proposal = pr[0] || null;
+
+    // Collect proof text (description + any PDF text)
+    let proofDesc = '';
+    let files = [];
+    if (proof) {
+      proofDesc = String(proof.description || '').trim();
+      files = Array.isArray(proof.files)
+        ? proof.files
+        : (typeof proof.files === 'string' ? JSON.parse(proof.files || '[]') : []);
+    }
+
+    // Extract text from all PDF files (best-effort, using your existing helpers)
+    let pdfText = '';
+    for (const f of files) {
+      if (!f?.url) continue;
+      const info = await waitForPdfInfoFromDoc({ url: f.url, name: f.name || '' });
+      if (info.used && info.text) {
+        pdfText += `\n\n[${f.name || 'file'}]\n${info.text}`;
+      }
+    }
+    pdfText = pdfText.trim();
+
+    // Build strict context
+    const context = [
+      'You are Agent 2 for LithiumX.',
+      'Answer ONLY using the provided bid/proposal fields and the submitted proof (description + extracted PDF text).',
+      'If something is not present in that material, say it is not stated in the submitted proof.',
+      '',
+      '--- PROPOSAL ---',
+      JSON.stringify({
+        org: proposal?.org_name || '',
+        title: proposal?.title || '',
+        summary: proposal?.summary || '',
+        budgetUSD: proposal?.amount_usd ?? 0,
+      }, null, 2),
+      '',
+      '--- BID ---',
+      JSON.stringify({
+        vendor: bid.vendor_name || '',
+        priceUSD: bid.price_usd ?? 0,
+        days: bid.days ?? 0,
+        notes: bid.notes || '',
+        milestones: (Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || '[]')),
+      }, null, 2),
+      '',
+      '--- PROOF ---',
+      JSON.stringify({
+        title: proof?.title || '',
+        description: proofDesc.slice(0, 4000),
+        files: files.map(f => ({ name: f.name, url: f.url })),
+      }, null, 2),
+      '',
+      pdfText
+        ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText.slice(0, 15000)}`
+        : `--- NO PDF TEXT AVAILABLE ---`,
+    ].join('\n');
+
+    if (!openai) return res.status(503).json({ error: 'OpenAI not configured' });
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.2,
+      messages: [
+        { role: 'system', content: 'Be concise. Cite precisely what is (or is not) in the proof.' },
+        { role: 'user', content: `${message}\n\n--- CONTEXT ---\n${context}` },
+      ],
+    });
+
+    const reply = completion.choices?.[0]?.message?.content?.trim() || 'No reply';
+    res.json({ reply });
+  } catch (err) {
+    console.error('POST /agent2/chat error:', err);
+    res.status(500).json({ error: 'Agent 2 failed to answer' });
+  }
+});
+
 // 🔒 Guard: only allow POST/OPTIONS; block/log everything else
 app.all('/bids/:id/analyze', (req, res, next) => {
   if (req.method === 'POST') return next();
