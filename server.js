@@ -1855,20 +1855,37 @@ Instruction:
 - If a PDF extract was available, use it; otherwise clearly say that no usable PDF text was available.
 - Be concise.`;
 
-    const msgs = [
-      { role: 'system', content: systemContext },
-      ...userMessages.map((m) => ({
-        role: m && m.role === 'assistant' ? 'assistant' : 'user',
-        content: String((m && m.content) || ''),
-      })),
-    ];
+    const lastUserText = String(userMessages.at(-1)?.content || '').trim()
+  || 'Analyze the provided materials.';
 
-    const stream = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.2,
-      messages: msgs,
-      stream: true,
-    });
+let stream;
+if (imageFiles.length > 0) {
+  // Build one user message that includes text + image_url parts + your context
+  const content = [{ type: 'text', text: `Question: ${lastUserText}\n\nUse the CONTEXT and attached images.` }];
+  for (const f of imageFiles.slice(0, 6)) {
+    content.push({ type: 'image_url', image_url: { url: f.url } });
+  }
+  content.push({ type: 'text', text: `\n\n--- CONTEXT ---\n${systemContext}` });
+
+  stream = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',     // vision-capable
+    temperature: 0.2,
+    messages: [{ role: 'user', content }],
+    stream: true,
+  });
+} else {
+  // Fallback to your original text-only flow
+  const msgs = [
+    { role: 'system', content: 'Be concise. If citing evidence, quote the exact line from the proof/PDF text.' },
+    { role: 'user', content: `${lastUserText}\n\n--- CONTEXT ---\n${systemContext}` },
+  ];
+  stream = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0.2,
+    messages: msgs,
+    stream: true,
+  });
+}
 
     for await (const part of stream) {
       const token = part?.choices?.[0]?.delta?.content || '';
