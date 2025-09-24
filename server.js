@@ -1478,17 +1478,19 @@ app.delete("/bids/:id", adminGuard, async (req, res) => {
 });
 
 app.patch("/bids/:id", adminGuard, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+  const bidId = Number(req.params.id);
+  if (!Number.isFinite(bidId)) {
+    return res.status(400).json({ error: "Invalid bid id" });
+  }
 
-  // Whitelist fields we allow admins to edit
+  // Whitelisted edits
   let { status, preferredStablecoin, priceUSD, days, notes } = req.body || {};
 
   const set = [];
-  const vals = [id]; // $1 = bid_id
+  const vals = [bidId]; // $1 = bid_id
   let i = 1;
 
-  // status: only these two for safety (mirrors your existing behavior)
+  // status: only approved/rejected if you want to keep PATCH for status
   if (status !== undefined) {
     const v = String(status).toLowerCase();
     if (!["approved", "rejected"].includes(v)) {
@@ -1497,7 +1499,7 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
     set.push(`status = $${++i}`); vals.push(v);
   }
 
-  // preferredStablecoin: only USDC or USDT
+  // stablecoin: only USDC/USDT
   if (preferredStablecoin !== undefined) {
     const v = String(preferredStablecoin || "").toUpperCase();
     if (!["USDC", "USDT"].includes(v)) {
@@ -1506,19 +1508,17 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
     set.push(`preferred_stablecoin = $${++i}`); vals.push(v);
   }
 
-  // Optional: allow price/days/notes with strict validation
+  // optional numeric/text edits
   if (priceUSD !== undefined) {
     const v = Number(priceUSD);
     if (!Number.isFinite(v) || v < 0) return res.status(400).json({ error: "Invalid priceUSD" });
     set.push(`price_usd = $${++i}`); vals.push(v);
   }
-
   if (days !== undefined) {
     const v = Number(days);
     if (!Number.isFinite(v) || v < 0) return res.status(400).json({ error: "Invalid days" });
     set.push(`days = $${++i}`); vals.push(v);
   }
-
   if (notes !== undefined) {
     if (typeof notes !== "string") return res.status(400).json({ error: "Invalid notes" });
     set.push(`notes = $${++i}`); vals.push(notes);
@@ -1528,18 +1528,25 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
     return res.status(400).json({ error: "No editable fields provided" });
   }
 
+  const sql = `
+    UPDATE bids
+    SET ${set.join(", ")}
+    WHERE bid_id = $1
+    RETURNING *
+  `;
+
   try {
-    const sql = `
-      UPDATE bids
-      SET ${set.join(", ")}, updated_at = NOW()
-      WHERE bid_id = $1
-      RETURNING *
-    `;
     const { rows } = await pool.query(sql, vals);
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
     return res.json(toCamel(rows[0]));
   } catch (err) {
-    console.error("patch bid update error", err);
+    console.error("PATCH /bids/:id failed", { bidId, body: req.body, sql, vals, err });
+    // 42703 = undefined_column
+    if (err?.code === "42703") {
+      return res.status(400).json({
+        error: "DB column not found. Ensure snake_case columns exist: preferred_stablecoin, price_usd, days, notes.",
+      });
+    }
     return res.status(500).json({ error: "Internal error updating bid" });
   }
 });
