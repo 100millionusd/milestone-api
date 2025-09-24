@@ -207,6 +207,92 @@ function isImageFile(f) {
   return IMAGE_EXT_RE.test(n) || mt.startsWith('image/');
 }
 
+// --- Confidence & Next-Checks helpers (global, top-level) ---
+function clamp01(n) {
+  const x = Number(n);
+  return Number.isFinite(x) ? Math.max(0, Math.min(1, x)) : null;
+}
+
+/**
+ * Try to recover a confidence value from streamed text.
+ * Looks for:
+ *   - JSON-like `confidence`: 0.73
+ *   - "Confidence: 0.73" (or 73%)
+ *   - "Confidence score [0–1]: 0.62"
+ * Returns number in [0,1] or null if none found.
+ */
+function extractConfidenceFromText(fullText) {
+  if (!fullText || typeof fullText !== 'string') return null;
+
+  // 1) JSON-like key
+  let m = fullText.match(/"confidence"\s*:\s*([0-9]*\.?[0-9]+)/i)
+       || fullText.match(/'confidence'\s*:\s*([0-9]*\.?[0-9]+)/i);
+  if (m) {
+    const v = clamp01(parseFloat(m[1]));
+    if (v !== null) return v;
+  }
+
+  // 2) "Confidence: 0.73" or "Confidence 73%"
+  m = fullText.match(/confidence[^0-9%]{0,10}([0-9]+(?:\.[0-9]+)?)\s*%/i);
+  if (m) {
+    const pct = parseFloat(m[1]);
+    const v = clamp01(pct / 100);
+    if (v !== null) return v;
+  }
+  m = fullText.match(/confidence[^0-9]{0,10}([0-9]*\.?[0-9]+)/i);
+  if (m) {
+    const v = clamp01(parseFloat(m[1]));
+    if (v !== null) return v;
+  }
+
+  // 3) Heuristic phrases (very rough fallback)
+  const lowish = /\b(?:unsure|uncertain|low confidence|inconclusive|insufficient evidence)\b/i.test(fullText);
+  if (lowish) return 0.25;
+
+  return null;
+}
+
+/**
+ * Build "Next checks" suggestions based on what we saw.
+ * Pass booleans about context so we can tailor suggestions.
+ */
+function buildNextChecks({ hasAnyPdfText = false, imageCount = 0, ocrSeen = false } = {}) {
+  const items = [];
+
+  // Generic
+  items.push('Ask vendor for original files (not screenshots) with metadata.');
+  items.push('Request a short video or screen capture proving the same result.');
+
+  // Images present
+  if (imageCount > 0) {
+    items.push('Provide 2–3 additional photos from different angles / lighting.');
+    items.push('Include one wide shot that shows context (workspace, tools, environment).');
+    items.push('Share an unedited image export (no compression) if possible.');
+  }
+
+  // PDFs used or missing
+  if (hasAnyPdfText) {
+    items.push('Upload the source document (editable, not just PDF) for spot-checking.');
+  } else {
+    items.push('Provide a PDF or text document with clear step-by-step evidence.');
+  }
+
+  // OCR/text presence
+  if (!ocrSeen) {
+    items.push('Include a close-up photo of any labels, serials, or on-screen outputs.');
+  }
+
+  // Keep list concise (unique + 5–7 items)
+  const seen = new Set();
+  const uniq = [];
+  for (const it of items) {
+    const k = it.toLowerCase();
+    if (!seen.has(k)) { seen.add(k); uniq.push(it); }
+    if (uniq.length >= 7) break;
+  }
+  return uniq;
+}
+
 /** Build a vision user content payload: first text, then image_url entries */
 function buildVisionUserContent(text, files = []) {
   const content = [{ type: 'text', text }];
@@ -1904,22 +1990,38 @@ Answer format:
       });
     }
 
-    // === SSE streaming loop ===
-    for await (const part of stream) {
-      const token = part?.choices?.[0]?.delta?.content || '';
-      if (token) res.write(`data: ${token}\n\n`);
-    }
-    res.write(`data: [DONE]\n\n`);
-    res.end();
-  } catch (err) {
-    console.error('Chat error:', err);
-    try {
-      res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`);
-      res.write(`data: [DONE]\n\n`);
-      res.end();
-    } catch {}
+// === SSE streaming loop (buffer + footer) ===
+let fullText = '';
+for await (const part of stream) {
+  const token = part?.choices?.[0]?.delta?.content || '';
+  if (token) {
+    fullText += token;
+    res.write(`data: ${token}\n\n`);
   }
-});
+}
+
+// ---- Post-stream footer: confidence floor + Next checks ----
+const conf = extractConfidenceFromText(fullText); // helper you added
+const hasAnyPdfText = proofsCtx.some(p => /^PDF EXTRACT/i.test(p.pdfNote || ''));
+const nextChecks = buildNextChecks({ hasAnyPdfText, imageCount: imageFiles.length }); // helper you added
+
+// If confidence is low, append a short banner
+if (conf !== null && conf < 0.35) {
+  res.write(`data: \n\n`);
+  res.write(`data: 🔎 Needs human review (low confidence: ${conf.toFixed(2)})\n\n`);
+}
+
+// Always include Next checks
+if (nextChecks.length) {
+  res.write(`data: \n\n`);
+  res.write(`data: Next checks:\n\n`);
+  for (const item of nextChecks) {
+    res.write(`data: • ${item}\n\n`);
+  }
+}
+
+res.write(`data: [DONE]\n\n`);
+res.end();
 
 // --- Agent2 Chat about a PROOF (uses bid + proof + extracted PDF text) -----
 app.post('/agent2/chat', adminGuard, async (req, res) => {
