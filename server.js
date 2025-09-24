@@ -1874,7 +1874,54 @@ if (imageFiles.length > 0) {
     stream: true,
   });
 } else {
-  // Fallback to your original text-only flow
+// Vision-first: if we have images, build a multi-part user message (text + image_url)
+// Otherwise, fall back to the plain text flow.
+let stream;
+
+// Make lastUserText available to BOTH branches
+const lastUserText =
+  String(userMessages.at(-1)?.content || '').trim() ||
+  'Analyze all provided materials, especially the images.';
+
+if (imageFiles.length > 0) {
+  const systemMsg = `
+You are Agent2 for LithiumX.
+
+You CAN analyze the images attached in this chat (provided as image URLs).
+You CANNOT browse the web or reverse-image-search; only mention this if directly asked.
+Do NOT add generic disclaimers like "I cannot tell if this is AI-generated" unless the user asks.
+
+ALWAYS perform a complete review of attached images:
+- Brief scene description.
+- Extract visible text (OCR-by-perception) as bullets.
+- Flag inconsistencies: lighting/shadows, warped text, odd hands/faces, repeating textures, reflection errors.
+- Cross-check claims in proposal/bid/proof vs. what the images show.
+- Note provenance if present in context; otherwise say none available.
+- Provide a confidence score [0–1].
+
+Answer format:
+1) 1–2 sentence conclusion
+2) Bullets: Evidence • Inconsistencies • OCR text • Fit-to-proof • Confidence
+`.trim();
+
+  const userVisionContent = [
+    { type: 'text', text: `User request: ${lastUserText}\n\nUse the CONTEXT and analyze ALL attached images.` },
+    // Attach up to 6 images to keep prompt small/fast
+    ...imageFiles.slice(0, 6).map(f => ({ type: 'image_url', image_url: { url: f.url } })),
+    { type: 'text', text: `\n\n--- CONTEXT ---\n${systemContext}` },
+  ];
+
+  stream = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',   // vision-capable
+    temperature: 0.2,
+    stream: true,
+    messages: [
+      { role: 'system', content: systemMsg },
+      { role: 'user', content: userVisionContent },
+    ],
+  });
+} else {
+  // Text-only fallback (no images found)
   const msgs = [
     { role: 'system', content: 'Be concise. If citing evidence, quote the exact line from the proof/PDF text.' },
     { role: 'user', content: `${lastUserText}\n\n--- CONTEXT ---\n${systemContext}` },
@@ -1887,17 +1934,13 @@ if (imageFiles.length > 0) {
   });
 }
 
-    for await (const part of stream) {
-      const token = part?.choices?.[0]?.delta?.content || '';
-      if (token) res.write(`data: ${token}\n\n`);
-    }
-    res.write(`data: [DONE]\n\n`);
-    res.end();
-  } catch (err) {
-    console.error('Chat error:', err);
-    try { res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`); res.write(`data: [DONE]\n\n`); res.end(); } catch {}
-  }
-});
+// === SSE streaming loop ===
+for await (const part of stream) {
+  const token = part?.choices?.[0]?.delta?.content || '';
+  if (token) res.write(`data: ${token}\n\n`);
+}
+res.write(`data: [DONE]\n\n`);
+res.end();
 
 // --- Agent2 Chat about a PROOF (uses bid + proof + extracted PDF text) -----
 app.post('/agent2/chat', adminGuard, async (req, res) => {
