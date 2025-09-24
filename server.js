@@ -2693,8 +2693,16 @@ const stream = await openai.chat.completions.create({
     res.end();
   } catch (err) {
     console.error('Proof chat SSE error:', err);
-    try { res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`); res.write(`data: [DONE]\n\n`); res.end(); } catch {}
-  }
+    try { res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`); res.write(`data: [DONE]\n\n`);
+res.end();
+} catch (err) {
+  console.error('Bid chat SSE error:', err);
+  try {
+    res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`);
+    res.write(`data: [DONE]\n\n`);
+    res.end();
+  } catch {}
+}
 });
 
 // ==============================
