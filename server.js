@@ -2387,6 +2387,134 @@ ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
   }
 });
 
+// --- Agent2 Chat about a SPECIFIC PROOF (SSE) -------------------------------
+app.all('/proofs/:id/chat', (req, res, next) => {
+  if (req.method === 'POST') return next();
+  if (req.method === 'OPTIONS') {
+    res.set('Allow', 'POST, OPTIONS');
+    return res.sendStatus(204);
+  }
+  res.set('Allow', 'POST, OPTIONS');
+  return res.status(405).json({ error: 'Method Not Allowed. Use POST /proofs/:id/chat.' });
+});
+
+// You can relax auth to adminOrBidOwnerGuard if you want vendors to chat about their own proofs.
+app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
+  try {
+    if (!openai) return res.status(503).json({ error: 'OpenAI not configured' });
+
+    const proofId = Number(req.params.id);
+    if (!Number.isFinite(proofId)) return res.status(400).json({ error: 'Invalid proof id' });
+
+    const userMessages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+    // SSE headers
+    res.set({
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+    });
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+    // 1) Load proof, bid, proposal
+    const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
+    const proof = pr[0];
+    if (!proof) { res.write(`data: ERROR Proof not found\n\n`); res.write(`data: [DONE]\n\n`); return res.end(); }
+
+    const { rows: br } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [proof.bid_id]);
+    const bid = br[0];
+    if (!bid) { res.write(`data: ERROR Bid not found for proof\n\n`); res.write(`data: [DONE]\n\n`); return res.end(); }
+
+    const { rows: por } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
+    const proposal = por[0] || null;
+
+    // 2) Normalize proof files and extract PDF text (best-effort)
+    const files = Array.isArray(proof.files)
+      ? proof.files
+      : (typeof proof.files === 'string' ? JSON.parse(proof.files || '[]') : []);
+
+    let pdfText = '';
+    try {
+      for (const f of files) {
+        const n = (f?.name || f?.url || '').toLowerCase();
+        const isPdf = n.endsWith('.pdf') || n.includes('.pdf?') || (f?.mimetype || '').includes('pdf');
+        if (!isPdf) continue;
+        const info = await withTimeout(
+          waitForPdfInfoFromDoc({ url: f.url, name: f.name || 'attachment.pdf', mimetype: 'application/pdf' }),
+          8000,
+          () => ({ used: false, reason: 'timeout' })
+        );
+        if (info.used && info.text) {
+          pdfText += `\n\n[${f.name || 'file'}]\n${info.text}`;
+        }
+      }
+    } catch (e) {
+      // Non-fatal
+    }
+    pdfText = (pdfText || '').slice(0, 15000);
+
+    // 3) Build concise, strict context
+    const context = [
+      'You are Agent 2 for LithiumX.',
+      'Answer ONLY using the provided proposal/bid fields and this specific proof (its text + any PDF extract below).',
+      'If the answer isn’t present, state that it is not in the submitted proof.',
+      '',
+      '--- PROPOSAL ---',
+      JSON.stringify({
+        org: proposal?.org_name || '',
+        title: proposal?.title || '',
+        summary: proposal?.summary || '',
+        budgetUSD: proposal?.amount_usd ?? 0,
+      }, null, 2),
+      '',
+      '--- BID ---',
+      JSON.stringify({
+        vendor: bid.vendor_name || '',
+        priceUSD: bid.price_usd ?? 0,
+        days: bid.days ?? 0,
+        notes: bid.notes || '',
+        milestones: (Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || '[]')),
+      }, null, 2),
+      '',
+      '--- PROOF ---',
+      JSON.stringify({
+        title: proof.title || '',
+        milestoneIndex: proof.milestone_index,
+        description: String(proof.description || '').slice(0, 4000),
+        files: files.map(f => ({ name: f.name, url: f.url })),
+      }, null, 2),
+      '',
+      pdfText ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText}` : `--- NO PDF TEXT AVAILABLE ---`,
+    ].join('\n');
+
+    // 4) Stream OpenAI completion
+    const messages = [
+      { role: 'system', content: 'Be concise. If citing evidence, quote the exact line from the proof/PDF text.' },
+      { role: 'user', content: context },
+      ...userMessages.map(m => ({
+        role: m && m.role === 'assistant' ? 'assistant' : 'user',
+        content: String(m?.content || ''),
+      })),
+    ];
+
+    const stream = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.2,
+      messages,
+      stream: true,
+    });
+
+    for await (const part of stream) {
+      const token = part?.choices?.[0]?.delta?.content || '';
+      if (token) res.write(`data: ${token}\n\n`);
+    }
+    res.write(`data: [DONE]\n\n`);
+    res.end();
+  } catch (err) {
+    console.error('Proof chat SSE error:', err);
+    try { res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`); res.write(`data: [DONE]\n\n`); res.end(); } catch {}
+  }
+});
+
 // ==============================
 // Routes — Vendor profile (fill once, used in Admin Vendors)
 // ==============================
