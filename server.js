@@ -1479,18 +1479,68 @@ app.delete("/bids/:id", adminGuard, async (req, res) => {
 
 app.patch("/bids/:id", adminGuard, async (req, res) => {
   const id = Number(req.params.id);
-  const desired = String(req.body?.status || "").toLowerCase();
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
-  if (!["approved", "rejected"].includes(desired)) {
-    return res.status(400).json({ error: 'Invalid status; expected "approved" or "rejected"' });
+
+  // Whitelist fields we allow admins to edit
+  let { status, preferredStablecoin, priceUSD, days, notes } = req.body || {};
+
+  const set = [];
+  const vals = [id]; // $1 = bid_id
+  let i = 1;
+
+  // status: only these two for safety (mirrors your existing behavior)
+  if (status !== undefined) {
+    const v = String(status).toLowerCase();
+    if (!["approved", "rejected"].includes(v)) {
+      return res.status(400).json({ error: 'Invalid status; expected "approved" or "rejected"' });
+    }
+    set.push(`status = $${++i}`); vals.push(v);
   }
+
+  // preferredStablecoin: only USDC or USDT
+  if (preferredStablecoin !== undefined) {
+    const v = String(preferredStablecoin || "").toUpperCase();
+    if (!["USDC", "USDT"].includes(v)) {
+      return res.status(400).json({ error: "preferredStablecoin must be USDC or USDT" });
+    }
+    set.push(`preferred_stablecoin = $${++i}`); vals.push(v);
+  }
+
+  // Optional: allow price/days/notes with strict validation
+  if (priceUSD !== undefined) {
+    const v = Number(priceUSD);
+    if (!Number.isFinite(v) || v < 0) return res.status(400).json({ error: "Invalid priceUSD" });
+    set.push(`price_usd = $${++i}`); vals.push(v);
+  }
+
+  if (days !== undefined) {
+    const v = Number(days);
+    if (!Number.isFinite(v) || v < 0) return res.status(400).json({ error: "Invalid days" });
+    set.push(`days = $${++i}`); vals.push(v);
+  }
+
+  if (notes !== undefined) {
+    if (typeof notes !== "string") return res.status(400).json({ error: "Invalid notes" });
+    set.push(`notes = $${++i}`); vals.push(notes);
+  }
+
+  if (set.length === 0) {
+    return res.status(400).json({ error: "No editable fields provided" });
+  }
+
   try {
-    const { rows } = await pool.query(`UPDATE bids SET status=$2 WHERE bid_id=$1 RETURNING *`, [ id, desired ]);
+    const sql = `
+      UPDATE bids
+      SET ${set.join(", ")}, updated_at = NOW()
+      WHERE bid_id = $1
+      RETURNING *
+    `;
+    const { rows } = await pool.query(sql, vals);
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
     return res.json(toCamel(rows[0]));
   } catch (err) {
-    console.error("patch bid status error", err);
-    return res.status(500).json({ error: "Internal error updating bid status" });
+    console.error("patch bid update error", err);
+    return res.status(500).json({ error: "Internal error updating bid" });
   }
 });
 
