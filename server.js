@@ -2586,21 +2586,22 @@ app.all('/proofs/:id/chat', (req, res, next) => {
 
 // You can relax auth to adminOrBidOwnerGuard if you want vendors to chat about their own proofs.
 app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
+  if (!openai) return res.status(503).json({ error: 'OpenAI not configured' });
+
+  const proofId = Number(req.params.id);
+  if (!Number.isFinite(proofId)) return res.status(400).json({ error: 'Invalid proof id' });
+
+  const userMessages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+
+  // SSE headers
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+  });
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
   try {
-    if (!openai) return res.status(503).json({ error: 'OpenAI not configured' });
-
-    const proofId = Number(req.params.id);
-    if (!Number.isFinite(proofId)) return res.status(400).json({ error: 'Invalid proof id' });
-
-    const userMessages = Array.isArray(req.body?.messages) ? req.body.messages : [];
-    // SSE headers
-    res.set({
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-cache, no-transform',
-      'Connection': 'keep-alive',
-    });
-    if (typeof res.flushHeaders === 'function') res.flushHeaders();
-
     // 1) Load proof, bid, proposal
     const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
     const proof = pr[0];
@@ -2618,6 +2619,10 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
       ? proof.files
       : (typeof proof.files === 'string' ? JSON.parse(proof.files || '[]') : []);
 
+    // collect images from this proof
+    const imageFiles = [];
+    for (const f of files) { if (isImageFile(f)) imageFiles.push(f); }
+
     let pdfText = '';
     try {
       for (const f of files) {
@@ -2629,20 +2634,16 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
           8000,
           () => ({ used: false, reason: 'timeout' })
         );
-        if (info.used && info.text) {
-          pdfText += `\n\n[${f.name || 'file'}]\n${info.text}`;
-        }
+        if (info.used && info.text) pdfText += `\n\n[${f.name || 'file'}]\n${info.text}`;
       }
-    } catch (e) {
-      // Non-fatal
-    }
+    } catch { /* non-fatal */ }
     pdfText = (pdfText || '').slice(0, 15000);
 
-    // 3) Build concise, strict context
+    // 3) Build concise context for this ONE proof
     const context = [
       'You are Agent 2 for LithiumX.',
-      'Answer ONLY using the provided proposal/bid fields and this specific proof (its text + any PDF extract below).',
-      'If the answer isn’t present, state that it is not in the submitted proof.',
+      'Answer ONLY using the proposal/bid fields and this specific proof (its text + any PDF extract below).',
+      'If the answer is not present, state that it is not in the submitted proof.',
       '',
       '--- PROPOSAL ---',
       JSON.stringify({
@@ -2672,43 +2673,58 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
       pdfText ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText}` : `--- NO PDF TEXT AVAILABLE ---`,
     ].join('\n');
 
-  // Turn the big context into a vision message with attached images
-const userContent = buildVisionUserContent(systemContext, imageFiles);
+    // 4) Choose vision vs text
+    let stream;
+    if (imageFiles.length > 0) {
+      const systemMsg = 'Be concise. Use the proof context provided. Perform an image review if images are attached.';
+      const userVisionContent = [
+        { type: 'text', text: `User request: ${String(userMessages.at(-1)?.content || '').trim() || 'Analyze this proof.'}\n\nUse the CONTEXT and analyze ALL attached images.` },
+        ...imageFiles.slice(0, 6).map(f => ({ type: 'image_url', image_url: { url: f.url } })),
+        { type: 'text', text: `\n\n--- CONTEXT ---\n${context}` },
+      ];
+      stream = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.2,
+        stream: true,
+        messages: [
+          { role: 'system', content: systemMsg },
+          { role: 'user', content: userVisionContent },
+        ],
+      });
+    } else {
+      const msgs = [
+        { role: 'system', content: 'Be concise. Use the proof context provided.' },
+        { role: 'user', content: `${String(userMessages.at(-1)?.content || '').trim() || 'Analyze this proof.'}\n\n--- CONTEXT ---\n${context}` },
+      ];
+      stream = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.2,
+        messages: msgs,
+        stream: true,
+      });
+    }
 
-const msgs = [
-  { role: 'system', content: 'Be concise. Use the bid/proof context provided.' },
-  { role: 'user', content: userContent },
-  ...userMessages.map((m) => ({
-    role: m && m.role === 'assistant' ? 'assistant' : 'user',
-    content: String((m && m.content) || ''),
-  })),
-];
-
-const stream = await openai.chat.completions.create({
-  model: 'gpt-4o-mini',
-  temperature: 0.2,
-  messages: msgs,
-  stream: true,
-});
-
+    // === SSE streaming loop (buffer + footer) ===
+    let fullText = '';
     for await (const part of stream) {
       const token = part?.choices?.[0]?.delta?.content || '';
-      if (token) res.write(`data: ${token}\n\n`);
+      if (token) {
+        fullText += token;
+        res.write(`data: ${token}\n\n`);
+      }
     }
+
+    // ---- Post-stream footer (simple) ----
     res.write(`data: [DONE]\n\n`);
     res.end();
   } catch (err) {
     console.error('Proof chat SSE error:', err);
-    try { res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`); res.write(`data: [DONE]\n\n`);
-res.end();
-} catch (err) {
-  console.error('Bid chat SSE error:', err);
-  try {
-    res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`);
-    res.write(`data: [DONE]\n\n`);
-    res.end();
-  } catch {}
-}
+    try {
+      res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`);
+      res.write(`data: [DONE]\n\n`);
+      res.end();
+    } catch {}
+  }
 });
 
 // ==============================
