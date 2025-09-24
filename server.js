@@ -1529,11 +1529,11 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
   }
 
   const sql = `
-    UPDATE bids
-    SET ${set.join(", ")}
-    WHERE bid_id = $1
-    RETURNING *
-  `;
+  UPDATE bids
+  SET ${set.join(", ")}, updated_at = NOW()
+  WHERE bid_id = $1
+  RETURNING *
+`;
 
   try {
     const { rows } = await pool.query(sql, vals);
