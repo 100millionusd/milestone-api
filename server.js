@@ -158,6 +158,25 @@ const pool = new Pool({
   }
 })();
 
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bid_audits (
+        id            bigserial PRIMARY KEY,
+        bid_id        bigint NOT NULL,
+        actor_wallet  text,
+        actor_role    text,
+        changes       jsonb NOT NULL,
+        created_at    timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bid_audits_bid ON bid_audits (bid_id);`);
+    console.log('[db] bid_audits ready');
+  } catch (e) {
+    console.error('bid_audits init failed:', e);
+  }
+})();
+
 // ==============================
 // Utilities
 // ==============================
@@ -1603,6 +1622,71 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
       });
     }
     return res.status(500).json({ error: "Internal error updating bid" });
+  }
+});
+
+// Admin: replace milestones array on a bid
+app.patch("/bids/:id/milestones", adminGuard, async (req, res) => {
+  const bidId = Number(req.params.id);
+  if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
+
+  const incoming = req.body?.milestones;
+  if (!Array.isArray(incoming)) {
+    return res.status(400).json({ error: "milestones must be an array" });
+  }
+
+  // Normalize + validate
+  const norm = incoming.map((m, i) => ({
+    name: String(m?.name ?? `Milestone ${i + 1}`),
+    amount: Number(m?.amount ?? 0),
+    dueDate: new Date(m?.dueDate ?? m?.due_date ?? Date.now()).toISOString(),
+    completed: !!m?.completed,
+    completionDate: m?.completionDate ?? null,
+    proof: m?.proof ?? "",
+    paymentTxHash: m?.paymentTxHash ?? null,
+    paymentDate: m?.paymentDate ?? null,
+  }));
+
+  if (norm.some(m => !Number.isFinite(m.amount) || m.amount < 0)) {
+    return res.status(400).json({ error: "All milestone amounts must be non-negative numbers" });
+  }
+
+  try {
+    // Load current for audit
+    const { rows: curRows } = await pool.query(
+      `SELECT bid_id, milestones, price_usd FROM bids WHERE bid_id=$1`,
+      [bidId]
+    );
+    const current = curRows[0];
+    if (!current) return res.status(404).json({ error: "Bid not found" });
+
+    // (Optional) Enforce sum === bid price
+    // const sum = norm.reduce((s, m) => s + Number(m.amount || 0), 0);
+    // if (Number(current.price_usd) !== sum) {
+    //   return res.status(400).json({ error: \`Sum of milestone amounts (\${sum}) must equal bid price (\${current.price_usd})\` });
+    // }
+
+    const { rows: upd } = await pool.query(
+      `UPDATE bids
+         SET milestones = $2::jsonb
+       WHERE bid_id = $1
+       RETURNING *`,
+      [bidId, JSON.stringify(norm)]
+    );
+
+    // Audit row
+    const actorWallet = req.user?.sub || null;
+    const actorRole = req.user?.role || "admin";
+    await pool.query(
+      `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
+       VALUES ($1, $2, $3, $4)`,
+      [bidId, actorWallet, actorRole, { milestones: { from: current.milestones, to: norm } }]
+    );
+
+    return res.json(toCamel(upd[0]));
+  } catch (err) {
+    console.error("PATCH /bids/:id/milestones failed", { bidId, err });
+    return res.status(500).json({ error: "Internal error updating milestones" });
   }
 });
 
