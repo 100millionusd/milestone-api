@@ -1873,7 +1873,7 @@ if (imageFiles.length > 0) {
     messages: [{ role: 'user', content }],
     stream: true,
   });
-} else {
+} else
 // Vision-first: if we have images, build a multi-part user message (text + image_url)
 // Otherwise, fall back to the plain text flow.
 let stream;
