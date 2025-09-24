@@ -3048,6 +3048,124 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
   }
 });
 
+// ADMIN: list proposers/entities that submitted proposals
+app.get('/admin/proposers', adminGuard, async (req, res) => {
+  try {
+    const includeArchived = ['true','1','yes'].includes(String(req.query.includeArchived || '').toLowerCase());
+    const qRaw = String(req.query.q || '').trim();
+    const q = qRaw ? `%${qRaw}%` : null;
+
+    const page  = Math.max(1, parseInt(String(req.query.page ?? '1'), 10));
+    const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? '100'), 10)));
+    const offset = (page - 1) * limit;
+
+    const whereParts = [];
+    const paramsList = [];
+    let p = 0;
+
+    if (!includeArchived) whereParts.push(`status <> 'archived'`);
+    if (q) {
+      whereParts.push(`(org_name ILIKE $${++p} OR contact ILIKE $${p} OR owner_wallet ILIKE $${p})`);
+      paramsList.push(q);
+    }
+    const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+    const listSql = `
+      WITH base AS (
+        SELECT
+          proposal_id,
+          org_name,
+          LOWER(org_name) AS org_key,
+          contact,
+          LOWER(contact)  AS contact_email,
+          owner_wallet,
+          owner_email,
+          amount_usd,
+          status,
+          created_at,
+          -- one-line address display
+          NULLIF(BTRIM(CONCAT_WS(', ',
+            NULLIF(address, ''),
+            NULLIF(city, ''),
+            NULLIF(country, '')
+          )), '') AS addr_display,
+          -- grouping key (prefer wallet, then contact, then org)
+          COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) AS entity_key
+        FROM proposals
+        ${whereSql}
+      ),
+      grp AS (
+        SELECT
+          entity_key,
+          MAX(org_name) FILTER (WHERE org_name IS NOT NULL AND org_name <> '') AS org_name,
+          MAX(owner_wallet) FILTER (WHERE owner_wallet IS NOT NULL AND owner_wallet <> '') AS wallet_address,
+          MAX(contact) FILTER (WHERE contact IS NOT NULL AND contact <> '') AS contact_email,
+          MAX(owner_email) FILTER (WHERE owner_email IS NOT NULL AND owner_email <> '') AS owner_email,
+          COUNT(*) AS proposals_count,
+          MAX(created_at) AS last_proposal_at,
+          COALESCE(SUM(amount_usd),0)::numeric AS total_budget_usd,
+          COUNT(*) FILTER (WHERE status='approved') AS approved_count,
+          COUNT(*) FILTER (WHERE status='pending')  AS pending_count,
+          COUNT(*) FILTER (WHERE status='rejected') AS rejected_count,
+          COUNT(*) FILTER (WHERE status='archived') AS archived_count
+        FROM base
+        GROUP BY entity_key
+      ),
+      latest_addr AS (
+        SELECT DISTINCT ON (entity_key)
+          entity_key, addr_display
+        FROM base
+        WHERE addr_display IS NOT NULL
+        ORDER BY entity_key, created_at DESC
+      )
+      SELECT g.*, la.addr_display
+      FROM grp g
+      LEFT JOIN latest_addr la USING (entity_key)
+      ORDER BY g.last_proposal_at DESC NULLS LAST, g.org_name ASC
+      LIMIT $${++p} OFFSET $${++p};
+    `;
+    const listParams = paramsList.concat([limit, offset]);
+
+    const countSql = `
+      WITH base AS (
+        SELECT COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) AS entity_key
+        FROM proposals
+        ${whereSql}
+      )
+      SELECT COUNT(DISTINCT entity_key)::int AS cnt FROM base;
+    `;
+    const countParams = paramsList.slice();
+
+    const [list, count] = await Promise.all([
+      pool.query(listSql, listParams),
+      pool.query(countSql, countParams),
+    ]);
+
+    const items = list.rows.map(r => ({
+      id: r.entity_key,
+      orgName: r.org_name || '',
+      address: r.addr_display || null,
+      walletAddress: r.wallet_address || null,
+      contactEmail: r.contact_email || null,
+      ownerEmail: r.owner_email || null,
+      proposalsCount: Number(r.proposals_count) || 0,
+      totalBudgetUSD: Number(r.total_budget_usd) || 0,
+      lastProposalAt: r.last_proposal_at ? new Date(r.last_proposal_at).toISOString() : null,
+      statusCounts: {
+        approved: Number(r.approved_count) || 0,
+        pending:  Number(r.pending_count)  || 0,
+        rejected: Number(r.rejected_count) || 0,
+        archived: Number(r.archived_count) || 0,
+      },
+    }));
+
+    res.json({ items, total: count.rows[0].cnt, page, pageSize: limit });
+  } catch (e) {
+    console.error('GET /admin/proposers error', e);
+    res.status(500).json({ error: 'Failed to list proposers' });
+  }
+});
+
 app.post('/admin/vendors/:wallet/archive', adminGuard, async (req, res) => {
   try {
     const wallet = String(req.params.wallet || '').toLowerCase();
