@@ -1486,65 +1486,120 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
   // Whitelisted edits
   let { status, preferredStablecoin, priceUSD, days, notes } = req.body || {};
 
-  const set = [];
-  const vals = [bidId]; // $1 = bid_id
-  let i = 1;
-
-  // status: only approved/rejected if you want to keep PATCH for status
-  if (status !== undefined) {
-    const v = String(status).toLowerCase();
-    if (!["approved", "rejected"].includes(v)) {
-      return res.status(400).json({ error: 'Invalid status; expected "approved" or "rejected"' });
-    }
-    set.push(`status = $${++i}`); vals.push(v);
-  }
-
-  // stablecoin: only USDC/USDT
-  if (preferredStablecoin !== undefined) {
-    const v = String(preferredStablecoin || "").toUpperCase();
-    if (!["USDC", "USDT"].includes(v)) {
-      return res.status(400).json({ error: "preferredStablecoin must be USDC or USDT" });
-    }
-    set.push(`preferred_stablecoin = $${++i}`); vals.push(v);
-  }
-
-  // optional numeric/text edits
-  if (priceUSD !== undefined) {
-    const v = Number(priceUSD);
-    if (!Number.isFinite(v) || v < 0) return res.status(400).json({ error: "Invalid priceUSD" });
-    set.push(`price_usd = $${++i}`); vals.push(v);
-  }
-  if (days !== undefined) {
-    const v = Number(days);
-    if (!Number.isFinite(v) || v < 0) return res.status(400).json({ error: "Invalid days" });
-    set.push(`days = $${++i}`); vals.push(v);
-  }
-  if (notes !== undefined) {
-    if (typeof notes !== "string") return res.status(400).json({ error: "Invalid notes" });
-    set.push(`notes = $${++i}`); vals.push(notes);
-  }
-
-  if (set.length === 0) {
-    return res.status(400).json({ error: "No editable fields provided" });
-  }
-
-  const sql = `
-  UPDATE bids
-  SET ${set.join(", ")}, updated_at = NOW()
-  WHERE bid_id = $1
-  RETURNING *
-`;
-
   try {
-    const { rows } = await pool.query(sql, vals);
-    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
-    return res.json(toCamel(rows[0]));
+    // 1) Load current row (to compute from->to changes); lock lightly to prevent races
+    const { rows: currentRows } = await pool.query(
+      `SELECT bid_id, status, preferred_stablecoin, price_usd, days, notes
+         FROM bids
+        WHERE bid_id = $1`,
+      [bidId]
+    );
+    const current = currentRows[0];
+    if (!current) return res.status(404).json({ error: "Bid not found" });
+
+    // 2) Build UPDATE SET and validate
+    const set = [];
+    const vals = [bidId]; // $1 = bid_id
+    let i = 1;
+
+    // status
+    if (status !== undefined) {
+      const v = String(status).toLowerCase();
+      if (!["approved", "rejected"].includes(v)) {
+        return res.status(400).json({ error: 'Invalid status; expected "approved" or "rejected"' });
+      }
+      set.push(`status = $${++i}`); vals.push(v);
+    }
+
+    // preferred_stablecoin
+    if (preferredStablecoin !== undefined) {
+      const v = String(preferredStablecoin || "").toUpperCase();
+      if (!["USDC", "USDT"].includes(v)) {
+        return res.status(400).json({ error: "preferredStablecoin must be USDC or USDT" });
+      }
+      set.push(`preferred_stablecoin = $${++i}`); vals.push(v);
+    }
+
+    // price_usd
+    if (priceUSD !== undefined) {
+      const v = Number(priceUSD);
+      if (!Number.isFinite(v) || v < 0) return res.status(400).json({ error: "Invalid priceUSD" });
+      set.push(`price_usd = $${++i}`); vals.push(v);
+    }
+
+    // days
+    if (days !== undefined) {
+      const v = Number(days);
+      if (!Number.isFinite(v) || v < 0) return res.status(400).json({ error: "Invalid days" });
+      set.push(`days = $${++i}`); vals.push(v);
+    }
+
+    // notes
+    if (notes !== undefined) {
+      if (typeof notes !== "string") return res.status(400).json({ error: "Invalid notes" });
+      set.push(`notes = $${++i}`); vals.push(notes);
+    }
+
+    if (set.length === 0) {
+      return res.status(400).json({ error: "No editable fields provided" });
+    }
+
+    // 3) Perform UPDATE
+    const sqlUpdate = `
+      UPDATE bids
+         SET ${set.join(", ")}, updated_at = NOW()  -- keep if you added updated_at; otherwise remove
+       WHERE bid_id = $1
+   RETURNING *`;
+    const { rows: updatedRows } = await pool.query(sqlUpdate, vals);
+    const updated = updatedRows[0];
+
+    // 4) Build audit JSON — include only actually changed keys
+    const changes = {};
+    const map = {
+      status: "status",
+      preferredStablecoin: "preferred_stablecoin",
+      priceUSD: "price_usd",
+      days: "days",
+      notes: "notes",
+    };
+
+    if (status !== undefined && current.status !== updated.status) {
+      changes["status"] = { from: current.status, to: updated.status };
+    }
+    if (preferredStablecoin !== undefined && current.preferred_stablecoin !== updated.preferred_stablecoin) {
+      changes["preferred_stablecoin"] = {
+        from: current.preferred_stablecoin,
+        to: updated.preferred_stablecoin,
+      };
+    }
+    if (priceUSD !== undefined && Number(current.price_usd) !== Number(updated.price_usd)) {
+      changes["price_usd"] = { from: Number(current.price_usd), to: Number(updated.price_usd) };
+    }
+    if (days !== undefined && Number(current.days) !== Number(updated.days)) {
+      changes["days"] = { from: Number(current.days), to: Number(updated.days) };
+    }
+    if (notes !== undefined && String(current.notes || "") !== String(updated.notes || "")) {
+      changes["notes"] = { from: current.notes || null, to: updated.notes || null };
+    }
+
+    // Only write an audit row if something actually changed
+    if (Object.keys(changes).length > 0) {
+      const actorWallet = req.user?.sub || null;  // your JWT puts wallet in sub
+      const actorRole = req.user?.role || "admin";
+      await pool.query(
+        `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
+         VALUES ($1, $2, $3, $4)`,
+        [bidId, actorWallet, actorRole, changes]
+      );
+    }
+
+    // Return normalized bid
+    return res.json(toCamel(updated));
   } catch (err) {
-    console.error("PATCH /bids/:id failed", { bidId, body: req.body, sql, vals, err });
-    // 42703 = undefined_column
+    console.error("PATCH /bids/:id failed", { bidId, body: req.body, err });
     if (err?.code === "42703") {
       return res.status(400).json({
-        error: "DB column not found. Ensure snake_case columns exist: preferred_stablecoin, price_usd, days, notes.",
+        error: "DB column not found. Ensure columns exist: preferred_stablecoin, price_usd, days, notes, updated_at (optional).",
       });
     }
     return res.status(500).json({ error: "Internal error updating bid" });
