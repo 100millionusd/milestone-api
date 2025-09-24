@@ -2001,17 +2001,15 @@ for await (const part of stream) {
 }
 
 // ---- Post-stream footer: confidence floor + Next checks ----
-const conf = extractConfidenceFromText(fullText); // helper you added
+const conf = extractConfidenceFromText(fullText);
 const hasAnyPdfText = proofsCtx.some(p => /^PDF EXTRACT/i.test(p.pdfNote || ''));
-const nextChecks = buildNextChecks({ hasAnyPdfText, imageCount: imageFiles.length }); // helper you added
+const nextChecks = buildNextChecks({ hasAnyPdfText, imageCount: imageFiles.length });
 
-// If confidence is low, append a short banner
 if (conf !== null && conf < 0.35) {
   res.write(`data: \n\n`);
   res.write(`data: 🔎 Needs human review (low confidence: ${conf.toFixed(2)})\n\n`);
 }
 
-// Always include Next checks
 if (nextChecks.length) {
   res.write(`data: \n\n`);
   res.write(`data: Next checks:\n\n`);
@@ -2022,6 +2020,15 @@ if (nextChecks.length) {
 
 res.write(`data: [DONE]\n\n`);
 res.end();
+} catch (err) {
+  console.error('Bid chat SSE error:', err);
+  try {
+    res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`);
+    res.write(`data: [DONE]\n\n`);
+    res.end();
+  } catch {}
+}
+});
 
 // --- Agent2 Chat about a PROOF (uses bid + proof + extracted PDF text) -----
 app.post('/agent2/chat', adminGuard, async (req, res) => {
