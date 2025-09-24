@@ -2684,7 +2684,6 @@ const stream = await openai.chat.completions.create({
   stream: true,
 });
 
-
     for await (const part of stream) {
       const token = part?.choices?.[0]?.delta?.content || '';
       if (token) res.write(`data: ${token}\n\n`);
