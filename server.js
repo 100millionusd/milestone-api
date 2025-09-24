@@ -207,6 +207,28 @@ function isImageFile(f) {
   return IMAGE_EXT_RE.test(n) || mt.startsWith('image/');
 }
 
+// Helpers to read proposal docs and pull BEFORE images
+function parseDocsToArray(docsRaw) {
+  if (Array.isArray(docsRaw)) return docsRaw;
+  if (typeof docsRaw === 'string') {
+    try { const arr = JSON.parse(docsRaw); return Array.isArray(arr) ? arr : []; }
+    catch { return []; }
+  }
+  return [];
+}
+function collectProposalImages(proposal) {
+  const docs = parseDocsToArray(proposal?.docs);
+  const seen = new Set();
+  const out = [];
+  for (const d of docs) {
+    if (d && d.url && isImageFile(d) && !seen.has(d.url)) {
+      seen.add(d.url);
+      out.push(d);
+    }
+  }
+  return out;
+}
+
 // --- Confidence & Next-Checks helpers (global, top-level) ---
 function clamp01(n) {
   const x = Number(n);
@@ -1934,61 +1956,88 @@ Instruction:
 - Be concise.`;
 
     // One last user line to steer the answer
-    const lastUserText =
-      String(userMessages.at(-1)?.content || '').trim() ||
-      'Analyze all provided materials, especially the images.';
+const lastUserText =
+  String(userMessages.at(-1)?.content || '').trim() ||
+  'Analyze all provided materials, especially the images.';
 
-    // Decide vision vs. text
-    let stream;
-    if (imageFiles.length > 0) {
-      const systemMsg = `
+// BEFORE images from the proposal docs
+const proposalImages = collectProposalImages(proposal);
+
+// Decide vision vs. text (compare BEFORE vs AFTER when any images exist)
+let stream;
+if ((imageFiles.length > 0) || (proposalImages.length > 0)) {
+  const systemMsg = `
 You are Agent2 for LithiumX.
 
-You CAN analyze the images attached in this chat (provided as image URLs).
-You CANNOT browse the web or reverse-image-search; only mention this if directly asked.
-Do NOT add generic disclaimers like "I cannot tell if this is AI-generated" unless the user asks.
+You CAN analyze the attached images (URLs). You CANNOT browse the web or reverse-image-search; only mention this if asked. Avoid generic disclaimers.
 
-ALWAYS perform a complete review of attached images:
-- Brief scene description.
-- Extract visible text (OCR-by-perception) as bullets.
-- Flag inconsistencies: lighting/shadows, warped text, odd hands/faces, repeating textures, reflection errors.
-- Cross-check claims in proposal/bid/proof vs. what the images show.
-- Note provenance if present in context; otherwise say none available.
-- Provide a confidence score [0–1].
+Task: Compare "BEFORE" (proposal) vs "AFTER" (proof) images to assess progress/changes and possible image reuse.
 
-Answer format:
-1) 1–2 sentence conclusion
-2) Bullets: Evidence • Inconsistencies • OCR text • Fit-to-proof • Confidence
+ALWAYS provide:
+1) 1–2 sentence conclusion (done/partial/unclear).
+2) Bullets with:
+   • Evidence (specific visual cues, materials, measurements, signage, timestamps)
+   • Differences/Progress (what changed between BEFORE and AFTER)
+   • Possible reuse / duplicates (same photo reused, tiny edits, stock-like anomalies)
+   • Inconsistencies (lighting/shadows mismatch, warped text, repetitive textures)
+   • OCR text (short bullets of visible text)
+   • Fit-to-proof (how AFTER matches the proof claim & milestone scope)
+   • Next checks (alt angles, close-ups, wider context, side-by-side, clearer doc page, etc.)
+   • Confidence [0–1]
+
+Rules:
+- Be concrete and cite visible cues.
+- If BEFORE is missing but AFTER exists, still analyze plausibility & completeness.
+- If AFTER is missing, say so.
+- If angles differ, note how that limits certainty.
 `.trim();
 
-      const userVisionContent = [
-        { type: 'text', text: `User request: ${lastUserText}\n\nUse the CONTEXT and analyze ALL attached images.` },
-        ...imageFiles.slice(0, 6).map(f => ({ type: 'image_url', image_url: { url: f.url } })),
-        { type: 'text', text: `\n\n--- CONTEXT ---\n${systemContext}` },
-      ];
+  const beforeImages = proposalImages.slice(0, 6);
+  const afterImages  = imageFiles.slice(0, 6);
 
-      stream = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',   // vision-capable
-        temperature: 0.2,
-        stream: true,
-        messages: [
-          { role: 'system', content: systemMsg },
-          { role: 'user', content: userVisionContent },
-        ],
-      });
-    } else {
-      // Text-only fallback (no images found)
-      const msgs = [
-        { role: 'system', content: 'Be concise. If citing evidence, quote the exact line from the proof/PDF text.' },
-        { role: 'user', content: `${lastUserText}\n\n--- CONTEXT ---\n${systemContext}` },
-      ];
-      stream = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.2,
-        messages: msgs,
-        stream: true,
-      });
-    }
+  const userVisionContent = [
+    { type: 'text', text: `User request: ${lastUserText}\n\nCompare BEFORE (proposal docs) vs AFTER (proofs) images.` },
+  ];
+
+  if (beforeImages.length) {
+    userVisionContent.push({ type: 'text', text: 'BEFORE (from proposal):' });
+    for (const f of beforeImages) userVisionContent.push({ type: 'image_url', image_url: { url: f.url } });
+  } else {
+    userVisionContent.push({ type: 'text', text: 'BEFORE: (none attached in proposal docs)' });
+  }
+
+  if (afterImages.length) {
+    userVisionContent.push({ type: 'text', text: 'AFTER (from proofs):' });
+    for (const f of afterImages) userVisionContent.push({ type: 'image_url', image_url: { url: f.url } });
+  } else {
+    userVisionContent.push({ type: 'text', text: 'AFTER: (no proof images found)' });
+  }
+
+  userVisionContent.push({ type: 'text', text: `\n\n--- CONTEXT ---\n${systemContext}` });
+
+  stream = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0.2,
+    stream: true,
+    messages: [
+      { role: 'system', content: systemMsg },
+      { role: 'user', content: userVisionContent },
+    ],
+  });
+
+} else {
+  // Text-only fallback (no images anywhere)
+  const msgs = [
+    { role: 'system', content: 'Be concise. If citing evidence, quote the exact line from the proof/PDF text.' },
+    { role: 'user', content: `${lastUserText}\n\n--- CONTEXT ---\n${systemContext}` },
+  ];
+  stream = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0.2,
+    messages: msgs,
+    stream: true,
+  });
+}
 
 // === SSE streaming loop (buffer + footer) ===
 let fullText = '';
