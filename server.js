@@ -1727,7 +1727,7 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
   const bidId = Number(req.params.id);
   if (!Number.isFinite(bidId)) return res.status(400).json({ error: 'Invalid bid id' });
 
-  const userMessages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
+  const userMessages = Array.isArray(req.body?.messages) ? req.body.messages : [];
 
   // SSE headers
   res.set({
@@ -1775,7 +1775,6 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
             () => ({ used: false, reason: 'timeout' })
           );
           if (info.used) {
-            // keep it compact to not blow the prompt
             const txt = (info.text || '').slice(0, 6000);
             pdfNote = `PDF EXTRACT (truncated): """${txt}"""`;
           } else {
@@ -1795,23 +1794,16 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
       });
     }
 
-    const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|tiff|svg)(\?|$)/i;
-function isImageFile(f) {
-  const n  = String(f?.name || f?.url || '').toLowerCase();
-  const mt = String(f?.mimetype || '').toLowerCase();
-  return IMAGE_EXT_RE.test(n) || mt.startsWith('image/');
-}
-
-// Collect images from the latest proofs (attach to the vision message)
-const imageFiles = [];
-for (const pr of proofRows) {
-  const fs = Array.isArray(pr.files)
-    ? pr.files
-    : (typeof pr.files === 'string' ? JSON.parse(pr.files || '[]') : []);
-  for (const f of fs) {
-    if (isImageFile(f)) imageFiles.push(f);
-  }
-}
+    // Collect images from the latest proofs
+    const imageFiles = [];
+    for (const pr of proofRows) {
+      const fs = Array.isArray(pr.files)
+        ? pr.files
+        : (typeof pr.files === 'string' ? JSON.parse(pr.files || '[]') : []);
+      for (const f of fs) {
+        if (isImageFile(f)) imageFiles.push(f);
+      }
+    }
 
     // Build chat context with **bid + proofs**
     const ai = coerceJson(bid.ai_analysis);
@@ -1855,36 +1847,15 @@ Instruction:
 - If a PDF extract was available, use it; otherwise clearly say that no usable PDF text was available.
 - Be concise.`;
 
-    const lastUserText = String(userMessages.at(-1)?.content || '').trim()
-  || 'Analyze the provided materials.';
+    // One last user line to steer the answer
+    const lastUserText =
+      String(userMessages.at(-1)?.content || '').trim() ||
+      'Analyze all provided materials, especially the images.';
 
-let stream;
-if (imageFiles.length > 0) {
-  // Build one user message that includes text + image_url parts + your context
-  const content = [{ type: 'text', text: `Question: ${lastUserText}\n\nUse the CONTEXT and attached images.` }];
-  for (const f of imageFiles.slice(0, 6)) {
-    content.push({ type: 'image_url', image_url: { url: f.url } });
-  }
-  content.push({ type: 'text', text: `\n\n--- CONTEXT ---\n${systemContext}` });
-
-  stream = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',     // vision-capable
-    temperature: 0.2,
-    messages: [{ role: 'user', content }],
-    stream: true,
-  });
-} else
-// Vision-first: if we have images, build a multi-part user message (text + image_url)
-// Otherwise, fall back to the plain text flow.
-let stream;
-
-// Make lastUserText available to BOTH branches
-const lastUserText =
-  String(userMessages.at(-1)?.content || '').trim() ||
-  'Analyze all provided materials, especially the images.';
-
-if (imageFiles.length > 0) {
-  const systemMsg = `
+    // Decide vision vs. text
+    let stream;
+    if (imageFiles.length > 0) {
+      const systemMsg = `
 You are Agent2 for LithiumX.
 
 You CAN analyze the images attached in this chat (provided as image URLs).
@@ -1904,43 +1875,51 @@ Answer format:
 2) Bullets: Evidence • Inconsistencies • OCR text • Fit-to-proof • Confidence
 `.trim();
 
-  const userVisionContent = [
-    { type: 'text', text: `User request: ${lastUserText}\n\nUse the CONTEXT and analyze ALL attached images.` },
-    // Attach up to 6 images to keep prompt small/fast
-    ...imageFiles.slice(0, 6).map(f => ({ type: 'image_url', image_url: { url: f.url } })),
-    { type: 'text', text: `\n\n--- CONTEXT ---\n${systemContext}` },
-  ];
+      const userVisionContent = [
+        { type: 'text', text: `User request: ${lastUserText}\n\nUse the CONTEXT and analyze ALL attached images.` },
+        ...imageFiles.slice(0, 6).map(f => ({ type: 'image_url', image_url: { url: f.url } })),
+        { type: 'text', text: `\n\n--- CONTEXT ---\n${systemContext}` },
+      ];
 
-  stream = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',   // vision-capable
-    temperature: 0.2,
-    stream: true,
-    messages: [
-      { role: 'system', content: systemMsg },
-      { role: 'user', content: userVisionContent },
-    ],
-  });
-} else {
-  // Text-only fallback (no images found)
-  const msgs = [
-    { role: 'system', content: 'Be concise. If citing evidence, quote the exact line from the proof/PDF text.' },
-    { role: 'user', content: `${lastUserText}\n\n--- CONTEXT ---\n${systemContext}` },
-  ];
-  stream = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    temperature: 0.2,
-    messages: msgs,
-    stream: true,
-  });
-}
+      stream = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',   // vision-capable
+        temperature: 0.2,
+        stream: true,
+        messages: [
+          { role: 'system', content: systemMsg },
+          { role: 'user', content: userVisionContent },
+        ],
+      });
+    } else {
+      // Text-only fallback (no images found)
+      const msgs = [
+        { role: 'system', content: 'Be concise. If citing evidence, quote the exact line from the proof/PDF text.' },
+        { role: 'user', content: `${lastUserText}\n\n--- CONTEXT ---\n${systemContext}` },
+      ];
+      stream = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.2,
+        messages: msgs,
+        stream: true,
+      });
+    }
 
-// === SSE streaming loop ===
-for await (const part of stream) {
-  const token = part?.choices?.[0]?.delta?.content || '';
-  if (token) res.write(`data: ${token}\n\n`);
-}
-res.write(`data: [DONE]\n\n`);
-res.end();
+    // === SSE streaming loop ===
+    for await (const part of stream) {
+      const token = part?.choices?.[0]?.delta?.content || '';
+      if (token) res.write(`data: ${token}\n\n`);
+    }
+    res.write(`data: [DONE]\n\n`);
+    res.end();
+  } catch (err) {
+    console.error('Chat error:', err);
+    try {
+      res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`);
+      res.write(`data: [DONE]\n\n`);
+      res.end();
+    } catch {}
+  }
+});
 
 // --- Agent2 Chat about a PROOF (uses bid + proof + extracted PDF text) -----
 app.post('/agent2/chat', adminGuard, async (req, res) => {
