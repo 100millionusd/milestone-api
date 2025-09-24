@@ -198,6 +198,26 @@ function coerceJson(val) {
   return val;
 }
 
+// --- Image helpers for vision models ---
+const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|tiff|svg)(\?|$)/i;
+function isImageFile(f) {
+  if (!f) return false;
+  const n = String(f.name || f.url || '').toLowerCase();
+  const mt = String(f.mimetype || '').toLowerCase();
+  return IMAGE_EXT_RE.test(n) || mt.startsWith('image/');
+}
+
+/** Build a vision user content payload: first text, then image_url entries */
+function buildVisionUserContent(text, files = []) {
+  const content = [{ type: 'text', text }];
+  for (const f of files) {
+    if (f?.url && isImageFile(f)) {
+      content.push({ type: 'image_url', image_url: { url: f.url } });
+    }
+  }
+  return content;
+}
+
 /* ===========================
    Admin Vendors helpers (ADDED)
    - robust email detection
@@ -1775,6 +1795,24 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
       });
     }
 
+    const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|tiff|svg)(\?|$)/i;
+function isImageFile(f) {
+  const n  = String(f?.name || f?.url || '').toLowerCase();
+  const mt = String(f?.mimetype || '').toLowerCase();
+  return IMAGE_EXT_RE.test(n) || mt.startsWith('image/');
+}
+
+// Collect images from the latest proofs (attach to the vision message)
+const imageFiles = [];
+for (const pr of proofRows) {
+  const fs = Array.isArray(pr.files)
+    ? pr.files
+    : (typeof pr.files === 'string' ? JSON.parse(pr.files || '[]') : []);
+  for (const f of fs) {
+    if (isImageFile(f)) imageFiles.push(f);
+  }
+}
+
     // Build chat context with **bid + proofs**
     const ai = coerceJson(bid.ai_analysis);
     const proofsBlock = proofsCtx.length
@@ -2486,22 +2524,25 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
       pdfText ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText}` : `--- NO PDF TEXT AVAILABLE ---`,
     ].join('\n');
 
-    // 4) Stream OpenAI completion
-    const messages = [
-      { role: 'system', content: 'Be concise. If citing evidence, quote the exact line from the proof/PDF text.' },
-      { role: 'user', content: context },
-      ...userMessages.map(m => ({
-        role: m && m.role === 'assistant' ? 'assistant' : 'user',
-        content: String(m?.content || ''),
-      })),
-    ];
+  // Turn the big context into a vision message with attached images
+const userContent = buildVisionUserContent(systemContext, imageFiles);
 
-    const stream = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.2,
-      messages,
-      stream: true,
-    });
+const msgs = [
+  { role: 'system', content: 'Be concise. Use the bid/proof context provided.' },
+  { role: 'user', content: userContent },
+  ...userMessages.map((m) => ({
+    role: m && m.role === 'assistant' ? 'assistant' : 'user',
+    content: String((m && m.content) || ''),
+  })),
+];
+
+const stream = await openai.chat.completions.create({
+  model: 'gpt-4o-mini',
+  temperature: 0.2,
+  messages: msgs,
+  stream: true,
+});
+
 
     for await (const part of stream) {
       const token = part?.choices?.[0]?.delta?.content || '';
