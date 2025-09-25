@@ -3141,6 +3141,81 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
       pool.query(countSql, countParams),
     ]);
 
+    // --- Admin: archive / unarchive / delete an ENTITY (bulk over proposals) ---
+app.post('/admin/entities/:id/archive', adminGuard, async (req, res) => {
+  try {
+    const id = String(req.params.id || '').toLowerCase();
+    if (!id) return res.status(400).json({ error: 'id required' });
+
+    const { rowCount } = await pool.query(`
+      UPDATE proposals
+         SET status = 'archived'
+       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
+         AND status <> 'archived'
+    `, [id]);
+
+    res.json({ ok: true, affected: rowCount });
+  } catch (e) {
+    console.error('archive entity error', e);
+    res.status(500).json({ error: 'Failed to archive entity' });
+  }
+});
+
+app.post('/admin/entities/:id/unarchive', adminGuard, async (req, res) => {
+  try {
+    const id = String(req.params.id || '').toLowerCase();
+    if (!id) return res.status(400).json({ error: 'id required' });
+
+    const toStatus = String(req.body?.toStatus || 'pending').toLowerCase();
+    if (!['pending','approved','rejected'].includes(toStatus)) {
+      return res.status(400).json({ error: 'Invalid toStatus' });
+    }
+
+    const { rowCount } = await pool.query(`
+      UPDATE proposals
+         SET status = $2
+       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
+         AND status = 'archived'
+    `, [id, toStatus]);
+
+    res.json({ ok: true, affected: rowCount, toStatus });
+  } catch (e) {
+    console.error('unarchive entity error', e);
+    res.status(500).json({ error: 'Failed to unarchive entity' });
+  }
+});
+
+app.delete('/admin/entities/:id', adminGuard, async (req, res) => {
+  try {
+    const id = String(req.params.id || '').toLowerCase();
+    if (!id) return res.status(400).json({ error: 'id required' });
+
+    const mode = String(req.query.mode || 'soft'); // soft | hard
+
+    if (mode === 'hard') {
+      // HARD DELETE: remove all proposals for this entity
+      const { rowCount } = await pool.query(`
+        DELETE FROM proposals
+         WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
+      `, [id]);
+      return res.json({ success: true, deleted: rowCount, mode });
+    }
+
+    // Default SOFT delete: archive everything
+    const { rowCount } = await pool.query(`
+      UPDATE proposals
+         SET status = 'archived'
+       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
+         AND status <> 'archived'
+    `, [id]);
+
+    res.json({ success: true, archived: rowCount, mode: 'soft' });
+  } catch (e) {
+    console.error('delete entity error', e);
+    res.status(500).json({ error: 'Failed to delete entity' });
+  }
+});
+
     const items = list.rows.map(r => ({
       id: r.entity_key,
       orgName: r.org_name || '',
