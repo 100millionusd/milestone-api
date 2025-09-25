@@ -2798,7 +2798,7 @@ ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
 
 // Reject the latest proof for a milestone (ADMIN)
 // URL: POST /bids/:bidId/milestones/:idx/reject
-app.post("/bids/:bidId/milestones/:idx/reject", adminOnlyGuard, async (req, res) => {
+app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => {
   try {
     const bidId = Number(req.params.bidId);
     const idx = Number(req.params.idx);
