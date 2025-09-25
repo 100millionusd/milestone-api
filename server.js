@@ -2612,12 +2612,12 @@ ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
       analysis = { summary: "Agent2 failed during analysis.", evidence: [], gaps: [], fit: "low", confidence: 0 };
     }
 
-    // 6) Save analysis (best-effort)
+// 6) Save analysis (best-effort)
 try {
-  await pool.query("UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2", [
-    JSON.stringify(analysis),
-    proofRow.proof_id,
-  ]);
+  await pool.query(
+    "UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2",
+    [ JSON.stringify(analysis), proofRow.proof_id ]
+  );
   proofRow.ai_analysis = analysis;
 } catch (e) {
   console.error("Failed to save ai_analysis for proof:", e);
@@ -2625,8 +2625,14 @@ try {
 
 // [NOTIFY] If the analysis looks suspicious, ping admins & vendor
 try {
+  const NOTIFY_ENABLED = process.env.NOTIFY_ENABLED === "true";
   if (NOTIFY_ENABLED && shouldNotify(analysis)) {
-    // bid and proposal are already in-scope above in this handler
+    const { rows: prj } = await pool.query(
+      "SELECT * FROM proposals WHERE proposal_id=$1",
+      [ bid.proposal_id || bid.proposalId ]
+    );
+    const proposal = prj[0] || null;
+
     await notifyProofFlag({ proof: proofRow, bid, proposal, analysis });
   }
 } catch (e) {
