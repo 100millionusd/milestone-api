@@ -1752,6 +1752,50 @@ app.post("/bids/:id/reject", adminGuard, async (req, res) => {
   }
 });
 
+// Reject a proof (ADMIN)
+app.post("/proofs/:id/reject", adminOnlyGuard, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const reason = (req.body && req.body.reason) ? String(req.body.reason).slice(0, 500) : null;
+
+    const { rows } = await pool.query(
+      `UPDATE proofs
+         SET status = 'rejected',
+             updated_at = NOW()
+         WHERE proof_id = $1
+         RETURNING proof_id, bid_id, status, updated_at`,
+      [id]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: "Proof not found" });
+
+    // OPTIONAL: notify vendor/admins on rejection (comment out if you don’t want it)
+    try {
+      if (process.env.NOTIFY_ENABLED === "true") {
+        const { rows: pr } = await pool.query("SELECT * FROM proofs WHERE proof_id=$1", [id]);
+        const proofRow = pr[0];
+        const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [proofRow.bid_id]);
+        const bid = bids[0];
+        const { rows: prj } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ bid.proposal_id || bid.proposalId ]);
+        const proposal = prj[0] || null;
+
+        const text = `❌ Proof rejected\nProject: ${proposal?.title || proposal?.name || proposal?.proposal_id}\nBid: ${bid?.bid_id}\nProof: ${id}${reason ? `\nReason: ${reason}` : ""}`;
+        // quick ping via your existing channels
+        if (typeof sendTelegram === "function") await sendTelegram(text);
+        if (typeof sendWhatsApp === "function") await sendWhatsApp(text, { toRole: "admins" });
+        if (typeof sendEmail === "function") await sendEmail({ subject: "❌ Proof rejected", text, toRole: "admins" });
+      }
+    } catch (e) {
+      console.warn("notify-on-reject failed (non-fatal):", String(e).slice(0,200));
+    }
+
+    return res.json({ ok: true, proof: rows[0] });
+  } catch (e) {
+    console.error("Reject proof failed:", e);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
 app.post("/bids/:id/archive", adminGuard, async (req, res) => {
   const { id } = req.params;
   try {
