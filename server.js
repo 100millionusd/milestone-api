@@ -2625,8 +2625,12 @@ try {
 
 // [NOTIFY] If the analysis looks suspicious, ping admins & vendor
 try {
-  const NOTIFY_ENABLED = process.env.NOTIFY_ENABLED === "true";
-  if (NOTIFY_ENABLED && shouldNotify(analysis)) {
+  const notifyEnabled = String(process.env.NOTIFY_ENABLED ?? "true").toLowerCase() !== "false";
+  const decision = shouldNotify(analysis);
+  console.log("[/proofs notify] enabled=%s fit=%s conf=%s shouldNotify=%s",
+    notifyEnabled, String(analysis?.fit || 'n/a'), String(analysis?.confidence ?? 'n/a'), decision);
+
+  if (notifyEnabled && decision) {
     const { rows: prj } = await pool.query(
       "SELECT * FROM proposals WHERE proposal_id=$1",
       [ bid.proposal_id || bid.proposalId ]
@@ -2634,6 +2638,9 @@ try {
     const proposal = prj[0] || null;
 
     await notifyProofFlag({ proof: proofRow, bid, proposal, analysis });
+    console.log("[/proofs notify] sent for proof_id=%s", proofRow.proof_id);
+  } else {
+    console.log("[/proofs notify] skipped");
   }
 } catch (e) {
   console.warn("notifyProofFlag failed (non-fatal):", String(e).slice(0,200));
@@ -2842,25 +2849,25 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
         );
         const proposal = prj[0] || null;
 
-        const text =
-          `❌ Proof rejected\n` +
-          `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}\n` +
-          `Bid: ${bidId} • Milestone: ${idx}\n` +
-          (reason ? `Reason: ${reason}` : "");
-        if (typeof sendTelegram === "function") await sendTelegram(text);
-        if (typeof sendWhatsApp === "function") await sendWhatsApp(text, { toRole: "admins" });
-        if (typeof sendEmail === "function") await sendEmail({ subject: "❌ Proof rejected", text, toRole: "admins" });
-      }
-    } catch (e) {
-      console.warn("notify-on-reject failed (non-fatal):", String(e).slice(0,200));
-    }
+        const msg = [
+  "❌ Proof rejected",
+  `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
+  `Bid: ${bidId} • Milestone: ${idx}`,
+  reason ? `Reason: ${reason}` : ""
+].filter(Boolean).join("\n");
 
-    return res.json({ ok: true, proof: rows[0] });
-  } catch (e) {
-    console.error("Reject milestone proof failed:", e);
-    return res.status(500).json({ error: "Internal error" });
-  }
-});
+await Promise.all(
+  [
+    // Telegram (admins)
+    TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, msg) : null,
+
+    // WhatsApp (admins)
+    ...(ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, msg)),
+
+    // Email (admins)
+    MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, "❌ Proof rejected", msg.replace(/\n/g, "<br>")) : null,
+  ].filter(Boolean)
+);
 
 // --- Agent2 Chat about a SPECIFIC PROOF (SSE) -------------------------------
 app.all('/proofs/:id/chat', (req, res, next) => {
