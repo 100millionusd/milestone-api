@@ -2796,6 +2796,72 @@ ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
   }
 });
 
+// Reject the latest proof for a milestone (ADMIN)
+// URL: POST /bids/:bidId/milestones/:idx/reject
+app.post("/bids/:bidId/milestones/:idx/reject", adminOnlyGuard, async (req, res) => {
+  try {
+    const bidId = Number(req.params.bidId);
+    const idx = Number(req.params.idx);
+    const reason = (req.body && req.body.reason) ? String(req.body.reason).slice(0, 500) : null;
+
+    if (!Number.isInteger(bidId) || !Number.isInteger(idx)) {
+      return res.status(400).json({ error: "bad bidId or milestone index" });
+    }
+
+    // Find the most recent proof for this milestone
+    const { rows: proofs } = await pool.query(
+      `SELECT proof_id FROM proofs
+         WHERE bid_id = $1 AND milestone_index = $2
+         ORDER BY submitted_at DESC NULLS LAST, updated_at DESC NULLS LAST
+         LIMIT 1`,
+      [bidId, idx]
+    );
+    if (!proofs.length) return res.status(404).json({ error: "No proof found for this milestone" });
+
+    const proofId = proofs[0].proof_id;
+
+    // Mark as rejected
+    const { rows } = await pool.query(
+      `UPDATE proofs
+         SET status = 'rejected', updated_at = NOW()
+       WHERE proof_id = $1
+       RETURNING proof_id, bid_id, milestone_index, status, updated_at`,
+      [proofId]
+    );
+
+    // (Optional) notify on manual rejection (comment out if you don't want it)
+    try {
+      if (process.env.NOTIFY_ENABLED === "true") {
+        const { rows: pr } = await pool.query("SELECT * FROM proofs WHERE proof_id=$1", [proofId]);
+        const proof = pr[0];
+        const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+        const bid = bids[0];
+        const { rows: prj } = await pool.query(
+          "SELECT * FROM proposals WHERE proposal_id=$1",
+          [ bid.proposal_id || bid.proposalId ]
+        );
+        const proposal = prj[0] || null;
+
+        const text =
+          `❌ Proof rejected\n` +
+          `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}\n` +
+          `Bid: ${bidId} • Milestone: ${idx}\n` +
+          (reason ? `Reason: ${reason}` : "");
+        if (typeof sendTelegram === "function") await sendTelegram(text);
+        if (typeof sendWhatsApp === "function") await sendWhatsApp(text, { toRole: "admins" });
+        if (typeof sendEmail === "function") await sendEmail({ subject: "❌ Proof rejected", text, toRole: "admins" });
+      }
+    } catch (e) {
+      console.warn("notify-on-reject failed (non-fatal):", String(e).slice(0,200));
+    }
+
+    return res.json({ ok: true, proof: rows[0] });
+  } catch (e) {
+    console.error("Reject milestone proof failed:", e);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // --- Agent2 Chat about a SPECIFIC PROOF (SSE) -------------------------------
 app.all('/proofs/:id/chat', (req, res, next) => {
   if (req.method === 'POST') return next();
