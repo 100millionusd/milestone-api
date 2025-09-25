@@ -2836,7 +2836,7 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
       [proofId]
     );
 
-    // (Optional) notify on manual rejection (comment out if you don't want it)
+    // (Optional) notify on manual rejection
     try {
       if (process.env.NOTIFY_ENABLED === "true") {
         const { rows: pr } = await pool.query("SELECT * FROM proofs WHERE proof_id=$1", [proofId]);
@@ -2850,24 +2850,37 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
         const proposal = prj[0] || null;
 
         const msg = [
-  "❌ Proof rejected",
-  `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
-  `Bid: ${bidId} • Milestone: ${idx}`,
-  reason ? `Reason: ${reason}` : ""
-].filter(Boolean).join("\n");
+          "❌ Proof rejected",
+          `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
+          `Bid: ${bidId} • Milestone: ${idx}`,
+          reason ? `Reason: ${reason}` : ""
+        ].filter(Boolean).join("\n");
 
-await Promise.all(
-  [
-    // Telegram (admins)
-    TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, msg) : null,
+        await Promise.all(
+          [
+            // Telegram (admins)
+            TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, msg) : null,
 
-    // WhatsApp (admins)
-    ...(ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, msg)),
+            // WhatsApp (admins)
+            ...(ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, msg)),
 
-    // Email (admins)
-    MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, "❌ Proof rejected", msg.replace(/\n/g, "<br>")) : null,
-  ].filter(Boolean)
-);
+            // Email (admins)
+            MAIL_ADMIN_TO?.length
+              ? sendEmail(MAIL_ADMIN_TO, "❌ Proof rejected", msg.replace(/\n/g, "<br>"))
+              : null,
+          ].filter(Boolean)
+        );
+      }
+    } catch (e) {
+      console.warn("notify-on-reject failed (non-fatal):", String(e).slice(0,200));
+    }
+
+    return res.json({ ok: true, proof: rows[0] });
+  } catch (e) {
+    console.error("Reject milestone proof failed:", e);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
 
 // --- Agent2 Chat about a SPECIFIC PROOF (SSE) -------------------------------
 app.all('/proofs/:id/chat', (req, res, next) => {
