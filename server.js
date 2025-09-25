@@ -198,6 +198,164 @@ function coerceJson(val) {
   return val;
 }
 
+// ==============================
+// Notifications (Telegram, Email via Resend, WhatsApp via Twilio)
+// ==============================
+const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const MAIL_FROM = process.env.MAIL_FROM || "LithiumX <noreply@example.com>";
+const MAIL_ADMIN_TO = (process.env.MAIL_ADMIN_TO || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_ADMIN_CHAT_IDS = (process.env.TELEGRAM_ADMIN_CHAT_IDS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || "";
+const ADMIN_WHATSAPP = (process.env.ADMIN_WHATSAPP || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const APP_BASE_URL = process.env.APP_BASE_URL || process.env.NEXT_PUBLIC_APP_BASE_URL || "";
+const NOTIFY_ENABLED = String(process.env.NOTIFY_ENABLED || "true").toLowerCase() !== "false";
+const NOTIFY_CONF_THRESHOLD = Number(process.env.NOTIFY_CONF_THRESHOLD || 0.35);
+const WA_DEFAULT_COUNTRY = process.env.WA_DEFAULT_COUNTRY || "+1";
+
+// Small helpers
+function toE164(raw) {
+  if (!raw) return null;
+  const s = String(raw).replace(/[^\d+]/g, "");
+  if (s.startsWith("+")) return s;
+  return `${WA_DEFAULT_COUNTRY}${s}`;
+}
+
+// Telegram
+async function sendTelegram(chatIds, text) {
+  if (!TELEGRAM_BOT_TOKEN || !chatIds?.length) return;
+  const payloads = chatIds.map(chat_id => ({
+    method: "POST",
+    url: `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id, text, parse_mode: "HTML", disable_web_page_preview: true }),
+  }));
+  await Promise.all(payloads.map(p => sendRequest("POST", p.url, p.headers, p.body).catch(() => null)));
+}
+
+// Email (Resend)
+async function sendEmail(toList, subject, html) {
+  if (!RESEND_API_KEY || !toList?.length) return;
+  const payload = JSON.stringify({
+    from: MAIL_FROM,
+    to: toList,
+    subject,
+    html,
+  });
+  await sendRequest(
+    "POST",
+    "https://api.resend.com/emails",
+    { "Authorization": `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
+    payload
+  );
+}
+
+// WhatsApp (Twilio)
+async function sendWhatsApp(to, body) {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_WHATSAPP_FROM) return;
+  const toNum = toE164(to);
+  if (!toNum) return;
+  const creds = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+  const form = new URLSearchParams({
+    From: TWILIO_WHATSAPP_FROM,
+    To: `whatsapp:${toNum}`,
+    Body: body,
+  }).toString();
+
+  await sendRequest(
+    "POST",
+    `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
+    {
+      "Authorization": `Basic ${creds}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Content-Length": Buffer.byteLength(form),
+    },
+    form
+  );
+}
+
+function shouldNotify(analysis) {
+  try {
+    const conf = Number(analysis?.confidence);
+    const fit = String(analysis?.fit || "").toLowerCase();
+    const gaps = Array.isArray(analysis?.gaps) ? analysis.gaps : [];
+    const text = String(analysis?.summary || "");
+    const kw = /(do not match|mismatch|inconsistent|wrong|duplicate|reused|fake|ai-generated)/i;
+    return (
+      !Number.isFinite(conf) ||
+      conf < NOTIFY_CONF_THRESHOLD ||
+      fit === "low" ||
+      gaps.length > 0 ||
+      kw.test(text)
+    );
+  } catch { return true; }
+}
+
+async function notifyProofFlag({ proof, bid, proposal, analysis }) {
+  const msIndex = Number(proof.milestone_index) + 1;
+  const subject = `⚠️ Proof needs review — ${proposal?.title || "Project"} (Milestone ${msIndex})`;
+  const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/bids/${bid.bid_id}?tab=proofs` : "";
+
+  const short = (s, n = 300) => (s || "").slice(0, n);
+
+  const text = [
+    `Project: ${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
+    `Vendor: ${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
+    `Milestone: #${msIndex}`,
+    `Confidence: ${analysis?.confidence ?? "n/a"}  Fit: ${analysis?.fit || "n/a"}`,
+    `Summary: ${short(analysis?.summary, 400)}`,
+    adminLink ? `Admin: ${adminLink}` : "",
+  ].filter(Boolean).join("\n");
+
+  const html = `
+    <h3>Proof needs review</h3>
+    <p><b>Project:</b> ${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}</p>
+    <p><b>Vendor:</b> ${bid.vendor_name || ""} (${bid.wallet_address || ""})</p>
+    <p><b>Milestone:</b> #${msIndex}</p>
+    <p><b>Confidence:</b> ${analysis?.confidence ?? "n/a"} &nbsp;&nbsp; <b>Fit:</b> ${analysis?.fit || "n/a"}</p>
+    <p><b>Summary:</b><br>${(analysis?.summary || "").replace(/\n/g, "<br>")}</p>
+    ${adminLink ? `<p><a href="${adminLink}">Open in Admin</a></p>` : ""}
+  `;
+
+  // Load vendor contacts
+  const { rows: vprows } = await pool.query(
+    `SELECT email, phone, telegram_chat_id FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+    [ (bid.wallet_address || "").toLowerCase() ]
+  );
+  const vp = vprows[0] || {};
+  const vendorEmail = (vp.email || "").trim();
+  const vendorPhone = (vp.phone || "").trim();
+  const vendorTg    = (vp.telegram_chat_id || "").trim();
+
+  // Admins
+  await Promise.all([
+    sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text),
+    sendEmail(MAIL_ADMIN_TO, subject, html),
+    ...ADMIN_WHATSAPP.map(n => sendWhatsApp(n, text)),
+  ]);
+
+  // Vendor (best-effort; skip if missing)
+  await Promise.all([
+    vendorTg ? sendTelegram([vendorTg], text) : null,
+    vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
+    vendorPhone ? sendWhatsApp(vendorPhone, text) : null,
+  ].filter(Boolean));
+}
+
 // --- Image helpers for vision models ---
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|tiff|svg)(\?|$)/i;
 function isImageFile(f) {
@@ -2455,15 +2613,25 @@ ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
     }
 
     // 6) Save analysis (best-effort)
-    try {
-      await pool.query("UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2", [
-        JSON.stringify(analysis),
-        proofRow.proof_id,
-      ]);
-      proofRow.ai_analysis = analysis;
-    } catch (e) {
-      console.error("Failed to save ai_analysis for proof:", e);
-    }
+try {
+  await pool.query("UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2", [
+    JSON.stringify(analysis),
+    proofRow.proof_id,
+  ]);
+  proofRow.ai_analysis = analysis;
+} catch (e) {
+  console.error("Failed to save ai_analysis for proof:", e);
+}
+
+// [NOTIFY] If the analysis looks suspicious, ping admins & vendor
+try {
+  if (NOTIFY_ENABLED && shouldNotify(analysis)) {
+    // bid and proposal are already in-scope above in this handler
+    await notifyProofFlag({ proof: proofRow, bid, proposal, analysis });
+  }
+} catch (e) {
+  console.warn("notifyProofFlag failed (non-fatal):", String(e).slice(0,200));
+}
 
     // 7) Also stamp a simple proof note back to the bid milestone for quick view
     const ms = milestones;
@@ -2918,6 +3086,31 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
   } catch (e) {
     console.error('POST /vendor/profile error:', e);
     res.status(500).json({ error: 'Failed to save profile' });
+  }
+});
+
+// Place anywhere with other routes
+app.post('/tg/webhook', async (req, res) => {
+  try {
+    const update = req.body || {};
+    const chatId = update?.message?.chat?.id;
+    const text   = String(update?.message?.text || '');
+    if (!chatId || !text.startsWith('/link ')) return res.json({ ok: true });
+
+    const wallet = text.slice(6).trim().toLowerCase();
+    if (!/^0x[a-f0-9]{40}$/.test(wallet)) {
+      await sendTelegram([chatId], "Send: /link 0xYourWalletAddress");
+      return res.json({ ok: true });
+    }
+    await pool.query(
+      `UPDATE vendor_profiles SET telegram_chat_id=$1, updated_at=now()
+       WHERE lower(wallet_address)=lower($2)`,
+      [String(chatId), wallet]
+    );
+    await sendTelegram([chatId], "✅ Linked! You'll receive proof review notices here.");
+    res.json({ ok: true });
+  } catch (e) {
+    res.json({ ok: true });
   }
 });
 
