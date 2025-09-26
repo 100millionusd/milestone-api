@@ -2897,46 +2897,71 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
     );
 
     // Notify
-    try {
-      if (process.env.NOTIFY_ENABLED === "true") {
-        const { rows: pr } = await pool.query("SELECT * FROM proofs WHERE proof_id=$1", [proofId]);
-        const proof = pr[0];
-        const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
-        const bid = bids[0];
-        const { rows: prj } = await pool.query(
-          "SELECT * FROM proposals WHERE proposal_id=$1",
-          [ bid.proposal_id || bid.proposalId ]
-        );
-        const proposal = prj[0] || null;
+try {
+  if (process.env.NOTIFY_ENABLED === "true") {
+    const { rows: pr } = await pool.query("SELECT * FROM proofs WHERE proof_id=$1", [proofId]);
+    const proof = pr[0];
+    const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    const bid = bids[0];
+    const { rows: prj } = await pool.query(
+      "SELECT * FROM proposals WHERE proposal_id=$1",
+      [ bid.proposal_id || bid.proposalId ]
+    );
+    const proposal = prj[0] || null;
 
-        const msg = [
-          "❌ Proof rejected",
-          `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
-          `Bid: ${bidId} • Milestone: ${idx}`,
-          reason ? `Reason: ${reason}` : ""
-        ].filter(Boolean).join("\n");
+    const subject = "❌ Proof rejected";
+    const msg = [
+      "❌ Proof rejected",
+      `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
+      `Bid: ${bidId} • Milestone: ${idx}`,
+      reason ? `Reason: ${reason}` : ""
+    ].filter(Boolean).join("\n");
+    const html = msg.replace(/\n/g, "<br>");
 
-        // WhatsApp template variables (if TWILIO_WA_CONTENT_SID is set)
-        const waVars = {
-          "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
-          "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
-          "3": `#${idx}`,
-          "4": reason ? reason : "No reason provided"
-        };
+    // Load vendor contacts (email/phone/telegram) from vendor_profiles
+    const { rows: vprows } = await pool.query(
+      `SELECT email, phone, telegram_chat_id
+         FROM vendor_profiles
+        WHERE lower(wallet_address)=lower($1)
+        LIMIT 1`,
+      [ (bid.wallet_address || "").toLowerCase() ]
+    );
+    const vp = vprows[0] || {};
+    const vendorEmail = (vp.email || "").trim();
+    const vendorPhone = (vp.phone || "").trim();
+    const vendorTg    = (vp.telegram_chat_id || "").trim();
 
-        await Promise.all(
-          [
-            TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, msg) : null,
-            ...(TWILIO_WA_CONTENT_SID
-              ? (ADMIN_WHATSAPP || []).map(n => sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars))
-              : (ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, msg))),
-            MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, "❌ Proof rejected", msg.replace(/\n/g, "<br>")) : null,
-          ].filter(Boolean)
-        );
-      }
-    } catch (e) {
-      console.warn("notify-on-reject failed (non-fatal):", String(e).slice(0,200));
-    }
+    // WhatsApp template variables (if TWILIO_WA_CONTENT_SID is set)
+    const waVars = {
+      "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
+      "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
+      "3": `#${idx}`,
+      "4": reason ? reason : "No reason provided"
+    };
+
+    await Promise.all(
+      [
+        // Admins
+        TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, msg) : null,
+        ...(TWILIO_WA_CONTENT_SID
+          ? (ADMIN_WHATSAPP || []).map(n => sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars))
+          : (ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, msg))),
+        MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
+
+        // Vendor (email + optional TG/WA)
+        vendorTg ? sendTelegram([vendorTg], msg) : null,
+        vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
+        vendorPhone
+          ? (TWILIO_WA_CONTENT_SID
+              ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
+              : sendWhatsApp(vendorPhone, msg))
+          : null,
+      ].filter(Boolean)
+    );
+  }
+} catch (e) {
+  console.warn("notify-on-reject failed (non-fatal):", String(e).slice(0,200));
+}
 
     return res.json({ ok: true, proof: rows[0] });
   } catch (e) {
