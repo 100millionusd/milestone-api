@@ -2907,18 +2907,26 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
           reason ? `Reason: ${reason}` : ""
         ].filter(Boolean).join("\n");
 
+        // If you have an approved WhatsApp template, use ContentSid; else fall back to free-form (24h window)
+        const waVars = {
+          "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
+          "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
+          "3": `#${idx}`,
+          "4": reason ? reason : "No reason provided"
+        };
+
         await Promise.all(
           [
             // Telegram (admins)
             TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, msg) : null,
 
             // WhatsApp (admins)
-            ...(ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, msg)),
+            ...(TWILIO_WA_CONTENT_SID
+              ? (ADMIN_WHATSAPP || []).map(n => sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars))
+              : (ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, msg))),
 
             // Email (admins)
-            MAIL_ADMIN_TO?.length
-              ? sendEmail(MAIL_ADMIN_TO, "❌ Proof rejected", msg.replace(/\n/g, "<br>"))
-              : null,
+            MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, "❌ Proof rejected", msg.replace(/\n/g, "<br>")) : null,
           ].filter(Boolean)
         );
       }
