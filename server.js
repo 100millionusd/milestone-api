@@ -143,9 +143,11 @@ const pool = new Pool({
     // Add columns if they don't exist
     await pool.query(`
       ALTER TABLE proposals
-        ADD COLUMN IF NOT EXISTS owner_wallet text,
-        ADD COLUMN IF NOT EXISTS owner_email  text,
-        ADD COLUMN IF NOT EXISTS updated_at   timestamptz NOT NULL DEFAULT now();
+        ADD COLUMN IF NOT EXISTS owner_wallet              text,
+        ADD COLUMN IF NOT EXISTS owner_email               text,
+        ADD COLUMN IF NOT EXISTS owner_phone               text,               -- NEW
+        ADD COLUMN IF NOT EXISTS owner_telegram_chat_id    text,               -- NEW
+        ADD COLUMN IF NOT EXISTS updated_at                timestamptz NOT NULL DEFAULT now();
     `);
 
     // Helpful index for "my proposals"
@@ -904,6 +906,7 @@ const proposalSchema = Joi.object({
   docs: Joi.array().default([]),
   cid: Joi.string().allow(""),
   ownerEmail: Joi.string().email().allow(""), // ✅ NEW (optional)
+  ownerPhone: Joi.string().allow("").optional(), 
 });
 
 const proposalUpdateSchema = Joi.object({
@@ -917,6 +920,7 @@ const proposalUpdateSchema = Joi.object({
   amountUSD: Joi.number().min(0),
   docs: Joi.array(),
   ownerEmail: Joi.string().email().allow(""),
+  ownerPhone: Joi.string().allow(""),
 }).min(1);
 
 const bidSchema = Joi.object({
@@ -1493,18 +1497,19 @@ app.post("/proposals", async (req, res) => {
     const { error, value } = proposalSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
 
-    // If the submitter is logged in (Web3Auth wallet), capture owner wallet + optional email
+    // If the submitter is logged in (Web3Auth wallet), capture owner wallet + optional email/phone
     const ownerWallet = (req.user?.sub || null);
     const ownerEmail  = (value.ownerEmail || null);
+    const ownerPhone  = (value.ownerPhone || null); // NEW
 
     const q = `
       INSERT INTO proposals (
         org_name, title, summary, contact, address, city, country, amount_usd, docs, cid, status,
-        owner_wallet, owner_email, updated_at
+        owner_wallet, owner_email, owner_phone, updated_at
       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',
-                $11,$12, NOW())
+                $11,$12,$13, NOW())
       RETURNING proposal_id, org_name, title, summary, contact, address, city, country,
-                amount_usd, docs, cid, status, created_at, owner_wallet, owner_email, updated_at
+                amount_usd, docs, cid, status, created_at, owner_wallet, owner_email, owner_phone, updated_at
     `;
     const vals = [
       value.orgName,
@@ -1519,6 +1524,7 @@ app.post("/proposals", async (req, res) => {
       value.cid,
       ownerWallet,
       ownerEmail,
+      ownerPhone, // NEW
     ];
 
     const { rows } = await pool.query(q, vals);
@@ -1548,6 +1554,7 @@ app.patch("/proposals/:id", adminOrProposalOwnerGuard, async (req, res) => {
       country: 'country',
       amountUSD: 'amount_usd',
       ownerEmail: 'owner_email',
+      ownerPhone: 'owner_phone',
       docs: 'docs',
     };
 
@@ -3311,6 +3318,14 @@ app.post('/tg/webhook', async (req, res) => {
       `UPDATE vendor_profiles
          SET telegram_chat_id = $1, updated_at = now()
        WHERE lower(wallet_address) = lower($2)`,
+      [ String(chatId), wallet.toLowerCase() ]
+    );
+
+    // ALSO store on proposals for proposers/entities
+    await pool.query(
+      `UPDATE proposals
+         SET owner_telegram_chat_id = $1, updated_at = now()
+       WHERE lower(owner_wallet) = lower($2)`,
       [ String(chatId), wallet.toLowerCase() ]
     );
 
