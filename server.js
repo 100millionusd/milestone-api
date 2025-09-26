@@ -106,20 +106,22 @@ const pool = new Pool({
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS vendor_profiles (
-        wallet_address  text PRIMARY KEY,
-        vendor_name     text NOT NULL,
-        email           text,
-        phone           text,
-        address         text,
-        website         text,
-        archived        boolean NOT NULL DEFAULT false,  -- NEW
-        created_at      timestamptz NOT NULL DEFAULT now(),
-        updated_at      timestamptz NOT NULL DEFAULT now()
+        wallet_address   text PRIMARY KEY,
+        vendor_name      text NOT NULL,
+        email            text,
+        phone            text,
+        address          text,
+        website          text,
+        archived         boolean NOT NULL DEFAULT false,  -- NEW
+        telegram_chat_id text,                            -- NEW
+        created_at       timestamptz NOT NULL DEFAULT now(),
+        updated_at       timestamptz NOT NULL DEFAULT now()
       );
     `);
 
-    // In case the table already existed without the column
+    // In case the table already existed without the columns
     await pool.query(`ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS archived boolean NOT NULL DEFAULT false;`);
+    await pool.query(`ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS telegram_chat_id text;`);
 
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_vendor_profiles_name
@@ -3147,7 +3149,7 @@ app.get('/vendor/profile', authRequired, async (req, res) => {
   try {
     const wallet = String(req.user?.sub || '').toLowerCase();
     const { rows } = await pool.query(
-      `SELECT wallet_address, vendor_name, email, phone, address, website
+      `SELECT wallet_address, vendor_name, email, phone, address, website, telegram_chat_id
        FROM vendor_profiles
        WHERE lower(wallet_address)=lower($1)`,
       [wallet]
@@ -3156,7 +3158,8 @@ app.get('/vendor/profile', authRequired, async (req, res) => {
     if (!rows[0]) return res.json(null);
 
     const r = rows[0];
-    // try to parse address as JSON; otherwise treat as single-line
+
+    // address can be JSON or plain text -> normalize to the UI shape you expect
     let parsed = null;
     try { parsed = JSON.parse(r.address || ''); } catch {}
     const address =
@@ -3164,23 +3167,25 @@ app.get('/vendor/profile', authRequired, async (req, res) => {
         ? {
             line1: parsed.line1 || '',
             city: parsed.city || '',
-            country: parsed.country || '',
             postalCode: parsed.postalCode || parsed.postal_code || '',
+            country: parsed.country || '',
           }
         : {
             line1: r.address || '',
             city: '',
-            country: '',
             postalCode: '',
+            country: '',
           };
 
-    return res.json({
+    res.json({
       walletAddress: r.wallet_address,
       vendorName: r.vendor_name || '',
       email: r.email || '',
       phone: r.phone || '',
       website: r.website || '',
       address,
+      telegram_chat_id: r.telegram_chat_id || null, // snake_case (backend)
+      telegramChatId: r.telegram_chat_id || null,   // camelCase (frontend convenience)
     });
   } catch (e) {
     console.error('GET /vendor/profile error:', e);
@@ -3269,28 +3274,52 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
   }
 });
 
-// Place anywhere with other routes
+// Telegram webhook: supports both "/link 0x..." and deep-link "/start link_0x..."
 app.post('/tg/webhook', async (req, res) => {
   try {
     const update = req.body || {};
-    const chatId = update?.message?.chat?.id;
-    const text   = String(update?.message?.text || '');
-    if (!chatId || !text.startsWith('/link ')) return res.json({ ok: true });
 
-    const wallet = text.slice(6).trim().toLowerCase();
-    if (!/^0x[a-f0-9]{40}$/.test(wallet)) {
-      await sendTelegram([chatId], "Send: /link 0xYourWalletAddress");
+    // Extract chat id + message text
+    const chatId = update?.message?.chat?.id || update?.chat?.id || update?.message?.from?.id;
+    const textRaw = update?.message?.text || update?.message?.data || update?.message?.caption || "";
+    const text = String(textRaw).trim();
+
+    if (!chatId || !text) return res.json({ ok: true });
+
+    // Parse wallet from either:
+    // 1) "/link 0xABC..."     (manual)
+    // 2) "/start link_0xABC"  (deep link)
+    let wallet = "";
+    if (/^\/link\s+/i.test(text)) {
+      wallet = text.slice(6).trim();
+    } else {
+      const m = text.match(/^\/start\s+link_(0x[a-fA-F0-9]{40})$/);
+      if (m) wallet = m[1];
+    }
+
+    // Ignore unrelated messages
+    if (!wallet) return res.json({ ok: true });
+
+    // Validate wallet
+    if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
+      await sendTelegram([String(chatId)], "Send: /link 0xYourWalletAddress");
       return res.json({ ok: true });
     }
+
+    // Store chat id on the vendor profile
     await pool.query(
-      `UPDATE vendor_profiles SET telegram_chat_id=$1, updated_at=now()
-       WHERE lower(wallet_address)=lower($2)`,
-      [String(chatId), wallet]
+      `UPDATE vendor_profiles
+         SET telegram_chat_id = $1, updated_at = now()
+       WHERE lower(wallet_address) = lower($2)`,
+      [ String(chatId), wallet.toLowerCase() ]
     );
-    await sendTelegram([chatId], "✅ Linked! You'll receive proof review notices here.");
-    res.json({ ok: true });
-  } catch (e) {
-    res.json({ ok: true });
+
+    // Confirm to the user
+    await sendTelegram([String(chatId)], `✅ Telegram linked to ${wallet}`);
+    return res.json({ ok: true });
+  } catch (_e) {
+    // Always 200 so Telegram doesn't retry forever
+    return res.json({ ok: true });
   }
 });
 
