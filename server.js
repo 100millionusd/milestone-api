@@ -333,6 +333,50 @@ async function sendWhatsAppTemplate(to, contentSid, vars) {
   );
 }
 
+// ==============================
+// Notifications — Proposals
+// ==============================
+async function notifyProposalSubmitted(p) {
+  try {
+    const id = p.proposal_id || p.proposalId;
+    const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/proposals/${id}` : null;
+
+    const subject = `📥 New proposal submitted`;
+    const lines = [
+      `📥 New proposal submitted`,
+      `Org: ${p.org_name || ""}`,
+      `Title: ${p.title || ""}`,
+      `Budget: $${p.amount_usd ?? 0}`,
+      adminLink ? `Admin: ${adminLink}` : "",
+    ].filter(Boolean);
+    const text = lines.join("\n");
+    const html = lines.join("<br>");
+
+    // proposer contacts
+    const proposerEmails = [p.contact, p.owner_email].map(s => (s||"").trim()).filter(Boolean);
+    const proposerPhone  = toE164(p.owner_phone || "");
+    const proposerTg     = (p.owner_telegram_chat_id || "").trim();
+
+    await Promise.all([
+      // Admins
+      TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
+      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      ...(ADMIN_WHATSAPP || []).map(n =>
+        TWILIO_WA_CONTENT_SID
+          ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": p.title || "", "2": p.org_name || "" })
+          : sendWhatsApp(n, text)
+      ),
+
+      // Proposer
+      proposerTg ? sendTelegram([proposerTg], text) : null,
+      proposerEmails.length ? sendEmail(proposerEmails, subject, html) : null,
+      proposerPhone ? sendWhatsApp(proposerPhone, text) : null,
+    ].filter(Boolean));
+  } catch (e) {
+    console.warn('notifyProposalSubmitted failed:', e);
+  }
+}
+
 function shouldNotify(analysis) {
   try {
     const conf = Number(analysis?.confidence);
@@ -1497,20 +1541,23 @@ app.post("/proposals", async (req, res) => {
     const { error, value } = proposalSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
 
-    // If the submitter is logged in (Web3Auth wallet), capture owner wallet + optional email/phone
+    // Submitter identity (if logged in via Web3Auth)
     const ownerWallet = (req.user?.sub || null);
     const ownerEmail  = (value.ownerEmail || null);
-    const ownerPhone  = (value.ownerPhone || null); // NEW
+    const ownerPhone  = toE164(value.ownerPhone || ""); // normalize for WhatsApp (optional helper)
 
     const q = `
       INSERT INTO proposals (
         org_name, title, summary, contact, address, city, country, amount_usd, docs, cid, status,
         owner_wallet, owner_email, owner_phone, updated_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',
-                $11,$12,$13, NOW())
+      ) VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',
+        $11,$12,$13, NOW()
+      )
       RETURNING proposal_id, org_name, title, summary, contact, address, city, country,
                 amount_usd, docs, cid, status, created_at, owner_wallet, owner_email, owner_phone, updated_at
     `;
+
     const vals = [
       value.orgName,
       value.title,
@@ -1524,13 +1571,21 @@ app.post("/proposals", async (req, res) => {
       value.cid,
       ownerWallet,
       ownerEmail,
-      ownerPhone, // NEW
+      ownerPhone || null,
     ];
 
     const { rows } = await pool.query(q, vals);
-    res.json(toCamel(rows[0]));
+    const row = rows[0];
+
+    // Notify admins + proposer on creation (optional; requires NOTIFY_ENABLED & helper)
+    if (typeof notifyProposalSubmitted === "function" && NOTIFY_ENABLED) {
+      try { await notifyProposalSubmitted(row); } catch (e) { console.warn("notifyProposalSubmitted failed:", e); }
+    }
+
+    return res.json(toCamel(row));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("POST /proposals error:", err);
+    return res.status(500).json({ error: err.message || "Failed to create proposal" });
   }
 });
 
