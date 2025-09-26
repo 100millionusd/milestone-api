@@ -377,35 +377,39 @@ async function notifyProofFlag({ proof, bid, proposal, analysis }) {
   const vendorPhone = (vp.phone || "").trim();
   const vendorTg    = (vp.telegram_chat_id || "").trim();
 
-  // Admins (use template when available; fallback to free-form)
-const waVars = {
-  "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
-  "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
-  "3": `#${msIndex}`,
-  "4": String(analysis?.confidence ?? "n/a"),
-  "5": String(analysis?.fit || "n/a"),
-  "6": short(analysis?.summary, 400),
-  "7": adminLink || ""
-};
+  // WhatsApp template variables (if you set TWILIO_WA_CONTENT_SID)
+  const waVars = {
+    "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
+    "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
+    "3": `#${msIndex}`,
+    "4": String(analysis?.confidence ?? "n/a"),
+    "5": String(analysis?.fit || "n/a"),
+    "6": short(analysis?.summary, 400),
+    "7": adminLink || ""
+  };
 
-await Promise.all([
-  sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text),
-  sendEmail(MAIL_ADMIN_TO, subject, html),
-  ...(TWILIO_WA_CONTENT_SID
-      ? ADMIN_WHATSAPP.map(n => sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars))
-      : ADMIN_WHATSAPP.map(n => sendWhatsApp(n, text)))
-]);
+  // Admins
+  await Promise.all([
+    TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
+    MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
+    ...(ADMIN_WHATSAPP || []).map(n =>
+      TWILIO_WA_CONTENT_SID
+        ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars)
+        : sendWhatsApp(n, text)
+    ),
+  ].filter(Boolean));
 
-  // Vendor (best-effort; skip if missing)
-await Promise.all([
-  vendorTg ? sendTelegram([vendorTg], text) : null,
-  vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
-  vendorPhone
-    ? (TWILIO_WA_CONTENT_SID
-        ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
-        : sendWhatsApp(vendorPhone, text))
-    : null,
-].filter(Boolean));
+  // Vendor (best-effort)
+  await Promise.all([
+    vendorTg ? sendTelegram([vendorTg], text) : null,
+    vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
+    vendorPhone
+      ? (TWILIO_WA_CONTENT_SID
+          ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
+          : sendWhatsApp(vendorPhone, text))
+      : null,
+  ].filter(Boolean));
+}
 
 // --- Image helpers for vision models ---
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|tiff|svg)(\?|$)/i;
@@ -2887,7 +2891,7 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
       [proofId]
     );
 
-    // (Optional) notify on manual rejection
+    // Notify
     try {
       if (process.env.NOTIFY_ENABLED === "true") {
         const { rows: pr } = await pool.query("SELECT * FROM proofs WHERE proof_id=$1", [proofId]);
@@ -2907,7 +2911,7 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
           reason ? `Reason: ${reason}` : ""
         ].filter(Boolean).join("\n");
 
-        // If you have an approved WhatsApp template, use ContentSid; else fall back to free-form (24h window)
+        // WhatsApp template variables (if TWILIO_WA_CONTENT_SID is set)
         const waVars = {
           "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
           "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
@@ -2917,15 +2921,10 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
 
         await Promise.all(
           [
-            // Telegram (admins)
             TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, msg) : null,
-
-            // WhatsApp (admins)
             ...(TWILIO_WA_CONTENT_SID
               ? (ADMIN_WHATSAPP || []).map(n => sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars))
               : (ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, msg))),
-
-            // Email (admins)
             MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, "❌ Proof rejected", msg.replace(/\n/g, "<br>")) : null,
           ].filter(Boolean)
         );
