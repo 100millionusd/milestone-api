@@ -202,7 +202,11 @@ function coerceJson(val) {
 // Notifications (Telegram, Email via Resend, WhatsApp via Twilio)
 // ==============================
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
-const MAIL_FROM = process.env.MAIL_FROM || "LithiumX <noreply@example.com>";
+// Accept either RESEND_FROM or MAIL_FROM (backward compatible)
+const MAIL_FROM = process.env.RESEND_FROM || process.env.MAIL_FROM || "LithiumX <noreply@example.com>";
+// Optional Reply-To (works with either RESEND_REPLY_TO or MAIL_REPLY_TO)
+const MAIL_REPLY_TO = process.env.RESEND_REPLY_TO || process.env.MAIL_REPLY_TO || undefined;
+
 const MAIL_ADMIN_TO = (process.env.MAIL_ADMIN_TO || "")
   .split(",")
   .map(s => s.trim())
@@ -256,6 +260,7 @@ async function sendEmail(toList, subject, html) {
     to: toList,
     subject,
     html,
+    reply_to: MAIL_REPLY_TO,   // <— added line
   });
   await sendRequest(
     "POST",
