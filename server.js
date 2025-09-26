@@ -422,6 +422,85 @@ async function notifyProposalRejected(p, reason) {
   }
 }
 
+// ==============================
+// Notifications — Bids
+// ==============================
+async function notifyBidApproved(bid, proposal, vendor) {
+  try {
+    const subject = `✅ Bid awarded`;
+    const lines = [
+      `✅ Bid awarded`,
+      `Project: ${proposal?.title || "(untitled)"}`,
+      `Vendor: ${bid?.vendor_name || vendor?.vendor_name || ""}`,
+      `Amount: $${bid?.price_usd ?? 0}`,
+      APP_BASE_URL ? `Admin: ${APP_BASE_URL}/admin/bids` : "",
+    ].filter(Boolean);
+    const text = lines.join("\n");
+    const html = lines.join("<br>");
+
+    // Vendor contacts
+    const vendorEmails = [vendor?.email].map(s => (s||"").trim()).filter(Boolean);
+    const vendorPhone  = toE164(vendor?.phone || "");
+    const vendorTg     = (vendor?.telegram_chat_id || "").trim();
+
+    await Promise.all([
+      // Admins
+      TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
+      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      ...(ADMIN_WHATSAPP || []).map(n =>
+        TWILIO_WA_CONTENT_SID
+          ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": proposal?.title || "", "2": "awarded" })
+          : sendWhatsApp(n, text)
+      ),
+
+      // Vendor
+      vendorTg ? sendTelegram([vendorTg], text) : null,
+      vendorEmails.length ? sendEmail(vendorEmails, subject, html) : null,
+      vendorPhone ? sendWhatsApp(vendorPhone, text) : null,
+    ].filter(Boolean));
+  } catch (e) {
+    console.warn('notifyBidApproved failed:', e);
+  }
+}
+
+async function notifyBidRejected(bid, proposal, vendor, reason) {
+  try {
+    const subject = `❌ Bid rejected`;
+    const lines = [
+      `❌ Bid rejected`,
+      `Project: ${proposal?.title || "(untitled)"}`,
+      `Vendor: ${bid?.vendor_name || vendor?.vendor_name || ""}`,
+      `Amount: $${bid?.price_usd ?? 0}`,
+      reason ? `Reason: ${reason}` : "",
+      APP_BASE_URL ? `Admin: ${APP_BASE_URL}/admin/bids` : "",
+    ].filter(Boolean);
+    const text = lines.join("\n");
+    const html = lines.join("<br>");
+
+    const vendorEmails = [vendor?.email].map(s => (s||"").trim()).filter(Boolean);
+    const vendorPhone  = toE164(vendor?.phone || "");
+    const vendorTg     = (vendor?.telegram_chat_id || "").trim();
+
+    await Promise.all([
+      // Admins
+      TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
+      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      ...(ADMIN_WHATSAPP || []).map(n =>
+        TWILIO_WA_CONTENT_SID
+          ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": proposal?.title || "", "2": "rejected" })
+          : sendWhatsApp(n, text)
+      ),
+
+      // Vendor
+      vendorTg ? sendTelegram([vendorTg], text) : null,
+      vendorEmails.length ? sendEmail(vendorEmails, subject, html) : null,
+      vendorPhone ? sendWhatsApp(vendorPhone, text) : null,
+    ].filter(Boolean));
+  } catch (e) {
+    console.warn('notifyBidRejected failed:', e);
+  }
+}
+
 function shouldNotify(analysis) {
   try {
     const conf = Number(analysis?.confidence);
@@ -1909,26 +1988,71 @@ app.post("/bids", async (req, res) => {
   }
 });
 
+// Approve / award bid (+ notify admin & vendor)
 app.post("/bids/:id/approve", adminGuard, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+
   try {
-    const { rows } = await pool.query(`UPDATE bids SET status='approved' WHERE bid_id=$1 RETURNING *`, [ id ]);
+    // 1) Update status -> approved
+    const { rows } = await pool.query(
+      `UPDATE bids SET status='approved', updated_at=NOW() WHERE bid_id=$1 RETURNING *`,
+      [ id ]
+    );
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
-    return res.json(toCamel(rows[0]));
+    const bid = rows[0];
+
+    // 2) Pull proposal + vendor profile for contacts
+    const [{ rows: prjRows }, { rows: vpRows }] = await Promise.all([
+      pool.query(`SELECT * FROM proposals WHERE proposal_id=$1`, [ bid.proposal_id ]),
+      pool.query(`SELECT * FROM vendor_profiles WHERE LOWER(wallet_address)=LOWER($1)`, [ bid.wallet_address ])
+    ]);
+    const proposal = prjRows[0] || null;
+    const vendor   = vpRows[0] || null;
+
+    // 3) Fire-and-forget notifications
+    if (typeof notifyBidApproved === "function") {
+      notifyBidApproved(bid, proposal, vendor).catch(() => null);
+    }
+
+    return res.json(toCamel(bid));
   } catch (err) {
     console.error("approve bid error", err);
     return res.status(500).json({ error: "Internal error approving bid" });
   }
 });
 
+// Reject bid (+ notify admin & vendor)
 app.post("/bids/:id/reject", adminGuard, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+
   try {
-    const { rows } = await pool.query(`UPDATE bids SET status='rejected' WHERE bid_id=$1 RETURNING *`, [ id ]);
+    // Optional reason from UI
+    const reason = String(req.body?.reason || req.body?.note || "").trim() || null;
+
+    // 1) Update status -> rejected
+    const { rows } = await pool.query(
+      `UPDATE bids SET status='rejected', updated_at=NOW() WHERE bid_id=$1 RETURNING *`,
+      [ id ]
+    );
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
-    return res.json(toCamel(rows[0]));
+    const bid = rows[0];
+
+    // 2) Pull proposal + vendor profile for contacts
+    const [{ rows: prjRows }, { rows: vpRows }] = await Promise.all([
+      pool.query(`SELECT * FROM proposals WHERE proposal_id=$1`, [ bid.proposal_id ]),
+      pool.query(`SELECT * FROM vendor_profiles WHERE LOWER(wallet_address)=LOWER($1)`, [ bid.wallet_address ])
+    ]);
+    const proposal = prjRows[0] || null;
+    const vendor   = vpRows[0] || null;
+
+    // 3) Fire-and-forget notifications
+    if (typeof notifyBidRejected === "function") {
+      notifyBidRejected(bid, proposal, vendor, reason).catch(() => null);
+    }
+
+    return res.json(toCamel(bid));
   } catch (err) {
     console.error("reject bid error", err);
     return res.status(500).json({ error: "Internal error rejecting bid" });
