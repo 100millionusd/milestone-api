@@ -264,25 +264,34 @@ async function sendEmail(toList, subject, html) {
   );
 }
 
+// always force a proper WhatsApp address: whatsapp:+E164
+function ensureWaAddr(x) {
+  const s = String(x || '').trim();
+  if (s.toLowerCase().startsWith('whatsapp:')) {
+    const num = s.slice(9).replace(/[^\d+]/g, '');
+    return `whatsapp:${num.startsWith('+') ? num : `+${num}`}`;
+  }
+  const digits = s.replace(/[^\d+]/g, '');
+  const e164 = digits.startsWith('+') ? digits : `+${digits}`;
+  return `whatsapp:${e164}`;
+}
+
 // WhatsApp (Twilio)
 async function sendWhatsApp(to, body) {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_WHATSAPP_FROM) return;
-  const toNum = toE164(to);
-  if (!toNum) return;
+
+  const fromAddr = ensureWaAddr(TWILIO_WHATSAPP_FROM); // e.g. whatsapp:+1415XXXXXXX
+  const toAddr   = ensureWaAddr(to);                   // e.g. whatsapp:+49XXXXXXXXX
+
   const creds = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
-  const form = new URLSearchParams({
-    From: TWILIO_WHATSAPP_FROM,
-    To: `whatsapp:${toNum}`,
-    Body: body,
-  }).toString();
+  const form = new URLSearchParams({ From: fromAddr, To: toAddr, Body: body }).toString();
 
   await sendRequest(
     "POST",
     `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
     {
       "Authorization": `Basic ${creds}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-      "Content-Length": Buffer.byteLength(form),
+      "Content-Type": "application/x-www-form-urlencoded"
     },
     form
   );
