@@ -221,6 +221,7 @@ const ADMIN_WHATSAPP = (process.env.ADMIN_WHATSAPP || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
+  const TWILIO_WA_CONTENT_SID = process.env.TWILIO_WA_CONTENT_SID || "";
 
 const APP_BASE_URL = process.env.APP_BASE_URL || process.env.NEXT_PUBLIC_APP_BASE_URL || "";
 const NOTIFY_ENABLED = String(process.env.NOTIFY_ENABLED || "true").toLowerCase() !== "false";
@@ -297,6 +298,32 @@ async function sendWhatsApp(to, body) {
   );
 }
 
+// WhatsApp (Twilio) — Template sender (for business-initiated/out-of-session)
+async function sendWhatsAppTemplate(to, contentSid, vars) {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_WHATSAPP_FROM || !contentSid) return;
+
+  const fromAddr = ensureWaAddr(TWILIO_WHATSAPP_FROM);
+  const toAddr   = ensureWaAddr(to);
+
+  const creds = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+  const form = new URLSearchParams({
+    From: fromAddr,
+    To: toAddr,
+    ContentSid: contentSid,
+    ContentVariables: JSON.stringify(vars),
+  }).toString();
+
+  await sendRequest(
+    "POST",
+    `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
+    {
+      "Authorization": `Basic ${creds}`,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    form
+  );
+}
+
 function shouldNotify(analysis) {
   try {
     const conf = Number(analysis?.confidence);
@@ -350,20 +377,35 @@ async function notifyProofFlag({ proof, bid, proposal, analysis }) {
   const vendorPhone = (vp.phone || "").trim();
   const vendorTg    = (vp.telegram_chat_id || "").trim();
 
-  // Admins
-  await Promise.all([
-    sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text),
-    sendEmail(MAIL_ADMIN_TO, subject, html),
-    ...ADMIN_WHATSAPP.map(n => sendWhatsApp(n, text)),
-  ]);
+  // Admins (use template when available; fallback to free-form)
+const waVars = {
+  "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
+  "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
+  "3": `#${msIndex}`,
+  "4": String(analysis?.confidence ?? "n/a"),
+  "5": String(analysis?.fit || "n/a"),
+  "6": short(analysis?.summary, 400),
+  "7": adminLink || ""
+};
+
+await Promise.all([
+  sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text),
+  sendEmail(MAIL_ADMIN_TO, subject, html),
+  ...(TWILIO_WA_CONTENT_SID
+      ? ADMIN_WHATSAPP.map(n => sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars))
+      : ADMIN_WHATSAPP.map(n => sendWhatsApp(n, text)))
+]);
 
   // Vendor (best-effort; skip if missing)
-  await Promise.all([
-    vendorTg ? sendTelegram([vendorTg], text) : null,
-    vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
-    vendorPhone ? sendWhatsApp(vendorPhone, text) : null,
-  ].filter(Boolean));
-}
+await Promise.all([
+  vendorTg ? sendTelegram([vendorTg], text) : null,
+  vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
+  vendorPhone
+    ? (TWILIO_WA_CONTENT_SID
+        ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
+        : sendWhatsApp(vendorPhone, text))
+    : null,
+].filter(Boolean));
 
 // --- Image helpers for vision models ---
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|tiff|svg)(\?|$)/i;
