@@ -377,6 +377,51 @@ async function notifyProposalSubmitted(p) {
   }
 }
 
+// ==============================
+// Notifications — Proposal Rejected
+// ==============================
+async function notifyProposalRejected(p, reason) {
+  try {
+    const id = p.proposal_id || p.proposalId;
+    const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/proposals/${id}` : null;
+
+    const subject = `❌ Proposal rejected`;
+    const lines = [
+      `❌ Proposal rejected`,
+      `Org: ${p.org_name || ""}`,
+      `Title: ${p.title || ""}`,
+      `Budget: $${p.amount_usd ?? 0}`,
+      reason ? `Reason: ${reason}` : "",
+      adminLink ? `Admin: ${adminLink}` : "",
+    ].filter(Boolean);
+    const text = lines.join("\n");
+    const html = lines.join("<br>");
+
+    // Proposer contacts
+    const proposerEmails = [p.contact, p.owner_email].map(s => (s||"").trim()).filter(Boolean);
+    const proposerPhone  = toE164(p.owner_phone || "");
+    const proposerTg     = (p.owner_telegram_chat_id || "").trim();
+
+    await Promise.all([
+      // Admins
+      TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
+      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      ...(ADMIN_WHATSAPP || []).map(n =>
+        TWILIO_WA_CONTENT_SID
+          ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": p.title || "", "2": "rejected" })
+          : sendWhatsApp(n, text)
+      ),
+
+      // Proposer
+      proposerTg ? sendTelegram([proposerTg], text) : null,
+      proposerEmails.length ? sendEmail(proposerEmails, subject, html) : null,
+      proposerPhone ? sendWhatsApp(proposerPhone, text) : null,
+    ].filter(Boolean));
+  } catch (e) {
+    console.warn('notifyProposalRejected failed:', e);
+  }
+}
+
 function shouldNotify(analysis) {
   try {
     const conf = Number(analysis?.confidence);
@@ -1664,20 +1709,34 @@ app.post("/proposals/:id/approve", adminGuard, async (req, res) => {
   }
 });
 
-// Reject proposal
+// Reject proposal (+ notify admins & proposer)
 app.post("/proposals/:id/reject", adminGuard, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-  const { rows } = await pool.query(
-      `UPDATE proposals SET status='rejected' WHERE proposal_id=$1 RETURNING *`,
+
+    // Optional reason from UI: { reason: "Doesn’t meet scope" }
+    const reason = String(req.body?.reason || req.body?.note || "").trim() || null;
+
+    const { rows } = await pool.query(
+      `UPDATE proposals SET status='rejected', updated_at = NOW()
+         WHERE proposal_id=$1
+       RETURNING *`,
       [id]
     );
     if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
-    res.json(toCamel(rows[0]));
+
+    const row = rows[0];
+
+    // fire-and-forget notifications
+    if (typeof notifyProposalRejected === "function") {
+      notifyProposalRejected(row, reason).catch(() => null);
+    }
+
+    return res.json(toCamel(row));
   } catch (err) {
     console.error("Error rejecting proposal:", err);
-    res.status(500).json({ error: "Failed to reject proposal" });
+    return res.status(500).json({ error: "Failed to reject proposal" });
   }
 });
 
