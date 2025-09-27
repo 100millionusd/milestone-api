@@ -3071,7 +3071,7 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (_req, res) 
 
 // Latest proof status per milestone for a bid
 // GET /bids/:bidId/proofs/latest-status
-app.get('/bids/:bidId/proofs/latest-status', adminOrBidOwnerGuard, async (req, res) => {
+app.get('/bids/:bidId/proofs/latest-status', adminGuard, async (req, res) => {
   try {
     const bidId = Number(req.params.bidId);
     if (!Number.isFinite(bidId)) return res.status(400).json({ error: 'Invalid bid id' });
@@ -3318,7 +3318,7 @@ try {
 
 // Latest proof status per milestone for a bid
 // GET /bids/:bidId/proofs/latest-status
-app.get('/bids/:bidId/proofs/latest-status', adminOrBidOwnerGuard, async (req, res) => {
+app.get('/bids/:bidId/proofs/latest-status', adminGuard, async (req, res) => {
   try {
     const bidId = Number(req.params.bidId);
     if (!Number.isFinite(bidId)) return res.status(400).json({ error: 'Invalid bid id' });
