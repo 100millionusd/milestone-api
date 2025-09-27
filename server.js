@@ -3068,6 +3068,47 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (_req, res) 
   res.json({ ok: true });
 });
 
+// Latest proof status per milestone for a bid
+// GET /bids/:bidId/proofs/latest-status
+app.get('/bids/:bidId/proofs/latest-status', adminOrBidOwnerGuard, async (req, res) => {
+  try {
+    const bidId = Number(req.params.bidId);
+    if (!Number.isFinite(bidId)) return res.status(400).json({ error: 'Invalid bid id' });
+
+    // Pick the latest proof per milestone by submitted_at/updated_at/proof_id
+    const { rows } = await pool.query(
+      `
+      with ranked as (
+        select
+          milestone_index,
+          status,
+          row_number() over (
+            partition by milestone_index
+            order by submitted_at desc nulls last,
+                     updated_at desc nulls last,
+                     proof_id desc
+          ) as rn
+        from proofs
+        where bid_id = $1
+      )
+      select milestone_index, status
+      from ranked
+      where rn = 1
+      `,
+      [bidId]
+    );
+
+    const byIndex = {};
+    for (const r of rows) {
+      byIndex[Number(r.milestone_index)] = String(r.status || 'pending');
+    }
+    res.json({ byIndex });
+  } catch (e) {
+    console.error('GET /bids/:bidId/proofs/latest-status failed', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
 // Re-run Agent2 on a single proof (admin only)
 app.all('/proofs/:id/analyze', (req, res, next) => {
   if (req.method === 'POST') return next();
