@@ -518,6 +518,47 @@ function shouldNotify(analysis) {
   } catch { return true; }
 }
 
+// ==============================
+// Notifications — Bid Submitted
+// ==============================
+async function notifyBidSubmitted(bid, proposal, vendor) {
+  try {
+    const subject = `📝 New bid submitted`;
+    const lines = [
+      `📝 New bid submitted`,
+      `Project: ${proposal?.title || "(untitled)"} (${proposal?.org_name || ""})`,
+      `Vendor: ${bid?.vendor_name || vendor?.vendor_name || ""}`,
+      `Amount: $${bid?.price_usd ?? 0}  •  Days: ${bid?.days ?? "-"}`,
+      APP_BASE_URL ? `Admin: ${APP_BASE_URL}/admin/bids` : "",
+    ].filter(Boolean);
+    const text = lines.join("\n");
+    const html = lines.join("<br>");
+
+    // Vendor contacts (confirmation back to submitter)
+    const vendorEmails = [vendor?.email].map(s => (s||"").trim()).filter(Boolean);
+    const vendorPhone  = toE164(vendor?.phone || "");
+    const vendorTg     = (vendor?.telegram_chat_id || "").trim();
+
+    await Promise.all([
+      // Admins
+      TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
+      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      ...(ADMIN_WHATSAPP || []).map(n =>
+        TWILIO_WA_CONTENT_SID
+          ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": proposal?.title || "", "2": "new bid" })
+          : sendWhatsApp(n, text)
+      ),
+
+      // Vendor (submission confirmation)
+      vendorTg ? sendTelegram([vendorTg], text) : null,
+      vendorEmails.length ? sendEmail(vendorEmails, subject, html) : null,
+      vendorPhone ? sendWhatsApp(vendorPhone, text) : null,
+    ].filter(Boolean));
+  } catch (e) {
+    console.warn('notifyBidSubmitted failed:', e);
+  }
+}
+
 async function notifyProofFlag({ proof, bid, proposal, analysis }) {
   const msIndex = Number(proof.milestone_index) + 1;
   const subject = `⚠️ Proof needs review — ${proposal?.title || "Project"} (Milestone ${msIndex})`;
@@ -1978,14 +2019,30 @@ app.post("/bids", async (req, res) => {
       })
     );
 
-    await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [ JSON.stringify(analysis), inserted.bid_id ]);
-    inserted.ai_analysis = analysis;
+  await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [
+  JSON.stringify(analysis),
+  inserted.bid_id
+]);
+inserted.ai_analysis = analysis;
 
-    return res.status(201).json(toCamel(inserted));
-  } catch (err) {
-    console.error("POST /bids error:", err);
-    return res.status(500).json({ error: err.message });
-  }
+// Load vendor + proposal for notifications
+const [{ rows: vp }, { rows: prj }] = await Promise.all([
+  pool.query(`SELECT * FROM vendor_profiles WHERE lower(wallet_address)=lower($1)`, [ inserted.wallet_address ]),
+  pool.query(`SELECT * FROM proposals WHERE proposal_id=$1`, [ inserted.proposal_id ])
+]);
+const vendor = vp[0] || null;
+const proposal = prj[0] || null;
+
+// Fire-and-forget notifications so the HTTP response isn’t delayed
+if (typeof notifyBidSubmitted === "function") {
+  notifyBidSubmitted(inserted, proposal, vendor).catch(() => null);
+}
+
+return res.status(201).json(toCamel(inserted));
+} catch (err) {
+  console.error("POST /bids error:", err);
+  return res.status(500).json({ error: err.message });
+}
 });
 
 // Approve / award bid (+ notify admin & vendor)
