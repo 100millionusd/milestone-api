@@ -3274,6 +3274,36 @@ try {
   }
 });
 
+// Latest proof status per milestone for a bid
+// GET /bids/:bidId/proofs/latest-status
+app.get('/bids/:bidId/proofs/latest-status', adminOrBidOwnerGuard, async (req, res) => {
+  try {
+    const bidId = Number(req.params.bidId);
+    if (!Number.isFinite(bidId)) return res.status(400).json({ error: 'Invalid bid id' });
+
+    // Get latest proof row per milestone
+    const sql = `
+      SELECT DISTINCT ON (milestone_index)
+             milestone_index, status
+        FROM proofs
+       WHERE bid_id = $1
+       ORDER BY milestone_index,
+                submitted_at DESC NULLS LAST,
+                updated_at  DESC NULLS LAST,
+                proof_id    DESC
+    `;
+    const { rows } = await pool.query(sql, [bidId]);
+
+    const byIndex = {};
+    for (const r of rows) byIndex[r.milestone_index] = r.status || 'pending';
+
+    return res.json({ byIndex });
+  } catch (e) {
+    console.error('GET /bids/:bidId/proofs/latest-status error', e);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // --- Agent2 Chat about a SPECIFIC PROOF (SSE) -------------------------------
 app.all('/proofs/:id/chat', (req, res, next) => {
   if (req.method === 'POST') return next();
