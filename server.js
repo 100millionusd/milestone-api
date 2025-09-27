@@ -182,6 +182,38 @@ const pool = new Pool({
 })();
 
 // ==============================
+// DB bootstrap — proofs: 1 pending per milestone
+// ==============================
+(async () => {
+  try {
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_proofs_pending
+        ON proofs (bid_id, milestone_index)
+      WHERE status = 'pending';
+    `);
+    console.log('[db] ux_proofs_pending ready');
+  } catch (e) {
+    console.error('ux_proofs_pending init failed:', e);
+  }
+})();
+
+// ==============================
+// DB bootstrap — proofs: 1 pending per milestone
+// ==============================
+(async () => {
+  try {
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_proofs_pending
+        ON proofs (bid_id, milestone_index)
+      WHERE status = 'pending';
+    `);
+    console.log('[db] ux_proofs_pending ready');
+  } catch (e) {
+    console.error('ux_proofs_pending init failed:', e);
+  }
+})();
+
+// ==============================
 // Utilities
 // ==============================
 function toCamel(row) {
@@ -2885,6 +2917,33 @@ app.post("/proofs", async (req, res) => {
     if (!milestones[milestoneIndex]) {
       return res.status(400).json({ error: "Invalid milestoneIndex for this bid" });
     }
+
+    // 2.5) Duplicate guards — block if a pending proof exists, or if latest is approved
+// A) Hard block if a pending proof already exists for this milestone
+const { rows: pend } = await pool.query(
+  `SELECT 1 FROM proofs
+    WHERE bid_id=$1 AND milestone_index=$2 AND status='pending'
+    LIMIT 1`,
+  [bidId, milestoneIndex]
+);
+if (pend.length) {
+  return res.status(409).json({ error: 'A proof is already pending review for this milestone.' });
+}
+
+// B) Block if the latest proof for this milestone is already approved
+const { rows: lastRows } = await pool.query(
+  `SELECT status
+     FROM proofs
+    WHERE bid_id=$1 AND milestone_index=$2
+    ORDER BY submitted_at DESC NULLS LAST,
+             updated_at  DESC NULLS LAST,
+             proof_id    DESC
+    LIMIT 1`,
+  [bidId, milestoneIndex]
+);
+if (lastRows[0] && String(lastRows[0].status || '').toLowerCase() === 'approved') {
+  return res.status(409).json({ error: 'This milestone has already been approved.' });
+}
 
     // 3) Normalize proof fields
     const files = Array.isArray(value.files) ? value.files : [];
