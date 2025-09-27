@@ -1456,7 +1456,8 @@ async function adminOrBidOwnerGuard(req, res, next) {
   if (req.user?.role === 'admin') return next();
   if (!req.user?.sub) return res.status(401).json({ error: 'Unauthorized' });
 
-  const bidId = Number(req.params.id);
+  const bidIdParam = (req.params.id ?? req.params.bidId);
+  const bidId = Number(bidIdParam);
   if (!Number.isFinite(bidId)) return res.status(400).json({ error: 'Invalid bid id' });
 
   try {
