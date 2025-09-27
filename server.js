@@ -3069,44 +3069,45 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (_req, res) 
   res.json({ ok: true });
 });
 
-// Latest proof status per milestone for a bid
-// GET /bids/:bidId/proofs/latest-status
+// --- Latest proof status per milestone for a bid --------------------------------
 app.get('/bids/:bidId/proofs/latest-status', adminGuard, async (req, res) => {
   try {
     const bidId = Number(req.params.bidId);
     if (!Number.isFinite(bidId)) return res.status(400).json({ error: 'Invalid bid id' });
 
-    // Pick the latest proof per milestone by submitted_at/updated_at/proof_id
-    const { rows } = await pool.query(
-      `
-      with ranked as (
-        select
+    // Debug log so you can confirm it's hit from the admin page
+    console.log('[latest-status] GET', { bidId, user: req.user?.sub, role: req.user?.role });
+
+    // Pick the most recent proof per milestone (submitted_at, then updated_at, then id)
+    const { rows } = await pool.query(`
+      WITH ranked AS (
+        SELECT
           milestone_index,
           status,
-          row_number() over (
-            partition by milestone_index
-            order by submitted_at desc nulls last,
-                     updated_at desc nulls last,
-                     proof_id desc
-          ) as rn
-        from proofs
-        where bid_id = $1
+          ROW_NUMBER() OVER (
+            PARTITION BY milestone_index
+            ORDER BY submitted_at DESC NULLS LAST,
+                     updated_at  DESC NULLS LAST,
+                     proof_id    DESC
+          ) AS rn
+        FROM proofs
+        WHERE bid_id = $1
       )
-      select milestone_index, status
-      from ranked
-      where rn = 1
-      `,
-      [bidId]
-    );
+      SELECT milestone_index, status
+      FROM ranked
+      WHERE rn = 1
+    `, [bidId]);
 
     const byIndex = {};
     for (const r of rows) {
       byIndex[Number(r.milestone_index)] = String(r.status || 'pending');
     }
-    res.json({ byIndex });
+
+    res.set('Cache-Control', 'no-store');
+    return res.json({ byIndex });
   } catch (e) {
-    console.error('GET /bids/:bidId/proofs/latest-status failed', e);
-    res.status(500).json({ error: 'Internal error' });
+    console.error('[latest-status] error', e);
+    return res.status(500).json({ error: 'Internal error' });
   }
 });
 
@@ -3313,36 +3314,6 @@ try {
   } catch (e) {
     console.error("Reject milestone proof failed:", e);
     return res.status(500).json({ error: "Internal error" });
-  }
-});
-
-// Latest proof status per milestone for a bid
-// GET /bids/:bidId/proofs/latest-status
-app.get('/bids/:bidId/proofs/latest-status', adminGuard, async (req, res) => {
-  try {
-    const bidId = Number(req.params.bidId);
-    if (!Number.isFinite(bidId)) return res.status(400).json({ error: 'Invalid bid id' });
-
-    // Get latest proof row per milestone
-    const sql = `
-      SELECT DISTINCT ON (milestone_index)
-             milestone_index, status
-        FROM proofs
-       WHERE bid_id = $1
-       ORDER BY milestone_index,
-                submitted_at DESC NULLS LAST,
-                updated_at  DESC NULLS LAST,
-                proof_id    DESC
-    `;
-    const { rows } = await pool.query(sql, [bidId]);
-
-    const byIndex = {};
-    for (const r of rows) byIndex[r.milestone_index] = r.status || 'pending';
-
-    return res.json({ byIndex });
-  } catch (e) {
-    console.error('GET /bids/:bidId/proofs/latest-status error', e);
-    return res.status(500).json({ error: 'Server error' });
   }
 });
 
