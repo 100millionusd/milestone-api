@@ -3117,16 +3117,19 @@ try {
   }
 });
 
+// GET /proofs
 app.get("/proofs", adminGuard, async (req, res) => {
   try {
     const bidId = Number(req.query.bidId);
+
     if (Number.isFinite(bidId)) {
       const { rows } = await pool.query(
-        "SELECT * FROM proofs WHERE bid_id=$1 AND status != 'rejected' ORDER BY submitted_at DESC NULLS LAST",
-        [ bidId ]
+        "SELECT * FROM proofs WHERE bid_id = $1 AND status != 'rejected' ORDER BY submitted_at DESC NULLS LAST",
+        [bidId]
       );
       return res.json(mapRows(rows));
     }
+
     const { rows } = await pool.query(
       "SELECT * FROM proofs WHERE status != 'rejected' ORDER BY submitted_at DESC NULLS LAST"
     );
