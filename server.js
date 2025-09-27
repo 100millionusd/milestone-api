@@ -182,18 +182,43 @@ const pool = new Pool({
 })();
 
 // ==============================
-// DB bootstrap — proofs: 1 pending per milestone
+// DB cleanup: collapse duplicate PENDING proofs per (bid, milestone) to the latest
+// and then enforce "at most one PENDING" going forward.
 // ==============================
 (async () => {
   try {
+    // 1) If there are multiple PENDING proofs for the same milestone,
+    //    keep the latest and mark the rest REJECTED.
+    await pool.query(`
+      WITH ranked AS (
+        SELECT proof_id,
+               ROW_NUMBER() OVER (
+                 PARTITION BY bid_id, milestone_index
+                 ORDER BY submitted_at DESC NULLS LAST,
+                          updated_at  DESC NULLS LAST,
+                          proof_id    DESC
+               ) AS rn
+        FROM proofs
+        WHERE status = 'pending'
+      )
+      UPDATE proofs p
+         SET status = 'rejected',
+             updated_at = NOW()
+      FROM ranked r
+      WHERE p.proof_id = r.proof_id
+        AND r.rn > 1
+    `);
+
+    // 2) Enforce "only one PENDING per (bid_id, milestone_index)" going forward.
     await pool.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS ux_proofs_pending
         ON proofs (bid_id, milestone_index)
       WHERE status = 'pending';
     `);
-    console.log('[db] ux_proofs_pending ready');
+
+    console.log('[db] duplicate pending proofs cleaned; unique index ready');
   } catch (e) {
-    console.error('ux_proofs_pending init failed:', e);
+    console.error('DB cleanup/index for proofs failed:', e);
   }
 })();
 
