@@ -3336,7 +3336,7 @@ app.get("/proofs/:bidId", adminGuard, async (req, res) => {
   }
 });
 
-// Approve the latest proof for a milestone (ADMIN)
+// Approve the latest proof for a milestone (ADMIN) — robust by proof_id
 app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) => {
   try {
     const bidId = Number(req.params.bidId);
@@ -3346,37 +3346,40 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
       return res.status(400).json({ error: "Invalid bidId or milestoneIndex" });
     }
 
-    // Find the most recent proof for this milestone
+    // Always pick the latest by proof_id (most robust)
     const { rows: proofs } = await pool.query(
-      `SELECT proof_id
+      `SELECT *
          FROM proofs
         WHERE bid_id = $1 AND milestone_index = $2
-        ORDER BY submitted_at DESC NULLS LAST, updated_at DESC NULLS LAST, proof_id DESC
+        ORDER BY proof_id DESC
         LIMIT 1`,
       [bidId, idx]
     );
     if (!proofs.length) {
       return res.status(404).json({ error: "No proof found for this milestone" });
     }
-    const proofId = proofs[0].proof_id;
+
+    const latest = proofs[0];
+
+    // Already approved? Return as ok.
+    if (String(latest.status).toLowerCase() === "approved") {
+      return res.json({ ok: true, proof: toCamel(latest) });
+    }
 
     // Mark as approved
     const { rows } = await pool.query(
       `UPDATE proofs
           SET status = 'approved', updated_at = NOW()
         WHERE proof_id = $1
-      RETURNING *`,
-      [proofId]
+        RETURNING *`,
+      [latest.proof_id]
     );
-    const updated = rows[0]; // <— INSERT AFTER THIS LINE
+    const updated = rows[0];
 
-    // === INSERTED NOTIFY BLOCK START ===
+    // Notify (admins + vendor) if enabled
     if (process.env.NOTIFY_ENABLED === "true") {
       try {
-        const { rows: [bid] } = await pool.query(
-          "SELECT * FROM bids WHERE bid_id=$1",
-          [ bidId ]
-        );
+        const { rows: [bid] } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
         if (bid) {
           const { rows: [proposal] } = await pool.query(
             "SELECT * FROM proposals WHERE proposal_id=$1",
@@ -3384,7 +3387,7 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
           );
           if (proposal && typeof notifyProofApproved === "function") {
             await notifyProofApproved({
-              proof: updated,   // the row you just updated to 'approved'
+              proof: updated,
               bid,
               proposal,
               msIndex: idx + 1
@@ -3395,7 +3398,6 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
         console.warn("notifyProofApproved failed (non-fatal):", String(e).slice(0,200));
       }
     }
-    // === INSERTED NOTIFY BLOCK END ===
 
     return res.json({ ok: true, proof: toCamel(updated) });
   } catch (e) {
