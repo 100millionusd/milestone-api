@@ -575,13 +575,22 @@ function shouldNotify(analysis) {
   } catch { return true; }
 }
 
-// --- bilingual helper ---
+// Helper: build bilingual text/html
+// ==================================
 function bi(en, es) {
+  const text = [
+    en.trim(),
+    '',
+    es.trim()
+  ].join('\n');
 
-  // --- short helper ---
-function short(str, maxLen = 200) {
-  if (!str) return '';
-  return str.length <= maxLen ? str : str.slice(0, maxLen - 3) + '...';
+  const html = [
+    `<div>${en.trim().replace(/\n/g, '<br>')}</div>`,
+    '<hr>',
+    `<div>${es.trim().replace(/\n/g, '<br>')}</div>`
+  ].join('\n');
+
+  return { text, html };
 }
 
   // Text (Telegram/WA session SMS)
@@ -663,31 +672,54 @@ async function notifyBidSubmitted(bid, proposal, vendor) {
   }
 }
 
+// ==================================
+// Notifications — Proof needs review
+// ==================================
 async function notifyProofFlag({ proof, bid, proposal, analysis }) {
+  const msIndex   = Number(proof.milestone_index) + 1;
+  const subject   = `⚠️ Proof needs review — ${proposal?.title || "Project"} (Milestone ${msIndex})`;
+  const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/bids/${bid.bid_id}?tab=proofs` : "";
+
+  const short = (s, n = 300) => (s || "").slice(0, n);
+
+  // Build bilingual payload (EN + ES)
+  const en = [
+    '⚠️ Proof needs review',
+    `Project: ${proposal?.title || '(untitled)'} — ${proposal?.org_name || ''}`,
+    `Vendor: ${bid.vendor_name || ''} (${bid.wallet_address || ''})`,
+    `Milestone: #${msIndex}`,
+    `Confidence: ${analysis?.confidence ?? 'n/a'}  •  Fit: ${analysis?.fit || 'n/a'}`,
+    `Summary: ${short(analysis?.summary, 400)}`,
+    adminLink ? `Admin: ${adminLink}` : ''
+  ].filter(Boolean).join('\n');
+
+  const es = [
+    '⚠️ La prueba requiere revisión',
+    `Proyecto: ${proposal?.title || '(sin título)'} — ${proposal?.org_name || ''}`,
+    `Proveedor: ${bid.vendor_name || ''} (${bid.wallet_address || ''})`,
+    `Hito: #${msIndex}`,
+    `Confianza: ${analysis?.confidence ?? 'n/a'}  •  Ajuste: ${analysis?.fit || 'n/a'}`,
+    `Resumen: ${short(analysis?.summary, 400)}`,
+    adminLink ? `Admin: ${adminLink}` : ''
+  ].filter(Boolean).join('\n');
+
+  const { text, html } = bi(en, es);
+
+  // Send (same targets/pattern as your other notifiers)
   try {
-    const msIndex = proof.milestone_index;
-    const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/proofs?bidId=${bid.bid_id}` : null;
-    const subject = `⚠️ Proof needs review`;
-
-    const en = [
-      '⚠️ Proof needs review',
-      `Project: ${proposal?.title || '(untitled)'} — ${proposal?.org_name || ''}`,
-      `Vendor: ${bid.vendor_name || ''} (${bid.wallet_address || ''})`,
-      `Milestone: #${msIndex}`,
-      `Confidence: ${analysis?.confidence ?? 'n/a'}  •  Fit: ${analysis?.fit || 'n/a'}`,
-      `Summary: ${short(analysis?.summary, 400)}`,
-      adminLink ? `Admin: ${adminLink}` : ''
-    ].filter(Boolean).join('\n');
-
-    const es = [
-      '⚠️ La prueba requiere revisión',
-      `Proyecto: ${proposal?.title || '(sin título)'} — ${proposal?.org_name || ''}`,
-      `Proveedor: ${bid.vendor_name || ''} (${bid.wallet_address || ''})`,
-      `Hito: #${msIndex}`,
-      `Confianza: ${analysis?.confidence ?? 'n/a'}  •  Ajuste: ${analysis?.fit || 'n/a'}`,
-      `Resumen: ${short(analysis?.summary, 400)}`,
-      adminLink ? `Admin: ${adminLink}` : ''
-    ].filter(Boolean).join('\n');
+    await Promise.all([
+      TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
+      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      ...(ADMIN_WHATSAPP || []).map(n =>
+        TWILIO_WA_CONTENT_SID
+          ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": proposal?.title || "", "2": "proof needs review" })
+          : sendWhatsApp(n, text)
+      ),
+    ].filter(Boolean));
+  } catch (e) {
+    console.warn('notifyProofFlag failed:', String(e).slice(0, 200));
+  }
+}
 
     // Build bilingual payload
     const { text, html } = bi(en, es);
