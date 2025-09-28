@@ -3289,8 +3289,8 @@ app.get("/proofs", adminGuard, async (req, res) => {
         status,
         title,
         description,
-        files,          -- if your column is files_json, see note below
-        ai_analysis,    -- if your column is ai_analysis_json, see note below
+        files,
+        ai_analysis,
         submitted_at,
         updated_at
       FROM proofs
@@ -3305,7 +3305,6 @@ app.get("/proofs", adminGuard, async (req, res) => {
 
     const { rows } = await pool.query(sql, params);
 
-    // Force exact shape the frontend expects
     const out = rows.map((r) => ({
       proofId: Number(r.proof_id),
       bidId: Number(r.bid_id),
@@ -3319,6 +3318,7 @@ app.get("/proofs", adminGuard, async (req, res) => {
       updatedAt: r.updated_at,
     }));
 
+    console.log(`[GET /proofs] bidId=${Number.isInteger(bidId) ? bidId : 'ALL'} -> ${out.length}`);
     return res.json(out);
   } catch (err) {
     console.error("[GET /proofs] error:", err);
