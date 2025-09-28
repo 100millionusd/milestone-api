@@ -3276,7 +3276,7 @@ try {
   }
 });
 
-// Normalized proofs feed for admin UI
+// Normalized proofs feed for admin UI (newest first, camelCase fields)
 app.get("/proofs", adminGuard, async (req, res) => {
   try {
     const bidId = Number(req.query.bidId);
@@ -3287,29 +3287,31 @@ app.get("/proofs", adminGuard, async (req, res) => {
         bid_id,
         milestone_index,
         status,
+        title,
         description,
-        files,
-        ai_analysis,
+        files,          -- if your column is files_json, see note below
+        ai_analysis,    -- if your column is ai_analysis_json, see note below
         submitted_at,
         updated_at
       FROM proofs
     `;
 
     const params = [];
-    const where  = Number.isFinite(bidId) ? "WHERE bid_id = $1" : "";
-    if (Number.isFinite(bidId)) params.push(bidId);
+    const where  = Number.isInteger(bidId) ? "WHERE bid_id = $1" : "";
+    if (Number.isInteger(bidId)) params.push(bidId);
 
     const order  = "ORDER BY proof_id DESC";
     const sql    = [baseSql, where, order].filter(Boolean).join("\n");
 
     const { rows } = await pool.query(sql, params);
 
-    // Force the exact shape the frontend expects
+    // Force exact shape the frontend expects
     const out = rows.map((r) => ({
       proofId: Number(r.proof_id),
       bidId: Number(r.bid_id),
       milestoneIndex: Number(r.milestone_index),
       status: String(r.status || "pending"),
+      title: r.title || "",
       description: r.description || "",
       files: Array.isArray(r.files) ? r.files : (r.files ? r.files : []),
       aiAnalysis: r.ai_analysis ?? null,
