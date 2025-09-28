@@ -3373,6 +3373,7 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
             [ bid.proposal_id ]
           );
           if (proposal && typeof notifyProofApproved === "function") {
+            console.log("[notify] approve about to send", { bidId, ms: idx + 1, proofId: updated.proof_id });
             await notifyProofApproved({
               proof: updated,
               bid,
