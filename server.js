@@ -3114,25 +3114,51 @@ try {
   }
 });
 
-// GET /proofs
+// Normalized proofs feed for admin UI
 app.get("/proofs", adminGuard, async (req, res) => {
   try {
     const bidId = Number(req.query.bidId);
 
-    if (Number.isFinite(bidId)) {
-      const { rows } = await pool.query(
-        "SELECT * FROM proofs WHERE bid_id = $1 AND status != 'rejected' ORDER BY submitted_at DESC NULLS LAST",
-        [bidId]
-      );
-      return res.json(mapRows(rows));
-    }
+    const baseSql = `
+      SELECT
+        proof_id,
+        bid_id,
+        milestone_index,
+        status,
+        description,
+        files,
+        ai_analysis,
+        submitted_at,
+        updated_at
+      FROM proofs
+    `;
 
-    const { rows } = await pool.query(
-      "SELECT * FROM proofs WHERE status != 'rejected' ORDER BY submitted_at DESC NULLS LAST"
-    );
-    return res.json(mapRows(rows));
+    const params = [];
+    const where  = Number.isFinite(bidId) ? "WHERE bid_id = $1" : "";
+    if (Number.isFinite(bidId)) params.push(bidId);
+
+    const order  = "ORDER BY proof_id DESC";
+    const sql    = [baseSql, where, order].filter(Boolean).join("\n");
+
+    const { rows } = await pool.query(sql, params);
+
+    // Force the exact shape the frontend expects
+    const out = rows.map((r) => ({
+      proofId: Number(r.proof_id),
+      bidId: Number(r.bid_id),
+      milestoneIndex: Number(r.milestone_index),
+      status: String(r.status || "pending"),
+      description: r.description || "",
+      files: Array.isArray(r.files) ? r.files : (r.files ? r.files : []),
+      aiAnalysis: r.ai_analysis ?? null,
+      submittedAt: r.submitted_at,
+      updatedAt: r.updated_at,
+    }));
+
+    return res.json(out);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("[GET /proofs] error:", err);
+    return res.status(500).json({ error: err.message || "Internal error" });
   }
 });
 
