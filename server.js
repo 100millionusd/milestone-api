@@ -2977,6 +2977,55 @@ app.post("/bids/:id/complete-milestone", async (req, res) => {
 
     await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [ JSON.stringify(milestones), bidId ]);
 
+    // --- BEGIN: approve latest proof for this milestone + notify ---
+    if (NOTIFY_ENABLED) {
+      try {
+        // 1) Grab the latest proof for this (bid, milestone)
+        const { rows: proofs } = await pool.query(
+          `SELECT *
+             FROM proofs
+            WHERE bid_id = $1 AND milestone_index = $2
+            ORDER BY proof_id DESC
+            LIMIT 1`,
+          [ bidId, milestoneIndex ]
+        );
+        const latest = proofs[0];
+
+        // 2) If present and not already approved, flip to approved
+        if (latest && String(latest.status || '').toLowerCase() !== 'approved') {
+          const { rows: upd } = await pool.query(
+            `UPDATE proofs
+               SET status = 'approved', updated_at = NOW()
+             WHERE proof_id = $1
+             RETURNING *`,
+            [ latest.proof_id ]
+          );
+          const updatedProof = upd[0];
+
+          // 3) Load proposal and fire the existing "proof approved" notifier
+          const { rows: [proposal] } =
+            await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ bid.proposal_id ]);
+
+          if (proposal && typeof notifyProofApproved === "function") {
+            console.log("[notify] approve about to send", {
+              bidId,
+              ms: milestoneIndex + 1,
+              proofId: updatedProof.proof_id
+            });
+            await notifyProofApproved({
+              proof: updatedProof,
+              bid,
+              proposal,
+              msIndex: milestoneIndex + 1
+            });
+          }
+        }
+      } catch (e) {
+        console.warn("notifyProofApproved via /complete-milestone failed:", String(e).slice(0,200));
+      }
+    }
+    // --- END: approve latest proof for this milestone + notify ---
+
     const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
     return res.json(toCamel(updated[0]));
   } catch (err) {
