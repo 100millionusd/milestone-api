@@ -575,43 +575,7 @@ function shouldNotify(analysis) {
   } catch { return true; }
 }
 
-// Helper: build bilingual text/html
-// ==================================
-function bi(en, es) {
-  const text = [
-    en.trim(),
-    '',
-    es.trim()
-  ].join('\n');
-
-  const html = [
-    `<div>${en.trim().replace(/\n/g, '<br>')}</div>`,
-    '<hr>',
-    `<div>${es.trim().replace(/\n/g, '<br>')}</div>`
-  ].join('\n');
-
-  return { text, html };
-}
-
-  // Text (Telegram/WA session SMS)
-  const text = [
-    en.trim(),
-    '',
-    '———',
-    '',
-    es.trim()
-  ].join('\n');
-
-  // HTML (email)
-  const html = [
-    `<div>${en.trim().replace(/\n/g,'<br>')}</div>`,
-    '<hr>',
-    `<div>${es.trim().replace(/\n/g,'<br>')}</div>`
-  ].join('\n');
-
-  return { text, html };
-}
-
+/* ==== Helper: build bilingual text/html (ONE COPY ONLY) ==== */
 function bi(en, es) {
   const text = `${en.trim()}\n\n${es.trim()}`;
   const html = [
