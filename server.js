@@ -3368,26 +3368,34 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
       RETURNING *`,
       [proofId]
     );
-    const updated = rows[0];
+    const updated = rows[0]; // <— INSERT AFTER THIS LINE
 
-    // Notify (admins + vendor) if enabled
+    // === INSERTED NOTIFY BLOCK START ===
     if (process.env.NOTIFY_ENABLED === "true") {
-      const { rows: [bid] } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
-      if (bid) {
-        const { rows: [proposal] } = await pool.query(
-          "SELECT * FROM proposals WHERE proposal_id=$1",
-          [ bid.proposal_id ]
+      try {
+        const { rows: [bid] } = await pool.query(
+          "SELECT * FROM bids WHERE bid_id=$1",
+          [ bidId ]
         );
-        if (proposal && typeof notifyProofApproved === "function") {
-          await notifyProofApproved({
-            proof: updated,
-            bid,
-            proposal,
-            msIndex: idx + 1
-          });
+        if (bid) {
+          const { rows: [proposal] } = await pool.query(
+            "SELECT * FROM proposals WHERE proposal_id=$1",
+            [ bid.proposal_id ]
+          );
+          if (proposal && typeof notifyProofApproved === "function") {
+            await notifyProofApproved({
+              proof: updated,   // the row you just updated to 'approved'
+              bid,
+              proposal,
+              msIndex: idx + 1
+            });
+          }
         }
+      } catch (e) {
+        console.warn("notifyProofApproved failed (non-fatal):", String(e).slice(0,200));
       }
     }
+    // === INSERTED NOTIFY BLOCK END ===
 
     return res.json({ ok: true, proof: toCamel(updated) });
   } catch (e) {
