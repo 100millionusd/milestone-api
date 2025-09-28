@@ -575,21 +575,47 @@ function shouldNotify(analysis) {
   } catch { return true; }
 }
 
+// --- bilingual helper ---
+function bi(en, es) {
+  // Text (Telegram/WA session SMS)
+  const text = [
+    en.trim(),
+    '',
+    '———',
+    '',
+    es.trim()
+  ].join('\n');
+
+  // HTML (email)
+  const html = [
+    `<div>${en.trim().replace(/\n/g,'<br>')}</div>`,
+    '<hr>',
+    `<div>${es.trim().replace(/\n/g,'<br>')}</div>`
+  ].join('\n');
+
+  return { text, html };
+}
+
 // ==============================
 // Notifications — Bid Submitted
 // ==============================
-async function notifyBidSubmitted(bid, proposal, vendor) {
-  try {
-    const subject = `📝 New bid submitted`;
-    const lines = [
-      `📝 New bid submitted`,
-      `Project: ${proposal?.title || "(untitled)"} (${proposal?.org_name || ""})`,
-      `Vendor: ${bid?.vendor_name || vendor?.vendor_name || ""}`,
-      `Amount: $${bid?.price_usd ?? 0}  •  Days: ${bid?.days ?? "-"}`,
-      APP_BASE_URL ? `Admin: ${APP_BASE_URL}/admin/bids` : "",
-    ].filter(Boolean);
-    const text = lines.join("\n");
-    const html = lines.join("<br>");
+const en = [
+  '📝 New bid submitted',
+  `Project: ${proposal?.title || '(untitled)'} (${proposal?.org_name || ''})`,
+  `Vendor: ${bid?.vendor_name || vendor?.vendor_name || ''}`,
+  `Amount: $${bid?.price_usd ?? 0}  •  Days: ${bid?.days ?? '-'}`,
+  APP_BASE_URL ? `Admin: ${APP_BASE_URL}/admin/bids` : ''
+].filter(Boolean).join('\n');
+
+const es = [
+  '📝 Nueva oferta enviada',
+  `Proyecto: ${proposal?.title || '(sin título)'} (${proposal?.org_name || ''})`,
+  `Proveedor: ${bid?.vendor_name || vendor?.vendor_name || ''}`,
+  `Importe: $${bid?.price_usd ?? 0}  •  Días: ${bid?.days ?? '-'}`,
+  APP_BASE_URL ? `Admin: ${APP_BASE_URL}/admin/bids` : ''
+].filter(Boolean).join('\n');
+
+const { text, html } = bi(en, es);
 
     // Vendor contacts (confirmation back to submitter)
     const vendorEmails = [vendor?.email].map(s => (s||"").trim()).filter(Boolean);
@@ -616,21 +642,29 @@ async function notifyBidSubmitted(bid, proposal, vendor) {
   }
 }
 
-async function notifyProofFlag({ proof, bid, proposal, analysis }) {
-  const msIndex = Number(proof.milestone_index) + 1;
-  const subject = `⚠️ Proof needs review — ${proposal?.title || "Project"} (Milestone ${msIndex})`;
-  const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/bids/${bid.bid_id}?tab=proofs` : "";
+const en = [
+  '⚠️ Proof needs review',
+  `Project: ${proposal?.title || '(untitled)'} — ${proposal?.org_name || ''}`,
+  `Vendor: ${bid.vendor_name || ''} (${bid.wallet_address || ''})`,
+  `Milestone: #${msIndex}`,
+  `Confidence: ${analysis?.confidence ?? 'n/a'}  •  Fit: ${analysis?.fit || 'n/a'}`,
+  `Summary: ${short(analysis?.summary, 400)}`,
+  adminLink ? `Admin: ${adminLink}` : ''
+].filter(Boolean).join('\n');
 
-  const short = (s, n = 300) => (s || "").slice(0, n);
+const es = [
+  '⚠️ La prueba requiere revisión',
+  `Proyecto: ${proposal?.title || '(sin título)'} — ${proposal?.org_name || ''}`,
+  `Proveedor: ${bid.vendor_name || ''} (${bid.wallet_address || ''})`,
+  `Hito: #${msIndex}`,
+  `Confianza: ${analysis?.confidence ?? 'n/a'}  •  Ajuste: ${analysis?.fit || 'n/a'}`,
+  `Resumen: ${short(analysis?.summary, 400)}`,
+  adminLink ? `Admin: ${adminLink}` : ''
+].filter(Boolean).join('\n');
 
-  const text = [
-    `Project: ${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
-    `Vendor: ${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
-    `Milestone: #${msIndex}`,
-    `Confidence: ${analysis?.confidence ?? "n/a"}  Fit: ${analysis?.fit || "n/a"}`,
-    `Summary: ${short(analysis?.summary, 400)}`,
-    adminLink ? `Admin: ${adminLink}` : "",
-  ].filter(Boolean).join("\n");
+// Build bilingual payload
+const { text, html } = bi(en, es);
+// ——— to here
 
   const html = `
     <h3>Proof needs review</h3>
@@ -3239,13 +3273,22 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) =
         const proposal = prj[0] || null;
 
         const subject = "❌ Proof rejected";
-        const msg = [
-          "❌ Proof rejected",
-          `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
-          `Bid: ${bidId} • Milestone: ${idx}`,
-          reason ? `Reason: ${reason}` : ""
-        ].filter(Boolean).join("\n");
-        const html = msg.replace(/\n/g, "<br>");
+
+const en = [
+  '❌ Proof rejected',
+  `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
+  `Bid: ${bidId} • Milestone: ${idx}`,
+  reason ? `Reason: ${reason}` : ''
+].filter(Boolean).join('\n');
+
+const es = [
+  '❌ Prueba rechazada',
+  `Proyecto: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
+  `Oferta: ${bidId} • Hito: ${idx}`,
+  reason ? `Motivo: ${reason}` : ''
+].filter(Boolean).join('\n');
+
+const { text: msg, html } = bi(en, es);
 
         const { rows: vprows } = await pool.query(
           `SELECT email, phone, telegram_chat_id
