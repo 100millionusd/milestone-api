@@ -577,6 +577,13 @@ function shouldNotify(analysis) {
 
 // --- bilingual helper ---
 function bi(en, es) {
+
+  // --- short helper ---
+function short(str, maxLen = 200) {
+  if (!str) return '';
+  return str.length <= maxLen ? str : str.slice(0, maxLen - 3) + '...';
+}
+
   // Text (Telegram/WA session SMS)
   const text = [
     en.trim(),
@@ -632,7 +639,7 @@ async function notifyBidSubmitted(bid, proposal, vendor) {
     const { text, html } = bi(en, es);
 
     // Vendor contacts (confirmation back to submitter)
-    const vendorEmails = [vendor?.email].map(s => (s || "").trim()).filter(Boolean);
+    const vendorEmails = [vendor?.email].map(s => (s||"").trim()).filter(Boolean);
     const vendorPhone  = toE164(vendor?.phone || "");
     const vendorTg     = (vendor?.telegram_chat_id || "").trim();
 
@@ -656,39 +663,81 @@ async function notifyBidSubmitted(bid, proposal, vendor) {
   }
 }
 
-const en = [
-  '⚠️ Proof needs review',
-  `Project: ${proposal?.title || '(untitled)'} — ${proposal?.org_name || ''}`,
-  `Vendor: ${bid.vendor_name || ''} (${bid.wallet_address || ''})`,
-  `Milestone: #${msIndex}`,
-  `Confidence: ${analysis?.confidence ?? 'n/a'}  •  Fit: ${analysis?.fit || 'n/a'}`,
-  `Summary: ${short(analysis?.summary, 400)}`,
-  adminLink ? `Admin: ${adminLink}` : ''
-].filter(Boolean).join('\n');
+async function notifyProofFlag({ proof, bid, proposal, analysis }) {
+  try {
+    const msIndex = proof.milestone_index;
+    const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/proofs?bidId=${bid.bid_id}` : null;
+    const subject = `⚠️ Proof needs review`;
 
-const es = [
-  '⚠️ La prueba requiere revisión',
-  `Proyecto: ${proposal?.title || '(sin título)'} — ${proposal?.org_name || ''}`,
-  `Proveedor: ${bid.vendor_name || ''} (${bid.wallet_address || ''})`,
-  `Hito: #${msIndex}`,
-  `Confianza: ${analysis?.confidence ?? 'n/a'}  •  Ajuste: ${analysis?.fit || 'n/a'}`,
-  `Resumen: ${short(analysis?.summary, 400)}`,
-  adminLink ? `Admin: ${adminLink}` : ''
-].filter(Boolean).join('\n');
+    const en = [
+      '⚠️ Proof needs review',
+      `Project: ${proposal?.title || '(untitled)'} — ${proposal?.org_name || ''}`,
+      `Vendor: ${bid.vendor_name || ''} (${bid.wallet_address || ''})`,
+      `Milestone: #${msIndex}`,
+      `Confidence: ${analysis?.confidence ?? 'n/a'}  •  Fit: ${analysis?.fit || 'n/a'}`,
+      `Summary: ${short(analysis?.summary, 400)}`,
+      adminLink ? `Admin: ${adminLink}` : ''
+    ].filter(Boolean).join('\n');
 
-// Build bilingual payload
-const { text, html } = bi(en, es);
-// ——— to here
+    const es = [
+      '⚠️ La prueba requiere revisión',
+      `Proyecto: ${proposal?.title || '(sin título)'} — ${proposal?.org_name || ''}`,
+      `Proveedor: ${bid.vendor_name || ''} (${bid.wallet_address || ''})`,
+      `Hito: #${msIndex}`,
+      `Confianza: ${analysis?.confidence ?? 'n/a'}  •  Ajuste: ${analysis?.fit || 'n/a'}`,
+      `Resumen: ${short(analysis?.summary, 400)}`,
+      adminLink ? `Admin: ${adminLink}` : ''
+    ].filter(Boolean).join('\n');
 
-  const html = `
-    <h3>Proof needs review</h3>
-    <p><b>Project:</b> ${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}</p>
-    <p><b>Vendor:</b> ${bid.vendor_name || ""} (${bid.wallet_address || ""})</p>
-    <p><b>Milestone:</b> #${msIndex}</p>
-    <p><b>Confidence:</b> ${analysis?.confidence ?? "n/a"} &nbsp;&nbsp; <b>Fit:</b> ${analysis?.fit || "n/a"}</p>
-    <p><b>Summary:</b><br>${(analysis?.summary || "").replace(/\n/g, "<br>")}</p>
-    ${adminLink ? `<p><a href="${adminLink}">Open in Admin</a></p>` : ""}
-  `;
+    // Build bilingual payload
+    const { text, html } = bi(en, es);
+
+    // Load vendor contacts
+    const { rows: vprows } = await pool.query(
+      `SELECT email, phone, telegram_chat_id FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+      [ (bid.wallet_address || "").toLowerCase() ]
+    );
+    const vp = vprows[0] || {};
+    const vendorEmail = (vp.email || "").trim();
+    const vendorPhone = (vp.phone || "").trim();
+    const vendorTg    = (vp.telegram_chat_id || "").trim();
+
+    // WhatsApp template variables (if you set TWILIO_WA_CONTENT_SID)
+    const waVars = {
+      "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
+      "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
+      "3": `#${msIndex}`,
+      "4": String(analysis?.confidence ?? "n/a"),
+      "5": String(analysis?.fit || "n/a"),
+      "6": short(analysis?.summary, 400),
+      "7": adminLink || ""
+    };
+
+    // Admins
+    await Promise.all([
+      TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
+      MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
+      ...(ADMIN_WHATSAPP || []).map(n =>
+        TWILIO_WA_CONTENT_SID
+          ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars)
+          : sendWhatsApp(n, text)
+      ),
+    ].filter(Boolean));
+
+    // Vendor (best-effort)
+    await Promise.all([
+      vendorTg ? sendTelegram([vendorTg], text) : null,
+      vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
+      vendorPhone
+        ? (TWILIO_WA_CONTENT_SID
+            ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
+            : sendWhatsApp(vendorPhone, text))
+        : null,
+    ].filter(Boolean));
+  } catch (e) {
+    console.warn('notifyProofFlag failed:', e);
+  }
+}
 
   // Load vendor contacts
   const { rows: vprows } = await pool.query(
