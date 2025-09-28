@@ -3141,12 +3141,9 @@ app.get("/proofs", adminGuard, async (req, res) => {
 
 app.get("/proofs/:bidId", adminGuard, async (req, res) => {
   try {
-    const bidId = Number(req.params.bidId);
-    if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
-
     const { rows } = await pool.query(
       "SELECT * FROM proofs WHERE bid_id=$1 AND status != 'rejected' ORDER BY submitted_at DESC NULLS LAST",
-      [ bidId ]
+      [ req.params.bidId ]
     );
     res.json(mapRows(rows));
   } catch (err) {
@@ -3154,39 +3151,149 @@ app.get("/proofs/:bidId", adminGuard, async (req, res) => {
   }
 });
 
-// Approve latest proof for milestone (compat endpoint used by some clients)
+// Approve the latest proof for a milestone (ADMIN)
 app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) => {
   try {
     const bidId = Number(req.params.bidId);
     const idx   = Number(req.params.milestoneIndex);
+
     if (!Number.isInteger(bidId) || !Number.isInteger(idx)) {
-      return res.status(400).json({ error: "Invalid bidId or milestoneIndex" });
+      return res.status(400).json({ error: "bad bidId or milestone index" });
     }
-    const updated = await setLatestProofStatus(bidId, idx, 'approved');
-    if (!updated) return res.status(404).json({ error: "No proof found for this milestone" });
-    return res.json(toCamel(updated));
-  } catch (err) {
-    console.error("approve proof error", err);
+
+    // Find the most recent proof for this milestone
+    const { rows: proofs } = await pool.query(
+      `SELECT proof_id
+         FROM proofs
+        WHERE bid_id = $1 AND milestone_index = $2
+        ORDER BY submitted_at DESC NULLS LAST, updated_at DESC NULLS LAST, proof_id DESC
+        LIMIT 1`,
+      [bidId, idx]
+    );
+    if (!proofs.length) return res.status(404).json({ error: "No proof found for this milestone" });
+
+    const proofId = proofs[0].proof_id;
+
+    // Mark as approved
+    const { rows } = await pool.query(
+      `UPDATE proofs
+          SET status = 'approved', updated_at = NOW()
+        WHERE proof_id = $1
+      RETURNING *`,
+      [proofId]
+    );
+
+    return res.json({ ok: true, proof: toCamel(rows[0]) });
+  } catch (e) {
+    console.error("Approve milestone proof failed:", e);
     return res.status(500).json({ error: "Internal error" });
   }
 });
 
-// Reject latest proof for milestone (compat endpoint used by some clients)
-// (Your /bids/:bidId/milestones/:idx/reject route already exists and notifies.)
+// Reject the latest proof for a milestone (ADMIN)
 app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) => {
   try {
     const bidId = Number(req.params.bidId);
     const idx   = Number(req.params.milestoneIndex);
-    const reason = (req.body && req.body.reason)
-      ? String(req.body.reason).slice(0, 500)
-      : null;
+    const reason = (req.body && req.body.reason) ? String(req.body.reason).slice(0, 500) : null;
 
     if (!Number.isInteger(bidId) || !Number.isInteger(idx)) {
-      return res.status(400).json({ error: "Invalid bidId or milestoneIndex" });
+      return res.status(400).json({ error: "bad bidId or milestone index" });
     }
 
-    const updated = await setLatestProofStatus(bidId, idx, 'rejected');
-    if (!updated) return res.status(404).json({ error: "No proof found for this milestone" });
+    // Find the most recent proof for this milestone
+    const { rows: proofs } = await pool.query(
+      `SELECT proof_id
+         FROM proofs
+        WHERE bid_id = $1 AND milestone_index = $2
+        ORDER BY submitted_at DESC NULLS LAST, updated_at DESC NULLS LAST, proof_id DESC
+        LIMIT 1`,
+      [bidId, idx]
+    );
+    if (!proofs.length) return res.status(404).json({ error: "No proof found for this milestone" });
+
+    const proofId = proofs[0].proof_id;
+
+    // Mark as rejected
+    const { rows } = await pool.query(
+      `UPDATE proofs
+          SET status = 'rejected', updated_at = NOW()
+        WHERE proof_id = $1
+      RETURNING *`,
+      [proofId]
+    );
+    const updated = rows[0];
+
+    // Notify (mirrors your /bids/:bidId/milestones/:idx/reject)
+    try {
+      if (process.env.NOTIFY_ENABLED === "true") {
+        const { rows: pr } = await pool.query("SELECT * FROM proofs WHERE proof_id=$1", [proofId]);
+        const proof = pr[0];
+        const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+        const bid = bids[0];
+        const { rows: prj } = await pool.query(
+          "SELECT * FROM proposals WHERE proposal_id=$1",
+          [ bid.proposal_id || bid.proposalId ]
+        );
+        const proposal = prj[0] || null;
+
+        const subject = "❌ Proof rejected";
+        const msg = [
+          "❌ Proof rejected",
+          `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
+          `Bid: ${bidId} • Milestone: ${idx}`,
+          reason ? `Reason: ${reason}` : ""
+        ].filter(Boolean).join("\n");
+        const html = msg.replace(/\n/g, "<br>");
+
+        const { rows: vprows } = await pool.query(
+          `SELECT email, phone, telegram_chat_id
+             FROM vendor_profiles
+            WHERE lower(wallet_address)=lower($1)
+            LIMIT 1`,
+          [ (bid.wallet_address || "").toLowerCase() ]
+        );
+        const vp = vprows[0] || {};
+        const vendorEmail = (vp.email || "").trim();
+        const vendorPhone = (vp.phone || "").trim();
+        const vendorTg    = (vp.telegram_chat_id || "").trim();
+
+        const waVars = {
+          "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
+          "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
+          "3": `#${idx}`,
+          "4": reason ? reason : "No reason provided"
+        };
+
+        await Promise.all(
+          [
+            TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, msg) : null,
+            ...(TWILIO_WA_CONTENT_SID
+              ? (ADMIN_WHATSAPP || []).map(n => sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars))
+              : (ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, msg))),
+            MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
+
+            // Vendor
+            vendorTg ? sendTelegram([vendorTg], msg) : null,
+            vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
+            vendorPhone
+              ? (TWILIO_WA_CONTENT_SID
+                  ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
+                  : sendWhatsApp(vendorPhone, msg))
+              : null,
+          ].filter(Boolean)
+        );
+      }
+    } catch (e) {
+      console.warn("notify-on-reject (proofs route) failed (non-fatal):", String(e).slice(0,200));
+    }
+
+    return res.json({ ok: true, proof: toCamel(updated) });
+  } catch (e) {
+    console.error("Reject milestone proof failed (proofs route):", e);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
 
     // Optional: fire the same notifications you already send in /bids/:bidId/milestones/:idx/reject
     try {
