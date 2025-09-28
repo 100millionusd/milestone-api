@@ -643,7 +643,6 @@ async function notifyProofFlag({ proof, bid, proposal, analysis }) {
   const msIndex   = Number(proof.milestone_index) + 1;
   const subject   = `⚠️ Proof needs review — ${proposal?.title || "Project"} (Milestone ${msIndex})`;
   const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/bids/${bid.bid_id}?tab=proofs` : "";
-
   const short = (s, n = 300) => (s || "").slice(0, n);
 
   // Build bilingual payload (EN + ES)
@@ -669,7 +668,6 @@ async function notifyProofFlag({ proof, bid, proposal, analysis }) {
 
   const { text, html } = bi(en, es);
 
-  // Send (same targets/pattern as your other notifiers)
   try {
     await Promise.all([
       TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
@@ -683,100 +681,6 @@ async function notifyProofFlag({ proof, bid, proposal, analysis }) {
   } catch (e) {
     console.warn('notifyProofFlag failed:', String(e).slice(0, 200));
   }
-}
-
-    // Build bilingual payload
-    const { text, html } = bi(en, es);
-
-    // Load vendor contacts
-    const { rows: vprows } = await pool.query(
-      `SELECT email, phone, telegram_chat_id FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-      [ (bid.wallet_address || "").toLowerCase() ]
-    );
-    const vp = vprows[0] || {};
-    const vendorEmail = (vp.email || "").trim();
-    const vendorPhone = (vp.phone || "").trim();
-    const vendorTg    = (vp.telegram_chat_id || "").trim();
-
-    // WhatsApp template variables (if you set TWILIO_WA_CONTENT_SID)
-    const waVars = {
-      "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
-      "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
-      "3": `#${msIndex}`,
-      "4": String(analysis?.confidence ?? "n/a"),
-      "5": String(analysis?.fit || "n/a"),
-      "6": short(analysis?.summary, 400),
-      "7": adminLink || ""
-    };
-
-    // Admins
-    await Promise.all([
-      TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
-      MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
-      ...(ADMIN_WHATSAPP || []).map(n =>
-        TWILIO_WA_CONTENT_SID
-          ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars)
-          : sendWhatsApp(n, text)
-      ),
-    ].filter(Boolean));
-
-    // Vendor (best-effort)
-    await Promise.all([
-      vendorTg ? sendTelegram([vendorTg], text) : null,
-      vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
-      vendorPhone
-        ? (TWILIO_WA_CONTENT_SID
-            ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
-            : sendWhatsApp(vendorPhone, text))
-        : null,
-    ].filter(Boolean));
-  } catch (e) {
-    console.warn('notifyProofFlag failed:', e);
-  }
-}
-
-  // Load vendor contacts
-  const { rows: vprows } = await pool.query(
-    `SELECT email, phone, telegram_chat_id FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-    [ (bid.wallet_address || "").toLowerCase() ]
-  );
-  const vp = vprows[0] || {};
-  const vendorEmail = (vp.email || "").trim();
-  const vendorPhone = (vp.phone || "").trim();
-  const vendorTg    = (vp.telegram_chat_id || "").trim();
-
-  // WhatsApp template variables (if you set TWILIO_WA_CONTENT_SID)
-  const waVars = {
-    "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
-    "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
-    "3": `#${msIndex}`,
-    "4": String(analysis?.confidence ?? "n/a"),
-    "5": String(analysis?.fit || "n/a"),
-    "6": short(analysis?.summary, 400),
-    "7": adminLink || ""
-  };
-
-  // Admins
-  await Promise.all([
-    TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
-    MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
-    ...(ADMIN_WHATSAPP || []).map(n =>
-      TWILIO_WA_CONTENT_SID
-        ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars)
-        : sendWhatsApp(n, text)
-    ),
-  ].filter(Boolean));
-
-  // Vendor (best-effort)
-  await Promise.all([
-    vendorTg ? sendTelegram([vendorTg], text) : null,
-    vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
-    vendorPhone
-      ? (TWILIO_WA_CONTENT_SID
-          ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
-          : sendWhatsApp(vendorPhone, text))
-      : null,
-  ].filter(Boolean));
 }
 
 // --- Image helpers for vision models ---
