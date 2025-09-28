@@ -596,29 +596,43 @@ function bi(en, es) {
   return { text, html };
 }
 
+function bi(en, es) {
+  const text = `${en.trim()}\n\n${es.trim()}`;
+  const html = [
+    `<div>${en.trim().replace(/\n/g,'<br>')}</div>`,
+    '<hr>',
+    `<div>${es.trim().replace(/\n/g,'<br>')}</div>`
+  ].join('\n');
+  return { text, html };
+}
+
 // ==============================
 // Notifications — Bid Submitted
 // ==============================
-const en = [
-  '📝 New bid submitted',
-  `Project: ${proposal?.title || '(untitled)'} (${proposal?.org_name || ''})`,
-  `Vendor: ${bid?.vendor_name || vendor?.vendor_name || ''}`,
-  `Amount: $${bid?.price_usd ?? 0}  •  Days: ${bid?.days ?? '-'}`,
-  APP_BASE_URL ? `Admin: ${APP_BASE_URL}/admin/bids` : ''
-].filter(Boolean).join('\n');
+async function notifyBidSubmitted(bid, proposal, vendor) {
+  try {
+    const subject = `📝 New bid submitted`;
 
-const es = [
-  '📝 Nueva oferta enviada',
-  `Proyecto: ${proposal?.title || '(sin título)'} (${proposal?.org_name || ''})`,
-  `Proveedor: ${bid?.vendor_name || vendor?.vendor_name || ''}`,
-  `Importe: $${bid?.price_usd ?? 0}  •  Días: ${bid?.days ?? '-'}`,
-  APP_BASE_URL ? `Admin: ${APP_BASE_URL}/admin/bids` : ''
-].filter(Boolean).join('\n');
+    const en = [
+      '📝 New bid submitted',
+      `Project: ${proposal?.title || '(untitled)'} (${proposal?.org_name || ''})`,
+      `Vendor: ${bid?.vendor_name || vendor?.vendor_name || ''}`,
+      `Amount: $${bid?.price_usd ?? 0}  •  Days: ${bid?.days ?? '-'}`,
+      APP_BASE_URL ? `Admin: ${APP_BASE_URL}/admin/bids` : ''
+    ].filter(Boolean).join('\n');
 
-const { text, html } = bi(en, es);
+    const es = [
+      '📝 Nueva oferta enviada',
+      `Proyecto: ${proposal?.title || '(sin título)'} (${proposal?.org_name || ''})`,
+      `Proveedor: ${bid?.vendor_name || vendor?.vendor_name || ''}`,
+      `Importe: $${bid?.price_usd ?? 0}  •  Días: ${bid?.days ?? '-'}`,
+      APP_BASE_URL ? `Admin: ${APP_BASE_URL}/admin/bids` : ''
+    ].filter(Boolean).join('\n');
+
+    const { text, html } = bi(en, es);
 
     // Vendor contacts (confirmation back to submitter)
-    const vendorEmails = [vendor?.email].map(s => (s||"").trim()).filter(Boolean);
+    const vendorEmails = [vendor?.email].map(s => (s || "").trim()).filter(Boolean);
     const vendorPhone  = toE164(vendor?.phone || "");
     const vendorTg     = (vendor?.telegram_chat_id || "").trim();
 
