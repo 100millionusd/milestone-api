@@ -683,6 +683,123 @@ async function notifyProofFlag({ proof, bid, proposal, analysis }) {
   }
 }
 
+// ======================================
+// Notifications — Proof approved (EN/ES)
+// ======================================
+async function notifyProofApproved({ proof, bid, proposal, msIndex }) {
+  const subject   = `✅ Proof approved — ${proposal?.title || "Project"} (Milestone ${msIndex})`;
+  const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/bids/${bid.bid_id}?tab=proofs` : "";
+
+  const en = [
+    '✅ Proof approved',
+    `Project: ${proposal?.title || '(untitled)'} — ${proposal?.org_name || ''}`,
+    `Vendor: ${bid.vendor_name || ''} (${bid.wallet_address || ''})`,
+    `Milestone: #${msIndex}`,
+    adminLink ? `Admin: ${adminLink}` : ''
+  ].filter(Boolean).join('\n');
+
+  const es = [
+    '✅ Prueba aprobada',
+    `Proyecto: ${proposal?.title || '(sin título)'} — ${proposal?.org_name || ''}`,
+    `Proveedor: ${bid.vendor_name || ''} (${bid.wallet_address || ''})`,
+    `Hito: #${msIndex}`,
+    adminLink ? `Admin: ${adminLink}` : ''
+  ].filter(Boolean).join('\n');
+
+  const { text, html } = bi(en, es);
+
+  // Admin broadcast
+  await Promise.all([
+    TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
+    MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+    ...(ADMIN_WHATSAPP || []).map(n =>
+      TWILIO_WA_CONTENT_SID
+        ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": proposal?.title || "", "2": "proof approved" })
+        : sendWhatsApp(n, text)
+    ),
+  ].filter(Boolean));
+
+  // Vendor (best-effort)
+  const { rows: vprows } = await pool.query(
+    `SELECT email, phone, telegram_chat_id FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+    [ (bid.wallet_address || "").toLowerCase() ]
+  );
+  const vp = vprows[0] || {};
+  const vendorEmail = (vp.email || "").trim();
+  const vendorPhone = toE164(vp.phone || "");
+  const vendorTg    = (vp.telegram_chat_id || "").trim();
+
+  await Promise.all([
+    vendorTg    ? sendTelegram([vendorTg], text)             : null,
+    vendorEmail ? sendEmail([vendorEmail], subject, html)    : null,
+    vendorPhone ? (
+      TWILIO_WA_CONTENT_SID
+        ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, { "1": proposal?.title || "", "2": "proof approved" })
+        : sendWhatsApp(vendorPhone, text)
+    ) : null,
+  ].filter(Boolean));
+}
+
+// ========================================
+// Notifications — Payment released (EN/ES)
+// ========================================
+async function notifyPaymentReleased({ bid, proposal, msIndex, amount, txHash }) {
+  const subject   = `💸 Payment released — ${proposal?.title || "Project"} (Milestone ${msIndex})`;
+  const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/bids/${bid.bid_id}` : "";
+  const amountStr = typeof amount === 'number' ? `$${Number(amount).toLocaleString()}` : String(amount || '');
+
+  const en = [
+    '💸 Payment released',
+    `Project: ${proposal?.title || '(untitled)'} — ${proposal?.org_name || ''}`,
+    `Vendor: ${bid.vendor_name || ''} (${bid.wallet_address || ''})`,
+    `Milestone: #${msIndex}  •  Amount: ${amountStr}`,
+    txHash ? `Tx: ${txHash}` : '',
+    adminLink ? `Admin: ${adminLink}` : ''
+  ].filter(Boolean).join('\n');
+
+  const es = [
+    '💸 Pago liberado',
+    `Proyecto: ${proposal?.title || '(sin título)'} — ${proposal?.org_name || ''}`,
+    `Proveedor: ${bid.vendor_name || ''} (${bid.wallet_address || ''})`,
+    `Hito: #${msIndex}  •  Importe: ${amountStr}`,
+    txHash ? `Tx: ${txHash}` : '',
+    adminLink ? `Admin: ${adminLink}` : ''
+  ].filter(Boolean).join('\n');
+
+  const { text, html } = bi(en, es);
+
+  // Admins
+  await Promise.all([
+    TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
+    MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+    ...(ADMIN_WHATSAPP || []).map(n =>
+      TWILIO_WA_CONTENT_SID
+        ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": proposal?.title || "", "2": "payment released" })
+        : sendWhatsApp(n, text)
+    ),
+  ].filter(Boolean));
+
+  // Vendor
+  const { rows: vprows } = await pool.query(
+    `SELECT email, phone, telegram_chat_id FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+    [ (bid.wallet_address || "").toLowerCase() ]
+  );
+  const vp = vprows[0] || {};
+  const vendorEmail = (vp.email || "").trim();
+  const vendorPhone = toE164(vp.phone || "");
+  const vendorTg    = (vp.telegram_chat_id || "").trim();
+
+  await Promise.all([
+    vendorTg    ? sendTelegram([vendorTg], text)             : null,
+    vendorEmail ? sendEmail([vendorEmail], subject, html)    : null,
+    vendorPhone ? (
+      TWILIO_WA_CONTENT_SID
+        ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, { "1": proposal?.title || "", "2": "payment released" })
+        : sendWhatsApp(vendorPhone, text)
+    ) : null,
+  ].filter(Boolean));
+}
+
 // --- Image helpers for vision models ---
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|tiff|svg)(\?|$)/i;
 function isImageFile(f) {
@@ -2858,6 +2975,10 @@ app.post("/bids/:id/complete-milestone", async (req, res) => {
   }
 });
 
+// ==============================
+// Routes — Complete/Pay milestone (frontend-compatible)
+// (replace ONLY the /pay-milestone route below)
+// ==============================
 app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
   const bidId = Number(req.params.id);
   const { milestoneIndex } = req.body || {};
@@ -2865,6 +2986,7 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
   if (!Number.isInteger(milestoneIndex) || milestoneIndex < 0) {
     return res.status(400).json({ error: "Invalid milestoneIndex" });
   }
+
   try {
     const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
@@ -2876,6 +2998,7 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
     const ms = milestones[milestoneIndex];
     if (!ms.completed) return res.status(400).json({ error: "Milestone not completed" });
 
+    // (Your chain send function)
     const receipt = await blockchainService.sendToken(
       bid.preferred_stablecoin,
       bid.wallet_address,
@@ -2883,12 +3006,26 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
     );
 
     ms.paymentTxHash = receipt.hash;
-    ms.paymentDate = new Date().toISOString();
+    ms.paymentDate   = new Date().toISOString();
 
     await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [ JSON.stringify(milestones), bidId ]);
 
+    // Notify admins + vendor (bilingual)
+    if (process.env.NOTIFY_ENABLED === "true") {
+      const { rows: [proposal] } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ bid.proposal_id ]);
+      if (proposal) {
+        await notifyPaymentReleased({
+          bid,
+          proposal,
+          msIndex: milestoneIndex + 1,
+          amount: ms.amount,
+          txHash: receipt.hash
+        });
+      }
+    }
+
     const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
-    return res.json({ success: true, bid: toCamel(updated[0]), receipt });
+    return res.json(toCamel(updated[0]));
   } catch (err) {
     console.error("pay-milestone error", err);
     return res.status(500).json({ error: "Internal error paying milestone" });
@@ -3181,7 +3318,7 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
     const idx   = Number(req.params.milestoneIndex);
 
     if (!Number.isInteger(bidId) || !Number.isInteger(idx)) {
-      return res.status(400).json({ error: "bad bidId or milestone index" });
+      return res.status(400).json({ error: "Invalid bidId or milestoneIndex" });
     }
 
     // Find the most recent proof for this milestone
@@ -3193,8 +3330,9 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
         LIMIT 1`,
       [bidId, idx]
     );
-    if (!proofs.length) return res.status(404).json({ error: "No proof found for this milestone" });
-
+    if (!proofs.length) {
+      return res.status(404).json({ error: "No proof found for this milestone" });
+    }
     const proofId = proofs[0].proof_id;
 
     // Mark as approved
@@ -3205,8 +3343,28 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
       RETURNING *`,
       [proofId]
     );
+    const updated = rows[0];
 
-    return res.json({ ok: true, proof: toCamel(rows[0]) });
+    // Notify (admins + vendor) if enabled
+    if (process.env.NOTIFY_ENABLED === "true") {
+      const { rows: [bid] } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+      if (bid) {
+        const { rows: [proposal] } = await pool.query(
+          "SELECT * FROM proposals WHERE proposal_id=$1",
+          [ bid.proposal_id ]
+        );
+        if (proposal && typeof notifyProofApproved === "function") {
+          await notifyProofApproved({
+            proof: updated,
+            bid,
+            proposal,
+            msIndex: idx + 1
+          });
+        }
+      }
+    }
+
+    return res.json({ ok: true, proof: toCamel(updated) });
   } catch (e) {
     console.error("Approve milestone proof failed:", e);
     return res.status(500).json({ error: "Internal error" });
