@@ -3545,6 +3545,40 @@ try {
   }
 });
 
+// --- LIST PROOFS (admin, legacy ?bidId=) -------------------------------
+app.get('/proofs', adminGuard, async (req, res) => {
+  try {
+    const bidId = Number(req.query.bidId);
+    if (!Number.isFinite(bidId)) {
+      return res.status(400).json({ error: 'bidId query param required' });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT
+         proof_id          AS "proofId",
+         bid_id            AS "bidId",
+         milestone_index   AS "milestoneIndex",
+         title,
+         description,
+         files,
+         status,
+         submitted_at      AS "submittedAt",
+         updated_at        AS "updatedAt"
+       FROM proofs
+       WHERE bid_id = $1
+       ORDER BY submitted_at DESC NULLS LAST,
+                updated_at  DESC NULLS LAST,
+                proof_id    DESC`,
+      [bidId]
+    );
+
+    return res.json(rows);
+  } catch (err) {
+    console.error('GET /proofs error', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // --- Agent2 Chat about a SPECIFIC PROOF (SSE) -------------------------------
 app.all('/proofs/:id/chat', (req, res, next) => {
   if (req.method === 'POST') return next();
