@@ -480,20 +480,35 @@ async function notifyProposalRejected(p, reason) {
 }
 
 // ==============================
-// Notifications — Bids
+// Notifications — Bids (EN/ES)
 // ==============================
 async function notifyBidApproved(bid, proposal, vendor) {
   try {
-    const subject = `✅ Bid awarded`;
-    const lines = [
-      `✅ Bid awarded`,
-      `Project: ${proposal?.title || "(untitled)"}`,
-      `Vendor: ${bid?.vendor_name || vendor?.vendor_name || ""}`,
-      `Amount: $${bid?.price_usd ?? 0}`,
-      APP_BASE_URL ? `Admin: ${APP_BASE_URL}/admin/bids` : "",
-    ].filter(Boolean);
-    const text = lines.join("\n");
-    const html = lines.join("<br>");
+    const subject   = `✅ Bid awarded`;
+    const title     = proposal?.title || "(untitled)";
+    const org       = proposal?.org_name || "";
+    const vendorStr = bid?.vendor_name || vendor?.vendor_name || "";
+    const amountStr = `$${bid?.price_usd ?? 0}`;
+    const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/bids` : "";
+
+    // Build bilingual body
+    const en = [
+      '✅ Bid awarded',
+      `Project: ${title}${org ? ` (${org})` : ''}`,
+      `Vendor: ${vendorStr}`,
+      `Amount: ${amountStr}`,
+      adminLink ? `Admin: ${adminLink}` : '',
+    ].filter(Boolean).join('\n');
+
+    const es = [
+      '✅ Oferta adjudicada',
+      `Proyecto: ${title}${org ? ` (${org})` : ''}`,
+      `Proveedor: ${vendorStr}`,
+      `Importe: ${amountStr}`,
+      adminLink ? `Admin: ${adminLink}` : '',
+    ].filter(Boolean).join('\n');
+
+    const { text, html } = bi(en, es); // uses your existing helper
 
     // Vendor contacts
     const vendorEmails = [vendor?.email].map(s => (s||"").trim()).filter(Boolean);
@@ -506,7 +521,7 @@ async function notifyBidApproved(bid, proposal, vendor) {
       MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
       ...(ADMIN_WHATSAPP || []).map(n =>
         TWILIO_WA_CONTENT_SID
-          ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": proposal?.title || "", "2": "awarded" })
+          ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": title, "2": "awarded" })
           : sendWhatsApp(n, text)
       ),
 
