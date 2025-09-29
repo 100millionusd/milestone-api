@@ -3856,6 +3856,70 @@ app.get('/proofs', adminGuard, async (req, res) => {
   }
 });
 
+// --- Vendor-safe: Archive a proof -------------------------------------------
+// POST /proofs/:id/archive
+// Auth: admin OR vendor who owns the bid (wallet matches)
+app.post('/proofs/:id/archive', authRequired, async (req, res) => {
+  const proofId = Number(req.params.id);
+  if (!Number.isFinite(proofId)) return res.status(400).json({ error: 'Invalid proof id' });
+
+  try {
+    // Load proof + owning bid (to verify ownership)
+    const { rows } = await pool.query(
+      `SELECT p.proof_id, p.bid_id, p.milestone_index, p.status,
+              b.wallet_address AS bid_wallet
+         FROM proofs p
+         JOIN bids b ON b.bid_id = p.bid_id
+        WHERE p.proof_id = $1`,
+      [proofId]
+    );
+    const pr = rows[0];
+    if (!pr) return res.status(404).json({ error: 'Proof not found' });
+
+    // Authorization: admin OR the wallet that owns the bid
+    const caller = String(req.user?.sub || '').toLowerCase();
+    const role   = String(req.user?.role || 'vendor').toLowerCase();
+    const owner  = String(pr.bid_wallet || '').toLowerCase();
+    if (!(role === 'admin' || (caller && caller === owner))) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    // Do NOT allow archiving if this is the latest PENDING proof for that milestone
+    const { rows: latest } = await pool.query(
+      `SELECT proof_id, status
+         FROM proofs
+        WHERE bid_id = $1 AND milestone_index = $2
+        ORDER BY submitted_at DESC NULLS LAST,
+                 updated_at  DESC NULLS LAST,
+                 proof_id    DESC
+        LIMIT 1`,
+      [pr.bid_id, pr.milestone_index]
+    );
+    const isLatestPending =
+      latest[0] &&
+      Number(latest[0].proof_id) === proofId &&
+      String(latest[0].status || '').toLowerCase() === 'pending';
+
+    if (isLatestPending) {
+      return res.status(409).json({ error: 'Cannot archive the latest pending proof for this milestone.' });
+    }
+
+    // Flip status to "archived" (re-uses the same status column)
+    const { rows: upd } = await pool.query(
+      `UPDATE proofs
+          SET status = 'archived', updated_at = NOW()
+        WHERE proof_id = $1
+        RETURNING *`,
+      [proofId]
+    );
+
+    return res.json({ ok: true, proof: toCamel(upd[0]) });
+  } catch (e) {
+    console.error('POST /proofs/:id/archive error', e);
+    return res.status(500).json({ error: 'Failed to archive proof' });
+  }
+});
+
 // --- Agent2 Chat about a SPECIFIC PROOF (SSE) -------------------------------
 app.all('/proofs/:id/chat', (req, res, next) => {
   if (req.method === 'POST') return next();
