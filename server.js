@@ -4825,6 +4825,295 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
 });
 
 // ==============================
+// Projects Directory (list with aggregates)
+// ==============================
+app.get("/projects", async (req, res) => {
+  try {
+    // Pagination / filters / sorting
+    const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+    const pageSize = Math.min(Math.max(parseInt(req.query.pageSize || '20', 10), 1), 100);
+    const offset = (page - 1) * pageSize;
+
+    const q = String(req.query.q || '').trim().toLowerCase();
+    const statuses = String(req.query.status || '')
+      .split(',').map(s => s.trim()).filter(Boolean);
+    const ownerWallet = String(req.query.ownerWallet || '').trim().toLowerCase();
+    const vendorWallet = String(req.query.vendorWallet || '').trim().toLowerCase();
+    const mineOnly = String(req.query.mineOnly || '') === 'true';
+    const sort = String(req.query.sort || 'activity');
+
+    // Current user (compatible with your JWT attach)  // :contentReference[oaicite:3]{index=3}
+    const user = req.user || null;
+    const isAdmin = String(user?.role || '').toLowerCase() === 'admin';
+    const myWallet = String(user?.sub || '').toLowerCase();
+
+    const where = [];
+    const params = [];
+
+    if (statuses.length) {
+      params.push(statuses);
+      where.push(`p.status = ANY($${params.length})`);
+    }
+    if (q) {
+      params.push(`%${q}%`);
+      where.push(`(LOWER(p.title) LIKE $${params.length} OR CAST(p.proposal_id AS TEXT) LIKE $${params.length})`);
+    }
+    if (ownerWallet || (mineOnly && myWallet)) {
+      params.push(ownerWallet || myWallet);
+      where.push(`LOWER(p.owner_wallet) = $${params.length}`);
+    }
+    if (vendorWallet) {
+      params.push(vendorWallet);
+      where.push(`EXISTS (SELECT 1 FROM bids b2 WHERE b2.proposal_id = p.proposal_id AND LOWER(b2.wallet_address) = $${params.length})`);
+    }
+    // Non-admin default: show my proposals if no other filter
+    if (!isAdmin && !ownerWallet && !mineOnly && !vendorWallet) {
+      params.push(myWallet || '__no_wallet__');
+      where.push(`LOWER(p.owner_wallet) = $${params.length}`);
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+    const sortSql = {
+      latest:   'p.created_at DESC',
+      oldest:   'p.created_at ASC',
+      bids:     'agg_bids_total DESC NULLS LAST',
+      paid:     'agg_ms_paid DESC NULLS LAST',
+      activity: 'last_activity_at DESC NULLS LAST',
+    }[sort] || 'last_activity_at DESC NULLS LAST';
+
+    // Count
+    const { rows: [{ cnt }] } = await pool.query(
+      `SELECT COUNT(*)::int AS cnt FROM proposals p ${whereSql}`,
+      params
+    );
+
+    // List with aggregates (no new tables, use your existing schema)
+    const sql = `
+      SELECT
+        p.proposal_id AS id,
+        p.title,
+        p.status,
+        p.owner_wallet,
+        p.owner_email,
+        p.created_at,
+        p.updated_at,
+
+        -- Bids aggregates
+        (SELECT COUNT(*) FROM bids b WHERE b.proposal_id = p.proposal_id) AS agg_bids_total,
+        (SELECT COUNT(*) FROM bids b WHERE b.proposal_id = p.proposal_id AND b.status = 'approved') AS agg_bids_approved,
+
+        -- Milestones: total from JSON arrays; completed if completed=true OR paymentTxHash present
+        COALESCE((
+          SELECT SUM(jsonb_array_length(COALESCE(b.milestones, '[]'::jsonb)))
+            FROM bids b
+           WHERE b.proposal_id = p.proposal_id
+        ), 0) AS agg_ms_total,
+
+        COALESCE((
+          SELECT COUNT(*)
+            FROM bids b
+            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(b.milestones, '[]'::jsonb)) ms
+           WHERE b.proposal_id = p.proposal_id
+             AND (
+               (ms->>'completed')::boolean IS TRUE OR
+               NULLIF(ms->>'paymentTxHash','') IS NOT NULL
+             )
+        ), 0) AS agg_ms_completed,
+
+        COALESCE((
+          SELECT COUNT(*)
+            FROM bids b
+            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(b.milestones, '[]'::jsonb)) ms
+           WHERE b.proposal_id = p.proposal_id
+             AND NULLIF(ms->>'paymentTxHash','') IS NOT NULL
+        ), 0) AS agg_ms_paid,
+
+        -- Last activity: newest among proposal updated/created, any bid created, any proof updated/submitted, any paymentDate in milestones
+        GREATEST(
+          p.updated_at,
+          p.created_at,
+          COALESCE((
+            SELECT MAX(b.created_at)
+              FROM bids b
+             WHERE b.proposal_id = p.proposal_id
+          ), TIMESTAMP 'epoch'),
+          COALESCE((
+            SELECT MAX(GREATEST(COALESCE(pr.updated_at, TIMESTAMP 'epoch'), COALESCE(pr.submitted_at, TIMESTAMP 'epoch')))
+              FROM proofs pr
+             WHERE pr.bid_id IN (SELECT bid_id FROM bids b WHERE b.proposal_id = p.proposal_id)
+          ), TIMESTAMP 'epoch'),
+          COALESCE((
+            SELECT MAX(NULLIF(ms->>'paymentDate','')::timestamptz)
+              FROM bids b
+              CROSS JOIN LATERAL jsonb_array_elements(COALESCE(b.milestones, '[]'::jsonb)) ms
+             WHERE b.proposal_id = p.proposal_id
+          ), TIMESTAMP 'epoch')
+        ) AS last_activity_at
+      FROM proposals p
+      ${whereSql}
+      ORDER BY ${sortSql}
+      LIMIT ${pageSize} OFFSET ${offset}
+    `;
+
+    const { rows } = await pool.query(sql, params);
+
+    // Keep snake_case aggregates to avoid touching your UI; key names are explicit
+    res.json({
+      page, pageSize, total: cnt,
+      items: rows.map(r => ({
+        id: r.id,
+        title: r.title,
+        status: r.status,
+        owner_wallet: r.owner_wallet,
+        owner_email: r.owner_email,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+        bids_total: Number(r.agg_bids_total || 0),
+        bids_approved: Number(r.agg_bids_approved || 0),
+        milestones_total: Number(r.agg_ms_total || 0),
+        milestones_completed: Number(r.agg_ms_completed || 0),
+        milestones_paid: Number(r.agg_ms_paid || 0),
+        last_activity_at: r.last_activity_at
+      }))
+    });
+  } catch (err) {
+    console.error("GET /projects error", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ==============================
+// Project Overview (single project “everything”)
+// ==============================
+app.get("/projects/:id/overview", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid project id" });
+
+  try {
+    // Load proposal (your PK is proposal_id)  // :contentReference[oaicite:4]{index=4}
+    const { rows: prjRows } = await pool.query(
+      `SELECT proposal_id, title, status, owner_wallet, owner_email, created_at, updated_at
+         FROM proposals
+        WHERE proposal_id = $1`,
+      [id]
+    );
+    const prj = prjRows[0];
+    if (!prj) return res.status(404).json({ error: "Not found" });
+
+    // Auth: admin OR proposal owner (reuse your JWT semantics)  // :contentReference[oaicite:5]{index=5}
+    const isAdmin = String(req.user?.role || '').toLowerCase() === 'admin';
+    const myWallet = String(req.user?.sub || '').toLowerCase();
+    if (!isAdmin && String(prj.owner_wallet || '').toLowerCase() !== myWallet) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    // Bids for this proposal
+    const { rows: bidRows } = await pool.query(
+      `SELECT bid_id, proposal_id, vendor_name, wallet_address, price_usd, days, notes,
+              preferred_stablecoin, milestones, status, created_at, updated_at
+         FROM bids
+        WHERE proposal_id = $1
+        ORDER BY created_at ASC`,
+      [id]
+    );
+
+    const bidIds = bidRows.map(b => b.bid_id);
+    let proofs = [];
+    if (bidIds.length) {
+      // Proofs (fields exist in your code paths)  // :contentReference[oaicite:6]{index=6}
+      const { rows: proofRows } = await pool.query(
+        `SELECT proof_id, bid_id, milestone_index, status, title, description, files, ai_analysis, submitted_at, updated_at
+           FROM proofs
+          WHERE bid_id = ANY($1::int[])
+          ORDER BY submitted_at ASC, proof_id ASC`,
+        [bidIds]
+      );
+      proofs = proofRows;
+    }
+
+    // Build milestone list: combine bid.milestones JSON + proof status + payments (paymentTxHash)
+    const approvedProof = new Set(
+      proofs.filter(p => String(p.status).toLowerCase() === 'approved')
+            .map(p => `${p.bid_id}:${p.milestone_index}`)
+    );
+
+    const msItems = [];
+    const paymentsActivity = [];
+    for (const b of bidRows) {
+      const arr = Array.isArray(b.milestones) ? b.milestones
+                : typeof b.milestones === 'string' ? JSON.parse(b.milestones || '[]')
+                : [];
+      arr.forEach((m, idx) => {
+        const key = `${b.bid_id}:${idx}`;
+        const paid = !!(m && m.paymentTxHash);
+        const completed = paid || approvedProof.has(key) || !!m?.completed;
+        if (paid && m.paymentDate) {
+          paymentsActivity.push({
+            type: 'milestone_paid',
+            at: m.paymentDate,
+            bid_id: b.bid_id,
+            milestone_index: idx,
+            amount_usd: m.amount ?? null,
+            tx_hash: m.paymentTxHash
+          });
+        }
+        msItems.push({
+          bid_id: b.bid_id,
+          index: idx,
+          title: m?.name || `Milestone ${idx+1}`,
+          amount_usd: m?.amount ?? null,
+          status: paid ? 'paid' : (completed ? 'completed' : 'pending'),
+          submitted_proof_id: null, // linked below if we want
+          completed_at: m?.completionDate || null,
+          paid_at: paid ? (m?.paymentDate || null) : null,
+          tx_hash: paid ? (m?.paymentTxHash || null) : null
+        });
+      });
+    }
+
+    const milestones = {
+      total: msItems.length,
+      completed: msItems.filter(x => x.status === 'completed' || x.status === 'paid').length,
+      paid: msItems.filter(x => x.status === 'paid').length,
+      items: msItems
+    };
+
+    // Activity (synthesized: created, bids, proofs, payments)
+    const activity = [
+      { type: 'proposal_created', at: prj.created_at, actor_role: 'owner' },
+      // You don't persist approved_at; status flip happens but no timestamp. We skip it here.  // :contentReference[oaicite:7]{index=7}
+      ...bidRows.map(b => ({ type: 'bid_submitted', at: b.created_at, bid_id: b.bid_id, actor_role: 'vendor', vendor_name: b.vendor_name })),
+      ...proofs.map(p => ({ type: 'proof_submitted', at: p.submitted_at, proof_id: p.proof_id, bid_id: p.bid_id, milestone_index: p.milestone_index })),
+      ...paymentsActivity
+    ].filter(Boolean).sort((a,b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+
+    return res.json({
+      proposal: {
+        id: prj.proposal_id,
+        title: prj.title,
+        status: prj.status,
+        owner_wallet: prj.owner_wallet,
+        owner_email: prj.owner_email,
+        created_at: prj.created_at,
+        updated_at: prj.updated_at
+      },
+      bids: {
+        total: bidRows.length,
+        approved: bidRows.filter(b => String(b.status).toLowerCase() === 'approved').length,
+        items: bidRows // snake_case; your pages can render as-is
+      },
+      milestones,
+      proofs,
+      activity
+    });
+  } catch (err) {
+    console.error("GET /projects/:id/overview error", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ==============================
 // Routes — Payments (legacy)
 // ==============================
 app.post("/payments/release", adminGuard, async (req, res) => {
