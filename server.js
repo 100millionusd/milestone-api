@@ -3375,7 +3375,8 @@ app.get("/proofs", adminGuard, async (req, res) => {
   }
 });
 
-app.get("/proofs/:bidId", adminGuard, async (req, res) => {
+// Allow admin OR the bid owner (vendor) to read proofs for that bid
+app.get("/proofs/:bidId", adminOrBidOwnerGuard, async (req, res) => {
   try {
     const { rows } = await pool.query(
       "SELECT * FROM proofs WHERE bid_id=$1 AND status != 'rejected' ORDER BY submitted_at DESC NULLS LAST",
