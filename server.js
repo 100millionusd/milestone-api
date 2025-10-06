@@ -1554,17 +1554,32 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
 const app = express();
 app.set("trust proxy", 1);
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (CORS_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error("Not allowed by CORS"));
-    },
-    credentials: true,
-  })
-);
-app.use(helmet());
+// --- CORS (fixed for Safari preflights) ---
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    if (CORS_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error("Not allowed by CORS"));
+  },
+  credentials: true,
+  methods: ['GET','HEAD','PUT','PATCH','POST','DELETE','OPTIONS'],
+  // Allow headers Safari often sends in preflight when dev tools “Disable cache” is on
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'Cache-Control',
+    'Pragma',
+    'X-Requested-With'
+  ],
+  maxAge: 86400, // cache the preflight
+};
+app.use(cors(corsOptions));
+// ensure ALL routes answer preflight
+app.options('*', cors(corsOptions));
+
+// --- Helmet (relaxed CORP for APIs) ---
+app.use(helmet({ crossOriginResourcePolicy: false }));
+
 app.use(express.json({ limit: "20mb" }));
 app.use(cookieParser()); // 🔐 parse JWT cookie
 
