@@ -42,6 +42,7 @@ const Joi = require("joi");
 const { Pool } = require("pg");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
+const cors = require('cors'); 
 
 // 🔐 auth utilities
 const cookieParser = require("cookie-parser");
@@ -1554,28 +1555,23 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
 const app = express();
 app.set("trust proxy", 1);
 
-app.use((req, _res, next) => {
-  if (req.url === '/api') req.url = '/';
-  else if (req.url.startsWith('/api/')) req.url = req.url.slice(4);
-  next();
-});
-
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (CORS_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error("Not allowed by CORS"));
-    },
-    credentials: true,
-    methods: ['GET','POST','PATCH','PUT','DELETE','OPTIONS'],
-    allowedHeaders: ['Content-Type','Authorization'],
-    maxAge: 86400,
-  })
-);
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: 'cross-origin' }
+// CORS FIRST — allow Netlify app + credentials + the cache-control header
+app.use(cors({
+  origin: 'https://lithiumx.netlify.app',
+  credentials: true,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','Cache-Control','X-Requested-With']
 }));
+app.options('*', cors({
+  origin: 'https://lithiumx.netlify.app',
+  credentials: true,
+  allowedHeaders: ['Content-Type','Authorization','Cache-Control','X-Requested-With']
+}));
+
+// Helmet (keep; this is fine)
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+
+// Keep these as-is
 app.use(express.json({ limit: "20mb" }));
 app.use(cookieParser()); // 🔐 parse JWT cookie
 
