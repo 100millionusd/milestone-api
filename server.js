@@ -1554,6 +1554,12 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
 const app = express();
 app.set("trust proxy", 1);
 
+app.use((req, _res, next) => {
+  if (req.url === '/api') req.url = '/';
+  else if (req.url.startsWith('/api/')) req.url = req.url.slice(4);
+  next();
+});
+
 app.use(
   cors({
     origin: (origin, cb) => {
@@ -1562,9 +1568,14 @@ app.use(
       return cb(new Error("Not allowed by CORS"));
     },
     credentials: true,
+    methods: ['GET','POST','PATCH','PUT','DELETE','OPTIONS'],
+    allowedHeaders: ['Content-Type','Authorization'],
+    maxAge: 86400,
   })
 );
-app.use(helmet());
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' }
+}));
 app.use(express.json({ limit: "20mb" }));
 app.use(cookieParser()); // 🔐 parse JWT cookie
 
