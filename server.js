@@ -1554,43 +1554,27 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
 const app = express();
 app.set("trust proxy", 1);
 
-// --- CORS (fixed for Safari preflights) ---
-const corsOptions = {
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (CORS_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error("Not allowed by CORS"));
-  },
-  credentials: true,
-  methods: ['GET','HEAD','PUT','PATCH','POST','DELETE','OPTIONS'],
-  // Allow headers Safari often sends in preflight when dev tools “Disable cache” is on
-  allowedHeaders: [
-    'Content-Type',
-    'Authorization',
-    'Cache-Control',
-    'Pragma',
-    'X-Requested-With'
-  ],
-  maxAge: 86400, // cache the preflight
-};
-app.use(cors(corsOptions));
-// ensure ALL routes answer preflight
-app.options('*', cors(corsOptions));
+// CORS + Helmet (Safari-friendly)
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      if (CORS_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error("Not allowed by CORS"));
+    },
+    credentials: true, // ok even if you switch to Bearer; doesn’t hurt
+    methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
+    allowedHeaders: ["Content-Type","Authorization","X-Requested-With"],
+    exposedHeaders: ["Content-Disposition"],
+  })
+);
+// Make sure preflight never fails
+app.options("*", cors());
 
-// --- Helmet (relaxed CORP for APIs) ---
-app.use(helmet({ crossOriginResourcePolicy: false }));
-
-app.use(express.json({ limit: "20mb" }));
-app.use(cookieParser()); // 🔐 parse JWT cookie
-
-// GET no-cache to make polling deterministic
-app.use((req, res, next) => {
-  if (req.method === 'GET') {
-    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-    res.set('Pragma', 'no-cache');
-  }
-  next();
-});
+// Helmet: don’t block cross-origin API usage
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
 
 app.use(fileUpload({ limits: { fileSize: 50 * 1024 * 1024 } }));
 
@@ -1733,12 +1717,33 @@ app.post("/auth/verify", async (req, res) => {
   const role = isAdminAddress(address) ? "admin" : "vendor";
   const token = signJwt({ sub: address, role });
 
+  // Set cookie for browsers that allow it (Chrome), harmless if Safari drops it
   res.cookie("auth_token", token, {
     httpOnly: true,
     secure: true,
     sameSite: "none",
     maxAge: 7 * 24 * 3600 * 1000,
   });
+
+  // best-effort: ensure vendor_profiles row exists
+  try {
+    const w = (address || '').toLowerCase();
+    if (w) {
+      await pool.query(
+        `INSERT INTO vendor_profiles (wallet_address, vendor_name, created_at, updated_at)
+         VALUES ($1, $2, NOW(), NOW())
+         ON CONFLICT (wallet_address) DO NOTHING`,
+        [w, '']
+      );
+    }
+  } catch (e) {
+    console.warn('profile auto-seed failed (non-fatal):', String(e).slice(0,200));
+  }
+
+  nonces.delete(address);
+  // ✅ Return the token so the frontend can use Authorization on Safari
+  res.json({ address, role, token });
+});
 
   // ⬇️ Auto-seed vendor_profiles row (non-fatal if it fails)
   try {
