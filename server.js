@@ -42,7 +42,6 @@ const Joi = require("joi");
 const { Pool } = require("pg");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
-const cors = require('cors'); 
 
 // 🔐 auth utilities
 const cookieParser = require("cookie-parser");
