@@ -1798,11 +1798,15 @@ app.post("/auth/login", async (req, res) => {
 });
 
 app.get("/auth/role", (req, res) => {
+  // ✅ Prefer req.user set by cookie OR Authorization: Bearer (works in Safari)
+  if (req.user) return res.json({ address: req.user.sub, role: req.user.role });
+
+  // legacy cookie fallback
   const token = req.cookies?.auth_token;
   const user = token ? verifyJwt(token) : null;
   if (user) return res.json({ address: user.sub, role: user.role });
 
-  // fallback (keeps current frontend working)
+  // query fallback (unchanged)
   const address = norm(req.query.address);
   if (!address) return res.json({ role: "guest" });
   const role = isAdminAddress(address) ? "admin" : "vendor";
