@@ -40,6 +40,11 @@ const http = require("http");
 const { ethers } = require("ethers");
 const Joi = require("joi");
 const { Pool } = require("pg");
+const { exiftool } = require("exiftool-vendored");
+const os = require("os");
+const fs = require("fs/promises");
+const path = require("path");
+const crypto = require("crypto");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
 
@@ -1247,6 +1252,102 @@ function withTimeout(p, ms, onTimeout) {
     t = setTimeout(() => resolve(typeof onTimeout === 'function' ? onTimeout() : onTimeout), ms);
   });
   return Promise.race([p, timeoutP]).finally(() => clearTimeout(t));
+}
+
+// ==============================
+// Media metadata (EXIF/GPS) from remote URLs
+// ==============================
+const MEDIA_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|tiff?|heic|heif|mp4|mov|avi|m4v)(\?|$)/i;
+
+function isMediaFile(f) {
+  if (!f) return false;
+  const n = String(f.name || f.url || "").toLowerCase();
+  const mt = String(f.mimetype || "").toLowerCase();
+  return MEDIA_EXT_RE.test(n) || mt.startsWith("image/") || mt.startsWith("video/");
+}
+
+/** Convert a file URL to a small metadata object (EXIF/GPS, hashes) */
+async function extractFileMetaFromUrl(file) {
+  try {
+    if (!file?.url) return null;
+
+    // Reuse your existing fetchAsBuffer helper
+    const buf = await fetchAsBuffer(file.url);
+    const sha256 = crypto.createHash("sha256").update(buf).digest("hex");
+
+    // Write to temp for exiftool
+    const bare = (file.name || file.url).split("?")[0];
+    const ext = path.extname(bare) || "";
+    const tmp = path.join(os.tmpdir(), `exif-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
+    await fs.writeFile(tmp, buf);
+
+    let tags = null;
+    try {
+      tags = await withTimeout(exiftool.read(tmp), 4000, () => null);
+    } catch { tags = null; }
+
+    try { await fs.unlink(tmp); } catch {}
+
+    const size = buf.length;
+    const exif = tags ? {
+      make: tags.Make || null,
+      model: tags.Model || null,
+      software: tags.Software || tags.ProcessingSoftware || null,
+      mimeType: tags.MIMEType || tags.MimeType || null,
+      imageWidth: tags.ImageWidth || tags.SourceImageWidth || null,
+      imageHeight: tags.ImageHeight || tags.SourceImageHeight || null,
+      megapixels: tags.Megapixels || null,
+      createDate: tags.DateTimeOriginal || tags.CreateDate || tags.MediaCreateDate || null,
+      modifyDate: tags.ModifyDate || null,
+      gpsLatitude: Number.isFinite(tags.GPSLatitude) ? Number(tags.GPSLatitude) : null,
+      gpsLongitude: Number.isFinite(tags.GPSLongitude) ? Number(tags.GPSLongitude) : null,
+      gpsAltitude: tags.GPSAltitude ?? null,
+      orientation: tags.Orientation || null,
+    } : null;
+
+    const suspectEdits = /photoshop|lightroom|gimp|snapseed|facetune|luminar|picsart|canva|after effects|premiere/i
+      .test(String(exif?.software || ""));
+
+    return {
+      url: file.url,
+      name: file.name || null,
+      mimetype: file.mimetype || null,
+      size,
+      hashSha256: sha256,
+      exif,
+      suspectEdits,
+    };
+  } catch {
+    return {
+      url: file?.url || null,
+      name: file?.name || null,
+      mimetype: file?.mimetype || null,
+      size: null,
+      hashSha256: null,
+      exif: null,
+      suspectEdits: false,
+    };
+  }
+}
+
+/** Summarize an array of metadata objects for LLM context */
+function summarizeMeta(metaArr = []) {
+  const lines = [];
+  for (const m of metaArr.slice(0, 10)) {
+    const parts = [];
+    if (m.exif?.createDate) parts.push(String(m.exif.createDate));
+    if (Number.isFinite(m.exif?.gpsLatitude) && Number.isFinite(m.exif?.gpsLongitude)) {
+      parts.push(`GPS ${m.exif.gpsLatitude.toFixed(6)}, ${m.exif.gpsLongitude.toFixed(6)}`);
+    } else {
+      parts.push(`GPS none`);
+    }
+    const cam = [m.exif?.make, m.exif?.model].filter(Boolean).join(" ");
+    if (cam) parts.push(cam);
+    if (m.exif?.software) parts.push(`Software ${m.exif.software}`);
+    if (m.suspectEdits) parts.push("⚠︎ edited");
+    lines.push(`- ${m.name || "file"} — ${parts.join(" • ")}`);
+  }
+  return lines.join("\n") || "(no EXIF/metadata available)";
 }
 
 // ==============================
@@ -3184,6 +3285,8 @@ if (lastRows[0] && String(lastRows[0].status || '').toLowerCase() === 'approved'
 
     // 3) Normalize proof fields
     const files = Array.isArray(value.files) ? value.files : [];
+    const mediaFiles = files.filter(isMediaFile);
+    const fileMeta = await Promise.all(mediaFiles.map(extractFileMetaFromUrl)).then(a => a.filter(Boolean));
     const legacyText = (value.proof || "").trim();
     const description = (value.description || legacyText || "").trim();
     const title = (value.title || `Proof for Milestone ${milestoneIndex + 1}`).trim();
