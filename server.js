@@ -2717,12 +2717,17 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
         }
       }
 
+      const meta = Array.isArray(pr.file_meta)
+        ? pr.file_meta
+        : (typeof pr.file_meta === "string" ? JSON.parse(pr.file_meta || "[]") : []);
+      const metaNote = summarizeMeta(meta);
       proofsCtx.push({
         milestoneIndex: pr.milestone_index,
         title,
         description: desc,
         files,
         pdfNote,
+        metaNote,
       });
     }
 
@@ -2740,17 +2745,21 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
     // Build chat context with **bid + proofs**
     const ai = coerceJson(bid.ai_analysis);
     const proofsBlock = proofsCtx.length
-      ? proofsCtx.map((p, i) => {
-          const filesList = (p.files || []).map(f => `- ${f.name || 'file'}: ${f.url}`).join('\n') || '(none)';
-          return `
+  ? proofsCtx.map((p, i) => {
+      const filesList = (p.files || []).map(f => `- ${f.name || 'file'}: ${f.url}`).join('\n') || '(none)';
+      return `
 Proof #${i + 1} — Milestone ${Number(p.milestoneIndex) + 1}: ${p.title}
 Description (truncated):
 """${p.description}"""
 Files:
 ${filesList}
+
+IMAGE/VIDEO METADATA:
+${p.metaNote}
+
 ${p.pdfNote}`.trim();
-        }).join('\n\n')
-      : '(no proofs submitted for this bid)';
+    }).join('\n\n')
+  : '(no proofs submitted for this bid)';
 
     const systemContext =
 `You are Agent2 for LithiumX.
@@ -2952,6 +2961,10 @@ app.post('/agent2/chat', adminGuard, async (req, res) => {
       }
     }
     pdfText = pdfText.trim();
+    const meta = Array.isArray(proof?.file_meta)
+      ? proof.file_meta
+      : (typeof proof?.file_meta === "string" ? JSON.parse(proof.file_meta || "[]") : []);
+    const metaBlock = summarizeMeta(meta);
 
     // Build strict context
     const context = [
@@ -2982,6 +2995,9 @@ app.post('/agent2/chat', adminGuard, async (req, res) => {
         description: proofDesc.slice(0, 4000),
         files: files.map(f => ({ name: f.name, url: f.url })),
       }, null, 2),
+            '',
+      '--- IMAGE/VIDEO METADATA ---',
+      metaBlock,
       '',
       pdfText
         ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText.slice(0, 15000)}`
@@ -3292,23 +3308,24 @@ if (lastRows[0] && String(lastRows[0].status || '').toLowerCase() === 'approved'
     const title = (value.title || `Proof for Milestone ${milestoneIndex + 1}`).trim();
     const vendorPrompt = (value.vendorPrompt || value.prompt || "").trim();
 
-    // 4) Insert proof row (pending)
-    const insertQ = `
-      INSERT INTO proofs
-        (bid_id, milestone_index, vendor_name, wallet_address, title, description, files, status, submitted_at, vendor_prompt, updated_at)
-      VALUES
-        ($1,$2,$3,$4,$5,$6,$7,'pending', NOW(), $8, NOW())
-      RETURNING *`;
-    const insertVals = [
-      bidId,
-      milestoneIndex,
-      bid.vendor_name || bid.vendorName || null,
-      bid.wallet_address || bid.walletAddress || null,
-      title,
-      description,
-      JSON.stringify(files),
-      vendorPrompt || null,
-    ];
+    // 4) Insert proof row (pending) — now storing file_meta
+const insertQ = `
+  INSERT INTO proofs
+    (bid_id, milestone_index, vendor_name, wallet_address, title, description, files, file_meta, status, submitted_at, vendor_prompt, updated_at)
+  VALUES
+    ($1,$2,$3,$4,$5,$6,$7,$8,'pending', NOW(), $9, NOW())
+  RETURNING *`;
+const insertVals = [
+  bidId,
+  milestoneIndex,
+  bid.vendor_name || bid.vendorName || null,
+  bid.wallet_address || bid.walletAddress || null,
+  title,
+  description,
+  JSON.stringify(files),
+  JSON.stringify(fileMeta || []),
+  vendorPrompt || "",
+];
     const { rows: pr } = await pool.query(insertQ, insertVals);
     let proofRow = pr[0];
 
