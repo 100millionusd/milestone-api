@@ -4273,35 +4273,13 @@ app.post('/proofs/:id/archive', authRequired, async (req, res) => {
     const pr = rows[0];
     if (!pr) return res.status(404).json({ error: 'Proof not found' });
 
-    // Authorization: admin OR the wallet that owns the bid
-    const caller = String(req.user?.sub || '').toLowerCase();
-    const role   = String(req.user?.role || 'vendor').toLowerCase();
-    const owner  = String(pr.bid_wallet || '').toLowerCase();
-    if (!(role === 'admin' || (caller && caller === owner))) {
+    const isAdmin = (req.user?.role || '').toLowerCase() === 'admin';
+    const caller = (req.user?.sub || '').toLowerCase();
+    if (!isAdmin && caller !== String(pr.bid_wallet || '').toLowerCase()) {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    // Do NOT allow archiving if this is the latest PENDING proof for that milestone
-    const { rows: latest } = await pool.query(
-      `SELECT proof_id, status
-         FROM proofs
-        WHERE bid_id = $1 AND milestone_index = $2
-        ORDER BY submitted_at DESC NULLS LAST,
-                 updated_at  DESC NULLS LAST,
-                 proof_id    DESC
-        LIMIT 1`,
-      [pr.bid_id, pr.milestone_index]
-    );
-    const isLatestPending =
-      latest[0] &&
-      Number(latest[0].proof_id) === proofId &&
-      String(latest[0].status || '').toLowerCase() === 'pending';
-
-    if (isLatestPending) {
-      return res.status(409).json({ error: 'Cannot archive the latest pending proof for this milestone.' });
-    }
-
-    // Flip status to "archived" (re-uses the same status column)
+    // Archive proof
     const { rows: upd } = await pool.query(
       `UPDATE proofs
           SET status = 'archived', updated_at = NOW()
@@ -4309,11 +4287,10 @@ app.post('/proofs/:id/archive', authRequired, async (req, res) => {
         RETURNING *`,
       [proofId]
     );
-
-    return res.json({ ok: true, proof: toCamel(upd[0]) });
+    return res.json(toCamel(upd[0]));
   } catch (e) {
-    console.error('POST /proofs/:id/archive error', e);
-    return res.status(500).json({ error: 'Failed to archive proof' });
+    console.error('/proofs/:id/archive error', e);
+    return res.status(500).json({ error: 'Internal error' });
   }
 });
 
