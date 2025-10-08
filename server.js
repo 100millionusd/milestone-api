@@ -4420,14 +4420,71 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
     const { rows: por } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
     const proposal = por[0] || null;
 
-    // 3) Normalize proof payload
-    const files = Array.isArray(proof.files)
-      ? proof.files
-      : (typeof proof.files === 'string' ? JSON.parse(proof.files || '[]') : []);
-    const meta = Array.isArray(proof.file_meta)
-      ? proof.file_meta
-      : (typeof proof.file_meta === 'string' ? JSON.parse(proof.file_meta || '[]') : []);
-    const metaNote = summarizeMeta(meta);
+// 3) Normalize proof payload (single source of truth)
+const files = Array.isArray(proof?.files)
+  ? proof.files
+  : (typeof proof?.files === 'string' ? JSON.parse(proof.files || '[]') : []);
+
+const meta = Array.isArray(proof?.file_meta)
+  ? proof.file_meta
+  : (typeof proof?.file_meta === 'string' ? JSON.parse(proof.file_meta || '[]') : []);
+
+const metaBlock = summarizeMeta(meta);
+
+// === A) Proof description string ===
+const proofDesc = String(proof?.description || '').trim();
+
+// === B) Extract PDF text from any proof files ===
+let pdfText = '';
+for (const f of files) {
+  if (!f?.url) continue;
+  const info = await waitForPdfInfoFromDoc({ url: f.url, name: f.name || '' });
+  if (info.used && info.text) {
+    pdfText += `\n\n[${f.name || 'file'}]\n${info.text}`;
+  }
+}
+pdfText = pdfText.trim();
+
+// === C) Build location block from AI geo or GPS (+ reverse geocode) ===
+let aiGeo = null;
+try { aiGeo = JSON.parse(proof?.ai_analysis || '{}')?.geo || null; } catch {}
+
+const lat = Number.isFinite(aiGeo?.lat) ? Number(aiGeo.lat)
+          : (Number.isFinite(proof?.gps_lat) ? Number(proof.gps_lat) : null);
+const lon = Number.isFinite(aiGeo?.lon) ? Number(aiGeo.lon)
+          : (Number.isFinite(proof?.gps_lon) ? Number(proof.gps_lon) : null);
+
+let rgeo = null;
+if (Number.isFinite(lat) && Number.isFinite(lon)) {
+  try { rgeo = await reverseGeocode(lat, lon); } catch {}
+}
+
+const loc = {
+  lat, lon,
+  country:  aiGeo?.country  ?? rgeo?.country  ?? null,
+  state:    aiGeo?.state    ?? rgeo?.state    ?? null,
+  county:   aiGeo?.county   ?? rgeo?.county   ?? null,
+  city:     aiGeo?.city     ?? rgeo?.city     ?? null,
+  suburb:   aiGeo?.suburb   ?? rgeo?.suburb   ?? null,
+  postcode: aiGeo?.postcode ?? rgeo?.postcode ?? null,
+  address:  aiGeo?.address  ?? rgeo?.displayName ?? rgeo?.label ?? null,
+  provider: aiGeo?.provider ?? rgeo?.provider ?? rgeo?.source ?? null,
+};
+
+const locationBlock = loc ? [
+  'Known location:',
+  (Number.isFinite(loc.lat) && Number.isFinite(loc.lon))
+    ? `- Coords: ${loc.lat.toFixed(6)}, ${loc.lon.toFixed(6)}`
+    : '- Coords: n/a',
+  loc.address ? `- Address: ${loc.address}` : '',
+  loc.city ? `- City: ${loc.city}` : '',
+  loc.state ? `- State/Region: ${loc.state}` : '',
+  loc.country ? `- Country: ${loc.country}` : '',
+  loc.provider ? `- Source: ${loc.provider}` : '',
+].filter(Boolean).join('\n') : 'Known location: (none)';
+
+// ⬇️ keep your existing line that used to follow metaNote
+const userText = ...
 
     const userText = String(req.body?.message || 'Analyze this proof for completeness and risks.').slice(0, 2000);
 
