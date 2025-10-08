@@ -4801,13 +4801,11 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
           amount_usd,
           status,
           created_at,
-          -- one-line address display
           NULLIF(BTRIM(CONCAT_WS(', ',
             NULLIF(address, ''),
             NULLIF(city, ''),
             NULLIF(country, '')
           )), '') AS addr_display,
-          -- grouping key (prefer wallet, then contact, then org)
           COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) AS entity_key
         FROM proposals
         ${whereSql}
@@ -4858,86 +4856,6 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
       pool.query(listSql, listParams),
       pool.query(countSql, countParams),
     ]);
-
-    // --- Admin: ENTITY actions (body-based; matches frontend) -------------------
-function deriveEntityKey(body = {}) {
-  const id = String(body.id || '').trim().toLowerCase();
-  const wallet = String(body.ownerWallet || body.wallet || '').trim().toLowerCase();
-  const email  = String(body.contactEmail || body.primaryEmail || '').trim().toLowerCase();
-  const org    = String(body.orgName || body.organization || '').trim().toLowerCase();
-  return id || wallet || email || org || null;
-}
-
-app.post('/admin/entities/archive', adminGuard, async (req, res) => {
-  try {
-    const key = deriveEntityKey(req.body);
-    if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
-
-    const { rowCount } = await pool.query(`
-      UPDATE proposals
-         SET status = 'archived'
-       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
-         AND status <> 'archived'
-    `, [key]);
-
-    res.json({ ok: true, affected: rowCount });
-  } catch (e) {
-    console.error('archive entity error', e);
-    res.status(500).json({ error: 'Failed to archive entity' });
-  }
-});
-
-app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
-  try {
-    const key = deriveEntityKey(req.body);
-    if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
-
-    const toStatus = String(req.body?.toStatus || 'pending').toLowerCase();
-    if (!['pending','approved','rejected'].includes(toStatus)) {
-      return res.status(400).json({ error: 'Invalid toStatus' });
-    }
-
-    const { rowCount } = await pool.query(`
-      UPDATE proposals
-         SET status = $2
-       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
-         AND status = 'archived'
-    `, [key, toStatus]);
-
-    res.json({ ok: true, affected: rowCount, toStatus });
-  } catch (e) {
-    console.error('unarchive entity error', e);
-    res.status(500).json({ error: 'Failed to unarchive entity' });
-  }
-});
-
-app.delete('/admin/entities', adminGuard, async (req, res) => {
-  try {
-    const key = deriveEntityKey(req.body);
-    if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
-
-    const mode = String(req.query.mode || 'soft'); // soft | hard
-    if (mode === 'hard') {
-      const { rowCount } = await pool.query(`
-        DELETE FROM proposals
-         WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
-      `, [key]);
-      return res.json({ success: true, deleted: rowCount, mode: 'hard' });
-    }
-
-    const { rowCount } = await pool.query(`
-      UPDATE proposals
-         SET status = 'archived'
-       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
-         AND status <> 'archived'
-    `, [key]);
-
-    res.json({ success: true, archived: rowCount, mode: 'soft' });
-  } catch (e) {
-    console.error('delete entity error', e);
-    res.status(500).json({ error: 'Failed to delete entity' });
-  }
-});
 
     const items = list.rows.map(r => ({
       id: r.entity_key,
@@ -5529,5 +5447,4 @@ app.listen(PORT, () => {
   console.log(`[api] Listening on :${PORT}`);
   console.log(`[api] Admin enforcement: ${ENFORCE_JWT_ADMIN ? "ON" : "OFF"}`);
   console.log(`[api] Vendor scoping:    ${SCOPE_BIDS_FOR_VENDOR ? "ON" : "OFF"}`);
-});
 });
