@@ -192,6 +192,31 @@ const pool = new Pool({
 })();
 
 // ==============================
+// DB bootstrap — required columns for proofs/bids used below
+// ==============================
+(async () => {
+  try {
+    await pool.query(`
+      ALTER TABLE proofs
+        ADD COLUMN IF NOT EXISTS file_meta     jsonb,
+        ADD COLUMN IF NOT EXISTS gps_lat       double precision,
+        ADD COLUMN IF NOT EXISTS gps_lon       double precision,
+        ADD COLUMN IF NOT EXISTS gps_alt       double precision,
+        ADD COLUMN IF NOT EXISTS capture_time  timestamptz,
+        ADD COLUMN IF NOT EXISTS vendor_prompt text,
+        ADD COLUMN IF NOT EXISTS updated_at    timestamptz NOT NULL DEFAULT now();
+    `);
+    await pool.query(`
+      ALTER TABLE bids
+        ADD COLUMN IF NOT EXISTS updated_at    timestamptz NOT NULL DEFAULT now();
+    `);
+    console.log('[db] proofs/bids columns ready');
+  } catch (e) {
+    console.error('proofs/bids columns init failed:', e);
+  }
+})();
+
+// ==============================
 // DB cleanup: collapse duplicate PENDING proofs per (bid, milestone) to the latest
 // and then enforce "at most one PENDING" going forward.
 // ==============================
@@ -229,22 +254,6 @@ const pool = new Pool({
     console.log('[db] duplicate pending proofs cleaned; unique index ready');
   } catch (e) {
     console.error('DB cleanup/index for proofs failed:', e);
-  }
-})();
-
-// ==============================
-// DB bootstrap — proofs: 1 pending per milestone
-// ==============================
-(async () => {
-  try {
-    await pool.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS ux_proofs_pending
-        ON proofs (bid_id, milestone_index)
-      WHERE status = 'pending';
-    `);
-    console.log('[db] ux_proofs_pending ready');
-  } catch (e) {
-    console.error('ux_proofs_pending init failed:', e);
   }
 })();
 
@@ -1259,27 +1268,38 @@ async function fetchAsBuffer(urlStr) {
   const orig = String(urlStr);
 
   function tryOnce(u, headers = {}) {
-    return new Promise((resolve, reject) => {
-      const url = new URL(u);
-      const lib = url.protocol === "https:" ? https : http;
-      const options = {
-        method: "GET",
-        hostname: url.hostname,
-        port: url.port || (url.protocol === "https:" ? 443 : 80),
-        path: url.pathname + url.search,
-        headers,
-      };
-      const req = lib.request(options, (res) => {
-        const code = res.statusCode || 0;
-        if (code >= 400) return reject(new Error(`HTTP ${code} fetching ${u}`));
-        const chunks = [];
-        res.on("data", (d) => chunks.push(d));
-        res.on("end", () => resolve(Buffer.concat(chunks)));
+  return new Promise((resolve, reject) => {
+    const url = new URL(u);
+    const lib = url.protocol === "https:" ? https : http;
+    const options = {
+      method: "GET",
+      hostname: url.hostname,
+      port: url.port || (url.protocol === "https:" ? 443 : 80),
+      path: url.pathname + url.search,
+      headers,
+      timeout: 15000
+    };
+    const req = lib.request(options, (res) => {
+      const code = res.statusCode || 0;
+      if (code >= 400) return reject(new Error(`HTTP ${code} fetching ${u}`));
+      const chunks = [];
+      let total = 0;
+      const CAP = 25 * 1024 * 1024; // 25MB
+      res.on("data", (d) => {
+        total += d.length;
+        if (total > CAP) {
+          req.destroy(new Error("Response too large"));
+          return;
+        }
+        chunks.push(d);
       });
-      req.on("error", reject);
-      req.end();
+      res.on("end", () => resolve(Buffer.concat(chunks)));
     });
-  }
+    req.on("timeout", () => { req.destroy(new Error("Timeout")); });
+    req.on("error", reject);
+    req.end();
+  });
+}
 
   const isDedicated = /\.mypinata\.cloud$/i.test(new URL(orig).hostname);
   const headers = {};
@@ -1761,7 +1781,15 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev_fallback_secret_change_me";
 const ENFORCE_JWT_ADMIN = String(process.env.ENFORCE_JWT_ADMIN || "false").toLowerCase() === "true";
 const SCOPE_BIDS_FOR_VENDOR = String(process.env.SCOPE_BIDS_FOR_VENDOR || "false").toLowerCase() === "true";
 
-const nonces = new Map(); // addressLower -> nonce
+const nonces = new Map(); // addressLower -> { nonce, exp }
+function putNonce(address, nonce) {
+  nonces.set(address, { nonce, exp: Date.now() + 5 * 60 * 1000 }); // 5 min
+}
+function getNonce(address) {
+  const e = nonces.get(address);
+  if (!e || e.exp < Date.now()) { nonces.delete(address); return null; }
+  return e.nonce;
+}
 
 function norm(a) { return String(a || "").trim().toLowerCase(); }
 function isAdminAddress(addr) { return ADMIN_SET.has(norm(addr)); }
@@ -1863,7 +1891,7 @@ app.post("/auth/nonce", (req, res) => {
   const address = norm(req.body?.address);
   if (!address) return res.status(400).json({ error: "address required" });
   const nonce = `LithiumX login nonce: ${Math.floor(Math.random() * 1e9)}`;
-  nonces.set(address, nonce);
+  putNonce(address, nonce);
   res.json({ nonce });
 });
 
@@ -1873,7 +1901,7 @@ app.post("/auth/verify", async (req, res) => {
   const signature = req.body?.signature;
   if (!address || !signature) return res.status(400).json({ error: "address and signature required" });
 
-  const nonce = nonces.get(address);
+  const nonce = getNonce(address);
   if (!nonce) return res.status(400).json({ error: "nonce not found or expired" });
 
   let recovered;
@@ -1918,7 +1946,7 @@ app.get("/auth/nonce", (req, res) => {
   const address = norm(req.query.address);
   if (!address) return res.status(400).json({ error: "address required" });
   const nonce = `LithiumX login nonce: ${Math.floor(Math.random() * 1e9)}`;
-  nonces.set(address, nonce);
+  putNonce(address, nonce);
   res.json({ nonce });
 });
 
@@ -1928,7 +1956,7 @@ app.post("/auth/login", async (req, res) => {
   const signature = req.body?.signature;
   if (!address || !signature) return res.status(400).json({ error: "address and signature required" });
 
-  const nonce = nonces.get(address);
+  const nonce = getNonce(address);
   if (!nonce) return res.status(400).json({ error: "nonce not found or expired" });
 
   let recovered;
@@ -3159,7 +3187,7 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
 // ==============================
 // Routes — Complete/Pay milestone (frontend-compatible)
 // ==============================
-app.post("/bids/:id/complete-milestone", async (req, res) => {
+  app.post("/bids/:id/complete-milestone", adminOrBidOwnerGuard, async (req, res) => {
   const bidId = Number(req.params.id);
   const { milestoneIndex, proof } = req.body || {};
   if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
@@ -3260,6 +3288,9 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
 
     const ms = milestones[milestoneIndex];
     if (!ms.completed) return res.status(400).json({ error: "Milestone not completed" });
+    if (ms.paymentTxHash) {
+  return res.status(409).json({ error: "Milestone already paid" });
+}
 
     // (Your chain send function)
     const receipt = await blockchainService.sendToken(
@@ -3298,7 +3329,7 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
 // ==============================
 // Routes — Proofs (robust, with Agent2)
 // ==============================
-app.post("/proofs", async (req, res) => {
+app.post("/proofs", authRequired, async (req, res) => {
   // Accept legacy & new shapes
   const schema = Joi.object({
     bidId: Joi.number().integer().required(),
@@ -3331,6 +3362,12 @@ app.post("/proofs", async (req, res) => {
     const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
     if (!bids[0]) return res.status(404).json({ error: "Bid not found" });
     const bid = bids[0];
+    const caller = String(req.user?.sub || '').toLowerCase();
+const isAdmin = String(req.user?.role || '').toLowerCase() === 'admin';
+if (!isAdmin && caller !== String(bid.wallet_address || '').toLowerCase()) {
+  return res.status(403).json({ error: "Forbidden" });
+}
+
 
     // 2) Ensure milestoneIndex is valid
     const milestones = Array.isArray(bid.milestones)
@@ -3435,8 +3472,31 @@ const insertVals = [
           bid.proposal_id || bid.proposalId,
         ]);
         const proposal = prj[0] || null;
+        // --- EXIF/GPS prep (uses fileMeta & captureIso computed earlier in this route) ---
+const meta = Array.isArray(fileMeta) ? fileMeta : [];
+const gpsItems = meta.filter(m =>
+  Number.isFinite(m?.exif?.gpsLatitude) && Number.isFinite(m?.exif?.gpsLongitude)
+);
+const gpsCount = gpsItems.length;
+const firstGps = gpsItems[0]
+  ? {
+      lat: Number(gpsItems[0].exif.gpsLatitude),
+      lon: Number(gpsItems[0].exif.gpsLongitude),
+      alt: Number.isFinite(Number(gpsItems[0].exif?.gpsAltitude))
+        ? Number(gpsItems[0].exif.gpsAltitude)
+        : null,
+    }
+  : { lat: null, lon: null, alt: null };
 
-        const basePrompt = `
+const metaBlock = summarizeMeta(meta);
+const capNote = captureIso
+  ? `First capture time (EXIF, ISO8601): ${captureIso}`
+  : 'No capture time in EXIF.';
+const gpsNote = gpsCount
+  ? `GPS present in ${gpsCount} file(s). First fix: ${firstGps.lat}, ${firstGps.lon}${firstGps.alt != null ? ` • alt ${firstGps.alt}m` : ''}`
+  : 'No GPS in submitted media.';
+
+    const basePrompt = `
 You are Agent2. Evaluate a vendor's submitted proof for a specific milestone.
 
 Return strict JSON:
@@ -3445,7 +3505,12 @@ Return strict JSON:
   "evidence": string[],
   "gaps": string[],
   "fit": "low" | "medium" | "high",
-  "confidence": number
+  "confidence": number,
+  "geo": {
+    "gpsCount": number,
+    "firstFix": { "lat": number|null, "lon": number|null, "alt": number|null },
+    "captureTime": string|null
+  }
 }
 
 Context:
@@ -3459,36 +3524,40 @@ Proof description (truncated):
 
 Files:
 ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
-        `.trim();
 
-        const fullPrompt = vendorPrompt ? `${vendorPrompt}\n\n---\n${basePrompt}` : basePrompt;
+MEDIA METADATA (EXIF/GPS summary):
+${metaBlock}
 
-        const resp = await openai.chat.completions.create({
-          model: "gpt-4o-mini",
-          temperature: 0.2,
-          messages: [{ role: "user", content: fullPrompt }],
-          response_format: { type: "json_object" },
-        });
+Hints:
+- ${gpsNote}
+- ${capNote}
+`.trim();
 
-        try {
-          const raw = resp.choices?.[0]?.message?.content || "{}";
-          analysis = JSON.parse(raw);
-        } catch {
-          analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
-        }
-      } else {
-        analysis = {
-          summary: "OpenAI not configured; no automatic proof analysis.",
-          evidence: [],
-          gaps: [],
-          fit: "low",
-          confidence: 0,
-        };
-      }
-    } catch (e) {
-      console.error("Agent2 proof analysis error:", e);
-      analysis = { summary: "Agent2 failed during analysis.", evidence: [], gaps: [], fit: "low", confidence: 0 };
-    }
+// Build full prompt (prepend vendorPrompt if present) and call OpenAI
+const fullPrompt = vendorPrompt ? `${vendorPrompt}\n\n---\n${basePrompt}` : basePrompt;
+
+const resp = await openai.chat.completions.create({
+  model: "gpt-4o-mini",
+  temperature: 0.2,
+  messages: [{ role: "user", content: fullPrompt }],
+  response_format: { type: "json_object" },
+});
+
+try {
+  const raw = resp.choices?.[0]?.message?.content || "{}";
+  analysis = JSON.parse(raw);
+} catch {
+  analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
+}
+
+// If model didn’t include geo, fill it from your computed EXIF/GPS
+if (!analysis.geo) {
+  analysis.geo = {
+    gpsCount,
+    firstFix: firstGps,
+    captureTime: captureIso || null,
+  };
+}
 
 // 6) Save analysis (best-effort)
 try {
@@ -3867,11 +3936,46 @@ app.post('/proofs/:id/analyze', adminGuard, async (req, res) => {
     const { rows: por } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
     const proposal = por[0] || null;
 
-    // 3) Build prompt
+    // 3) Build prompt inputs
     const vendorPrompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
-    const files = Array.isArray(proof.files) ? proof.files : (typeof proof.files === 'string' ? JSON.parse(proof.files || '[]') : []);
+    const files = Array.isArray(proof.files)
+      ? proof.files
+      : (typeof proof.files === 'string' ? JSON.parse(proof.files || '[]') : []);
     const description = String(proof.description || '').slice(0, 2000);
 
+    // --- EXIF/GPS prep from the saved proof row ---
+    const meta = Array.isArray(proof.file_meta)
+      ? proof.file_meta
+      : (typeof proof.file_meta === "string" ? JSON.parse(proof.file_meta || "[]") : []);
+
+    const gpsItems = meta.filter(m =>
+      Number.isFinite(m?.exif?.gpsLatitude) && Number.isFinite(m?.exif?.gpsLongitude)
+    );
+    const gpsCount = gpsItems.length;
+    const firstGps = gpsItems[0]
+      ? {
+          lat: Number(gpsItems[0].exif.gpsLatitude),
+          lon: Number(gpsItems[0].exif.gpsLongitude),
+          alt: Number.isFinite(Number(gpsItems[0].exif?.gpsAltitude))
+            ? Number(gpsItems[0].exif.gpsAltitude)
+            : null,
+        }
+      : { lat: null, lon: null, alt: null };
+
+    const captureIso = proof.capture_time || null; // we saved this on submit
+    const metaBlock = summarizeMeta(meta);
+    const capNote = captureIso
+      ? `First capture time (EXIF, ISO8601): ${captureIso}`
+      : 'No capture time in EXIF.';
+    const gpsNote = gpsCount
+      ? `GPS present in ${gpsCount} file(s). First fix: ${firstGps.lat}, ${firstGps.lon}${firstGps.alt != null ? ` • alt ${firstGps.alt}m` : ''}`
+      : 'No GPS in submitted media.';
+
+    // Milestone info for this proof
+    const msArr = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
+    const ms = msArr[proof.milestone_index] || {};
+
+    // 4) Base prompt (now includes EXIF/GPS + capture time block)
     const basePrompt = `
 You are Agent2. Evaluate a vendor's submitted proof for a specific milestone.
 
@@ -3881,12 +3985,17 @@ Return strict JSON:
   "evidence": string[],
   "gaps": string[],
   "fit": "low" | "medium" | "high",
-  "confidence": number
+  "confidence": number,
+  "geo": {
+    "gpsCount": number,
+    "firstFix": { "lat": number|null, "lon": number|null, "alt": number|null },
+    "captureTime": string|null
+  }
 }
 
 Context:
 - Proposal: ${proposal?.title || "(unknown)"} (${proposal?.org_name || "(unknown)"})
-- Milestone: ${(Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]"))[proof.milestone_index]?.name || "(unknown)"} — $${(Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]"))[proof.milestone_index]?.amount ?? "?"}
+- Milestone: ${ms?.name || "(unknown)"} — $${ms?.amount ?? "?"}
 - Vendor: ${bid.vendor_name || "(unknown)"}
 
 Proof title: ${proof.title || "(untitled)"}
@@ -3895,11 +4004,18 @@ Proof description (truncated):
 
 Files:
 ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
-    `.trim();
+
+MEDIA METADATA (EXIF/GPS summary):
+${metaBlock}
+
+Hints:
+- ${gpsNote}
+- ${capNote}
+`.trim();
 
     const fullPrompt = vendorPrompt ? `${vendorPrompt}\n\n---\n${basePrompt}` : basePrompt;
 
-    // 4) Run OpenAI (or fallback)
+    // 5) Run OpenAI (or fallback)
     let analysis;
     if (!openai) {
       analysis = {
@@ -3908,6 +4024,7 @@ ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
         gaps: [],
         fit: "low",
         confidence: 0,
+        geo: { gpsCount, firstFix: firstGps, captureTime: captureIso || null },
       };
     } else {
       const resp = await openai.chat.completions.create({
@@ -3923,9 +4040,14 @@ ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
       } catch {
         analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
       }
+
+      // Ensure geo always present
+      if (!analysis.geo) {
+        analysis.geo = { gpsCount, firstFix: firstGps, captureTime: captureIso || null };
+      }
     }
 
-    // 5) Save & return
+    // 6) Save & return
     const { rows: upd } = await pool.query(
       'UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2 RETURNING *',
       [JSON.stringify(analysis), proofId]
