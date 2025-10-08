@@ -4253,7 +4253,7 @@ try {
   }
 });
 
-/// --- Vendor-safe: Archive a proof -------------------------------------------
+// --- Vendor-safe: Archive a proof -------------------------------------------
 // POST /proofs/:id/archive
 // Auth: admin OR vendor who owns the bid (wallet matches)
 app.post('/proofs/:id/archive', authRequired, async (req, res) => {
@@ -4265,10 +4265,7 @@ app.post('/proofs/:id/archive', authRequired, async (req, res) => {
   try {
     // Load proof + owning bid (to verify ownership)
     const { rows } = await pool.query(
-      `SELECT p.proof_id,
-              p.bid_id,
-              p.milestone_index,
-              p.status,
+      `SELECT p.proof_id, p.bid_id, p.milestone_index, p.status,
               b.wallet_address AS bid_wallet
          FROM proofs p
          JOIN bids b ON b.bid_id = p.bid_id
@@ -4278,27 +4275,29 @@ app.post('/proofs/:id/archive', authRequired, async (req, res) => {
     const pr = rows[0];
     if (!pr) return res.status(404).json({ error: 'Proof not found' });
 
-    const isAdmin = (req.user?.role || '').toLowerCase() === 'admin';
-    const caller  = (req.user?.sub  || '').toLowerCase();
+    const caller  = String(req.user?.sub || '').toLowerCase();
+    const isAdmin = String(req.user?.role || '').toLowerCase() === 'admin';
+    const owner   = String(pr.bid_wallet || '').toLowerCase();
 
-    if (!isAdmin && caller !== String(pr.bid_wallet || '').toLowerCase()) {
-      return res.status(403).json({ error: 'Forbidden' });
+    if (!isAdmin && !caller) return res.status(401).json({ error: 'Unauthorized' });
+    if (!isAdmin && caller !== owner) return res.status(403).json({ error: 'Forbidden' });
+
+    if (String(pr.status || '').toLowerCase() === 'archived') {
+      return res.json({ ok: true, proof: toCamel(pr) });
     }
 
-    // Archive proof
     const { rows: upd } = await pool.query(
       `UPDATE proofs
-          SET status = 'archived',
-              updated_at = NOW()
+          SET status = 'archived', updated_at = NOW()
         WHERE proof_id = $1
         RETURNING *`,
       [proofId]
     );
 
-    return res.json(toCamel(upd[0]));
+    return res.json({ ok: true, proof: toCamel(upd[0]) });
   } catch (err) {
-    console.error('/proofs/:id/archive error', err);
-    return res.status(500).json({ error: 'Internal error' });
+    console.error('archive proof error:', err);
+    return res.status(500).json({ error: 'Internal error archiving proof' });
   }
 });
 
