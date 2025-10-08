@@ -4301,6 +4301,13 @@ app.post('/proofs/:id/archive', authRequired, async (req, res) => {
   }
 });
 
+// --- graceful shutdown + listen ---
+process.on('SIGINT', async () => {
+  try { await exiftool.end(); } catch {}
+  process.exit(0);
+});
+app.listen(PORT, () => console.log(`[server] listening on ${PORT}`));
+
 // --- Agent2 Chat about a SPECIFIC PROOF (SSE) -------------------------------
 app.all('/proofs/:id/chat', (req, res, next) => {
   if (req.method === 'POST') return next();
