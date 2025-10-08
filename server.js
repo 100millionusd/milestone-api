@@ -2034,6 +2034,15 @@ app.get("/health", async (_req, res) => {
 });
 app.get("/test", (_req, res) => res.json({ ok: true }));
 
+// --- Helper for /admin/entities routes (match org/email/wallet) ---
+function deriveEntityKey(body = {}) {
+  const id     = String(body.id || '').trim().toLowerCase();             // optional internal id
+  const wallet = String(body.ownerWallet || body.wallet || '').trim().toLowerCase();
+  const email  = String(body.contactEmail || body.email || '').trim().toLowerCase();
+  const org    = String(body.orgName || body.organization || '').trim().toLowerCase();
+  return id || wallet || email || org || null;
+}
+
 // ==============================
 // Routes — Proposals
 // ==============================
@@ -2058,6 +2067,84 @@ app.get("/proposals", async (req, res) => {
     res.json(mapRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ==============================
+// Admin — “Entities” (operate over proposals by org/email/wallet)
+// ==============================
+
+// Archive all proposals for a given org/email/wallet
+app.post('/admin/entities/archive', adminGuard, async (req, res) => {
+  try {
+    const key = deriveEntityKey(req.body);
+    if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
+
+    const { rowCount } = await pool.query(`
+      UPDATE proposals
+         SET status = 'archived', updated_at = NOW()
+       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
+         AND status <> 'archived'
+    `, [key]);
+
+    return res.json({ ok: true, affected: rowCount });
+  } catch (e) {
+    console.error('archive entity error', e);
+    return res.status(500).json({ error: 'Failed to archive entity' });
+  }
+});
+
+// Unarchive (set back to a status, default 'pending')
+app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
+  try {
+    const key = deriveEntityKey(req.body);
+    if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
+
+    const toStatus = String(req.body?.toStatus || 'pending').toLowerCase();
+    if (!['pending','approved','rejected'].includes(toStatus)) {
+      return res.status(400).json({ error: 'Invalid toStatus' });
+    }
+
+    const { rowCount } = await pool.query(`
+      UPDATE proposals
+         SET status = $2, updated_at = NOW()
+       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
+         AND status = 'archived'
+    `, [key, toStatus]);
+
+    return res.json({ ok: true, affected: rowCount, toStatus });
+  } catch (e) {
+    console.error('unarchive entity error', e);
+    return res.status(500).json({ error: 'Failed to unarchive entity' });
+  }
+});
+
+// Delete proposals for that entity (mode=soft/hard via ?mode=soft|hard)
+app.delete('/admin/entities', adminGuard, async (req, res) => {
+  try {
+    const key = deriveEntityKey(req.body);
+    if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
+
+    const mode = String(req.query.mode || 'soft').toLowerCase(); // soft | hard
+    if (mode === 'hard') {
+      const { rowCount } = await pool.query(`
+        DELETE FROM proposals
+         WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
+      `, [key]);
+      return res.json({ success: true, deleted: rowCount, mode: 'hard' });
+    }
+
+    const { rowCount } = await pool.query(`
+      UPDATE proposals
+         SET status = 'archived', updated_at = NOW()
+       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
+         AND status <> 'archived'
+    `, [key]);
+
+    return res.json({ success: true, archived: rowCount, mode: 'soft' });
+  } catch (e) {
+    console.error('delete entity error', e);
+    return res.status(500).json({ error: 'Failed to delete entity' });
   }
 });
 
