@@ -1439,6 +1439,43 @@ function summarizeMeta(metaArr = []) {
 }
 
 // ==============================
+// Reverse geocoding (OpenStreetMap Nominatim)
+// ==============================
+async function reverseGeocode(lat, lon) {
+  try {
+    const u = new URL("https://nominatim.openstreetmap.org/reverse");
+    u.search = new URLSearchParams({
+      lat: String(lat),
+      lon: String(lon),
+      format: "jsonv2",
+      addressdetails: "1",
+    });
+
+    // Node 22 has global fetch
+    const r = await fetch(u, {
+      headers: { "User-Agent": "LithiumX/1.0 (ops@yourdomain.tld)" }, // required by Nominatim
+    });
+    if (!r.ok) return null;
+
+    const j = await r.json();
+    const a = j.address || {};
+    return {
+      country: a.country || null,
+      region: a.state || a.region || null,
+      province: a.county || a.province || null,
+      municipality: a.municipality || a.city || a.town || a.village || null,
+      suburb: a.suburb || a.neighbourhood || null,
+      road: a.road || null,
+      postcode: a.postcode || null,
+      displayName: j.display_name || null,
+      source: "nominatim",
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ==============================
 // PDF Extraction (debug-friendly with retries)
 // (functions already above)
 // ==============================
@@ -3516,6 +3553,17 @@ app.post("/proofs", authRequired, async (req, res) => {
 
     const { lat: gpsLat, lon: gpsLon, alt: gpsAlt } = findFirstGps(fileMeta);
     const captureIso = findFirstCaptureIso(fileMeta);
+    // Best-effort reverse geocode (3–4s cap)
+let geoAddress = null;
+if (Number.isFinite(gpsLat) && Number.isFinite(gpsLon)) {
+  try {
+    geoAddress = await withTimeout(
+      reverseGeocode(gpsLat, gpsLon),
+      4000,
+      () => null
+    );
+  } catch {}
+}
 
     const legacyText   = (value.proof || "").trim();
     const description  = (value.description || legacyText || "").trim();
@@ -4107,6 +4155,12 @@ Hints:
         analysis.geo = { gpsCount, firstFix: firstGps, captureTime: captureIso || null };
       }
     }
+    
+    // Attach human-readable location if we got one
+if (geoAddress) {
+  analysis.geo.address = geoAddress;
+}
+
 
     // 6) Save & return
     const { rows: upd } = await pool.query(
