@@ -4294,7 +4294,6 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
     const metaNote = summarizeMeta(meta);
     const userText = String(req.body?.message || 'Analyze this proof for completeness and risks.').slice(0, 2000);
 
-    // Build short text-only context (you can enhance with image URLs similarly to /bids/:id/chat)
     const context = [
       'You are Agent2 for LithiumX.',
       '',
@@ -4345,7 +4344,6 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
       }
     }
 
-    // Optional footer
     const conf = extractConfidenceFromText(full);
     if (conf !== null && conf < 0.35) {
       res.write(`data: \n\n`);
