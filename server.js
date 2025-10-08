@@ -3221,6 +3221,104 @@ app.post('/agent2/chat', adminGuard, async (req, res) => {
       ? proof.file_meta
       : (typeof proof?.file_meta === "string" ? JSON.parse(proof.file_meta || "[]") : []);
     const metaBlock = summarizeMeta(meta);
+    // === LOCATION: extract from bid/proof AI, or fall back to reverse geocode ===
+const coerceJson = (v) => {
+  if (!v) return null;
+  if (typeof v === 'object') return v;
+  try { return JSON.parse(String(v)); } catch { return null; }
+};
+
+const pickGeo = (obj) => {
+  if (!obj) return null;
+  const g = obj.geo || (obj.ai_analysis && obj.ai_analysis.geo) || null;
+  if (!g) return null;
+  const lat = Number.isFinite(g.lat) ? Number(g.lat)
+    : (Number.isFinite(g.firstFix?.lat) ? Number(g.firstFix.lat) : null);
+  const lon = Number.isFinite(g.lon) ? Number(g.lon)
+    : (Number.isFinite(g.firstFix?.lon) ? Number(g.firstFix.lon) : null);
+  return {
+    lat, lon,
+    country: g.country || null,
+    state: g.state || g.region || null,
+    county: g.county || g.province || null,
+    city: g.city || g.municipality || null,
+    suburb: g.suburb || null,
+    postcode: g.postcode || null,
+    address: g.address || g.label || g.displayName || null,
+    provider: g.provider || g.source || null,
+  };
+};
+
+const bidAI  = coerceJson(bid?.ai_analysis);
+const proofAI = coerceJson(proof?.ai_analysis);
+
+let loc = pickGeo(bidAI) || pickGeo(proofAI) || null;
+
+// Fallback: use proof columns or latest proof + reverse geocode
+if (!loc) {
+  let glat = Number(proof?.gps_lat);
+  let glon = Number(proof?.gps_lon);
+
+  if (!Number.isFinite(glat) || !Number.isFinite(glon)) {
+    const { rows: [latestProof] } = await pool.query(
+      'SELECT gps_lat, gps_lon, ai_analysis FROM proofs WHERE bid_id=$1 ORDER BY proof_id DESC LIMIT 1',
+      [bidId]
+    );
+    if (latestProof) {
+      const latestAI = coerceJson(latestProof.ai_analysis);
+      loc = pickGeo(latestAI) || null;
+      if (!loc) {
+        glat = Number(latestProof.gps_lat);
+        glon = Number(latestProof.gps_lon);
+      }
+    }
+  }
+
+  if (!loc && Number.isFinite(glat) && Number.isFinite(glon)) {
+    loc = { lat: glat, lon: glon };
+    try {
+      // ensure reverseGeocode(lat, lon) is in scope (same file or imported)
+      const rg = await reverseGeocode(glat, glon);
+      if (rg) {
+        Object.assign(loc, {
+          address: rg.label || rg.displayName || null,
+          country: rg.country || null,
+          state: rg.state || rg.region || null,
+          county: rg.county || rg.province || null,
+          city: rg.city || rg.municipality || null,
+          suburb: rg.suburb || null,
+          postcode: rg.postcode || null,
+          provider: rg.provider || rg.source || 'nominatim',
+        });
+      }
+    } catch {}
+  }
+}
+
+const locationBlock = loc ? [
+  'Known location:',
+  (Number.isFinite(loc.lat) && Number.isFinite(loc.lon))
+    ? `- Coords: ${loc.lat.toFixed(6)}, ${loc.lon.toFixed(6)}`
+    : '- Coords: n/a',
+  loc.address ? `- Address: ${loc.address}` : '',
+  loc.city ? `- City: ${loc.city}` : '',
+  loc.state ? `- State/Region: ${loc.state}` : '',
+  loc.country ? `- Country: ${loc.country}` : '',
+  loc.provider ? `- Source: ${loc.provider}` : '',
+].filter(Boolean).join('\n') : 'Known location: (none)';
+
+// If the user is asking for location, answer directly
+if (/(^|\b)(where|location|country|city|address|coords?)\b/i.test(String(message))) {
+  if (loc && (loc.address || loc.city || loc.country || (Number.isFinite(loc.lat) && Number.isFinite(loc.lon)))) {
+    const line = [
+      loc.address || [loc.city, loc.state, loc.country].filter(Boolean).join(', '),
+      (Number.isFinite(loc.lat) && Number.isFinite(loc.lon)) ? `(${loc.lat.toFixed(6)}, ${loc.lon.toFixed(6)})` : null
+    ].filter(Boolean).join(' ');
+    return res.json({ reply: line || 'Location available but not fully specified.' });
+  } else {
+    return res.json({ reply: 'No location available in the proof or bid context.' });
+  }
+}
 
     // Build strict context
     const context = [
@@ -4453,35 +4551,48 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
 
     // 4) Create context block
     const context = [
-      'You are Agent2 for LithiumX.',
-      '',
-      '--- PROPOSAL ---',
-      JSON.stringify({
-        org: proposal?.org_name || '',
-        title: proposal?.title || '',
-        summary: proposal?.summary || '',
-        budgetUSD: proposal?.amount_usd ?? 0,
-      }, null, 2),
-      '',
-      '--- BID ---',
-      JSON.stringify({
-        vendor: bid.vendor_name || '',
-        priceUSD: bid.price_usd ?? 0,
-        days: bid.days ?? 0,
-        notes: bid.notes || '',
-        milestoneIndex: proof.milestone_index
-      }, null, 2),
-      '',
-      '--- PROOF ---',
-      JSON.stringify({
-        title: proof.title || '',
-        description: String(proof.description || '').slice(0, 2000),
-        files: files.map(f => ({ name: f.name, url: f.url })),
-      }, null, 2),
-      '',
-      '--- IMAGE/VIDEO METADATA ---',
-      metaNote,
-    ].join('\n');
+  'You are Agent 2 for LithiumX.',
+  'Answer ONLY using the provided bid/proposal fields and the submitted proof (description + extracted PDF text).',
+  'If something is not present in that material, say it is not stated in the submitted proof.',
+  '',
+  '--- PROPOSAL ---',
+  JSON.stringify({
+    org: proposal?.org_name || '',
+    title: proposal?.title || '',
+    summary: proposal?.summary || '',
+    budgetUSD: proposal?.amount_usd ?? 0,
+  }, null, 2),
+  '',
+  '--- BID ---',
+  JSON.stringify({
+    vendor: bid.vendor_name || '',
+    priceUSD: bid.price_usd ?? 0,
+    days: bid.days ?? 0,
+    notes: bid.notes || '',
+    milestones: (Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || '[]')),
+  }, null, 2),
+  '',
+  '--- PROOF ---',
+  JSON.stringify({
+    title: proof?.title || '',
+    description: proofDesc.slice(0, 4000),
+    files: files.map(f => ({ name: f.name, url: f.url })),
+  }, null, 2),
+  '',
+  '--- IMAGE/VIDEO METADATA ---',
+  metaBlock,
+  '',
+
+  // >>> INSERTED LINES <<<
+  '--- KNOWN LOCATION ---',
+  locationBlock,
+  '',
+  // <<< END INSERTION <<<
+
+  pdfText
+    ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText.slice(0, 15000)}`
+    : `--- NO PDF TEXT AVAILABLE ---`,
+].join('\n');
 
     // 5) Choose vision vs text model
     let stream;
