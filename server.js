@@ -4243,14 +4243,10 @@ app.all('/proofs/:id/chat', (req, res, next) => {
 
 // NOTE: keep adminGuard, or relax to adminOrBidOwnerGuard if vendors should access their own proofs.
 app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
-  if (!openai) {
-    return res.status(503).json({ error: 'OpenAI not configured' });
-  }
+  if (!openai) return res.status(503).json({ error: 'OpenAI not configured' });
 
   const proofId = Number(req.params.id);
-  if (!Number.isFinite(proofId)) {
-    return res.status(400).json({ error: 'Invalid proof id' });
-  }
+  if (!Number.isFinite(proofId)) return res.status(400).json({ error: 'Invalid proof id' });
 
   // SSE headers
   res.set({
@@ -4261,39 +4257,44 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
   try {
-    // Load proof
+    // 1) Load proof
     const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
-    if (!pr[0]) {
+    const proof = pr[0];
+    if (!proof) {
       res.write(`data: ERROR Proof not found\n\n`);
       res.write(`data: [DONE]\n\n`);
       return res.end();
     }
-    const proof = pr[0];
 
-    // Load bid + proposal for context
+    // 2) Load bid + proposal
     const { rows: br } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [proof.bid_id]);
-    if (!br[0]) {
-      res.write(`data: ERROR Bid not found\n\n`);
+    const bid = br[0];
+    if (!bid) {
+      res.write(`data: ERROR Bid not found for proof\n\n`);
       res.write(`data: [DONE]\n\n`);
       return res.end();
     }
-    const bid = br[0];
 
     const { rows: por } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
     const proposal = por[0] || null;
 
-    // Normalize files + meta
+    // 3) Normalize proof payload
     const files = Array.isArray(proof.files)
       ? proof.files
       : (typeof proof.files === 'string' ? JSON.parse(proof.files || '[]') : []);
-
     const meta = Array.isArray(proof.file_meta)
       ? proof.file_meta
       : (typeof proof.file_meta === 'string' ? JSON.parse(proof.file_meta || '[]') : []);
-
     const metaNote = summarizeMeta(meta);
+
     const userText = String(req.body?.message || 'Analyze this proof for completeness and risks.').slice(0, 2000);
 
+    // Gather any images from proof; also BEFORE images from proposal docs (if present)
+    const proposalImages = collectProposalImages(proposal);
+    const proofImages = files.filter(isImageFile);
+    const hasAnyImages = proposalImages.length > 0 || proofImages.length > 0;
+
+    // 4) Create context block
     const context = [
       'You are Agent2 for LithiumX.',
       '',
@@ -4317,7 +4318,7 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
       '--- PROOF ---',
       JSON.stringify({
         title: proof.title || '',
-        description: String(proof.description || '').slice(0, 1200),
+        description: String(proof.description || '').slice(0, 2000),
         files: files.map(f => ({ name: f.name, url: f.url })),
       }, null, 2),
       '',
@@ -4325,16 +4326,75 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
       metaNote,
     ].join('\n');
 
-    const stream = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.2,
-      stream: true,
-      messages: [
-        { role: 'system', content: 'Be concise. Cite specific items from the provided proof context. If something is missing, say so.' },
-        { role: 'user', content: `${userText}\n\n--- CONTEXT ---\n${context}` },
-      ],
-    });
+    // 5) Choose vision vs text model
+    let stream;
+    if (hasAnyImages) {
+      const beforeImgs = proposalImages.slice(0, 6);
+      const afterImgs  = proofImages.slice(0, 6);
 
+      const systemMsg = `
+You are Agent2 for LithiumX.
+
+You CAN analyze the attached images (URLs). You CANNOT browse the web or reverse-image-search.
+
+Task: Compare "BEFORE" (proposal) vs "AFTER" (proof) images to assess progress/changes and possible image reuse.
+
+ALWAYS provide:
+1) 1–2 sentence conclusion (done/partial/unclear).
+2) Bullets with:
+   • Evidence (visual cues, materials, measurements, signage, timestamps)
+   • Differences/Progress
+   • Possible reuse/duplicates
+   • Inconsistencies (warped text/repetitive textures)
+   • OCR snippets (short)
+   • Fit-to-proof (does AFTER match the milestone claim?)
+   • Next checks
+   • Confidence [0–1]
+
+Be concrete and cite visible cues.`.trim();
+
+      const content = [
+        { type: 'text', text: `User request: ${userText}\n\nCompare BEFORE (proposal docs) vs AFTER (proof) images.` },
+      ];
+
+      if (beforeImgs.length) {
+        content.push({ type: 'text', text: 'BEFORE (from proposal):' });
+        for (const f of beforeImgs) content.push({ type: 'image_url', image_url: { url: f.url } });
+      } else {
+        content.push({ type: 'text', text: 'BEFORE: (none)' });
+      }
+
+      if (afterImgs.length) {
+        content.push({ type: 'text', text: 'AFTER (from proof):' });
+        for (const f of afterImgs) content.push({ type: 'image_url', image_url: { url: f.url } });
+      } else {
+        content.push({ type: 'text', text: 'AFTER: (none)' });
+      }
+
+      content.push({ type: 'text', text: `\n\n--- CONTEXT ---\n${context}` });
+
+      stream = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.2,
+        stream: true,
+        messages: [
+          { role: 'system', content: systemMsg },
+          { role: 'user', content },
+        ],
+      });
+    } else {
+      stream = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.2,
+        stream: true,
+        messages: [
+          { role: 'system', content: 'Be concise. Cite specific items from the provided proof context.' },
+          { role: 'user', content: `${userText}\n\n--- CONTEXT ---\n${context}` },
+        ],
+      });
+    }
+
+    // 6) Stream tokens
     let full = '';
     for await (const part of stream) {
       const token = part?.choices?.[0]?.delta?.content || '';
@@ -4344,11 +4404,24 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
       }
     }
 
+    // 7) Footer: low-confidence hint + next checks
     const conf = extractConfidenceFromText(full);
+    const nextChecks = buildNextChecks({
+      hasAnyPdfText: false,
+      imageCount: proofImages.length,
+      ocrSeen: /[A-Za-z0-9]{3,}/.test(full || '')
+    });
+
     if (conf !== null && conf < 0.35) {
       res.write(`data: \n\n`);
       res.write(`data: 🔎 Needs human review (low confidence: ${conf.toFixed(2)})\n\n`);
     }
+    if (nextChecks.length) {
+      res.write(`data: \n\n`);
+      res.write(`data: Next checks:\n\n`);
+      for (const item of nextChecks) res.write(`data: • ${item}\n\n`);
+    }
+
     res.write(`data: [DONE]\n\n`);
     res.end();
   } catch (err) {
