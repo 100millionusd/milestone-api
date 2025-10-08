@@ -4301,11 +4301,61 @@ app.post('/proofs/:id/archive', authRequired, async (req, res) => {
   }
 });
 
+// --- Agent2 Chat about a SPECIFIC PROOF (SSE) -------------------------------
+app.all('/proofs/:id/chat', (req, res, next) => {
+  if (req.method === 'POST') return next();
+  if (req.method === 'OPTIONS') {
+    res.set('Allow', 'POST, OPTIONS');
+    return res.sendStatus(204);
+  }
+  res.set('Allow', 'POST, OPTIONS');
+  return res.status(405).json({ error: 'Method Not Allowed. Use POST /proofs/:id/chat.' });
+});
+
+// NOTE: keep adminGuard, or relax to adminOrBidOwnerGuard if vendors should access their own proofs.
+app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
+  if (!openai) return res.status(503).json({ error: 'OpenAI not configured' });
+
+  const proofId = Number(req.params.id);
+  if (!Number.isFinite(proofId)) return res.status(400).json({ error: 'Invalid proof id' });
+
+  // SSE headers
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+  });
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+  try {
+    const { rows } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
+    const proof = rows[0];
+    if (!proof) {
+      res.write(`data: ERROR Proof not found\n\n`);
+      res.write(`data: [DONE]\n\n`);
+      return res.end();
+    }
+
+    // Minimal placeholder stream (compile-safe). Swap in your real logic later.
+    res.write(`data: Chat connected for proof ${proofId}\n\n`);
+    res.write(`data: [DONE]\n\n`);
+    res.end();
+  } catch (err) {
+    console.error('proof chat SSE error:', err);
+    try {
+      res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`);
+      res.write(`data: [DONE]\n\n`);
+      res.end();
+    } catch {}
+  }
+});
+
 // --- graceful shutdown + listen ---
 process.on('SIGINT', async () => {
   try { await exiftool.end(); } catch {}
   process.exit(0);
 });
+
 app.listen(PORT, () => console.log(`[server] listening on ${PORT}`));
 
 // --- Agent2 Chat about a SPECIFIC PROOF (SSE) -------------------------------
