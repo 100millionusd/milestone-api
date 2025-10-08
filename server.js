@@ -1439,46 +1439,82 @@ function summarizeMeta(metaArr = []) {
 }
 
 // ==============================
-// Reverse geocoding (OpenStreetMap Nominatim)
+// Reverse Geocode (country / city label from GPS)
+// Uses OpenCage if OPENCAGE_API_KEY is set; falls back to Nominatim
 // ==============================
 async function reverseGeocode(lat, lon) {
-  try {
-    const u = new URL("https://nominatim.openstreetmap.org/reverse");
-    u.search = new URLSearchParams({
-      lat: String(lat),
-      lon: String(lon),
-      format: "jsonv2",
-      addressdetails: "1",
-    });
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
 
-    // Node 22 has global fetch
-    const r = await fetch(u, {
-      headers: { "User-Agent": "LithiumX/1.0 (ops@yourdomain.tld)" }, // required by Nominatim
-    });
-    if (!r.ok) return null;
+  // 1) OpenCage (recommended: set OPENCAGE_API_KEY)
+  const ocKey = (process.env.OPENCAGE_API_KEY || '').trim();
+  if (ocKey) {
+    try {
+      const url = `https://api.opencagedata.com/geocode/v1/json?q=${encodeURIComponent(lat + ',' + lon)}&key=${ocKey}&no_annotations=1&language=en`;
+      const { status, body } = await sendRequest("GET", url, { Accept: "application/json" });
+      if (status >= 200 && status < 300) {
+        const json = JSON.parse(body || "{}");
+        const comp = json?.results?.[0]?.components || {};
+        const label = json?.results?.[0]?.formatted || null;
 
-    const j = await r.json();
-    const a = j.address || {};
-    return {
-      country: a.country || null,
-      region: a.state || a.region || null,
-      province: a.county || a.province || null,
-      municipality: a.municipality || a.city || a.town || a.village || null,
-      suburb: a.suburb || a.neighbourhood || null,
-      road: a.road || null,
-      postcode: a.postcode || null,
-      displayName: j.display_name || null,
-      source: "nominatim",
-    };
-  } catch {
-    return null;
+        const city =
+          comp.city || comp.town || comp.village || comp.hamlet || comp.municipality || comp.locality || null;
+        const state = comp.state || comp.region || comp.province || null;
+        const country = comp.country || null;
+        const postcode = comp.postcode || null;
+
+        return {
+          provider: "opencage",
+          label,
+          country,
+          state,
+          county: comp.county || null,
+          city,
+          suburb: comp.suburb || comp.neighbourhood || null,
+          postcode,
+        };
+      }
+    } catch (_) {}
   }
-}
 
-// ==============================
-// PDF Extraction (debug-friendly with retries)
-// (functions already above)
-// ==============================
+  // 2) Nominatim fallback (requires a UA; be a good citizen)
+  try {
+    const ua = process.env.NOMINATIM_UA || "LithiumX/1.0 (admin@yourdomain.com)";
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&zoom=14&addressdetails=1`;
+    const { status, body } = await sendRequest(
+      "GET",
+      url,
+      { Accept: "application/json", "User-Agent": ua },
+      null
+    );
+    if (status >= 200 && status < 300) {
+      const json = JSON.parse(body || "{}");
+      const a = json?.address || {};
+
+      const city =
+        a.city || a.town || a.village || a.hamlet || a.municipality || a.locality || null;
+      const state = a.state || a.region || a.province || null;
+      const country = a.country || null;
+      const postcode = a.postcode || null;
+
+      // best-effort readable label
+      const bits = [city, state, country].filter(Boolean);
+      const label = bits.join(", ") || json?.display_name || null;
+
+      return {
+        provider: "nominatim",
+        label,
+        country,
+        state,
+        county: a.county || null,
+        city,
+        suburb: a.suburb || a.neighbourhood || null,
+        postcode,
+      };
+    }
+  } catch (_) {}
+
+  return null;
+}
 
 // ==============================
 // Blockchain service
@@ -3453,9 +3489,6 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
 // ==============================
 // Routes — Proofs (robust, with Agent2)
 // ==============================
-// ==============================
-// Routes — Proofs (robust, with Agent2)
-// ==============================
 app.post("/proofs", authRequired, async (req, res) => {
   // Accept legacy & new shapes
   const schema = Joi.object({
@@ -3553,16 +3586,10 @@ app.post("/proofs", authRequired, async (req, res) => {
 
     const { lat: gpsLat, lon: gpsLon, alt: gpsAlt } = findFirstGps(fileMeta);
     const captureIso = findFirstCaptureIso(fileMeta);
-    // Best-effort reverse geocode (3–4s cap)
-let geoAddress = null;
+   // Reverse geocode once if we have GPS
+let rgeo = null;
 if (Number.isFinite(gpsLat) && Number.isFinite(gpsLon)) {
-  try {
-    geoAddress = await withTimeout(
-      reverseGeocode(gpsLat, gpsLon),
-      4000,
-      () => null
-    );
-  } catch {}
+  try { rgeo = await reverseGeocode(gpsLat, gpsLon); } catch {}
 }
 
     const legacyText   = (value.proof || "").trim();
@@ -4072,6 +4099,13 @@ app.post('/proofs/:id/analyze', adminGuard, async (req, res) => {
       : { lat: null, lon: null, alt: null };
 
     const captureIso = proof.capture_time || null; // we saved this on submit
+    const lat = Number.isFinite(firstGps?.lat) ? firstGps.lat : (Number.isFinite(proof.gps_lat) ? Number(proof.gps_lat) : null);
+const lon = Number.isFinite(firstGps?.lon) ? firstGps.lon : (Number.isFinite(proof.gps_lon) ? Number(proof.gps_lon) : null);
+
+let rgeo = null;
+if (Number.isFinite(lat) && Number.isFinite(lon)) {
+  try { rgeo = await reverseGeocode(lat, lon); } catch {}
+}
     const metaBlock = summarizeMeta(meta);
     const capNote = captureIso
       ? `First capture time (EXIF, ISO8601): ${captureIso}`
@@ -4124,43 +4158,67 @@ Hints:
 
     const fullPrompt = vendorPrompt ? `${vendorPrompt}\n\n---\n${basePrompt}` : basePrompt;
 
-    // 5) Run OpenAI (or fallback)
-    let analysis;
-    if (!openai) {
-      analysis = {
-        summary: "OpenAI not configured; no automatic proof analysis.",
-        evidence: [],
-        gaps: [],
-        fit: "low",
-        confidence: 0,
-        geo: { gpsCount, firstFix: firstGps, captureTime: captureIso || null },
-      };
-    } else {
-      const resp = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        temperature: 0.2,
-        messages: [{ role: "user", content: fullPrompt }],
-        response_format: { type: "json_object" },
-      });
+// 5) Run OpenAI (or fallback)
+let analysis;
+if (!openai) {
+  analysis = {
+    summary: "OpenAI not configured; no automatic proof analysis.",
+    evidence: [],
+    gaps: [],
+    fit: "low",
+    confidence: 0,
+    geo: { gpsCount, firstFix: firstGps, captureTime: captureIso || null },
+  };
+} else {
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0.2,
+    messages: [{ role: "user", content: fullPrompt }],
+    response_format: { type: "json_object" },
+  });
 
-      try {
-        const raw = resp.choices?.[0]?.message?.content || "{}";
-        analysis = JSON.parse(raw);
-      } catch {
-        analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
-      }
+  try {
+    const raw = resp.choices?.[0]?.message?.content || "{}";
+    analysis = JSON.parse(raw);
+  } catch {
+    analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
+  }
+} // ← end else
 
-      // Ensure geo always present
-      if (!analysis.geo) {
-        analysis.geo = { gpsCount, firstFix: firstGps, captureTime: captureIso || null };
-      }
-    }
-    
-    // Attach human-readable location if we got one
-if (geoAddress) {
-  analysis.geo.address = geoAddress;
+// ↓↓↓ THIS BLOCK GOES OUTSIDE the else, before the DB UPDATE ↓↓↓
+
+// Ensure geo always present
+if (!analysis.geo) {
+  analysis.geo = { gpsCount, firstFix: firstGps, captureTime: captureIso || null };
 }
 
+// Attach GPS + human-readable location (uses the `lat`/`lon` you computed above)
+analysis.geo.lat = Number.isFinite(lat) ? lat : (analysis.geo.lat ?? null);
+analysis.geo.lon = Number.isFinite(lon) ? lon : (analysis.geo.lon ?? null);
+if (captureIso && !analysis.geo.captureTime) analysis.geo.captureTime = captureIso;
+
+if (rgeo) {
+  Object.assign(analysis.geo, {
+    // handle either new {provider,label} or older {source,displayName}
+    provider: rgeo.provider || rgeo.source || null,
+    address:  rgeo.label || rgeo.displayName || null,
+    country:  rgeo.country ?? null,
+    state:    rgeo.state || rgeo.region || null,
+    county:   rgeo.county || rgeo.province || null,
+    city:     rgeo.city || rgeo.municipality || null,
+    suburb:   rgeo.suburb ?? null,
+    postcode: rgeo.postcode ?? null,
+  });
+}
+
+// (optional) add a readable line to the summary
+const locBits = [analysis.geo.city, analysis.geo.state, analysis.geo.country].filter(Boolean);
+if (locBits.length) {
+  const locLine = `Location: ${locBits.join(", ")} (${analysis.geo.lat?.toFixed?.(6)}, ${analysis.geo.lon?.toFixed?.(6)})`;
+  if (!String(analysis.summary || "").includes(locLine)) {
+    analysis.summary = `${analysis.summary ? analysis.summary.trim() + "\n\n" : ""}${locLine}`;
+  }
+}
 
     // 6) Save & return
     const { rows: upd } = await pool.query(
