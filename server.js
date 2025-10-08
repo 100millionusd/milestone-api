@@ -4161,6 +4161,7 @@ app.post('/proofs/:id/analyze', adminGuard, async (req, res) => {
     const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
     const proof = pr[0];
     if (!proof) return res.status(404).json({ error: 'Proof not found' });
+    const proofDesc = String(proof.description || '').trim();
 
     // 2) Load bid + proposal for context
     const { rows: br } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [proof.bid_id]);
