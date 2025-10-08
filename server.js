@@ -67,6 +67,11 @@ const PINATA_API_KEY = (process.env.PINATA_API_KEY || "").trim();
 const PINATA_SECRET_API_KEY = (process.env.PINATA_SECRET_API_KEY || "").trim();
 const PINATA_GATEWAY = process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud";
 
+// Optional: dedicated gateway auth + public fallback
+const PINATA_JWT = (process.env.PINATA_JWT || "").trim();                     // your Pinata JWT (works on dedicated gateways)
+const PINATA_GATEWAY_TOKEN = (process.env.PINATA_GATEWAY_TOKEN || "").trim(); // or a Gateway Subdomain Token
+const PINATA_PUBLIC_GATEWAY = process.env.PINATA_PUBLIC_GATEWAY || "https://gateway.pinata.cloud/ipfs/";
+
 // OpenAI client (supports project-scoped keys)
 const openai = (() => {
   const key = (process.env.OPENAI_API_KEY || "").trim();
@@ -1229,20 +1234,83 @@ function sendRequest(method, urlStr, headers = {}, body = null) {
   });
 }
 
-/** Fetch a URL into a Buffer */
+// If PINATA_PUBLIC_GATEWAY is a full URL (e.g. https://gateway.pinata.cloud/ipfs/),
+// rewrite /ipfs/<cid>/... to that base. Otherwise treat it as a bare hostname.
+function rewriteToGateway(u, base) {
+  try {
+    const m = String(u).match(/\/ipfs\/([^/]+)(\/.*)?$/i);
+    if (!m) return u;
+    const cid  = m[1];
+    const rest = m[2] || "";
+    const b    = base.replace(/\/+$/, "/");
+    return b.startsWith("http")
+      ? b + cid + rest
+      : (new URL(u)).toString().replace((new URL(u)).hostname, b);
+  } catch { return u; }
+}
+
+function toPublicGateway(u) {
+  const pub = process.env.PINATA_PUBLIC_GATEWAY || "https://gateway.pinata.cloud/ipfs/";
+  return rewriteToGateway(u, pub);
+}
+
+/** Fetch a URL into a Buffer (supports mypinata.cloud auth + public fallbacks) */
 async function fetchAsBuffer(urlStr) {
-  return new Promise((resolve, reject) => {
-    const lib = urlStr.startsWith("https:") ? https : http;
-    const req = lib.get(urlStr, (res) => {
-      if (res.statusCode && res.statusCode >= 400) {
-        return reject(new Error(`HTTP ${res.statusCode} fetching ${urlStr}`));
-      }
-      const chunks = [];
-      res.on("data", (d) => chunks.push(d));
-      res.on("end", () => resolve(Buffer.concat(chunks)));
+  const orig = String(urlStr);
+
+  function tryOnce(u, headers = {}) {
+    return new Promise((resolve, reject) => {
+      const url = new URL(u);
+      const lib = url.protocol === "https:" ? https : http;
+      const options = {
+        method: "GET",
+        hostname: url.hostname,
+        port: url.port || (url.protocol === "https:" ? 443 : 80),
+        path: url.pathname + url.search,
+        headers,
+      };
+      const req = lib.request(options, (res) => {
+        const code = res.statusCode || 0;
+        if (code >= 400) return reject(new Error(`HTTP ${code} fetching ${u}`));
+        const chunks = [];
+        res.on("data", (d) => chunks.push(d));
+        res.on("end", () => resolve(Buffer.concat(chunks)));
+      });
+      req.on("error", reject);
+      req.end();
     });
-    req.on("error", reject);
-  });
+  }
+
+  const isDedicated = /\.mypinata\.cloud$/i.test(new URL(orig).hostname);
+  const headers = {};
+
+  // If it’s a dedicated Pinata subdomain, send auth if available
+  if (isDedicated) {
+    if (PINATA_JWT)           headers["Authorization"] = `Bearer ${PINATA_JWT}`;
+    if (PINATA_GATEWAY_TOKEN) headers["x-pinata-gateway-token"] = PINATA_GATEWAY_TOKEN;
+  }
+
+  // 1) Try original URL (with headers for dedicated gateway)
+  try {
+    return await tryOnce(orig, headers);
+  } catch (e) {
+    // 2) Fall back to public gateways
+    const candidates = [
+      toPublicGateway(orig),
+      rewriteToGateway(orig, "https://ipfs.io/ipfs/"),
+      rewriteToGateway(orig, "https://cf-ipfs.com/ipfs/"),
+      rewriteToGateway(orig, "https://dweb.link/ipfs/"),
+    ];
+    let lastErr = e;
+    for (const u of candidates) {
+      try {
+        return await tryOnce(u);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr;
+  }
 }
 
 /** Promise.race timeout helper */
@@ -1272,7 +1340,7 @@ async function extractFileMetaFromUrl(file) {
     if (!file?.url) return null;
 
     // Reuse your existing fetchAsBuffer helper
-    const buf = await fetchAsBuffer(file.url);
+    const buf = await fetchAsBuffer(toPublicGateway(file.url));
     const sha256 = crypto.createHash("sha256").update(buf).digest("hex");
 
     // Write to temp for exiftool
@@ -3303,6 +3371,30 @@ if (lastRows[0] && String(lastRows[0].status || '').toLowerCase() === 'approved'
     const files = Array.isArray(value.files) ? value.files : [];
     const mediaFiles = files.filter(isMediaFile);
     const fileMeta = await Promise.all(mediaFiles.map(extractFileMetaFromUrl)).then(a => a.filter(Boolean));
+    // Derive first GPS + first capture date from fileMeta (if present)
+function findFirstGps(arr = []) {
+  for (const m of arr) {
+    const lat = Number(m?.exif?.gpsLatitude);
+    const lon = Number(m?.exif?.gpsLongitude);
+    if (Number.isFinite(lat) && Number.isFinite(lon)) {
+      const alt = Number.isFinite(Number(m?.exif?.gpsAltitude)) ? Number(m?.exif?.gpsAltitude) : null;
+      return { lat, lon, alt };
+    }
+  }
+  return { lat: null, lon: null, alt: null };
+}
+function findFirstCaptureIso(arr = []) {
+  for (const m of arr) {
+    const raw = m?.exif?.createDate;
+    if (!raw) continue;
+    const norm = String(raw).replace(/^([0-9]{4}):([0-9]{2}):([0-9]{2})\s/, "$1-$2-$3 ");
+    const d = new Date(norm + "Z");
+    if (!Number.isNaN(d.getTime())) return d.toISOString();
+  }
+  return null;
+}
+const { lat: gpsLat, lon: gpsLon, alt: gpsAlt } = findFirstGps(fileMeta);
+const captureIso = findFirstCaptureIso(fileMeta);
     const legacyText = (value.proof || "").trim();
     const description = (value.description || legacyText || "").trim();
     const title = (value.title || `Proof for Milestone ${milestoneIndex + 1}`).trim();
@@ -3311,9 +3403,13 @@ if (lastRows[0] && String(lastRows[0].status || '').toLowerCase() === 'approved'
     // 4) Insert proof row (pending) — now storing file_meta
 const insertQ = `
   INSERT INTO proofs
-    (bid_id, milestone_index, vendor_name, wallet_address, title, description, files, file_meta, status, submitted_at, vendor_prompt, updated_at)
+    (bid_id, milestone_index, vendor_name, wallet_address, title, description,
+     files, file_meta, gps_lat, gps_lon, gps_alt, capture_time,
+     status, submitted_at, vendor_prompt, updated_at)
   VALUES
-    ($1,$2,$3,$4,$5,$6,$7,$8,'pending', NOW(), $9, NOW())
+    ($1,$2,$3,$4,$5,$6,
+     $7,$8,$9,$10,$11,$12,
+     'pending', NOW(), $13, NOW())
   RETURNING *`;
 const insertVals = [
   bidId,
@@ -3324,6 +3420,7 @@ const insertVals = [
   description,
   JSON.stringify(files),
   JSON.stringify(fileMeta || []),
+  gpsLat, gpsLon, gpsAlt, captureIso,      // <-- new derived values
   vendorPrompt || "",
 ];
     const { rows: pr } = await pool.query(insertQ, insertVals);
@@ -3944,40 +4041,6 @@ try {
   } catch (e) {
     console.error("Reject milestone proof failed:", e);
     return res.status(500).json({ error: "Internal error" });
-  }
-});
-
-// --- LIST PROOFS (admin, legacy ?bidId=) -------------------------------
-app.get('/proofs', adminGuard, async (req, res) => {
-  try {
-    const bidId = Number(req.query.bidId);
-    if (!Number.isFinite(bidId)) {
-      return res.status(400).json({ error: 'bidId query param required' });
-    }
-
-    const { rows } = await pool.query(
-      `SELECT
-         proof_id          AS "proofId",
-         bid_id            AS "bidId",
-         milestone_index   AS "milestoneIndex",
-         title,
-         description,
-         files,
-         status,
-         submitted_at      AS "submittedAt",
-         updated_at        AS "updatedAt"
-       FROM proofs
-       WHERE bid_id = $1
-       ORDER BY submitted_at DESC NULLS LAST,
-                updated_at  DESC NULLS LAST,
-                proof_id    DESC`,
-      [bidId]
-    );
-
-    return res.json(rows);
-  } catch (err) {
-    console.error('GET /proofs error', err);
-    return res.status(500).json({ error: 'Server error' });
   }
 });
 
