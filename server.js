@@ -3416,6 +3416,9 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
 // ==============================
 // Routes — Proofs (robust, with Agent2)
 // ==============================
+// ==============================
+// Routes — Proofs (robust, with Agent2)
+// ==============================
 app.post("/proofs", authRequired, async (req, res) => {
   // Accept legacy & new shapes
   const schema = Joi.object({
@@ -3430,13 +3433,10 @@ app.post("/proofs", authRequired, async (req, res) => {
       .items(Joi.object({ name: Joi.string().allow(""), url: Joi.string().uri().required() }))
       .default([])
       .optional(),
-    // accept either name from the client
     prompt: Joi.string().allow("").optional(),
     vendorPrompt: Joi.string().allow("").optional(),
-  })
-  .or('proof', 'description') // Require either proof OR description
-  .messages({
-    'object.missing': 'Must provide either proof (legacy) or description (new format)'
+  }).or("proof", "description").messages({
+    "object.missing": "Must provide either proof (legacy) or description (new format)",
   });
 
   const { error, value } = schema.validate(req.body || {}, { abortEarly: false });
@@ -3445,18 +3445,18 @@ app.post("/proofs", authRequired, async (req, res) => {
   const { bidId, milestoneIndex } = value;
 
   try {
-    // 1) Ensure bid exists
+    // 1) Ensure bid exists & caller allowed
     const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
     if (!bids[0]) return res.status(404).json({ error: "Bid not found" });
     const bid = bids[0];
-    const caller = String(req.user?.sub || '').toLowerCase();
-const isAdmin = String(req.user?.role || '').toLowerCase() === 'admin';
-if (!isAdmin && caller !== String(bid.wallet_address || '').toLowerCase()) {
-  return res.status(403).json({ error: "Forbidden" });
-}
 
+    const caller  = String(req.user?.sub || "").toLowerCase();
+    const isAdmin = String(req.user?.role || "").toLowerCase() === "admin";
+    if (!isAdmin && caller !== String(bid.wallet_address || "").toLowerCase()) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
 
-    // 2) Ensure milestoneIndex is valid
+    // 2) Validate milestone
     const milestones = Array.isArray(bid.milestones)
       ? bid.milestones
       : JSON.parse(bid.milestones || "[]");
@@ -3464,126 +3464,121 @@ if (!isAdmin && caller !== String(bid.wallet_address || '').toLowerCase()) {
       return res.status(400).json({ error: "Invalid milestoneIndex for this bid" });
     }
 
-    // 2.5) Duplicate guards — block if a pending proof exists, or if latest is approved
-// A) Hard block if a pending proof already exists for this milestone
-const { rows: pend } = await pool.query(
-  `SELECT 1 FROM proofs
-    WHERE bid_id=$1 AND milestone_index=$2 AND status='pending'
-    LIMIT 1`,
-  [bidId, milestoneIndex]
-);
-if (pend.length) {
-  return res.status(409).json({ error: 'A proof is already pending review for this milestone.' });
-}
+    // 3) Duplicate guards
+    const { rows: pend } = await pool.query(
+      `SELECT 1 FROM proofs WHERE bid_id=$1 AND milestone_index=$2 AND status='pending' LIMIT 1`,
+      [bidId, milestoneIndex]
+    );
+    if (pend.length) {
+      return res.status(409).json({ error: "A proof is already pending review for this milestone." });
+    }
+    const { rows: lastRows } = await pool.query(
+      `SELECT status
+         FROM proofs
+        WHERE bid_id=$1 AND milestone_index=$2
+        ORDER BY submitted_at DESC NULLS LAST,
+                 updated_at  DESC NULLS LAST,
+                 proof_id    DESC
+        LIMIT 1`,
+      [bidId, milestoneIndex]
+    );
+    if (lastRows[0] && String(lastRows[0].status || "").toLowerCase() === "approved") {
+      return res.status(409).json({ error: "This milestone has already been approved." });
+    }
 
-// B) Block if the latest proof for this milestone is already approved
-const { rows: lastRows } = await pool.query(
-  `SELECT status
-     FROM proofs
-    WHERE bid_id=$1 AND milestone_index=$2
-    ORDER BY submitted_at DESC NULLS LAST,
-             updated_at  DESC NULLS LAST,
-             proof_id    DESC
-    LIMIT 1`,
-  [bidId, milestoneIndex]
-);
-if (lastRows[0] && String(lastRows[0].status || '').toLowerCase() === 'approved') {
-  return res.status(409).json({ error: 'This milestone has already been approved.' });
-}
-
-    // 3) Normalize proof fields
+    // 4) Normalize proof fields
     const files = Array.isArray(value.files) ? value.files : [];
     const mediaFiles = files.filter(isMediaFile);
     const fileMeta = await Promise.all(mediaFiles.map(extractFileMetaFromUrl)).then(a => a.filter(Boolean));
-    // Derive first GPS + first capture date from fileMeta (if present)
-function findFirstGps(arr = []) {
-  for (const m of arr) {
-    const lat = Number(m?.exif?.gpsLatitude);
-    const lon = Number(m?.exif?.gpsLongitude);
-    if (Number.isFinite(lat) && Number.isFinite(lon)) {
-      const alt = Number.isFinite(Number(m?.exif?.gpsAltitude)) ? Number(m?.exif?.gpsAltitude) : null;
-      return { lat, lon, alt };
+
+    // helpers
+    function findFirstGps(arr = []) {
+      for (const m of arr) {
+        const lat = Number(m?.exif?.gpsLatitude);
+        const lon = Number(m?.exif?.gpsLongitude);
+        if (Number.isFinite(lat) && Number.isFinite(lon)) {
+          const alt = Number.isFinite(Number(m?.exif?.gpsAltitude)) ? Number(m?.exif?.gpsAltitude) : null;
+          return { lat, lon, alt };
+        }
+      }
+      return { lat: null, lon: null, alt: null };
     }
-  }
-  return { lat: null, lon: null, alt: null };
-}
-function findFirstCaptureIso(arr = []) {
-  for (const m of arr) {
-    const raw = m?.exif?.createDate;
-    if (!raw) continue;
-    const norm = String(raw).replace(/^([0-9]{4}):([0-9]{2}):([0-9]{2})\s/, "$1-$2-$3 ");
-    const d = new Date(norm + "Z");
-    if (!Number.isNaN(d.getTime())) return d.toISOString();
-  }
-  return null;
-}
-const { lat: gpsLat, lon: gpsLon, alt: gpsAlt } = findFirstGps(fileMeta);
-const captureIso = findFirstCaptureIso(fileMeta);
-    const legacyText = (value.proof || "").trim();
-    const description = (value.description || legacyText || "").trim();
-    const title = (value.title || `Proof for Milestone ${milestoneIndex + 1}`).trim();
+    function findFirstCaptureIso(arr = []) {
+      for (const m of arr) {
+        const raw = m?.exif?.createDate;
+        if (!raw) continue;
+        const norm = String(raw).replace(/^([0-9]{4}):([0-9]{2}):([0-9]{2})\s/, "$1-$2-$3 ");
+        const d = new Date(norm + "Z");
+        if (!Number.isNaN(d.getTime())) return d.toISOString();
+      }
+      return null;
+    }
+
+    const { lat: gpsLat, lon: gpsLon, alt: gpsAlt } = findFirstGps(fileMeta);
+    const captureIso = findFirstCaptureIso(fileMeta);
+
+    const legacyText   = (value.proof || "").trim();
+    const description  = (value.description || legacyText || "").trim();
+    const title        = (value.title || `Proof for Milestone ${milestoneIndex + 1}`).trim();
     const vendorPrompt = (value.vendorPrompt || value.prompt || "").trim();
 
-    // 4) Insert proof row (pending) — now storing file_meta
-const insertQ = `
-  INSERT INTO proofs
-    (bid_id, milestone_index, vendor_name, wallet_address, title, description,
-     files, file_meta, gps_lat, gps_lon, gps_alt, capture_time,
-     status, submitted_at, vendor_prompt, updated_at)
-  VALUES
-    ($1,$2,$3,$4,$5,$6,
-     $7,$8,$9,$10,$11,$12,
-     'pending', NOW(), $13, NOW())
-  RETURNING *`;
-const insertVals = [
-  bidId,
-  milestoneIndex,
-  bid.vendor_name || bid.vendorName || null,
-  bid.wallet_address || bid.walletAddress || null,
-  title,
-  description,
-  JSON.stringify(files),
-  JSON.stringify(fileMeta || []),
-  gpsLat, gpsLon, gpsAlt, captureIso,      // <-- new derived values
-  vendorPrompt || "",
-];
+    // 5) Insert proof row
+    const insertQ = `
+      INSERT INTO proofs
+        (bid_id, milestone_index, vendor_name, wallet_address, title, description,
+         files, file_meta, gps_lat, gps_lon, gps_alt, capture_time,
+         status, submitted_at, vendor_prompt, updated_at)
+      VALUES
+        ($1,$2,$3,$4,$5,$6,
+         $7,$8,$9,$10,$11,$12,
+         'pending', NOW(), $13, NOW())
+      RETURNING *`;
+    const insertVals = [
+      bidId,
+      milestoneIndex,
+      bid.vendor_name || bid.vendorName || null,
+      bid.wallet_address || bid.walletAddress || null,
+      title,
+      description,
+      JSON.stringify(files),
+      JSON.stringify(fileMeta || []),
+      gpsLat, gpsLon, gpsAlt, captureIso,
+      vendorPrompt || "",
+    ];
     const { rows: pr } = await pool.query(insertQ, insertVals);
     let proofRow = pr[0];
 
-    // 5) Try Agent2 analysis (non-fatal)
-    let analysis = null;
+    // 6) (Best-effort) Agent2 analysis + notify
     try {
       if (openai && (vendorPrompt || description || files.length)) {
-        // pull proposal for context
         const { rows: prj } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [
           bid.proposal_id || bid.proposalId,
         ]);
         const proposal = prj[0] || null;
-        // --- EXIF/GPS prep (uses fileMeta & captureIso computed earlier in this route) ---
-const meta = Array.isArray(fileMeta) ? fileMeta : [];
-const gpsItems = meta.filter(m =>
-  Number.isFinite(m?.exif?.gpsLatitude) && Number.isFinite(m?.exif?.gpsLongitude)
-);
-const gpsCount = gpsItems.length;
-const firstGps = gpsItems[0]
-  ? {
-      lat: Number(gpsItems[0].exif.gpsLatitude),
-      lon: Number(gpsItems[0].exif.gpsLongitude),
-      alt: Number.isFinite(Number(gpsItems[0].exif?.gpsAltitude))
-        ? Number(gpsItems[0].exif.gpsAltitude)
-        : null,
-    }
-  : { lat: null, lon: null, alt: null };
 
-const metaBlock = summarizeMeta(meta);
-const capNote = captureIso
-  ? `First capture time (EXIF, ISO8601): ${captureIso}`
-  : 'No capture time in EXIF.';
-const gpsNote = gpsCount
-  ? `GPS present in ${gpsCount} file(s). First fix: ${firstGps.lat}, ${firstGps.lon}${firstGps.alt != null ? ` • alt ${firstGps.alt}m` : ''}`
-  : 'No GPS in submitted media.';
+        const metaBlock = summarizeMeta(fileMeta);
+        const gpsCount = fileMeta.filter(m =>
+          Number.isFinite(m?.exif?.gpsLatitude) && Number.isFinite(m?.exif?.gpsLongitude)
+        ).length;
+        const firstFix = fileMeta.find(m =>
+          Number.isFinite(m?.exif?.gpsLatitude) && Number.isFinite(m?.exif?.gpsLongitude)
+        );
+        const firstGps = firstFix
+          ? {
+              lat: Number(firstFix.exif.gpsLatitude),
+              lon: Number(firstFix.exif.gpsLongitude),
+              alt: Number.isFinite(Number(firstFix?.exif?.gpsAltitude))
+                ? Number(firstFix.exif.gpsAltitude)
+                : null,
+            }
+          : { lat: null, lon: null, alt: null };
 
-    const basePrompt = `
+        const capNote = captureIso ? `First capture time (EXIF, ISO8601): ${captureIso}` : "No capture time in EXIF.";
+        const gpsNote = gpsCount
+          ? `GPS present in ${gpsCount} file(s). First fix: ${firstGps.lat}, ${firstGps.lon}${firstGps.alt != null ? ` • alt ${firstGps.alt}m` : ""}`
+          : "No GPS in submitted media.";
+
+        const basePrompt = `
 You are Agent2. Evaluate a vendor's submitted proof for a specific milestone.
 
 Return strict JSON:
@@ -3620,86 +3615,65 @@ Hints:
 - ${capNote}
 `.trim();
 
-// Build full prompt (prepend vendorPrompt if present) and call OpenAI
-const fullPrompt = vendorPrompt ? `${vendorPrompt}\n\n---\n${basePrompt}` : basePrompt;
+        const fullPrompt = vendorPrompt ? `${vendorPrompt}\n\n---\n${basePrompt}` : basePrompt;
 
-const resp = await openai.chat.completions.create({
-  model: "gpt-4o-mini",
-  temperature: 0.2,
-  messages: [{ role: "user", content: fullPrompt }],
-  response_format: { type: "json_object" },
-});
+        const resp = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          temperature: 0.2,
+          messages: [{ role: "user", content: fullPrompt }],
+          response_format: { type: "json_object" },
+        });
 
-try {
-  const raw = resp.choices?.[0]?.message?.content || "{}";
-  analysis = JSON.parse(raw);
-} catch {
-  analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
-}
+        let analysis;
+        try {
+          const raw = resp.choices?.[0]?.message?.content || "{}";
+          analysis = JSON.parse(raw);
+        } catch {
+          analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
+        }
+        if (!analysis.geo) {
+          analysis.geo = { gpsCount, firstFix: firstGps, captureTime: captureIso || null };
+        }
 
-// If model didn’t include geo, fill it from your computed EXIF/GPS
-if (!analysis.geo) {
-  analysis.geo = {
-    gpsCount,
-    firstFix: firstGps,
-    captureTime: captureIso || null,
-  };
-}
+        await pool.query(
+          "UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2",
+          [JSON.stringify(analysis), proofRow.proof_id]
+        );
+        proofRow.ai_analysis = analysis;
 
-// 6) Save analysis (best-effort)
-try {
-  await pool.query(
-    "UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2",
-    [ JSON.stringify(analysis), proofRow.proof_id ]
-  );
-  proofRow.ai_analysis = analysis;
-} catch (e) {
-  console.error("Failed to save ai_analysis for proof:", e);
-}
+        // notify if suspicious
+        if (shouldNotify(analysis)) {
+          try {
+            const { rows: prj2 } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [
+              bid.proposal_id || bid.proposalId,
+            ]);
+            const proposal2 = prj2[0] || null;
+            await notifyProofFlag({ proof: proofRow, bid, proposal: proposal2, analysis });
+          } catch (e) {
+            console.warn("notifyProofFlag failed (non-fatal):", String(e).slice(0, 200));
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Agent2 analysis skipped:", String(e).slice(0, 200));
+    }
 
-// [NOTIFY] If the analysis looks suspicious, ping admins & vendor
-try {
-  const notifyEnabled = String(process.env.NOTIFY_ENABLED ?? "true").toLowerCase() !== "false";
-  const decision = shouldNotify(analysis);
-  console.log("[/proofs notify] enabled=%s fit=%s conf=%s shouldNotify=%s",
-    notifyEnabled, String(analysis?.fit || 'n/a'), String(analysis?.confidence ?? 'n/a'), decision);
-
-  if (notifyEnabled && decision) {
-    const { rows: prj } = await pool.query(
-      "SELECT * FROM proposals WHERE proposal_id=$1",
-      [ bid.proposal_id || bid.proposalId ]
-    );
-    const proposal = prj[0] || null;
-
-    await notifyProofFlag({ proof: proofRow, bid, proposal, analysis });
-    console.log("[/proofs notify] sent for proof_id=%s", proofRow.proof_id);
-  } else {
-    console.log("[/proofs notify] skipped");
-  }
-} catch (e) {
-  console.warn("notifyProofFlag failed (non-fatal):", String(e).slice(0,200));
-}
-
-    // 7) Also stamp a simple proof note back to the bid milestone for quick view
+    // 7) Stamp a simple proof note back to milestones for quick view
     const ms = milestones;
     ms[milestoneIndex] = {
       ...(ms[milestoneIndex] || {}),
-      proof:
-        description ||
-        (files.length ? `Files:\n${files.map((f) => f.url).join("\n")}` : "") ||
-        legacyText,
+      proof: description || (files.length ? `Files:\n${files.map((f) => f.url).join("\n")}` : "") || legacyText,
     };
     await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(ms), bidId]);
 
-// 8) Done
-  return res.status(201).json(toCamel(proofRow));
-} catch (err) {
-  console.error("POST /proofs error:", err);
-  // return a safe 400 with guidance
-  return res
-    .status(400)
-    .json({ error: "Invalid /proofs request. Check bidId, milestoneIndex, and payload format." });
-}
+    // 8) Done
+    return res.status(201).json(toCamel(proofRow));
+  } catch (err) {
+    console.error("POST /proofs error:", err);
+    return res
+      .status(400)
+      .json({ error: "Invalid /proofs request. Check bidId, milestoneIndex, and payload format." });
+  }
 });
 
 // Normalized proofs feed for admin UI (newest first, camelCase fields)
