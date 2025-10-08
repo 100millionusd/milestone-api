@@ -4483,9 +4483,6 @@ const locationBlock = loc ? [
   loc.provider ? `- Source: ${loc.provider}` : '',
 ].filter(Boolean).join('\n') : 'Known location: (none)';
 
-// ⬇️ keep your existing line that used to follow metaNote
-const userText = ...
-
     const userText = String(req.body?.message || 'Analyze this proof for completeness and risks.').slice(0, 2000);
 
     // Gather any images from proof; also BEFORE images from proposal docs (if present)
