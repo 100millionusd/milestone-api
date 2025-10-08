@@ -3605,14 +3605,14 @@ try {
     await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(ms), bidId]);
 
     // 8) Done
-    return res.status(201).json(toCamel(proofRow));
-  } catch (err) {
-    console.error("POST /proofs error:", err);
-    // return a safe 400 with guidance
-    return res
-      .status(400)
-      .json({ error: "Invalid /proofs request. Check bidId, milestoneIndex, and payload format." });
-  }
+  return res.status(201).json(toCamel(proofRow));
+} catch (err) {
+  console.error("POST /proofs error:", err);
+  // return a safe 400 with guidance
+  return res
+    .status(400)
+    .json({ error: "Invalid /proofs request. Check bidId, milestoneIndex, and payload format." });
+}
 });
 
 // Normalized proofs feed for admin UI (newest first, camelCase fields)
