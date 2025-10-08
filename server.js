@@ -4241,14 +4241,16 @@ app.all('/proofs/:id/chat', (req, res, next) => {
   return res.status(405).json({ error: 'Method Not Allowed. Use POST /proofs/:id/chat.' });
 });
 
-// You can relax auth to adminOrBidOwnerGuard if you want vendors to chat about their own proofs.
+// NOTE: keep adminGuard, or relax to adminOrBidOwnerGuard if vendors should access their own proofs.
 app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
-  if (!openai) return res.status(503).json({ error: 'OpenAI not configured' });
+  if (!openai) {
+    return res.status(503).json({ error: 'OpenAI not configured' });
+  }
 
   const proofId = Number(req.params.id);
-  if (!Number.isFinite(proofId)) return res.status(400).json({ error: 'Invalid proof id' });
-
-  const userMessages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+  if (!Number.isFinite(proofId)) {
+    return res.status(400).json({ error: 'Invalid proof id' });
+  }
 
   // SSE headers
   res.set({
@@ -4259,48 +4261,42 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
   try {
-    // 1) Load proof, bid, proposal
+    // Load proof
     const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
+    if (!pr[0]) {
+      res.write(`data: ERROR Proof not found\n\n`);
+      res.write(`data: [DONE]\n\n`);
+      return res.end();
+    }
     const proof = pr[0];
-    if (!proof) { res.write(`data: ERROR Proof not found\n\n`); res.write(`data: [DONE]\n\n`); return res.end(); }
 
+    // Load bid + proposal for context
     const { rows: br } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [proof.bid_id]);
+    if (!br[0]) {
+      res.write(`data: ERROR Bid not found\n\n`);
+      res.write(`data: [DONE]\n\n`);
+      return res.end();
+    }
     const bid = br[0];
-    if (!bid) { res.write(`data: ERROR Bid not found for proof\n\n`); res.write(`data: [DONE]\n\n`); return res.end(); }
 
     const { rows: por } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
     const proposal = por[0] || null;
 
-    // 2) Normalize proof files and extract PDF text (best-effort)
+    // Normalize files + meta
     const files = Array.isArray(proof.files)
       ? proof.files
       : (typeof proof.files === 'string' ? JSON.parse(proof.files || '[]') : []);
 
-    // collect images from this proof
-    const imageFiles = [];
-    for (const f of files) { if (isImageFile(f)) imageFiles.push(f); }
+    const meta = Array.isArray(proof.file_meta)
+      ? proof.file_meta
+      : (typeof proof.file_meta === 'string' ? JSON.parse(proof.file_meta || '[]') : []);
 
-    let pdfText = '';
-    try {
-      for (const f of files) {
-        const n = (f?.name || f?.url || '').toLowerCase();
-        const isPdf = n.endsWith('.pdf') || n.includes('.pdf?') || (f?.mimetype || '').includes('pdf');
-        if (!isPdf) continue;
-        const info = await withTimeout(
-          waitForPdfInfoFromDoc({ url: f.url, name: f.name || 'attachment.pdf', mimetype: 'application/pdf' }),
-          8000,
-          () => ({ used: false, reason: 'timeout' })
-        );
-        if (info.used && info.text) pdfText += `\n\n[${f.name || 'file'}]\n${info.text}`;
-      }
-    } catch { /* non-fatal */ }
-    pdfText = (pdfText || '').slice(0, 15000);
+    const metaNote = summarizeMeta(meta);
+    const userText = String(req.body?.message || 'Analyze this proof for completeness and risks.').slice(0, 2000);
 
-    // 3) Build concise context for this ONE proof
+    // Build short text-only context (you can enhance with image URLs similarly to /bids/:id/chat)
     const context = [
-      'You are Agent 2 for LithiumX.',
-      'Answer ONLY using the proposal/bid fields and this specific proof (its text + any PDF extract below).',
-      'If the answer is not present, state that it is not in the submitted proof.',
+      'You are Agent2 for LithiumX.',
       '',
       '--- PROPOSAL ---',
       JSON.stringify({
@@ -4316,66 +4312,49 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
         priceUSD: bid.price_usd ?? 0,
         days: bid.days ?? 0,
         notes: bid.notes || '',
-        milestones: (Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || '[]')),
+        milestoneIndex: proof.milestone_index
       }, null, 2),
       '',
       '--- PROOF ---',
       JSON.stringify({
         title: proof.title || '',
-        milestoneIndex: proof.milestone_index,
-        description: String(proof.description || '').slice(0, 4000),
+        description: String(proof.description || '').slice(0, 1200),
         files: files.map(f => ({ name: f.name, url: f.url })),
       }, null, 2),
       '',
-      pdfText ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText}` : `--- NO PDF TEXT AVAILABLE ---`,
+      '--- IMAGE/VIDEO METADATA ---',
+      metaNote,
     ].join('\n');
 
-    // 4) Choose vision vs text
-    let stream;
-    if (imageFiles.length > 0) {
-      const systemMsg = 'Be concise. Use the proof context provided. Perform an image review if images are attached.';
-      const userVisionContent = [
-        { type: 'text', text: `User request: ${String(userMessages.at(-1)?.content || '').trim() || 'Analyze this proof.'}\n\nUse the CONTEXT and analyze ALL attached images.` },
-        ...imageFiles.slice(0, 6).map(f => ({ type: 'image_url', image_url: { url: f.url } })),
-        { type: 'text', text: `\n\n--- CONTEXT ---\n${context}` },
-      ];
-      stream = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.2,
-        stream: true,
-        messages: [
-          { role: 'system', content: systemMsg },
-          { role: 'user', content: userVisionContent },
-        ],
-      });
-    } else {
-      const msgs = [
-        { role: 'system', content: 'Be concise. Use the proof context provided.' },
-        { role: 'user', content: `${String(userMessages.at(-1)?.content || '').trim() || 'Analyze this proof.'}\n\n--- CONTEXT ---\n${context}` },
-      ];
-      stream = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.2,
-        messages: msgs,
-        stream: true,
-      });
-    }
+    const stream = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.2,
+      stream: true,
+      messages: [
+        { role: 'system', content: 'Be concise. Cite specific items from the provided proof context. If something is missing, say so.' },
+        { role: 'user', content: `${userText}\n\n--- CONTEXT ---\n${context}` },
+      ],
+    });
 
-    // === SSE streaming loop (buffer + footer) ===
-    let fullText = '';
+    let full = '';
     for await (const part of stream) {
       const token = part?.choices?.[0]?.delta?.content || '';
       if (token) {
-        fullText += token;
+        full += token;
         res.write(`data: ${token}\n\n`);
       }
     }
 
-    // ---- Post-stream footer (simple) ----
+    // Optional footer
+    const conf = extractConfidenceFromText(full);
+    if (conf !== null && conf < 0.35) {
+      res.write(`data: \n\n`);
+      res.write(`data: 🔎 Needs human review (low confidence: ${conf.toFixed(2)})\n\n`);
+    }
     res.write(`data: [DONE]\n\n`);
     res.end();
   } catch (err) {
-    console.error('Proof chat SSE error:', err);
+    console.error('/proofs/:id/chat SSE error:', err);
     try {
       res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`);
       res.write(`data: [DONE]\n\n`);
