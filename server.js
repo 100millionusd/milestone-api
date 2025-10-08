@@ -4432,7 +4432,7 @@ Be concrete and cite visible cues.`.trim();
       res.end();
     } catch {}
   }
-});
+}); 
 
 // ==============================
 // Routes — Vendor profile (fill once, used in Admin Vendors)
