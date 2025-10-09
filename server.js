@@ -3040,6 +3040,42 @@ app.get('/admin/anchor/candidates', async (req, res) => {
   }
 });
 
+// GET /admin/anchor/periods — what the API's DB thinks is available to anchor
+app.get('/admin/anchor/periods', async (req, res) => {
+  try {
+    const q = `
+      SELECT to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') AS period,
+             COUNT(*) AS cnt
+      FROM bid_audits
+      WHERE leaf_hash IS NOT NULL
+        AND batch_id IS NULL
+      GROUP BY 1
+      ORDER BY 1`;
+    const { rows } = await pool.query(q);
+    res.json({ ok: true, rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// GET /admin/anchor/last — last few audits the API can see
+app.get('/admin/anchor/last', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT audit_id, bid_id,
+             to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS') AS created_utc,
+             (ipfs_cid IS NOT NULL) AS has_ipfs,
+             (leaf_hash IS NOT NULL) AS has_leaf,
+             batch_id
+      FROM bid_audits
+      ORDER BY audit_id DESC
+      LIMIT 10`);
+    res.json({ ok: true, rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 // --- Bid Chat (SSE) ---------------------------------------------------------
 app.all('/bids/:id/chat', (req, res, next) => {
   if (req.method === 'POST') return next();
