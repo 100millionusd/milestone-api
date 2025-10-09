@@ -67,12 +67,12 @@ async function anchorPeriod(pool, periodId) {
   // 1) Collect unbatched leaves for this period (UTC hour)
   const rows = (
     await pool.query(
-      `SELECT id, leaf_hash
+      `SELECT audit_id, leaf_hash
          FROM bid_audits
         WHERE batch_id IS NULL
           AND leaf_hash IS NOT NULL
           AND to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') = $1
-        ORDER BY id ASC`,
+        ORDER BY audit_id ASC`,
       [periodId]
     )
   ).rows;
@@ -126,8 +126,8 @@ async function anchorPeriod(pool, periodId) {
           SET batch_id=$1,
               merkle_index=$2,
               merkle_proof=$3::bytea[]
-        WHERE id=$4`,
-      [batch.id, i, proof, rows[i].id]
+        WHERE audit_id=$4`,
+      [batch.id, i, proof, rows[i].audit_id]
     );
   }
 
@@ -151,12 +151,12 @@ async function finalizeExistingAnchor(pool, periodId, txHash = null) {
   // 1) Load rows for this period (UTC hour), unbatched
   const rows = (
     await pool.query(
-      `SELECT id, leaf_hash
+      `SELECT audit_id, leaf_hash
          FROM bid_audits
         WHERE to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') = $1
           AND leaf_hash IS NOT NULL
           AND batch_id IS NULL
-        ORDER BY id ASC`,
+        ORDER BY audit_id ASC`,
       [periodId]
     )
   ).rows;
@@ -210,8 +210,8 @@ async function finalizeExistingAnchor(pool, periodId, txHash = null) {
           SET batch_id=$1,
               merkle_index=$2,
               merkle_proof=$3::bytea[]
-        WHERE id=$4`,
-      [batch.id, i, proof, rows[i].id]
+        WHERE audit_id=$4`,
+      [batch.id, i, proof, rows[i].audit_id]
     );
   }
 
