@@ -1522,7 +1522,7 @@ async function reverseGeocode(lat, lon) {
 // ==============================
 class BlockchainService {
   constructor() {
-    this.provider = new ethers.JsonRpcProvider(SEPOLIA_RPC_URL);
+    this.provider = new ethers.providers.JsonRpcProvider(SEPOLIA_RPC_URL);
     if (PRIVATE_KEY) {
       const pk = PRIVATE_KEY.startsWith("0x") ? PRIVATE_KEY : `0x${PRIVATE_KEY}`;
       this.signer = new ethers.Wallet(pk, this.provider);
@@ -1536,7 +1536,7 @@ class BlockchainService {
     const token = TOKENS[tokenSymbol];
     const contract = new ethers.Contract(token.address, ERC20_ABI, this.signer);
     const decimals = await contract.decimals();
-    const amt = ethers.parseUnits(amount.toString(), decimals);
+    const amt = ethers.utils.parseUnits(amount.toString(), decimals);
 
     const balance = await contract.balanceOf(this.signer.address);
     if (balance < amt) throw new Error("Insufficient balance");
@@ -1553,7 +1553,7 @@ class BlockchainService {
     const contract = new ethers.Contract(token.address, ERC20_ABI, this.signer);
     const balance = await contract.balanceOf(this.signer.address);
     const decimals = await contract.decimals();
-    return parseFloat(ethers.formatUnits(balance, decimals));
+    return parseFloat(ethers.utils.formatUnits(balance, decimals));
   }
 }
 
