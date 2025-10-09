@@ -47,6 +47,7 @@ const path = require("path");
 const crypto = require("crypto");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
+const { enrichAuditRow } = require('./services/auditPinata');
 
 // 🔐 auth utilities
 const cookieParser = require("cookie-parser");
@@ -2813,12 +2814,12 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
     if (Object.keys(changes).length > 0) {
       const actorWallet = req.user?.sub || null;  // your JWT puts wallet in sub
       const actorRole = req.user?.role || "admin";
-      await pool.query(
-        `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
-         VALUES ($1, $2, $3, $4)`,
-        [bidId, actorWallet, actorRole, changes]
-      );
-    }
+      const ins = await pool.query(
+  'INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes) VALUES ($1, $2, $3, $4) RETURNING id',
+  [bidId, actorWallet, actorRole, changes]
+);
+// fire-and-forget; don’t block user response
+enrichAuditRow(pool, ins.rows[0].id).catch(err => console.error('audit enrich failed:', err));
 
     // Return normalized bid
     return res.json(toCamel(updated));
@@ -2885,17 +2886,70 @@ app.patch("/bids/:id/milestones", adminGuard, async (req, res) => {
     // Audit row
     const actorWallet = req.user?.sub || null;
     const actorRole = req.user?.role || "admin";
-    await pool.query(
-      `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
-       VALUES ($1, $2, $3, $4)`,
-      [bidId, actorWallet, actorRole, { milestones: { from: current.milestones, to: norm } }]
-    );
+    const ins = await pool.query(
+  `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
+   VALUES ($1, $2, $3, $4) RETURNING id`,
+  [bidId, actorWallet, actorRole, { milestones: { from: current.milestones, to: norm } }]
+);
+
+// fire-and-forget enrichment (IPFS + hash)
+enrichAuditRow(pool, ins.rows[0].id).catch(err =>
+  console.error('audit enrich failed:', err)
+);
 
     return res.json(toCamel(upd[0]));
   } catch (err) {
     console.error("PATCH /bids/:id/milestones failed", { bidId, err });
     return res.status(500).json({ error: "Internal error updating milestones" });
   }
+});
+
+// GET /audit?itemType=proposal&itemId=123  OR  /audit?itemType=bid&itemId=456
+app.get('/audit', async (req, res) => {
+  const itemType = String(req.query.itemType || '').toLowerCase();
+  const itemId = Number(req.query.itemId);
+
+  if (!itemType || !Number.isFinite(itemId)) return res.json([]);
+
+  if (itemType === 'bid') {
+    const { rows } = await pool.query(
+      `SELECT created_at, actor_role, actor_wallet, changes, ipfs_cid, batch_id
+       FROM bid_audits WHERE bid_id = $1 ORDER BY created_at DESC`,
+      [itemId]
+    );
+    return res.json(rows.map(r => ({
+      created_at: r.created_at,
+      action: 'update',
+      actor_role: r.actor_role,
+      actor_address: r.actor_wallet,
+      changed_fields: Object.keys(r.changes || {}),
+      ipfs_cid: r.ipfs_cid,
+      batch: r.batch_id ? { id: r.batch_id } : null
+    })));
+  }
+
+  if (itemType === 'proposal') {
+    // join through bids to show all bid audits for this proposal
+    const { rows } = await pool.query(
+      `SELECT ba.created_at, ba.actor_role, ba.actor_wallet, ba.changes, ba.ipfs_cid, ba.batch_id
+       FROM bid_audits ba
+       JOIN bids b ON b.id = ba.bid_id
+       WHERE b.proposal_id = $1
+       ORDER BY ba.created_at DESC`,
+      [itemId]
+    );
+    return res.json(rows.map(r => ({
+      created_at: r.created_at,
+      action: 'update',
+      actor_role: r.actor_role,
+      actor_address: r.actor_wallet,
+      changed_fields: Object.keys(r.changes || {}),
+      ipfs_cid: r.ipfs_cid,
+      batch: r.batch_id ? { id: r.batch_id } : null
+    })));
+  }
+
+  res.json([]);
 });
 
 // --- Bid Chat (SSE) ---------------------------------------------------------
