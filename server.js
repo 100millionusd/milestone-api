@@ -2818,8 +2818,10 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
   'INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes) VALUES ($1, $2, $3, $4) RETURNING id',
   [bidId, actorWallet, actorRole, changes]
 );
+
 // fire-and-forget; don’t block user response
 enrichAuditRow(pool, ins.rows[0].id).catch(err => console.error('audit enrich failed:', err));
+}
 
     // Return normalized bid
     return res.json(toCamel(updated));
