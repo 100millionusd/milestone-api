@@ -2814,13 +2814,12 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
     if (Object.keys(changes).length > 0) {
       const actorWallet = req.user?.sub || null;  // your JWT puts wallet in sub
       const actorRole = req.user?.role || "admin";
-      const ins = await pool.query(
-  'INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes) VALUES ($1, $2, $3, $4) RETURNING id',
+// AFTER (correct)
+const ins = await pool.query(
+  'INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes) VALUES ($1,$2,$3,$4) RETURNING audit_id',
   [bidId, actorWallet, actorRole, changes]
 );
-
-// fire-and-forget; don’t block user response
-enrichAuditRow(pool, ins.rows[0].id).catch(err => console.error('audit enrich failed:', err));
+enrichAuditRow(pool, ins.rows[0].audit_id).catch(/* ... */);
 }
 
     // Return normalized bid
