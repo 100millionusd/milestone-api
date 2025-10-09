@@ -1852,6 +1852,8 @@ const ADMIN_SET = new Set(
     .map((a) => a.trim().toLowerCase())
     .filter(Boolean)
 );
+const ADMIN_OVERRIDE_ADDR = norm(process.env.ADMIN_OVERRIDE_ADDR);
+if (ADMIN_OVERRIDE_ADDR) ADMIN_SET.add(ADMIN_OVERRIDE_ADDR);
 const JWT_SECRET = process.env.JWT_SECRET || "dev_fallback_secret_change_me";
 const ENFORCE_JWT_ADMIN = String(process.env.ENFORCE_JWT_ADMIN || "false").toLowerCase() === "true";
 const SCOPE_BIDS_FOR_VENDOR = String(process.env.SCOPE_BIDS_FOR_VENDOR || "false").toLowerCase() === "true";
