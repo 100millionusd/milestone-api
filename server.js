@@ -2915,40 +2915,74 @@ app.get('/audit', async (req, res) => {
 
   if (itemType === 'bid') {
     const { rows } = await pool.query(
-      `SELECT created_at, actor_role, actor_wallet, changes, ipfs_cid, batch_id
-       FROM bid_audits WHERE bid_id = $1 ORDER BY created_at DESC`,
-      [itemId]
-    );
-    return res.json(rows.map(r => ({
-      created_at: r.created_at,
-      action: 'update',
-      actor_role: r.actor_role,
-      actor_address: r.actor_wallet,
-      changed_fields: Object.keys(r.changes || {}),
-      ipfs_cid: r.ipfs_cid,
-      batch: r.batch_id ? { id: r.batch_id } : null
-    })));
+  `SELECT
+     ba.created_at,
+     ba.actor_role,
+     ba.actor_wallet,
+     ba.changes,
+     ba.ipfs_cid,
+     ba.batch_id,
+     ab.period_id,
+     ab.tx_hash,
+     ab.contract_addr,
+     ab.chain_id
+   FROM bid_audits ba
+   LEFT JOIN audit_batches ab ON ab.id = ba.batch_id
+   WHERE ba.bid_id = $1
+   ORDER BY ba.created_at DESC`,
+  [itemId]
+);
+return res.json(rows.map(r => ({
+  created_at: r.created_at,
+  action: 'update',
+  actor_role: r.actor_role,
+  actor_address: r.actor_wallet,
+  changed_fields: Object.keys(r.changes || {}),
+  ipfs_cid: r.ipfs_cid,
+  batch: r.batch_id ? {
+    period_id: r.period_id,
+    tx_hash: r.tx_hash,
+    contract_addr: r.contract_addr,
+    chain_id: r.chain_id
+  } : null
+})));
   }
 
   if (itemType === 'proposal') {
     // join through bids to show all bid audits for this proposal
     const { rows } = await pool.query(
-      `SELECT ba.created_at, ba.actor_role, ba.actor_wallet, ba.changes, ba.ipfs_cid, ba.batch_id
-       FROM bid_audits ba
-       JOIN bids b ON b.id = ba.bid_id
-       WHERE b.proposal_id = $1
-       ORDER BY ba.created_at DESC`,
-      [itemId]
-    );
-    return res.json(rows.map(r => ({
-      created_at: r.created_at,
-      action: 'update',
-      actor_role: r.actor_role,
-      actor_address: r.actor_wallet,
-      changed_fields: Object.keys(r.changes || {}),
-      ipfs_cid: r.ipfs_cid,
-      batch: r.batch_id ? { id: r.batch_id } : null
-    })));
+  `SELECT
+     ba.created_at,
+     ba.actor_role,
+     ba.actor_wallet,
+     ba.changes,
+     ba.ipfs_cid,
+     ba.batch_id,
+     ab.period_id,
+     ab.tx_hash,
+     ab.contract_addr,
+     ab.chain_id
+   FROM bid_audits ba
+   JOIN bids b ON b.bid_id = ba.bid_id
+   LEFT JOIN audit_batches ab ON ab.id = ba.batch_id
+   WHERE b.proposal_id = $1
+   ORDER BY ba.created_at DESC`,
+  [itemId]
+);
+return res.json(rows.map(r => ({
+  created_at: r.created_at,
+  action: 'update',
+  actor_role: r.actor_role,
+  actor_address: r.actor_wallet,
+  changed_fields: Object.keys(r.changes || {}),
+  ipfs_cid: r.ipfs_cid,
+  batch: r.batch_id ? {
+    period_id: r.period_id,
+    tx_hash: r.tx_hash,
+    contract_addr: r.contract_addr,
+    chain_id: r.chain_id
+  } : null
+})));
   }
 
   res.json([]);
