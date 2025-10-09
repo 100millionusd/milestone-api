@@ -2988,6 +2988,34 @@ return res.json(rows.map(r => ({
   res.json([]);
 });
 
+// GET /admin/anchor?period=YYYY-MM-DDTHH
+// Anchors the specified hour (UTC) on-chain and writes batch/proofs to DB.
+app.get('/admin/anchor', async (req, res) => {
+  try {
+    const period = req.query.period ? String(req.query.period) : periodIdForDate();
+    const out = await anchorPeriod(pool, period);
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// GET /admin/anchor/finalize?period=YYYY-MM-DDTHH&tx=0xTXHASH
+// Use this if you already anchored externally; verifies on-chain root and links DB rows.
+app.get('/admin/anchor/finalize', async (req, res) => {
+  try {
+    const period = String(req.query.period || '');
+    const tx = req.query.tx ? String(req.query.tx) : null;
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}$/.test(period)) {
+      return res.status(400).json({ ok: false, error: 'period must be YYYY-MM-DDTHH (UTC hour)' });
+    }
+    const out = await finalizeExistingAnchor(pool, period, tx);
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 // --- Bid Chat (SSE) ---------------------------------------------------------
 app.all('/bids/:id/chat', (req, res, next) => {
   if (req.method === 'POST') return next();
