@@ -40,6 +40,7 @@ const http = require("http");
 const { ethers } = require("ethers");
 const Joi = require("joi");
 const { Pool } = require("pg");
+const { anchorPeriod, periodIdForDate, finalizeExistingAnchor } = require('./services/anchor');
 const { exiftool } = require("exiftool-vendored");
 const os = require("os");
 const fs = require("fs/promises");
