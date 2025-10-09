@@ -3016,6 +3016,30 @@ app.get('/admin/anchor/finalize', async (req, res) => {
   }
 });
 
+// GET /admin/anchor/candidates?period=YYYY-MM-DDTHH
+app.get('/admin/anchor/candidates', async (req, res) => {
+  try {
+    const period = String(req.query.period || '');
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}$/.test(period)) {
+      return res.status(400).json({ ok: false, error: 'period must be YYYY-MM-DDTHH' });
+    }
+    const { rows } = await pool.query(
+      `SELECT audit_id, bid_id, created_at,
+              (ipfs_cid IS NOT NULL) AS has_ipfs,
+              (leaf_hash IS NOT NULL) AS has_leaf
+         FROM bid_audits
+        WHERE batch_id IS NULL
+          AND leaf_hash IS NOT NULL
+          AND to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') = $1
+        ORDER BY audit_id ASC`,
+      [period]
+    );
+    res.type('application/json').json({ ok: true, period, count: rows.length, rows });
+  } catch (e) {
+    res.status(500).type('application/json').json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 // --- Bid Chat (SSE) ---------------------------------------------------------
 app.all('/bids/:id/chat', (req, res, next) => {
   if (req.method === 'POST') return next();
