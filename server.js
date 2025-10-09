@@ -2921,6 +2921,8 @@ app.get('/audit', async (req, res) => {
      ba.actor_wallet,
      ba.changes,
      ba.ipfs_cid,
+     ba.merkle_index,
+     ba.merkle_proof,
      ba.batch_id,
      ab.period_id,
      ab.tx_hash,
@@ -2939,7 +2941,15 @@ return res.json(rows.map(r => ({
   actor_address: r.actor_wallet,
   changed_fields: Object.keys(r.changes || {}),
   ipfs_cid: r.ipfs_cid,
-  batch: r.batch_id ? {
+  merkle_index: r.merkle_index ?? null,
+  proof: Array.isArray(r.merkle_proof)
+    ? r.merkle_proof.map(buf =>
+        typeof buf === 'string'
+          ? (buf.startsWith('0x') ? buf : '0x' + buf) // if driver returns hex strings
+          : '0x' + Buffer.from(buf).toString('hex')   // if pg returns Buffer objects
+      )
+    : [],
+  batch: r.period_id ? {
     period_id: r.period_id,
     tx_hash: r.tx_hash,
     contract_addr: r.contract_addr,
@@ -2957,6 +2967,8 @@ return res.json(rows.map(r => ({
      ba.actor_wallet,
      ba.changes,
      ba.ipfs_cid,
+     ba.merkle_index,
+     ba.merkle_proof,
      ba.batch_id,
      ab.period_id,
      ab.tx_hash,
@@ -2976,7 +2988,15 @@ return res.json(rows.map(r => ({
   actor_address: r.actor_wallet,
   changed_fields: Object.keys(r.changes || {}),
   ipfs_cid: r.ipfs_cid,
-  batch: r.batch_id ? {
+  merkle_index: r.merkle_index ?? null,
+  proof: Array.isArray(r.merkle_proof)
+    ? r.merkle_proof.map(buf =>
+        typeof buf === 'string'
+          ? (buf.startsWith('0x') ? buf : '0x' + buf) // if driver returns hex strings
+          : '0x' + Buffer.from(buf).toString('hex')   // if pg returns Buffer objects
+      )
+    : [],
+  batch: r.period_id ? {
     period_id: r.period_id,
     tx_hash: r.tx_hash,
     contract_addr: r.contract_addr,
