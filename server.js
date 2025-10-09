@@ -1917,7 +1917,14 @@ function requireRole(role) {
 function adminGuard(req, res, next) {
   if (!ENFORCE_JWT_ADMIN) return next(); // compatibility mode
   if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+
+  // accept admin if current address is in ADMIN_SET (override), even if JWT role is stale
+  const addr = norm(req.user.sub || req.user.address || req.user.walletAddress || "");
+  const isAdminNow = isAdminAddress(addr);
+
+  if (req.user.role !== "admin" && !isAdminNow) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
   next();
 }
 
