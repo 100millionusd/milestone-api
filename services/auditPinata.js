@@ -26,20 +26,21 @@ async function uploadJsonToPinata(json) {
 }
 
 /**
- * Take a bid_audits row id, build a canonical JSON, upload to IPFS,
- * compute keccak hash, and write ipfs_cid + leaf_hash back into the row.
+ * Enrich one bid_audits row: build canonical JSON -> IPFS -> keccak(utf8) -> write ipfs_cid + leaf_hash.
+ * Uses audit_id (NOT id).
  */
 async function enrichAuditRow(pool, auditId) {
   // 1) load the audit row
   const { rows } = await pool.query(
-    `SELECT id, bid_id, actor_wallet, actor_role, changes, created_at
-     FROM bid_audits WHERE id = $1`,
+    `SELECT audit_id, bid_id, actor_wallet, actor_role, changes, created_at
+       FROM bid_audits
+      WHERE audit_id = $1`,
     [auditId]
   );
   if (!rows.length) return;
   const row = rows[0];
 
-  // 2) build a minimal, public-safe event JSON (no PII)
+  // 2) build minimal public-safe JSON
   const changedFields = row.changes && typeof row.changes === 'object'
     ? Object.keys(row.changes)
     : [];
@@ -47,26 +48,29 @@ async function enrichAuditRow(pool, auditId) {
     _schema: 'bid-audit@v1',
     itemType: 'bid',
     itemId: Number(row.bid_id),
-    action: 'update',               // your existing route only logs updates; adjust if you add more
+    action: 'update',
     actorRole: row.actor_role || 'admin',
     actorAddress: row.actor_wallet || null,
     changedFields,
-    changes: row.changes || null,   // keep the minimal diff object you already write
+    changes: row.changes || null,
     createdAt: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString(),
   };
 
   // 3) canonicalize + hash
   const canonical = canonicalize(eventJson);
   const bytes = Buffer.from(canonical, 'utf8');
-  const leafHashHex = keccak256(bytes);                // 0x…
+  const leafHashHex = keccak256(bytes);
   const leafHash = Buffer.from(leafHashHex.slice(2), 'hex');
 
-  // 4) upload to Pinata
+  // 4) upload to IPFS
   const { cid } = await uploadJsonToPinata(eventJson);
 
-  // 5) write back to the same bid_audits row
+  // 5) write back
   await pool.query(
-    `UPDATE bid_audits SET ipfs_cid = $2, leaf_hash = $3 WHERE id = $1`,
+    `UPDATE bid_audits
+        SET ipfs_cid = $2,
+            leaf_hash = $3
+      WHERE audit_id = $1`,
     [auditId, cid, leafHash]
   );
 
