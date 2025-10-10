@@ -40,7 +40,6 @@ const http = require("http");
 const { ethers } = require("ethers");
 const Joi = require("joi");
 const { Pool } = require("pg");
-const { anchorPeriod, periodIdForDate, finalizeExistingAnchor } = require('./services/anchor');
 const { exiftool } = require("exiftool-vendored");
 const os = require("os");
 const fs = require("fs/promises");
@@ -48,7 +47,6 @@ const path = require("path");
 const crypto = require("crypto");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
-const { enrichAuditRow } = require('./services/auditPinata');
 
 // 🔐 auth utilities
 const cookieParser = require("cookie-parser");
@@ -1523,7 +1521,7 @@ async function reverseGeocode(lat, lon) {
 // ==============================
 class BlockchainService {
   constructor() {
-    this.provider = new ethers.providers.JsonRpcProvider(SEPOLIA_RPC_URL);
+    this.provider = new ethers.JsonRpcProvider(SEPOLIA_RPC_URL);
     if (PRIVATE_KEY) {
       const pk = PRIVATE_KEY.startsWith("0x") ? PRIVATE_KEY : `0x${PRIVATE_KEY}`;
       this.signer = new ethers.Wallet(pk, this.provider);
@@ -1537,7 +1535,7 @@ class BlockchainService {
     const token = TOKENS[tokenSymbol];
     const contract = new ethers.Contract(token.address, ERC20_ABI, this.signer);
     const decimals = await contract.decimals();
-    const amt = ethers.utils.parseUnits(amount.toString(), decimals);
+    const amt = ethers.parseUnits(amount.toString(), decimals);
 
     const balance = await contract.balanceOf(this.signer.address);
     if (balance < amt) throw new Error("Insufficient balance");
@@ -1554,7 +1552,7 @@ class BlockchainService {
     const contract = new ethers.Contract(token.address, ERC20_ABI, this.signer);
     const balance = await contract.balanceOf(this.signer.address);
     const decimals = await contract.decimals();
-    return parseFloat(ethers.utils.formatUnits(balance, decimals));
+    return parseFloat(ethers.formatUnits(balance, decimals));
   }
 }
 
@@ -1852,8 +1850,6 @@ const ADMIN_SET = new Set(
     .map((a) => a.trim().toLowerCase())
     .filter(Boolean)
 );
-const ADMIN_OVERRIDE_ADDR = norm(process.env.ADMIN_OVERRIDE_ADDR);
-if (ADMIN_OVERRIDE_ADDR) ADMIN_SET.add(ADMIN_OVERRIDE_ADDR);
 const JWT_SECRET = process.env.JWT_SECRET || "dev_fallback_secret_change_me";
 const ENFORCE_JWT_ADMIN = String(process.env.ENFORCE_JWT_ADMIN || "false").toLowerCase() === "true";
 const SCOPE_BIDS_FOR_VENDOR = String(process.env.SCOPE_BIDS_FOR_VENDOR || "false").toLowerCase() === "true";
@@ -1917,14 +1913,7 @@ function requireRole(role) {
 function adminGuard(req, res, next) {
   if (!ENFORCE_JWT_ADMIN) return next(); // compatibility mode
   if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-
-  // accept admin if current address is in ADMIN_SET (override), even if JWT role is stale
-  const addr = norm(req.user.sub || req.user.address || req.user.walletAddress || "");
-  const isAdminNow = isAdminAddress(addr);
-
-  if (req.user.role !== "admin" && !isAdminNow) {
-    return res.status(403).json({ error: "Forbidden" });
-  }
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Forbidden" });
   next();
 }
 
@@ -2824,13 +2813,12 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
     if (Object.keys(changes).length > 0) {
       const actorWallet = req.user?.sub || null;  // your JWT puts wallet in sub
       const actorRole = req.user?.role || "admin";
-// AFTER (correct)
-const ins = await pool.query(
-  'INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes) VALUES ($1,$2,$3,$4) RETURNING audit_id',
-  [bidId, actorWallet, actorRole, changes]
-);
-enrichAuditRow(pool, ins.rows[0].audit_id).catch(/* ... */);
-}
+      await pool.query(
+        `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
+         VALUES ($1, $2, $3, $4)`,
+        [bidId, actorWallet, actorRole, changes]
+      );
+    }
 
     // Return normalized bid
     return res.json(toCamel(updated));
@@ -2897,211 +2885,16 @@ app.patch("/bids/:id/milestones", adminGuard, async (req, res) => {
     // Audit row
     const actorWallet = req.user?.sub || null;
     const actorRole = req.user?.role || "admin";
-    const ins = await pool.query(
-  `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
-   VALUES ($1, $2, $3, $4) RETURNING id`,
-  [bidId, actorWallet, actorRole, { milestones: { from: current.milestones, to: norm } }]
-);
-
-// fire-and-forget enrichment (IPFS + hash)
-enrichAuditRow(pool, ins.rows[0].id).catch(err =>
-  console.error('audit enrich failed:', err)
-);
+    await pool.query(
+      `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
+       VALUES ($1, $2, $3, $4)`,
+      [bidId, actorWallet, actorRole, { milestones: { from: current.milestones, to: norm } }]
+    );
 
     return res.json(toCamel(upd[0]));
   } catch (err) {
     console.error("PATCH /bids/:id/milestones failed", { bidId, err });
     return res.status(500).json({ error: "Internal error updating milestones" });
-  }
-});
-
-// GET /audit?itemType=proposal&itemId=123  OR  /audit?itemType=bid&itemId=456
-app.get('/audit', async (req, res) => {
-  const itemType = String(req.query.itemType || '').toLowerCase();
-  const itemId = Number(req.query.itemId);
-
-  if (!itemType || !Number.isFinite(itemId)) return res.json([]);
-
-  if (itemType === 'bid') {
-    const { rows } = await pool.query(
-  `SELECT
-     ba.created_at,
-     ba.actor_role,
-     ba.actor_wallet,
-     ba.changes,
-     ba.ipfs_cid,
-     ba.merkle_index,
-     ba.merkle_proof,
-     ba.batch_id,
-     ab.period_id,
-     ab.tx_hash,
-     ab.contract_addr,
-     ab.chain_id
-   FROM bid_audits ba
-   LEFT JOIN audit_batches ab ON ab.id = ba.batch_id
-   WHERE ba.bid_id = $1
-   ORDER BY ba.created_at DESC`,
-  [itemId]
-);
-return res.json(rows.map(r => ({
-  created_at: r.created_at,
-  action: 'update',
-  actor_role: r.actor_role,
-  actor_address: r.actor_wallet,
-  changed_fields: Object.keys(r.changes || {}),
-  ipfs_cid: r.ipfs_cid,
-  merkle_index: r.merkle_index ?? null,
-  proof: Array.isArray(r.merkle_proof)
-    ? r.merkle_proof.map(buf =>
-        typeof buf === 'string'
-          ? (buf.startsWith('0x') ? buf : '0x' + buf) // if driver returns hex strings
-          : '0x' + Buffer.from(buf).toString('hex')   // if pg returns Buffer objects
-      )
-    : [],
-  batch: r.period_id ? {
-    period_id: r.period_id,
-    tx_hash: r.tx_hash,
-    contract_addr: r.contract_addr,
-    chain_id: r.chain_id
-  } : null
-})));
-  }
-
-  if (itemType === 'proposal') {
-    // join through bids to show all bid audits for this proposal
-    const { rows } = await pool.query(
-  `SELECT
-     ba.created_at,
-     ba.actor_role,
-     ba.actor_wallet,
-     ba.changes,
-     ba.ipfs_cid,
-     ba.merkle_index,
-     ba.merkle_proof,
-     ba.batch_id,
-     ab.period_id,
-     ab.tx_hash,
-     ab.contract_addr,
-     ab.chain_id
-   FROM bid_audits ba
-   JOIN bids b ON b.bid_id = ba.bid_id
-   LEFT JOIN audit_batches ab ON ab.id = ba.batch_id
-   WHERE b.proposal_id = $1
-   ORDER BY ba.created_at DESC`,
-  [itemId]
-);
-return res.json(rows.map(r => ({
-  created_at: r.created_at,
-  action: 'update',
-  actor_role: r.actor_role,
-  actor_address: r.actor_wallet,
-  changed_fields: Object.keys(r.changes || {}),
-  ipfs_cid: r.ipfs_cid,
-  merkle_index: r.merkle_index ?? null,
-  proof: Array.isArray(r.merkle_proof)
-    ? r.merkle_proof.map(buf =>
-        typeof buf === 'string'
-          ? (buf.startsWith('0x') ? buf : '0x' + buf) // if driver returns hex strings
-          : '0x' + Buffer.from(buf).toString('hex')   // if pg returns Buffer objects
-      )
-    : [],
-  batch: r.period_id ? {
-    period_id: r.period_id,
-    tx_hash: r.tx_hash,
-    contract_addr: r.contract_addr,
-    chain_id: r.chain_id
-  } : null
-})));
-  }
-
-  res.json([]);
-});
-
-// GET /admin/anchor?period=YYYY-MM-DDTHH
-// Anchors the specified hour (UTC) on-chain and writes batch/proofs to DB.
-app.get('/admin/anchor', async (req, res) => {
-  try {
-    const period = req.query.period ? String(req.query.period) : periodIdForDate();
-    const out = await anchorPeriod(pool, period);
-    res.json({ ok: true, ...out });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// GET /admin/anchor/finalize?period=YYYY-MM-DDTHH&tx=0xTXHASH
-// Use this if you already anchored externally; verifies on-chain root and links DB rows.
-app.get('/admin/anchor/finalize', async (req, res) => {
-  try {
-    const period = String(req.query.period || '');
-    const tx = req.query.tx ? String(req.query.tx) : null;
-    if (!/^\d{4}-\d{2}-\d{2}T\d{2}$/.test(period)) {
-      return res.status(400).json({ ok: false, error: 'period must be YYYY-MM-DDTHH (UTC hour)' });
-    }
-    const out = await finalizeExistingAnchor(pool, period, tx);
-    res.json({ ok: true, ...out });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// GET /admin/anchor/candidates?period=YYYY-MM-DDTHH
-app.get('/admin/anchor/candidates', async (req, res) => {
-  try {
-    const period = String(req.query.period || '');
-    if (!/^\d{4}-\d{2}-\d{2}T\d{2}$/.test(period)) {
-      return res.status(400).json({ ok: false, error: 'period must be YYYY-MM-DDTHH' });
-    }
-    const { rows } = await pool.query(
-      `SELECT audit_id, bid_id, created_at,
-              (ipfs_cid IS NOT NULL) AS has_ipfs,
-              (leaf_hash IS NOT NULL) AS has_leaf
-         FROM bid_audits
-        WHERE batch_id IS NULL
-          AND leaf_hash IS NOT NULL
-          AND to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') = $1
-        ORDER BY audit_id ASC`,
-      [period]
-    );
-    res.type('application/json').json({ ok: true, period, count: rows.length, rows });
-  } catch (e) {
-    res.status(500).type('application/json').json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// GET /admin/anchor/periods — what the API's DB thinks is available to anchor
-app.get('/admin/anchor/periods', async (req, res) => {
-  try {
-    const q = `
-      SELECT to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') AS period,
-             COUNT(*) AS cnt
-      FROM bid_audits
-      WHERE leaf_hash IS NOT NULL
-        AND batch_id IS NULL
-      GROUP BY 1
-      ORDER BY 1`;
-    const { rows } = await pool.query(q);
-    res.json({ ok: true, rows });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// GET /admin/anchor/last — last few audits the API can see
-app.get('/admin/anchor/last', async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT audit_id, bid_id,
-             to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS') AS created_utc,
-             (ipfs_cid IS NOT NULL) AS has_ipfs,
-             (leaf_hash IS NOT NULL) AS has_leaf,
-             batch_id
-      FROM bid_audits
-      ORDER BY audit_id DESC
-      LIMIT 10`);
-    res.json({ ok: true, rows });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
