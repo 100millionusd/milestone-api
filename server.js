@@ -2637,7 +2637,7 @@ return res.status(201).json(toCamel(inserted));
 });
 
 // Approve / award bid (+ notify admin & vendor)
-eq, res) => {
+app.post("/bids/:id/approve", adminGuard, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
 
