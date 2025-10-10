@@ -1344,6 +1344,25 @@ function withTimeout(p, ms, onTimeout) {
   return Promise.race([p, timeoutP]).finally(() => clearTimeout(t));
 }
 
+// ---- AUDIT write helper (single place) ----
+async function writeAudit(bidId, req, changes) {
+  try {
+    const actorWallet = req.user?.sub || req.user?.address || null;
+    const actorRole   = req.user?.role || 'vendor';
+    const { rows } = await pool.query(
+      `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
+       VALUES ($1,$2,$3,$4)
+       RETURNING audit_id`,
+      [Number(bidId), actorWallet, actorRole, changes]
+    );
+    if (typeof enrichAuditRow === 'function') {
+      enrichAuditRow(pool, rows[0].audit_id).catch(() => null); // adds ipfs_cid & leaf_hash
+    }
+  } catch (e) {
+    console.warn('writeAudit failed (non-fatal):', String(e).slice(0,200));
+  }
+}
+
 // ==============================
 // Media metadata (EXIF/GPS) from remote URLs
 // ==============================
@@ -2649,6 +2668,7 @@ app.post("/bids/:id/approve", adminGuard, async (req, res) => {
     );
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
     const bid = rows[0];
+    await writeAudit(id, req, { status: { to: 'approved' } });
 
     // 2) Pull proposal + vendor profile for contacts
     const [{ rows: prjRows }, { rows: vpRows }] = await Promise.all([
@@ -2686,6 +2706,7 @@ app.post("/bids/:id/reject", adminGuard, async (req, res) => {
     );
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
     const bid = rows[0];
+    await writeAudit(id, req, { status: { to: 'rejected' }, reason });
 
     // 2) Pull proposal + vendor profile for contacts
     const [{ rows: prjRows }, { rows: vpRows }] = await Promise.all([
@@ -2973,13 +2994,14 @@ return res.json(rows.map(r => ({
   actor_role: r.actor_role,
   actor_address: r.actor_wallet,
   changed_fields: Object.keys(r.changes || {}),
+  changes: r.changes || {},                 // ← add this line
   ipfs_cid: r.ipfs_cid,
   merkle_index: r.merkle_index ?? null,
   proof: Array.isArray(r.merkle_proof)
     ? r.merkle_proof.map(buf =>
         typeof buf === 'string'
-          ? (buf.startsWith('0x') ? buf : '0x' + buf) // if driver returns hex strings
-          : '0x' + Buffer.from(buf).toString('hex')   // if pg returns Buffer objects
+          ? (buf.startsWith('0x') ? buf : '0x' + buf)
+          : '0x' + Buffer.from(buf).toString('hex')
       )
     : [],
   batch: r.period_id ? {
@@ -3020,13 +3042,14 @@ return res.json(rows.map(r => ({
   actor_role: r.actor_role,
   actor_address: r.actor_wallet,
   changed_fields: Object.keys(r.changes || {}),
+  changes: r.changes || {},                 // ← add this line
   ipfs_cid: r.ipfs_cid,
   merkle_index: r.merkle_index ?? null,
   proof: Array.isArray(r.merkle_proof)
     ? r.merkle_proof.map(buf =>
         typeof buf === 'string'
-          ? (buf.startsWith('0x') ? buf : '0x' + buf) // if driver returns hex strings
-          : '0x' + Buffer.from(buf).toString('hex')   // if pg returns Buffer objects
+          ? (buf.startsWith('0x') ? buf : '0x' + buf)
+          : '0x' + Buffer.from(buf).toString('hex')
       )
     : [],
   batch: r.period_id ? {
@@ -3583,6 +3606,9 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
     if (typeof proof === "string" && proof.trim()) ms.proof = proof.trim();
 
     await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [ JSON.stringify(milestones), bidId ]);
+    await writeAudit(bidId, req, {
+  milestone_completed: { index: milestoneIndex, completionDate: ms.completionDate, proof: !!proof }
+});
 
     // --- BEGIN: approve latest proof for this milestone + notify ---
     if (NOTIFY_ENABLED) {
@@ -3608,6 +3634,7 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
             [ latest.proof_id ]
           );
           const updatedProof = upd[0];
+          await writeAudit(bidId, req, { proof_approved: { index: milestoneIndex, proofId: updatedProof.proof_id } });
 
           // 3) Load proposal and fire the existing "proof approved" notifier
           const { rows: [proposal] } =
@@ -3678,6 +3705,15 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
     ms.paymentDate   = new Date().toISOString();
 
     await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [ JSON.stringify(milestones), bidId ]);
+    
+    await writeAudit(bidId, req, {
+  payment_released: {
+    index: milestoneIndex,
+    amount: ms.amount,
+    token: bid.preferred_stablecoin,
+    txHash: receipt.hash
+  }
+});
 
     // Notify admins + vendor (bilingual)
     if (process.env.NOTIFY_ENABLED === "true") {
@@ -3837,6 +3873,15 @@ if (Number.isFinite(gpsLat) && Number.isFinite(gpsLon)) {
     ];
     const { rows: pr } = await pool.query(insertQ, insertVals);
     let proofRow = pr[0];
+    await writeAudit(bidId, req, {
+  proof_submitted: {
+    index: milestoneIndex,
+    proofId: proofRow.proof_id,
+    files: (files || []).length,
+    hasGps: Number.isFinite(gpsLat) && Number.isFinite(gpsLon)
+  }
+});
+
 
     // 6) (Best-effort) Agent2 analysis + notify
     try {
@@ -3930,6 +3975,14 @@ Hints:
           [JSON.stringify(analysis), proofRow.proof_id]
         );
         proofRow.ai_analysis = analysis;
+        await writeAudit(bidId, req, {
+  proof_analyzed: {
+    index: milestoneIndex,
+    proofId: proofRow.proof_id,
+    fit: analysis?.fit,
+    confidence: analysis?.confidence
+  }
+});
 
         // notify if suspicious
         if (shouldNotify(analysis)) {
@@ -4068,6 +4121,7 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
       [latest.proof_id]
     );
     const updated = rows[0];
+    await writeAudit(bidId, req, { proof_approved: { index: idx, proofId: updated.proof_id } });
 
     // Notify (admins + vendor) if enabled
     if (NOTIFY_ENABLED) {
@@ -4133,6 +4187,7 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) =
     `, [bidId, idx]);
 
     const updated = rows[0];
+    await writeAudit(bidId, req, { proof_rejected: { index: idx, proofId: updated.proof_id, reason } });
     if (!updated) {
       return res.status(404).json({ error: "No proof found for this milestone" });
     }
