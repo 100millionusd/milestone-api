@@ -3680,19 +3680,32 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
     return res.status(400).json({ error: "Invalid milestoneIndex" });
   }
 
+  const client = await pool.connect();
   try {
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
-    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
+    // BEGIN + lock the bid row so two requests can’t pay the same milestone
+    await client.query("BEGIN");
+    const { rows } = await client.query("SELECT * FROM bids WHERE bid_id=$1 FOR UPDATE", [ bidId ]);
+    if (!rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Bid not found" });
+    }
 
     const bid = rows[0];
     const milestones = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
-    if (!milestones[milestoneIndex]) return res.status(400).json({ error: "Milestone index out of range" });
+    if (!milestones[milestoneIndex]) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Milestone index out of range" });
+    }
 
     const ms = milestones[milestoneIndex];
-    if (!ms.completed) return res.status(400).json({ error: "Milestone not completed" });
+    if (!ms.completed) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Milestone not completed" });
+    }
     if (ms.paymentTxHash) {
-  return res.status(409).json({ error: "Milestone already paid" });
-}
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Milestone already paid" });
+    }
 
     // (Your chain send function)
     const receipt = await blockchainService.sendToken(
@@ -3704,18 +3717,19 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
     ms.paymentTxHash = receipt.hash;
     ms.paymentDate   = new Date().toISOString();
 
-    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [ JSON.stringify(milestones), bidId ]);
-    
-    await writeAudit(bidId, req, {
-  payment_released: {
-    index: milestoneIndex,
-    amount: ms.amount,
-    token: bid.preferred_stablecoin,
-    txHash: receipt.hash
-  }
-});
+    await client.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [ JSON.stringify(milestones), bidId ]);
+    await client.query("COMMIT");
 
-    // Notify admins + vendor (bilingual)
+    // --- unchanged: audit, notify, final fetch ---
+    await writeAudit(bidId, req, {
+      payment_released: {
+        index: milestoneIndex,
+        amount: ms.amount,
+        token: bid.preferred_stablecoin,
+        txHash: receipt.hash
+      }
+    });
+
     if (process.env.NOTIFY_ENABLED === "true") {
       const { rows: [proposal] } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ bid.proposal_id ]);
       if (proposal) {
@@ -3732,8 +3746,11 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
     const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
     return res.json(toCamel(updated[0]));
   } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
     console.error("pay-milestone error", err);
     return res.status(500).json({ error: "Internal error paying milestone" });
+  } finally {
+    client.release();
   }
 });
 
