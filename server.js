@@ -3670,7 +3670,6 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
 
 // ==============================
 // Routes — Complete/Pay milestone (frontend-compatible)
-// (replace ONLY the /pay-milestone route below)
 // ==============================
 app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
   const bidId = Number(req.params.id);
@@ -3684,9 +3683,10 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // Prevent concurrent pays for the same (bidId, milestoneIndex)
+    // 🔒 Prevent concurrent pays for the same (bidId, milestoneIndex).
+    // Use the SINGLE-ARG form to avoid the (bigint,bigint) error.
     const { rows: lock } = await client.query(
-      "SELECT pg_try_advisory_xact_lock($1::int, $2::int) AS got",
+      "SELECT pg_try_advisory_xact_lock( ($1::bigint << 32) + $2::bigint ) AS got",
       [bidId, milestoneIndex]
     );
     if (!lock[0]?.got) {
