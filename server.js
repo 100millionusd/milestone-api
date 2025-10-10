@@ -3668,6 +3668,10 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
   }
 });
 
+// ==============================
+// Routes — Complete/Pay milestone (frontend-compatible)
+// (replace ONLY the /pay-milestone route below)
+// ==============================
 app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
   const bidId = Number(req.params.id);
   const { milestoneIndex } = req.body || {};
@@ -3680,9 +3684,9 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // 🚧 HARD STOP: allow only one payment per (bidId, milestoneIndex) in this tx
+    // Prevent concurrent pays for the same (bidId, milestoneIndex)
     const { rows: lock } = await client.query(
-      "SELECT pg_try_advisory_xact_lock($1::bigint, $2::bigint) AS got",
+      "SELECT pg_try_advisory_xact_lock($1::int, $2::int) AS got",
       [bidId, milestoneIndex]
     );
     if (!lock[0]?.got) {
@@ -3690,15 +3694,21 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
       return res.status(409).json({ error: "Payment already in progress or completed" });
     }
 
-    // From here on, only ONE concurrent request can proceed.
-    const { rows } = await client.query("SELECT * FROM bids WHERE bid_id=$1 FOR UPDATE", [ bidId ]);
+    // Lock the bid row while checking/updating
+    const { rows } = await client.query(
+      "SELECT * FROM bids WHERE bid_id=$1 FOR UPDATE",
+      [bidId]
+    );
     if (!rows[0]) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Bid not found" });
     }
 
     const bid = rows[0];
-    const milestones = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
+    const milestones = Array.isArray(bid.milestones)
+      ? bid.milestones
+      : JSON.parse(bid.milestones || "[]");
+
     if (!milestones[milestoneIndex]) {
       await client.query("ROLLBACK");
       return res.status(400).json({ error: "Milestone index out of range" });
@@ -3709,22 +3719,28 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ error: "Milestone not completed" });
     }
+
+    // Idempotent guard under lock
     if (ms.paymentTxHash) {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "Milestone already paid" });
     }
 
-    // 🔗 Send funds
+    // (Your chain send function)
     const receipt = await blockchainService.sendToken(
       bid.preferred_stablecoin,
       bid.wallet_address,
       ms.amount
     );
 
-    // ✅ Mark paid atomically in the same tx
+    // Mark paid inside the same transaction
     ms.paymentTxHash = receipt.hash;
     ms.paymentDate   = new Date().toISOString();
-    await client.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [ JSON.stringify(milestones), bidId ]);
+
+    await client.query(
+      "UPDATE bids SET milestones=$1 WHERE bid_id=$2",
+      [JSON.stringify(milestones), bidId]
+    );
 
     await client.query("COMMIT");
 
@@ -3739,7 +3755,10 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
     });
 
     if (process.env.NOTIFY_ENABLED === "true") {
-      const { rows: [proposal] } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ bid.proposal_id ]);
+      const { rows: [proposal] } = await pool.query(
+        "SELECT * FROM proposals WHERE proposal_id=$1",
+        [bid.proposal_id]
+      );
       if (proposal) {
         await notifyPaymentReleased({
           bid,
@@ -3751,7 +3770,10 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
       }
     }
 
-    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
+    const { rows: updated } = await pool.query(
+      "SELECT * FROM bids WHERE bid_id=$1",
+      [bidId]
+    );
     return res.json(toCamel(updated[0]));
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
