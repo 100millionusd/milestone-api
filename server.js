@@ -3669,7 +3669,7 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
 });
 
 // ==============================
-// Routes — Complete/Pay milestone (frontend-compatible)
+// Routes — Complete/Pay milestone (idempotent)
 // ==============================
 app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
   const bidId = Number(req.params.id);
@@ -3679,30 +3679,21 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
     return res.status(400).json({ error: "Invalid milestoneIndex" });
   }
 
-  const client = await pool.connect();
   try {
-    await client.query("BEGIN");
+    // 0) Ensure the idempotency ledger exists (safe to run repeatedly)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS milestone_payments (
+        bid_id BIGINT NOT NULL,
+        milestone_index INT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        tx_hash TEXT,
+        PRIMARY KEY (bid_id, milestone_index)
+      )
+    `);
 
-    // 🔒 Prevent concurrent pays for the same (bidId, milestoneIndex).
-    // Use the SINGLE-ARG form to avoid the (bigint,bigint) error.
-    const { rows: lock } = await client.query(
-      "SELECT pg_try_advisory_xact_lock( ($1::bigint << 32) + $2::bigint ) AS got",
-      [bidId, milestoneIndex]
-    );
-    if (!lock[0]?.got) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ error: "Payment already in progress or completed" });
-    }
-
-    // Lock the bid row while checking/updating
-    const { rows } = await client.query(
-      "SELECT * FROM bids WHERE bid_id=$1 FOR UPDATE",
-      [bidId]
-    );
-    if (!rows[0]) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Bid not found" });
-    }
+    // 1) Load bid + milestone; bail if already paid (covers legacy too)
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
 
     const bid = rows[0];
     const milestones = Array.isArray(bid.milestones)
@@ -3710,41 +3701,52 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
       : JSON.parse(bid.milestones || "[]");
 
     if (!milestones[milestoneIndex]) {
-      await client.query("ROLLBACK");
       return res.status(400).json({ error: "Milestone index out of range" });
     }
 
     const ms = milestones[milestoneIndex];
     if (!ms.completed) {
-      await client.query("ROLLBACK");
       return res.status(400).json({ error: "Milestone not completed" });
     }
-
-    // Idempotent guard under lock
-    if (ms.paymentTxHash) {
-      await client.query("ROLLBACK");
+    // legacy-safe "already paid" check
+    if (ms.paymentTxHash || ms.paymentDate || ms.status === "paid") {
       return res.status(409).json({ error: "Milestone already paid" });
     }
 
-    // (Your chain send function)
+    // 2) **Idempotency gate** — only one request can pass this INSERT.
+    const ins = await pool.query(
+      `INSERT INTO milestone_payments (bid_id, milestone_index)
+       VALUES ($1, $2)
+       ON CONFLICT DO NOTHING
+       RETURNING 1`,
+      [bidId, milestoneIndex]
+    );
+    if (ins.rowCount === 0) {
+      // Someone else already inserted (in progress or done) ⇒ do not send again
+      return res.status(409).json({ error: "Payment already in progress or completed" });
+    }
+
+    // 3) Execute the transfer
     const receipt = await blockchainService.sendToken(
       bid.preferred_stablecoin,
       bid.wallet_address,
       ms.amount
     );
 
-    // Mark paid inside the same transaction
+    // 4) Persist "paid" in both places
     ms.paymentTxHash = receipt.hash;
-    ms.paymentDate   = new Date().toISOString();
+    ms.paymentDate = new Date().toISOString();
 
-    await client.query(
+    await pool.query(
       "UPDATE bids SET milestones=$1 WHERE bid_id=$2",
       [JSON.stringify(milestones), bidId]
     );
+    await pool.query(
+      "UPDATE milestone_payments SET tx_hash=$3 WHERE bid_id=$1 AND milestone_index=$2",
+      [bidId, milestoneIndex, receipt.hash]
+    );
 
-    await client.query("COMMIT");
-
-    // --- unchanged: audit, notify, final fetch ---
+    // 5) Notify & audit (unchanged)
     await writeAudit(bidId, req, {
       payment_released: {
         index: milestoneIndex,
@@ -3776,11 +3778,15 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
     );
     return res.json(toCamel(updated[0]));
   } catch (err) {
-    try { await client.query("ROLLBACK"); } catch {}
+    // If transfer fails before we mark paid, remove the ledger row so a retry is possible
+    try {
+      await pool.query(
+        "DELETE FROM milestone_payments WHERE bid_id=$1 AND milestone_index=$2",
+        [Number(req.params.id), (req.body || {}).milestoneIndex]
+      );
+    } catch {}
     console.error("pay-milestone error", err);
     return res.status(500).json({ error: "Internal error paying milestone" });
-  } finally {
-    client.release();
   }
 });
 
