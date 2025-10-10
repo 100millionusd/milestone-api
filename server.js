@@ -40,8 +40,15 @@ const http = require("http");
 const { ethers } = require("ethers");
 const Joi = require("joi");
 const { Pool } = require("pg");
+const { anchorPeriod, periodIdForDate, finalizeExistingAnchor } = require('./services/anchor');
+const { exiftool } = require("exiftool-vendored");
+const os = require("os");
+const fs = require("fs/promises");
+const path = require("path");
+const crypto = require("crypto");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
+const { enrichAuditRow } = require('./services/auditPinata');
 
 // 🔐 auth utilities
 const cookieParser = require("cookie-parser");
@@ -61,6 +68,11 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || DEF
 const PINATA_API_KEY = (process.env.PINATA_API_KEY || "").trim();
 const PINATA_SECRET_API_KEY = (process.env.PINATA_SECRET_API_KEY || "").trim();
 const PINATA_GATEWAY = process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud";
+
+// Optional: dedicated gateway auth + public fallback
+const PINATA_JWT = (process.env.PINATA_JWT || "").trim();                     // your Pinata JWT (works on dedicated gateways)
+const PINATA_GATEWAY_TOKEN = (process.env.PINATA_GATEWAY_TOKEN || "").trim(); // or a Gateway Subdomain Token
+const PINATA_PUBLIC_GATEWAY = process.env.PINATA_PUBLIC_GATEWAY || "https://gateway.pinata.cloud/ipfs/";
 
 // OpenAI client (supports project-scoped keys)
 const openai = (() => {
@@ -182,6 +194,31 @@ const pool = new Pool({
 })();
 
 // ==============================
+// DB bootstrap — required columns for proofs/bids used below
+// ==============================
+(async () => {
+  try {
+    await pool.query(`
+      ALTER TABLE proofs
+        ADD COLUMN IF NOT EXISTS file_meta     jsonb,
+        ADD COLUMN IF NOT EXISTS gps_lat       double precision,
+        ADD COLUMN IF NOT EXISTS gps_lon       double precision,
+        ADD COLUMN IF NOT EXISTS gps_alt       double precision,
+        ADD COLUMN IF NOT EXISTS capture_time  timestamptz,
+        ADD COLUMN IF NOT EXISTS vendor_prompt text,
+        ADD COLUMN IF NOT EXISTS updated_at    timestamptz NOT NULL DEFAULT now();
+    `);
+    await pool.query(`
+      ALTER TABLE bids
+        ADD COLUMN IF NOT EXISTS updated_at    timestamptz NOT NULL DEFAULT now();
+    `);
+    console.log('[db] proofs/bids columns ready');
+  } catch (e) {
+    console.error('proofs/bids columns init failed:', e);
+  }
+})();
+
+// ==============================
 // DB cleanup: collapse duplicate PENDING proofs per (bid, milestone) to the latest
 // and then enforce "at most one PENDING" going forward.
 // ==============================
@@ -219,22 +256,6 @@ const pool = new Pool({
     console.log('[db] duplicate pending proofs cleaned; unique index ready');
   } catch (e) {
     console.error('DB cleanup/index for proofs failed:', e);
-  }
-})();
-
-// ==============================
-// DB bootstrap — proofs: 1 pending per milestone
-// ==============================
-(async () => {
-  try {
-    await pool.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS ux_proofs_pending
-        ON proofs (bid_id, milestone_index)
-      WHERE status = 'pending';
-    `);
-    console.log('[db] ux_proofs_pending ready');
-  } catch (e) {
-    console.error('ux_proofs_pending init failed:', e);
   }
 })();
 
@@ -1224,20 +1245,94 @@ function sendRequest(method, urlStr, headers = {}, body = null) {
   });
 }
 
-/** Fetch a URL into a Buffer */
+// If PINATA_PUBLIC_GATEWAY is a full URL (e.g. https://gateway.pinata.cloud/ipfs/),
+// rewrite /ipfs/<cid>/... to that base. Otherwise treat it as a bare hostname.
+function rewriteToGateway(u, base) {
+  try {
+    const m = String(u).match(/\/ipfs\/([^/]+)(\/.*)?$/i);
+    if (!m) return u;
+    const cid  = m[1];
+    const rest = m[2] || "";
+    const b    = base.replace(/\/+$/, "/");
+    return b.startsWith("http")
+      ? b + cid + rest
+      : (new URL(u)).toString().replace((new URL(u)).hostname, b);
+  } catch { return u; }
+}
+
+function toPublicGateway(u) {
+  const pub = process.env.PINATA_PUBLIC_GATEWAY || "https://gateway.pinata.cloud/ipfs/";
+  return rewriteToGateway(u, pub);
+}
+
+/** Fetch a URL into a Buffer (supports mypinata.cloud auth + public fallbacks) */
 async function fetchAsBuffer(urlStr) {
+  const orig = String(urlStr);
+
+  function tryOnce(u, headers = {}) {
   return new Promise((resolve, reject) => {
-    const lib = urlStr.startsWith("https:") ? https : http;
-    const req = lib.get(urlStr, (res) => {
-      if (res.statusCode && res.statusCode >= 400) {
-        return reject(new Error(`HTTP ${res.statusCode} fetching ${urlStr}`));
-      }
+    const url = new URL(u);
+    const lib = url.protocol === "https:" ? https : http;
+    const options = {
+      method: "GET",
+      hostname: url.hostname,
+      port: url.port || (url.protocol === "https:" ? 443 : 80),
+      path: url.pathname + url.search,
+      headers,
+      timeout: 15000
+    };
+    const req = lib.request(options, (res) => {
+      const code = res.statusCode || 0;
+      if (code >= 400) return reject(new Error(`HTTP ${code} fetching ${u}`));
       const chunks = [];
-      res.on("data", (d) => chunks.push(d));
+      let total = 0;
+      const CAP = 25 * 1024 * 1024; // 25MB
+      res.on("data", (d) => {
+        total += d.length;
+        if (total > CAP) {
+          req.destroy(new Error("Response too large"));
+          return;
+        }
+        chunks.push(d);
+      });
       res.on("end", () => resolve(Buffer.concat(chunks)));
     });
+    req.on("timeout", () => { req.destroy(new Error("Timeout")); });
     req.on("error", reject);
+    req.end();
   });
+}
+
+  const isDedicated = /\.mypinata\.cloud$/i.test(new URL(orig).hostname);
+  const headers = {};
+
+  // If it’s a dedicated Pinata subdomain, send auth if available
+  if (isDedicated) {
+    if (PINATA_JWT)           headers["Authorization"] = `Bearer ${PINATA_JWT}`;
+    if (PINATA_GATEWAY_TOKEN) headers["x-pinata-gateway-token"] = PINATA_GATEWAY_TOKEN;
+  }
+
+  // 1) Try original URL (with headers for dedicated gateway)
+  try {
+    return await tryOnce(orig, headers);
+  } catch (e) {
+    // 2) Fall back to public gateways
+    const candidates = [
+      toPublicGateway(orig),
+      rewriteToGateway(orig, "https://ipfs.io/ipfs/"),
+      rewriteToGateway(orig, "https://cf-ipfs.com/ipfs/"),
+      rewriteToGateway(orig, "https://dweb.link/ipfs/"),
+    ];
+    let lastErr = e;
+    for (const u of candidates) {
+      try {
+        return await tryOnce(u);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr;
+  }
 }
 
 /** Promise.race timeout helper */
@@ -1250,16 +1345,185 @@ function withTimeout(p, ms, onTimeout) {
 }
 
 // ==============================
-// PDF Extraction (debug-friendly with retries)
-// (functions already above)
+// Media metadata (EXIF/GPS) from remote URLs
 // ==============================
+const MEDIA_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|tiff?|heic|heif|mp4|mov|avi|m4v)(\?|$)/i;
+
+function isMediaFile(f) {
+  if (!f) return false;
+  const n = String(f.name || f.url || "").toLowerCase();
+  const mt = String(f.mimetype || "").toLowerCase();
+  return MEDIA_EXT_RE.test(n) || mt.startsWith("image/") || mt.startsWith("video/");
+}
+
+/** Convert a file URL to a small metadata object (EXIF/GPS, hashes) */
+async function extractFileMetaFromUrl(file) {
+  try {
+    if (!file?.url) return null;
+
+    // Reuse your existing fetchAsBuffer helper
+    const buf = await fetchAsBuffer(toPublicGateway(file.url));
+    const sha256 = crypto.createHash("sha256").update(buf).digest("hex");
+
+    // Write to temp for exiftool
+    const bare = (file.name || file.url).split("?")[0];
+    const ext = path.extname(bare) || "";
+    const tmp = path.join(os.tmpdir(), `exif-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
+    await fs.writeFile(tmp, buf);
+
+    let tags = null;
+    try {
+      tags = await withTimeout(exiftool.read(tmp), 4000, () => null);
+    } catch { tags = null; }
+
+    try { await fs.unlink(tmp); } catch {}
+
+    const size = buf.length;
+    const exif = tags ? {
+      make: tags.Make || null,
+      model: tags.Model || null,
+      software: tags.Software || tags.ProcessingSoftware || null,
+      mimeType: tags.MIMEType || tags.MimeType || null,
+      imageWidth: tags.ImageWidth || tags.SourceImageWidth || null,
+      imageHeight: tags.ImageHeight || tags.SourceImageHeight || null,
+      megapixels: tags.Megapixels || null,
+      createDate: tags.DateTimeOriginal || tags.CreateDate || tags.MediaCreateDate || null,
+      modifyDate: tags.ModifyDate || null,
+      gpsLatitude: Number.isFinite(tags.GPSLatitude) ? Number(tags.GPSLatitude) : null,
+      gpsLongitude: Number.isFinite(tags.GPSLongitude) ? Number(tags.GPSLongitude) : null,
+      gpsAltitude: tags.GPSAltitude ?? null,
+      orientation: tags.Orientation || null,
+    } : null;
+
+    const suspectEdits = /photoshop|lightroom|gimp|snapseed|facetune|luminar|picsart|canva|after effects|premiere/i
+      .test(String(exif?.software || ""));
+
+    return {
+      url: file.url,
+      name: file.name || null,
+      mimetype: file.mimetype || null,
+      size,
+      hashSha256: sha256,
+      exif,
+      suspectEdits,
+    };
+  } catch {
+    return {
+      url: file?.url || null,
+      name: file?.name || null,
+      mimetype: file?.mimetype || null,
+      size: null,
+      hashSha256: null,
+      exif: null,
+      suspectEdits: false,
+    };
+  }
+}
+
+/** Summarize an array of metadata objects for LLM context */
+function summarizeMeta(metaArr = []) {
+  const lines = [];
+  for (const m of metaArr.slice(0, 10)) {
+    const parts = [];
+    if (m.exif?.createDate) parts.push(String(m.exif.createDate));
+    if (Number.isFinite(m.exif?.gpsLatitude) && Number.isFinite(m.exif?.gpsLongitude)) {
+      parts.push(`GPS ${m.exif.gpsLatitude.toFixed(6)}, ${m.exif.gpsLongitude.toFixed(6)}`);
+    } else {
+      parts.push(`GPS none`);
+    }
+    const cam = [m.exif?.make, m.exif?.model].filter(Boolean).join(" ");
+    if (cam) parts.push(cam);
+    if (m.exif?.software) parts.push(`Software ${m.exif.software}`);
+    if (m.suspectEdits) parts.push("⚠︎ edited");
+    lines.push(`- ${m.name || "file"} — ${parts.join(" • ")}`);
+  }
+  return lines.join("\n") || "(no EXIF/metadata available)";
+}
+
+// ==============================
+// Reverse Geocode (country / city label from GPS)
+// Uses OpenCage if OPENCAGE_API_KEY is set; falls back to Nominatim
+// ==============================
+async function reverseGeocode(lat, lon) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+
+  // 1) OpenCage (recommended: set OPENCAGE_API_KEY)
+  const ocKey = (process.env.OPENCAGE_API_KEY || '').trim();
+  if (ocKey) {
+    try {
+      const url = `https://api.opencagedata.com/geocode/v1/json?q=${encodeURIComponent(lat + ',' + lon)}&key=${ocKey}&no_annotations=1&language=en`;
+      const { status, body } = await sendRequest("GET", url, { Accept: "application/json" });
+      if (status >= 200 && status < 300) {
+        const json = JSON.parse(body || "{}");
+        const comp = json?.results?.[0]?.components || {};
+        const label = json?.results?.[0]?.formatted || null;
+
+        const city =
+          comp.city || comp.town || comp.village || comp.hamlet || comp.municipality || comp.locality || null;
+        const state = comp.state || comp.region || comp.province || null;
+        const country = comp.country || null;
+        const postcode = comp.postcode || null;
+
+        return {
+          provider: "opencage",
+          label,
+          country,
+          state,
+          county: comp.county || null,
+          city,
+          suburb: comp.suburb || comp.neighbourhood || null,
+          postcode,
+        };
+      }
+    } catch (_) {}
+  }
+
+  // 2) Nominatim fallback (requires a UA; be a good citizen)
+  try {
+    const ua = process.env.NOMINATIM_UA || "LithiumX/1.0 (admin@yourdomain.com)";
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&zoom=14&addressdetails=1`;
+    const { status, body } = await sendRequest(
+      "GET",
+      url,
+      { Accept: "application/json", "User-Agent": ua },
+      null
+    );
+    if (status >= 200 && status < 300) {
+      const json = JSON.parse(body || "{}");
+      const a = json?.address || {};
+
+      const city =
+        a.city || a.town || a.village || a.hamlet || a.municipality || a.locality || null;
+      const state = a.state || a.region || a.province || null;
+      const country = a.country || null;
+      const postcode = a.postcode || null;
+
+      // best-effort readable label
+      const bits = [city, state, country].filter(Boolean);
+      const label = bits.join(", ") || json?.display_name || null;
+
+      return {
+        provider: "nominatim",
+        label,
+        country,
+        state,
+        county: a.county || null,
+        city,
+        suburb: a.suburb || a.neighbourhood || null,
+        postcode,
+      };
+    }
+  } catch (_) {}
+
+  return null;
+}
 
 // ==============================
 // Blockchain service
 // ==============================
 class BlockchainService {
   constructor() {
-    this.provider = new ethers.JsonRpcProvider(SEPOLIA_RPC_URL);
+    this.provider = new ethers.providers.JsonRpcProvider(SEPOLIA_RPC_URL);
     if (PRIVATE_KEY) {
       const pk = PRIVATE_KEY.startsWith("0x") ? PRIVATE_KEY : `0x${PRIVATE_KEY}`;
       this.signer = new ethers.Wallet(pk, this.provider);
@@ -1273,7 +1537,7 @@ class BlockchainService {
     const token = TOKENS[tokenSymbol];
     const contract = new ethers.Contract(token.address, ERC20_ABI, this.signer);
     const decimals = await contract.decimals();
-    const amt = ethers.parseUnits(amount.toString(), decimals);
+    const amt = ethers.utils.parseUnits(amount.toString(), decimals);
 
     const balance = await contract.balanceOf(this.signer.address);
     if (balance < amt) throw new Error("Insufficient balance");
@@ -1290,7 +1554,7 @@ class BlockchainService {
     const contract = new ethers.Contract(token.address, ERC20_ABI, this.signer);
     const balance = await contract.balanceOf(this.signer.address);
     const decimals = await contract.decimals();
-    return parseFloat(ethers.formatUnits(balance, decimals));
+    return parseFloat(ethers.utils.formatUnits(balance, decimals));
   }
 }
 
@@ -1588,11 +1852,21 @@ const ADMIN_SET = new Set(
     .map((a) => a.trim().toLowerCase())
     .filter(Boolean)
 );
+const ADMIN_OVERRIDE_ADDR = norm(process.env.ADMIN_OVERRIDE_ADDR);
+if (ADMIN_OVERRIDE_ADDR) ADMIN_SET.add(ADMIN_OVERRIDE_ADDR);
 const JWT_SECRET = process.env.JWT_SECRET || "dev_fallback_secret_change_me";
 const ENFORCE_JWT_ADMIN = String(process.env.ENFORCE_JWT_ADMIN || "false").toLowerCase() === "true";
 const SCOPE_BIDS_FOR_VENDOR = String(process.env.SCOPE_BIDS_FOR_VENDOR || "false").toLowerCase() === "true";
 
-const nonces = new Map(); // addressLower -> nonce
+const nonces = new Map(); // addressLower -> { nonce, exp }
+function putNonce(address, nonce) {
+  nonces.set(address, { nonce, exp: Date.now() + 5 * 60 * 1000 }); // 5 min
+}
+function getNonce(address) {
+  const e = nonces.get(address);
+  if (!e || e.exp < Date.now()) { nonces.delete(address); return null; }
+  return e.nonce;
+}
 
 function norm(a) { return String(a || "").trim().toLowerCase(); }
 function isAdminAddress(addr) { return ADMIN_SET.has(norm(addr)); }
@@ -1643,7 +1917,14 @@ function requireRole(role) {
 function adminGuard(req, res, next) {
   if (!ENFORCE_JWT_ADMIN) return next(); // compatibility mode
   if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+
+  // accept admin if current address is in ADMIN_SET (override), even if JWT role is stale
+  const addr = norm(req.user.sub || req.user.address || req.user.walletAddress || "");
+  const isAdminNow = isAdminAddress(addr);
+
+  if (req.user.role !== "admin" && !isAdminNow) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
   next();
 }
 
@@ -1694,7 +1975,7 @@ app.post("/auth/nonce", (req, res) => {
   const address = norm(req.body?.address);
   if (!address) return res.status(400).json({ error: "address required" });
   const nonce = `LithiumX login nonce: ${Math.floor(Math.random() * 1e9)}`;
-  nonces.set(address, nonce);
+  putNonce(address, nonce);
   res.json({ nonce });
 });
 
@@ -1704,7 +1985,7 @@ app.post("/auth/verify", async (req, res) => {
   const signature = req.body?.signature;
   if (!address || !signature) return res.status(400).json({ error: "address and signature required" });
 
-  const nonce = nonces.get(address);
+  const nonce = getNonce(address);
   if (!nonce) return res.status(400).json({ error: "nonce not found or expired" });
 
   let recovered;
@@ -1749,7 +2030,7 @@ app.get("/auth/nonce", (req, res) => {
   const address = norm(req.query.address);
   if (!address) return res.status(400).json({ error: "address required" });
   const nonce = `LithiumX login nonce: ${Math.floor(Math.random() * 1e9)}`;
-  nonces.set(address, nonce);
+  putNonce(address, nonce);
   res.json({ nonce });
 });
 
@@ -1759,7 +2040,7 @@ app.post("/auth/login", async (req, res) => {
   const signature = req.body?.signature;
   if (!address || !signature) return res.status(400).json({ error: "address and signature required" });
 
-  const nonce = nonces.get(address);
+  const nonce = getNonce(address);
   if (!nonce) return res.status(400).json({ error: "nonce not found or expired" });
 
   let recovered;
@@ -1837,6 +2118,15 @@ app.get("/health", async (_req, res) => {
 });
 app.get("/test", (_req, res) => res.json({ ok: true }));
 
+// --- Helper for /admin/entities routes (match org/email/wallet) ---
+function deriveEntityKey(body = {}) {
+  const id     = String(body.id || '').trim().toLowerCase();             // optional internal id
+  const wallet = String(body.ownerWallet || body.wallet || '').trim().toLowerCase();
+  const email  = String(body.contactEmail || body.email || '').trim().toLowerCase();
+  const org    = String(body.orgName || body.organization || '').trim().toLowerCase();
+  return id || wallet || email || org || null;
+}
+
 // ==============================
 // Routes — Proposals
 // ==============================
@@ -1861,6 +2151,84 @@ app.get("/proposals", async (req, res) => {
     res.json(mapRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ==============================
+// Admin — “Entities” (operate over proposals by org/email/wallet)
+// ==============================
+
+// Archive all proposals for a given org/email/wallet
+app.post('/admin/entities/archive', adminGuard, async (req, res) => {
+  try {
+    const key = deriveEntityKey(req.body);
+    if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
+
+    const { rowCount } = await pool.query(`
+      UPDATE proposals
+         SET status = 'archived', updated_at = NOW()
+       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
+         AND status <> 'archived'
+    `, [key]);
+
+    return res.json({ ok: true, affected: rowCount });
+  } catch (e) {
+    console.error('archive entity error', e);
+    return res.status(500).json({ error: 'Failed to archive entity' });
+  }
+});
+
+// Unarchive (set back to a status, default 'pending')
+app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
+  try {
+    const key = deriveEntityKey(req.body);
+    if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
+
+    const toStatus = String(req.body?.toStatus || 'pending').toLowerCase();
+    if (!['pending','approved','rejected'].includes(toStatus)) {
+      return res.status(400).json({ error: 'Invalid toStatus' });
+    }
+
+    const { rowCount } = await pool.query(`
+      UPDATE proposals
+         SET status = $2, updated_at = NOW()
+       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
+         AND status = 'archived'
+    `, [key, toStatus]);
+
+    return res.json({ ok: true, affected: rowCount, toStatus });
+  } catch (e) {
+    console.error('unarchive entity error', e);
+    return res.status(500).json({ error: 'Failed to unarchive entity' });
+  }
+});
+
+// Delete proposals for that entity (mode=soft/hard via ?mode=soft|hard)
+app.delete('/admin/entities', adminGuard, async (req, res) => {
+  try {
+    const key = deriveEntityKey(req.body);
+    if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
+
+    const mode = String(req.query.mode || 'soft').toLowerCase(); // soft | hard
+    if (mode === 'hard') {
+      const { rowCount } = await pool.query(`
+        DELETE FROM proposals
+         WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
+      `, [key]);
+      return res.json({ success: true, deleted: rowCount, mode: 'hard' });
+    }
+
+    const { rowCount } = await pool.query(`
+      UPDATE proposals
+         SET status = 'archived', updated_at = NOW()
+       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
+         AND status <> 'archived'
+    `, [key]);
+
+    return res.json({ success: true, archived: rowCount, mode: 'soft' });
+  } catch (e) {
+    console.error('delete entity error', e);
+    return res.status(500).json({ error: 'Failed to delete entity' });
   }
 });
 
@@ -2456,12 +2824,13 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
     if (Object.keys(changes).length > 0) {
       const actorWallet = req.user?.sub || null;  // your JWT puts wallet in sub
       const actorRole = req.user?.role || "admin";
-      await pool.query(
-        `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
-         VALUES ($1, $2, $3, $4)`,
-        [bidId, actorWallet, actorRole, changes]
-      );
-    }
+// AFTER (correct)
+const ins = await pool.query(
+  'INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes) VALUES ($1,$2,$3,$4) RETURNING audit_id',
+  [bidId, actorWallet, actorRole, changes]
+);
+enrichAuditRow(pool, ins.rows[0].audit_id).catch(/* ... */);
+}
 
     // Return normalized bid
     return res.json(toCamel(updated));
@@ -2528,16 +2897,211 @@ app.patch("/bids/:id/milestones", adminGuard, async (req, res) => {
     // Audit row
     const actorWallet = req.user?.sub || null;
     const actorRole = req.user?.role || "admin";
-    await pool.query(
-      `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
-       VALUES ($1, $2, $3, $4)`,
-      [bidId, actorWallet, actorRole, { milestones: { from: current.milestones, to: norm } }]
-    );
+    const ins = await pool.query(
+  `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
+   VALUES ($1, $2, $3, $4) RETURNING id`,
+  [bidId, actorWallet, actorRole, { milestones: { from: current.milestones, to: norm } }]
+);
+
+// fire-and-forget enrichment (IPFS + hash)
+enrichAuditRow(pool, ins.rows[0].id).catch(err =>
+  console.error('audit enrich failed:', err)
+);
 
     return res.json(toCamel(upd[0]));
   } catch (err) {
     console.error("PATCH /bids/:id/milestones failed", { bidId, err });
     return res.status(500).json({ error: "Internal error updating milestones" });
+  }
+});
+
+// GET /audit?itemType=proposal&itemId=123  OR  /audit?itemType=bid&itemId=456
+app.get('/audit', async (req, res) => {
+  const itemType = String(req.query.itemType || '').toLowerCase();
+  const itemId = Number(req.query.itemId);
+
+  if (!itemType || !Number.isFinite(itemId)) return res.json([]);
+
+  if (itemType === 'bid') {
+    const { rows } = await pool.query(
+  `SELECT
+     ba.created_at,
+     ba.actor_role,
+     ba.actor_wallet,
+     ba.changes,
+     ba.ipfs_cid,
+     ba.merkle_index,
+     ba.merkle_proof,
+     ba.batch_id,
+     ab.period_id,
+     ab.tx_hash,
+     ab.contract_addr,
+     ab.chain_id
+   FROM bid_audits ba
+   LEFT JOIN audit_batches ab ON ab.id = ba.batch_id
+   WHERE ba.bid_id = $1
+   ORDER BY ba.created_at DESC`,
+  [itemId]
+);
+return res.json(rows.map(r => ({
+  created_at: r.created_at,
+  action: 'update',
+  actor_role: r.actor_role,
+  actor_address: r.actor_wallet,
+  changed_fields: Object.keys(r.changes || {}),
+  ipfs_cid: r.ipfs_cid,
+  merkle_index: r.merkle_index ?? null,
+  proof: Array.isArray(r.merkle_proof)
+    ? r.merkle_proof.map(buf =>
+        typeof buf === 'string'
+          ? (buf.startsWith('0x') ? buf : '0x' + buf) // if driver returns hex strings
+          : '0x' + Buffer.from(buf).toString('hex')   // if pg returns Buffer objects
+      )
+    : [],
+  batch: r.period_id ? {
+    period_id: r.period_id,
+    tx_hash: r.tx_hash,
+    contract_addr: r.contract_addr,
+    chain_id: r.chain_id
+  } : null
+})));
+  }
+
+  if (itemType === 'proposal') {
+    // join through bids to show all bid audits for this proposal
+    const { rows } = await pool.query(
+  `SELECT
+     ba.created_at,
+     ba.actor_role,
+     ba.actor_wallet,
+     ba.changes,
+     ba.ipfs_cid,
+     ba.merkle_index,
+     ba.merkle_proof,
+     ba.batch_id,
+     ab.period_id,
+     ab.tx_hash,
+     ab.contract_addr,
+     ab.chain_id
+   FROM bid_audits ba
+   JOIN bids b ON b.bid_id = ba.bid_id
+   LEFT JOIN audit_batches ab ON ab.id = ba.batch_id
+   WHERE b.proposal_id = $1
+   ORDER BY ba.created_at DESC`,
+  [itemId]
+);
+return res.json(rows.map(r => ({
+  created_at: r.created_at,
+  action: 'update',
+  actor_role: r.actor_role,
+  actor_address: r.actor_wallet,
+  changed_fields: Object.keys(r.changes || {}),
+  ipfs_cid: r.ipfs_cid,
+  merkle_index: r.merkle_index ?? null,
+  proof: Array.isArray(r.merkle_proof)
+    ? r.merkle_proof.map(buf =>
+        typeof buf === 'string'
+          ? (buf.startsWith('0x') ? buf : '0x' + buf) // if driver returns hex strings
+          : '0x' + Buffer.from(buf).toString('hex')   // if pg returns Buffer objects
+      )
+    : [],
+  batch: r.period_id ? {
+    period_id: r.period_id,
+    tx_hash: r.tx_hash,
+    contract_addr: r.contract_addr,
+    chain_id: r.chain_id
+  } : null
+})));
+  }
+
+  res.json([]);
+});
+
+// GET /admin/anchor?period=YYYY-MM-DDTHH
+// Anchors the specified hour (UTC) on-chain and writes batch/proofs to DB.
+app.get('/admin/anchor', async (req, res) => {
+  try {
+    const period = req.query.period ? String(req.query.period) : periodIdForDate();
+    const out = await anchorPeriod(pool, period);
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// GET /admin/anchor/finalize?period=YYYY-MM-DDTHH&tx=0xTXHASH
+// Use this if you already anchored externally; verifies on-chain root and links DB rows.
+app.get('/admin/anchor/finalize', async (req, res) => {
+  try {
+    const period = String(req.query.period || '');
+    const tx = req.query.tx ? String(req.query.tx) : null;
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}$/.test(period)) {
+      return res.status(400).json({ ok: false, error: 'period must be YYYY-MM-DDTHH (UTC hour)' });
+    }
+    const out = await finalizeExistingAnchor(pool, period, tx);
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// GET /admin/anchor/candidates?period=YYYY-MM-DDTHH
+app.get('/admin/anchor/candidates', async (req, res) => {
+  try {
+    const period = String(req.query.period || '');
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}$/.test(period)) {
+      return res.status(400).json({ ok: false, error: 'period must be YYYY-MM-DDTHH' });
+    }
+    const { rows } = await pool.query(
+      `SELECT audit_id, bid_id, created_at,
+              (ipfs_cid IS NOT NULL) AS has_ipfs,
+              (leaf_hash IS NOT NULL) AS has_leaf
+         FROM bid_audits
+        WHERE batch_id IS NULL
+          AND leaf_hash IS NOT NULL
+          AND to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') = $1
+        ORDER BY audit_id ASC`,
+      [period]
+    );
+    res.type('application/json').json({ ok: true, period, count: rows.length, rows });
+  } catch (e) {
+    res.status(500).type('application/json').json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// GET /admin/anchor/periods — what the API's DB thinks is available to anchor
+app.get('/admin/anchor/periods', async (req, res) => {
+  try {
+    const q = `
+      SELECT to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') AS period,
+             COUNT(*) AS cnt
+      FROM bid_audits
+      WHERE leaf_hash IS NOT NULL
+        AND batch_id IS NULL
+      GROUP BY 1
+      ORDER BY 1`;
+    const { rows } = await pool.query(q);
+    res.json({ ok: true, rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// GET /admin/anchor/last — last few audits the API can see
+app.get('/admin/anchor/last', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT audit_id, bid_id,
+             to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS') AS created_utc,
+             (ipfs_cid IS NOT NULL) AS has_ipfs,
+             (leaf_hash IS NOT NULL) AS has_leaf,
+             batch_id
+      FROM bid_audits
+      ORDER BY audit_id DESC
+      LIMIT 10`);
+    res.json({ ok: true, rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
@@ -2616,12 +3180,17 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
         }
       }
 
+      const meta = Array.isArray(pr.file_meta)
+        ? pr.file_meta
+        : (typeof pr.file_meta === "string" ? JSON.parse(pr.file_meta || "[]") : []);
+      const metaNote = summarizeMeta(meta);
       proofsCtx.push({
         milestoneIndex: pr.milestone_index,
         title,
         description: desc,
         files,
         pdfNote,
+        metaNote,
       });
     }
 
@@ -2639,17 +3208,21 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
     // Build chat context with **bid + proofs**
     const ai = coerceJson(bid.ai_analysis);
     const proofsBlock = proofsCtx.length
-      ? proofsCtx.map((p, i) => {
-          const filesList = (p.files || []).map(f => `- ${f.name || 'file'}: ${f.url}`).join('\n') || '(none)';
-          return `
+  ? proofsCtx.map((p, i) => {
+      const filesList = (p.files || []).map(f => `- ${f.name || 'file'}: ${f.url}`).join('\n') || '(none)';
+      return `
 Proof #${i + 1} — Milestone ${Number(p.milestoneIndex) + 1}: ${p.title}
 Description (truncated):
 """${p.description}"""
 Files:
 ${filesList}
+
+IMAGE/VIDEO METADATA:
+${p.metaNote}
+
 ${p.pdfNote}`.trim();
-        }).join('\n\n')
-      : '(no proofs submitted for this bid)';
+    }).join('\n\n')
+  : '(no proofs submitted for this bid)';
 
     const systemContext =
 `You are Agent2 for LithiumX.
@@ -2809,19 +3382,19 @@ app.post('/agent2/chat', adminGuard, async (req, res) => {
     if (!message) return res.status(400).json({ error: 'Missing message' });
 
     // Load proof if provided (and derive bidId if needed)
-    const proofId = Number(rawProofId);
-    let proof = null;
-    if (Number.isFinite(proofId)) {
-      const { rows } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
-      proof = rows[0] || null;
-    }
+const proofId = Number(rawProofId);
+let proof = null;
+if (Number.isFinite(proofId)) {
+  const { rows } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
+  proof = rows[0] || null;
+}
 
-    let bidId = Number(rawBidId);
-    if (!Number.isFinite(bidId) && proof) bidId = Number(proof.bid_id);
+let bidId = Number(rawBidId);
+if (!Number.isFinite(bidId) && proof) bidId = Number(proof.bid_id);
 
-    if (!Number.isFinite(bidId)) {
-      return res.status(400).json({ error: 'Provide bidId or a proofId that belongs to a bid' });
-    }
+if (!Number.isFinite(bidId)) {
+  return res.status(400).json({ error: 'Provide bidId or a proofId that belongs to a bid' });
+}
 
     // Load bid + proposal for context
     const { rows: br } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [bidId]);
@@ -2831,26 +3404,11 @@ app.post('/agent2/chat', adminGuard, async (req, res) => {
     const { rows: pr } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
     const proposal = pr[0] || null;
 
-    // Collect proof text (description + any PDF text)
-    let proofDesc = '';
-    let files = [];
-    if (proof) {
-      proofDesc = String(proof.description || '').trim();
-      files = Array.isArray(proof.files)
-        ? proof.files
-        : (typeof proof.files === 'string' ? JSON.parse(proof.files || '[]') : []);
-    }
-
-    // Extract text from all PDF files (best-effort, using your existing helpers)
-    let pdfText = '';
-    for (const f of files) {
-      if (!f?.url) continue;
-      const info = await waitForPdfInfoFromDoc({ url: f.url, name: f.name || '' });
-      if (info.used && info.text) {
-        pdfText += `\n\n[${f.name || 'file'}]\n${info.text}`;
-      }
-    }
-    pdfText = pdfText.trim();
+    // Collect proof text (description + any PDF text) — you likely already have this above; keep it once.
+const proofDesc = String(proof?.description || '').trim();
+let files = Array.isArray(proof?.files)
+  ? proof.files
+  : (typeof proof?.files === 'string' ? JSON.parse(proof.files || '[]') : []);
 
     // Build strict context
     const context = [
@@ -2881,10 +3439,16 @@ app.post('/agent2/chat', adminGuard, async (req, res) => {
         description: proofDesc.slice(0, 4000),
         files: files.map(f => ({ name: f.name, url: f.url })),
       }, null, 2),
-      '',
-      pdfText
-        ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText.slice(0, 15000)}`
-        : `--- NO PDF TEXT AVAILABLE ---`,
+            '',
+      '--- IMAGE/VIDEO METADATA ---',
+metaBlock,
+'',
+'--- KNOWN LOCATION ---',
+locationBlock,
+'',
+pdfText
+  ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText.slice(0, 15000)}`
+  : `--- NO PDF TEXT AVAILABLE ---`,
     ].join('\n');
 
     if (!openai) return res.status(503).json({ error: 'OpenAI not configured' });
@@ -2974,7 +3538,7 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
 // ==============================
 // Routes — Complete/Pay milestone (frontend-compatible)
 // ==============================
-app.post("/bids/:id/complete-milestone", async (req, res) => {
+  app.post("/bids/:id/complete-milestone", adminOrBidOwnerGuard, async (req, res) => {
   const bidId = Number(req.params.id);
   const { milestoneIndex, proof } = req.body || {};
   if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
@@ -3075,6 +3639,9 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
 
     const ms = milestones[milestoneIndex];
     if (!ms.completed) return res.status(400).json({ error: "Milestone not completed" });
+    if (ms.paymentTxHash) {
+  return res.status(409).json({ error: "Milestone already paid" });
+}
 
     // (Your chain send function)
     const receipt = await blockchainService.sendToken(
@@ -3113,7 +3680,7 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
 // ==============================
 // Routes — Proofs (robust, with Agent2)
 // ==============================
-app.post("/proofs", async (req, res) => {
+app.post("/proofs", authRequired, async (req, res) => {
   // Accept legacy & new shapes
   const schema = Joi.object({
     bidId: Joi.number().integer().required(),
@@ -3127,13 +3694,10 @@ app.post("/proofs", async (req, res) => {
       .items(Joi.object({ name: Joi.string().allow(""), url: Joi.string().uri().required() }))
       .default([])
       .optional(),
-    // accept either name from the client
     prompt: Joi.string().allow("").optional(),
     vendorPrompt: Joi.string().allow("").optional(),
-  })
-  .or('proof', 'description') // Require either proof OR description
-  .messages({
-    'object.missing': 'Must provide either proof (legacy) or description (new format)'
+  }).or("proof", "description").messages({
+    "object.missing": "Must provide either proof (legacy) or description (new format)",
   });
 
   const { error, value } = schema.validate(req.body || {}, { abortEarly: false });
@@ -3142,12 +3706,18 @@ app.post("/proofs", async (req, res) => {
   const { bidId, milestoneIndex } = value;
 
   try {
-    // 1) Ensure bid exists
+    // 1) Ensure bid exists & caller allowed
     const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
     if (!bids[0]) return res.status(404).json({ error: "Bid not found" });
     const bid = bids[0];
 
-    // 2) Ensure milestoneIndex is valid
+    const caller  = String(req.user?.sub || "").toLowerCase();
+    const isAdmin = String(req.user?.role || "").toLowerCase() === "admin";
+    if (!isAdmin && caller !== String(bid.wallet_address || "").toLowerCase()) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    // 2) Validate milestone
     const milestones = Array.isArray(bid.milestones)
       ? bid.milestones
       : JSON.parse(bid.milestones || "[]");
@@ -3155,46 +3725,79 @@ app.post("/proofs", async (req, res) => {
       return res.status(400).json({ error: "Invalid milestoneIndex for this bid" });
     }
 
-    // 2.5) Duplicate guards — block if a pending proof exists, or if latest is approved
-// A) Hard block if a pending proof already exists for this milestone
-const { rows: pend } = await pool.query(
-  `SELECT 1 FROM proofs
-    WHERE bid_id=$1 AND milestone_index=$2 AND status='pending'
-    LIMIT 1`,
-  [bidId, milestoneIndex]
-);
-if (pend.length) {
-  return res.status(409).json({ error: 'A proof is already pending review for this milestone.' });
-}
+    // 3) Duplicate guards
+    const { rows: pend } = await pool.query(
+      `SELECT 1 FROM proofs WHERE bid_id=$1 AND milestone_index=$2 AND status='pending' LIMIT 1`,
+      [bidId, milestoneIndex]
+    );
+    if (pend.length) {
+      return res.status(409).json({ error: "A proof is already pending review for this milestone." });
+    }
+    const { rows: lastRows } = await pool.query(
+      `SELECT status
+         FROM proofs
+        WHERE bid_id=$1 AND milestone_index=$2
+        ORDER BY submitted_at DESC NULLS LAST,
+                 updated_at  DESC NULLS LAST,
+                 proof_id    DESC
+        LIMIT 1`,
+      [bidId, milestoneIndex]
+    );
+    if (lastRows[0] && String(lastRows[0].status || "").toLowerCase() === "approved") {
+      return res.status(409).json({ error: "This milestone has already been approved." });
+    }
 
-// B) Block if the latest proof for this milestone is already approved
-const { rows: lastRows } = await pool.query(
-  `SELECT status
-     FROM proofs
-    WHERE bid_id=$1 AND milestone_index=$2
-    ORDER BY submitted_at DESC NULLS LAST,
-             updated_at  DESC NULLS LAST,
-             proof_id    DESC
-    LIMIT 1`,
-  [bidId, milestoneIndex]
-);
-if (lastRows[0] && String(lastRows[0].status || '').toLowerCase() === 'approved') {
-  return res.status(409).json({ error: 'This milestone has already been approved.' });
-}
-
-    // 3) Normalize proof fields
+    // 4) Normalize proof fields
     const files = Array.isArray(value.files) ? value.files : [];
-    const legacyText = (value.proof || "").trim();
-    const description = (value.description || legacyText || "").trim();
-    const title = (value.title || `Proof for Milestone ${milestoneIndex + 1}`).trim();
+    const mediaFiles = files.filter(isMediaFile);
+    const fileMeta = await Promise.all(mediaFiles.map(extractFileMetaFromUrl)).then(a => a.filter(Boolean));
+
+    // helpers
+    function findFirstGps(arr = []) {
+      for (const m of arr) {
+        const lat = Number(m?.exif?.gpsLatitude);
+        const lon = Number(m?.exif?.gpsLongitude);
+        if (Number.isFinite(lat) && Number.isFinite(lon)) {
+          const alt = Number.isFinite(Number(m?.exif?.gpsAltitude)) ? Number(m?.exif?.gpsAltitude) : null;
+          return { lat, lon, alt };
+        }
+      }
+      return { lat: null, lon: null, alt: null };
+    }
+    function findFirstCaptureIso(arr = []) {
+      for (const m of arr) {
+        const raw = m?.exif?.createDate;
+        if (!raw) continue;
+        const norm = String(raw).replace(/^([0-9]{4}):([0-9]{2}):([0-9]{2})\s/, "$1-$2-$3 ");
+        const d = new Date(norm + "Z");
+        if (!Number.isNaN(d.getTime())) return d.toISOString();
+      }
+      return null;
+    }
+
+    const { lat: gpsLat, lon: gpsLon, alt: gpsAlt } = findFirstGps(fileMeta);
+    const captureIso = findFirstCaptureIso(fileMeta);
+   // Reverse geocode once if we have GPS
+let rgeo = null;
+if (Number.isFinite(gpsLat) && Number.isFinite(gpsLon)) {
+  try { rgeo = await reverseGeocode(gpsLat, gpsLon); } catch {}
+}
+
+    const legacyText   = (value.proof || "").trim();
+    const description  = (value.description || legacyText || "").trim();
+    const title        = (value.title || `Proof for Milestone ${milestoneIndex + 1}`).trim();
     const vendorPrompt = (value.vendorPrompt || value.prompt || "").trim();
 
-    // 4) Insert proof row (pending)
+    // 5) Insert proof row
     const insertQ = `
       INSERT INTO proofs
-        (bid_id, milestone_index, vendor_name, wallet_address, title, description, files, status, submitted_at, vendor_prompt, updated_at)
+        (bid_id, milestone_index, vendor_name, wallet_address, title, description,
+         files, file_meta, gps_lat, gps_lon, gps_alt, capture_time,
+         status, submitted_at, vendor_prompt, updated_at)
       VALUES
-        ($1,$2,$3,$4,$5,$6,$7,'pending', NOW(), $8, NOW())
+        ($1,$2,$3,$4,$5,$6,
+         $7,$8,$9,$10,$11,$12,
+         'pending', NOW(), $13, NOW())
       RETURNING *`;
     const insertVals = [
       bidId,
@@ -3204,20 +3807,42 @@ if (lastRows[0] && String(lastRows[0].status || '').toLowerCase() === 'approved'
       title,
       description,
       JSON.stringify(files),
-      vendorPrompt || null,
+      JSON.stringify(fileMeta || []),
+      gpsLat, gpsLon, gpsAlt, captureIso,
+      vendorPrompt || "",
     ];
     const { rows: pr } = await pool.query(insertQ, insertVals);
     let proofRow = pr[0];
 
-    // 5) Try Agent2 analysis (non-fatal)
-    let analysis = null;
+    // 6) (Best-effort) Agent2 analysis + notify
     try {
       if (openai && (vendorPrompt || description || files.length)) {
-        // pull proposal for context
         const { rows: prj } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [
           bid.proposal_id || bid.proposalId,
         ]);
         const proposal = prj[0] || null;
+
+        const metaBlock = summarizeMeta(fileMeta);
+        const gpsCount = fileMeta.filter(m =>
+          Number.isFinite(m?.exif?.gpsLatitude) && Number.isFinite(m?.exif?.gpsLongitude)
+        ).length;
+        const firstFix = fileMeta.find(m =>
+          Number.isFinite(m?.exif?.gpsLatitude) && Number.isFinite(m?.exif?.gpsLongitude)
+        );
+        const firstGps = firstFix
+          ? {
+              lat: Number(firstFix.exif.gpsLatitude),
+              lon: Number(firstFix.exif.gpsLongitude),
+              alt: Number.isFinite(Number(firstFix?.exif?.gpsAltitude))
+                ? Number(firstFix.exif.gpsAltitude)
+                : null,
+            }
+          : { lat: null, lon: null, alt: null };
+
+        const capNote = captureIso ? `First capture time (EXIF, ISO8601): ${captureIso}` : "No capture time in EXIF.";
+        const gpsNote = gpsCount
+          ? `GPS present in ${gpsCount} file(s). First fix: ${firstGps.lat}, ${firstGps.lon}${firstGps.alt != null ? ` • alt ${firstGps.alt}m` : ""}`
+          : "No GPS in submitted media.";
 
         const basePrompt = `
 You are Agent2. Evaluate a vendor's submitted proof for a specific milestone.
@@ -3228,7 +3853,12 @@ Return strict JSON:
   "evidence": string[],
   "gaps": string[],
   "fit": "low" | "medium" | "high",
-  "confidence": number
+  "confidence": number,
+  "geo": {
+    "gpsCount": number,
+    "firstFix": { "lat": number|null, "lon": number|null, "alt": number|null },
+    "captureTime": string|null
+  }
 }
 
 Context:
@@ -3242,7 +3872,14 @@ Proof description (truncated):
 
 Files:
 ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
-        `.trim();
+
+MEDIA METADATA (EXIF/GPS summary):
+${metaBlock}
+
+Hints:
+- ${gpsNote}
+- ${capNote}
+`.trim();
 
         const fullPrompt = vendorPrompt ? `${vendorPrompt}\n\n---\n${basePrompt}` : basePrompt;
 
@@ -3253,68 +3890,45 @@ ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
           response_format: { type: "json_object" },
         });
 
+        let analysis;
         try {
           const raw = resp.choices?.[0]?.message?.content || "{}";
           analysis = JSON.parse(raw);
         } catch {
           analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
         }
-      } else {
-        analysis = {
-          summary: "OpenAI not configured; no automatic proof analysis.",
-          evidence: [],
-          gaps: [],
-          fit: "low",
-          confidence: 0,
-        };
+        if (!analysis.geo) {
+          analysis.geo = { gpsCount, firstFix: firstGps, captureTime: captureIso || null };
+        }
+
+        await pool.query(
+          "UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2",
+          [JSON.stringify(analysis), proofRow.proof_id]
+        );
+        proofRow.ai_analysis = analysis;
+
+        // notify if suspicious
+        if (shouldNotify(analysis)) {
+          try {
+            const { rows: prj2 } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [
+              bid.proposal_id || bid.proposalId,
+            ]);
+            const proposal2 = prj2[0] || null;
+            await notifyProofFlag({ proof: proofRow, bid, proposal: proposal2, analysis });
+          } catch (e) {
+            console.warn("notifyProofFlag failed (non-fatal):", String(e).slice(0, 200));
+          }
+        }
       }
     } catch (e) {
-      console.error("Agent2 proof analysis error:", e);
-      analysis = { summary: "Agent2 failed during analysis.", evidence: [], gaps: [], fit: "low", confidence: 0 };
+      console.warn("Agent2 analysis skipped:", String(e).slice(0, 200));
     }
 
-// 6) Save analysis (best-effort)
-try {
-  await pool.query(
-    "UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2",
-    [ JSON.stringify(analysis), proofRow.proof_id ]
-  );
-  proofRow.ai_analysis = analysis;
-} catch (e) {
-  console.error("Failed to save ai_analysis for proof:", e);
-}
-
-// [NOTIFY] If the analysis looks suspicious, ping admins & vendor
-try {
-  const notifyEnabled = String(process.env.NOTIFY_ENABLED ?? "true").toLowerCase() !== "false";
-  const decision = shouldNotify(analysis);
-  console.log("[/proofs notify] enabled=%s fit=%s conf=%s shouldNotify=%s",
-    notifyEnabled, String(analysis?.fit || 'n/a'), String(analysis?.confidence ?? 'n/a'), decision);
-
-  if (notifyEnabled && decision) {
-    const { rows: prj } = await pool.query(
-      "SELECT * FROM proposals WHERE proposal_id=$1",
-      [ bid.proposal_id || bid.proposalId ]
-    );
-    const proposal = prj[0] || null;
-
-    await notifyProofFlag({ proof: proofRow, bid, proposal, analysis });
-    console.log("[/proofs notify] sent for proof_id=%s", proofRow.proof_id);
-  } else {
-    console.log("[/proofs notify] skipped");
-  }
-} catch (e) {
-  console.warn("notifyProofFlag failed (non-fatal):", String(e).slice(0,200));
-}
-
-    // 7) Also stamp a simple proof note back to the bid milestone for quick view
+    // 7) Stamp a simple proof note back to milestones for quick view
     const ms = milestones;
     ms[milestoneIndex] = {
       ...(ms[milestoneIndex] || {}),
-      proof:
-        description ||
-        (files.length ? `Files:\n${files.map((f) => f.url).join("\n")}` : "") ||
-        legacyText,
+      proof: description || (files.length ? `Files:\n${files.map((f) => f.url).join("\n")}` : "") || legacyText,
     };
     await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(ms), bidId]);
 
@@ -3322,7 +3936,6 @@ try {
     return res.status(201).json(toCamel(proofRow));
   } catch (err) {
     console.error("POST /proofs error:", err);
-    // return a safe 400 with guidance
     return res
       .status(400)
       .json({ error: "Invalid /proofs request. Check bidId, milestoneIndex, and payload format." });
@@ -3641,6 +4254,7 @@ app.post('/proofs/:id/analyze', adminGuard, async (req, res) => {
     const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
     const proof = pr[0];
     if (!proof) return res.status(404).json({ error: 'Proof not found' });
+    const proofDesc = String(proof.description || '').trim();
 
     // 2) Load bid + proposal for context
     const { rows: br } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [proof.bid_id]);
@@ -3650,11 +4264,53 @@ app.post('/proofs/:id/analyze', adminGuard, async (req, res) => {
     const { rows: por } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
     const proposal = por[0] || null;
 
-    // 3) Build prompt
+    // 3) Build prompt inputs
     const vendorPrompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
-    const files = Array.isArray(proof.files) ? proof.files : (typeof proof.files === 'string' ? JSON.parse(proof.files || '[]') : []);
+    const files = Array.isArray(proof.files)
+      ? proof.files
+      : (typeof proof.files === 'string' ? JSON.parse(proof.files || '[]') : []);
     const description = String(proof.description || '').slice(0, 2000);
 
+    // --- EXIF/GPS prep from the saved proof row ---
+    const meta = Array.isArray(proof.file_meta)
+      ? proof.file_meta
+      : (typeof proof.file_meta === "string" ? JSON.parse(proof.file_meta || "[]") : []);
+
+    const gpsItems = meta.filter(m =>
+      Number.isFinite(m?.exif?.gpsLatitude) && Number.isFinite(m?.exif?.gpsLongitude)
+    );
+    const gpsCount = gpsItems.length;
+    const firstGps = gpsItems[0]
+      ? {
+          lat: Number(gpsItems[0].exif.gpsLatitude),
+          lon: Number(gpsItems[0].exif.gpsLongitude),
+          alt: Number.isFinite(Number(gpsItems[0].exif?.gpsAltitude))
+            ? Number(gpsItems[0].exif.gpsAltitude)
+            : null,
+        }
+      : { lat: null, lon: null, alt: null };
+
+    const captureIso = proof.capture_time || null; // we saved this on submit
+    const lat = Number.isFinite(firstGps?.lat) ? firstGps.lat : (Number.isFinite(proof.gps_lat) ? Number(proof.gps_lat) : null);
+const lon = Number.isFinite(firstGps?.lon) ? firstGps.lon : (Number.isFinite(proof.gps_lon) ? Number(proof.gps_lon) : null);
+
+let rgeo = null;
+if (Number.isFinite(lat) && Number.isFinite(lon)) {
+  try { rgeo = await reverseGeocode(lat, lon); } catch {}
+}
+    const metaBlock = summarizeMeta(meta);
+    const capNote = captureIso
+      ? `First capture time (EXIF, ISO8601): ${captureIso}`
+      : 'No capture time in EXIF.';
+    const gpsNote = gpsCount
+      ? `GPS present in ${gpsCount} file(s). First fix: ${firstGps.lat}, ${firstGps.lon}${firstGps.alt != null ? ` • alt ${firstGps.alt}m` : ''}`
+      : 'No GPS in submitted media.';
+
+    // Milestone info for this proof
+    const msArr = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
+    const ms = msArr[proof.milestone_index] || {};
+
+    // 4) Base prompt (now includes EXIF/GPS + capture time block)
     const basePrompt = `
 You are Agent2. Evaluate a vendor's submitted proof for a specific milestone.
 
@@ -3664,12 +4320,17 @@ Return strict JSON:
   "evidence": string[],
   "gaps": string[],
   "fit": "low" | "medium" | "high",
-  "confidence": number
+  "confidence": number,
+  "geo": {
+    "gpsCount": number,
+    "firstFix": { "lat": number|null, "lon": number|null, "alt": number|null },
+    "captureTime": string|null
+  }
 }
 
 Context:
 - Proposal: ${proposal?.title || "(unknown)"} (${proposal?.org_name || "(unknown)"})
-- Milestone: ${(Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]"))[proof.milestone_index]?.name || "(unknown)"} — $${(Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]"))[proof.milestone_index]?.amount ?? "?"}
+- Milestone: ${ms?.name || "(unknown)"} — $${ms?.amount ?? "?"}
 - Vendor: ${bid.vendor_name || "(unknown)"}
 
 Proof title: ${proof.title || "(untitled)"}
@@ -3678,37 +4339,80 @@ Proof description (truncated):
 
 Files:
 ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
-    `.trim();
+
+MEDIA METADATA (EXIF/GPS summary):
+${metaBlock}
+
+Hints:
+- ${gpsNote}
+- ${capNote}
+`.trim();
 
     const fullPrompt = vendorPrompt ? `${vendorPrompt}\n\n---\n${basePrompt}` : basePrompt;
 
-    // 4) Run OpenAI (or fallback)
-    let analysis;
-    if (!openai) {
-      analysis = {
-        summary: "OpenAI not configured; no automatic proof analysis.",
-        evidence: [],
-        gaps: [],
-        fit: "low",
-        confidence: 0,
-      };
-    } else {
-      const resp = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        temperature: 0.2,
-        messages: [{ role: "user", content: fullPrompt }],
-        response_format: { type: "json_object" },
-      });
+// 5) Run OpenAI (or fallback)
+let analysis;
+if (!openai) {
+  analysis = {
+    summary: "OpenAI not configured; no automatic proof analysis.",
+    evidence: [],
+    gaps: [],
+    fit: "low",
+    confidence: 0,
+    geo: { gpsCount, firstFix: firstGps, captureTime: captureIso || null },
+  };
+} else {
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0.2,
+    messages: [{ role: "user", content: fullPrompt }],
+    response_format: { type: "json_object" },
+  });
 
-      try {
-        const raw = resp.choices?.[0]?.message?.content || "{}";
-        analysis = JSON.parse(raw);
-      } catch {
-        analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
-      }
-    }
+  try {
+    const raw = resp.choices?.[0]?.message?.content || "{}";
+    analysis = JSON.parse(raw);
+  } catch {
+    analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
+  }
+} // ← end else
 
-    // 5) Save & return
+// ↓↓↓ THIS BLOCK GOES OUTSIDE the else, before the DB UPDATE ↓↓↓
+
+// Ensure geo always present
+if (!analysis.geo) {
+  analysis.geo = { gpsCount, firstFix: firstGps, captureTime: captureIso || null };
+}
+
+// Attach GPS + human-readable location (uses the `lat`/`lon` you computed above)
+analysis.geo.lat = Number.isFinite(lat) ? lat : (analysis.geo.lat ?? null);
+analysis.geo.lon = Number.isFinite(lon) ? lon : (analysis.geo.lon ?? null);
+if (captureIso && !analysis.geo.captureTime) analysis.geo.captureTime = captureIso;
+
+if (rgeo) {
+  Object.assign(analysis.geo, {
+    // handle either new {provider,label} or older {source,displayName}
+    provider: rgeo.provider || rgeo.source || null,
+    address:  rgeo.label || rgeo.displayName || null,
+    country:  rgeo.country ?? null,
+    state:    rgeo.state || rgeo.region || null,
+    county:   rgeo.county || rgeo.province || null,
+    city:     rgeo.city || rgeo.municipality || null,
+    suburb:   rgeo.suburb ?? null,
+    postcode: rgeo.postcode ?? null,
+  });
+}
+
+// (optional) add a readable line to the summary
+const locBits = [analysis.geo.city, analysis.geo.state, analysis.geo.country].filter(Boolean);
+if (locBits.length) {
+  const locLine = `Location: ${locBits.join(", ")} (${analysis.geo.lat?.toFixed?.(6)}, ${analysis.geo.lon?.toFixed?.(6)})`;
+  if (!String(analysis.summary || "").includes(locLine)) {
+    analysis.summary = `${analysis.summary ? analysis.summary.trim() + "\n\n" : ""}${locLine}`;
+  }
+}
+
+    // 6) Save & return
     const { rows: upd } = await pool.query(
       'UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2 RETURNING *',
       [JSON.stringify(analysis), proofId]
@@ -3827,46 +4531,14 @@ try {
   }
 });
 
-// --- LIST PROOFS (admin, legacy ?bidId=) -------------------------------
-app.get('/proofs', adminGuard, async (req, res) => {
-  try {
-    const bidId = Number(req.query.bidId);
-    if (!Number.isFinite(bidId)) {
-      return res.status(400).json({ error: 'bidId query param required' });
-    }
-
-    const { rows } = await pool.query(
-      `SELECT
-         proof_id          AS "proofId",
-         bid_id            AS "bidId",
-         milestone_index   AS "milestoneIndex",
-         title,
-         description,
-         files,
-         status,
-         submitted_at      AS "submittedAt",
-         updated_at        AS "updatedAt"
-       FROM proofs
-       WHERE bid_id = $1
-       ORDER BY submitted_at DESC NULLS LAST,
-                updated_at  DESC NULLS LAST,
-                proof_id    DESC`,
-      [bidId]
-    );
-
-    return res.json(rows);
-  } catch (err) {
-    console.error('GET /proofs error', err);
-    return res.status(500).json({ error: 'Server error' });
-  }
-});
-
 // --- Vendor-safe: Archive a proof -------------------------------------------
 // POST /proofs/:id/archive
 // Auth: admin OR vendor who owns the bid (wallet matches)
 app.post('/proofs/:id/archive', authRequired, async (req, res) => {
   const proofId = Number(req.params.id);
-  if (!Number.isFinite(proofId)) return res.status(400).json({ error: 'Invalid proof id' });
+  if (!Number.isFinite(proofId)) {
+    return res.status(400).json({ error: 'Invalid proof id' });
+  }
 
   try {
     // Load proof + owning bid (to verify ownership)
@@ -3881,35 +4553,17 @@ app.post('/proofs/:id/archive', authRequired, async (req, res) => {
     const pr = rows[0];
     if (!pr) return res.status(404).json({ error: 'Proof not found' });
 
-    // Authorization: admin OR the wallet that owns the bid
-    const caller = String(req.user?.sub || '').toLowerCase();
-    const role   = String(req.user?.role || 'vendor').toLowerCase();
-    const owner  = String(pr.bid_wallet || '').toLowerCase();
-    if (!(role === 'admin' || (caller && caller === owner))) {
-      return res.status(403).json({ error: 'Forbidden' });
+    const caller  = String(req.user?.sub || '').toLowerCase();
+    const isAdmin = String(req.user?.role || '').toLowerCase() === 'admin';
+    const owner   = String(pr.bid_wallet || '').toLowerCase();
+
+    if (!isAdmin && !caller) return res.status(401).json({ error: 'Unauthorized' });
+    if (!isAdmin && caller !== owner) return res.status(403).json({ error: 'Forbidden' });
+
+    if (String(pr.status || '').toLowerCase() === 'archived') {
+      return res.json({ ok: true, proof: toCamel(pr) });
     }
 
-    // Do NOT allow archiving if this is the latest PENDING proof for that milestone
-    const { rows: latest } = await pool.query(
-      `SELECT proof_id, status
-         FROM proofs
-        WHERE bid_id = $1 AND milestone_index = $2
-        ORDER BY submitted_at DESC NULLS LAST,
-                 updated_at  DESC NULLS LAST,
-                 proof_id    DESC
-        LIMIT 1`,
-      [pr.bid_id, pr.milestone_index]
-    );
-    const isLatestPending =
-      latest[0] &&
-      Number(latest[0].proof_id) === proofId &&
-      String(latest[0].status || '').toLowerCase() === 'pending';
-
-    if (isLatestPending) {
-      return res.status(409).json({ error: 'Cannot archive the latest pending proof for this milestone.' });
-    }
-
-    // Flip status to "archived" (re-uses the same status column)
     const { rows: upd } = await pool.query(
       `UPDATE proofs
           SET status = 'archived', updated_at = NOW()
@@ -3919,9 +4573,9 @@ app.post('/proofs/:id/archive', authRequired, async (req, res) => {
     );
 
     return res.json({ ok: true, proof: toCamel(upd[0]) });
-  } catch (e) {
-    console.error('POST /proofs/:id/archive error', e);
-    return res.status(500).json({ error: 'Failed to archive proof' });
+  } catch (err) {
+    console.error('archive proof error:', err);
+    return res.status(500).json({ error: 'Internal error archiving proof' });
   }
 });
 
@@ -3936,14 +4590,12 @@ app.all('/proofs/:id/chat', (req, res, next) => {
   return res.status(405).json({ error: 'Method Not Allowed. Use POST /proofs/:id/chat.' });
 });
 
-// You can relax auth to adminOrBidOwnerGuard if you want vendors to chat about their own proofs.
+// NOTE: keep adminGuard, or relax to adminOrBidOwnerGuard if vendors should access their own proofs.
 app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
   if (!openai) return res.status(503).json({ error: 'OpenAI not configured' });
 
   const proofId = Number(req.params.id);
   if (!Number.isFinite(proofId)) return res.status(400).json({ error: 'Invalid proof id' });
-
-  const userMessages = Array.isArray(req.body?.messages) ? req.body.messages : [];
 
   // SSE headers
   res.set({
@@ -3954,130 +4606,249 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
   try {
-    // 1) Load proof, bid, proposal
+    // 1) Load proof
     const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
     const proof = pr[0];
-    if (!proof) { res.write(`data: ERROR Proof not found\n\n`); res.write(`data: [DONE]\n\n`); return res.end(); }
+    if (!proof) {
+      res.write(`data: ERROR Proof not found\n\n`);
+      res.write(`data: [DONE]\n\n`);
+      return res.end();
+    }
 
+    // 2) Load bid + proposal
     const { rows: br } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [proof.bid_id]);
     const bid = br[0];
-    if (!bid) { res.write(`data: ERROR Bid not found for proof\n\n`); res.write(`data: [DONE]\n\n`); return res.end(); }
+    if (!bid) {
+      res.write(`data: ERROR Bid not found for proof\n\n`);
+      res.write(`data: [DONE]\n\n`);
+      return res.end();
+    }
 
     const { rows: por } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
     const proposal = por[0] || null;
 
-    // 2) Normalize proof files and extract PDF text (best-effort)
-    const files = Array.isArray(proof.files)
-      ? proof.files
-      : (typeof proof.files === 'string' ? JSON.parse(proof.files || '[]') : []);
+// 3) Normalize proof payload (single source of truth)
+const files = Array.isArray(proof?.files)
+  ? proof.files
+  : (typeof proof?.files === 'string' ? JSON.parse(proof.files || '[]') : []);
 
-    // collect images from this proof
-    const imageFiles = [];
-    for (const f of files) { if (isImageFile(f)) imageFiles.push(f); }
+const meta = Array.isArray(proof?.file_meta)
+  ? proof.file_meta
+  : (typeof proof?.file_meta === 'string' ? JSON.parse(proof.file_meta || '[]') : []);
 
-    let pdfText = '';
-    try {
-      for (const f of files) {
-        const n = (f?.name || f?.url || '').toLowerCase();
-        const isPdf = n.endsWith('.pdf') || n.includes('.pdf?') || (f?.mimetype || '').includes('pdf');
-        if (!isPdf) continue;
-        const info = await withTimeout(
-          waitForPdfInfoFromDoc({ url: f.url, name: f.name || 'attachment.pdf', mimetype: 'application/pdf' }),
-          8000,
-          () => ({ used: false, reason: 'timeout' })
-        );
-        if (info.used && info.text) pdfText += `\n\n[${f.name || 'file'}]\n${info.text}`;
-      }
-    } catch { /* non-fatal */ }
-    pdfText = (pdfText || '').slice(0, 15000);
+const metaBlock = summarizeMeta(meta);
 
-    // 3) Build concise context for this ONE proof
+// === A) Proof description string ===
+const proofDesc = String(proof?.description || '').trim();
+
+// === B) Extract PDF text from any proof files ===
+let pdfText = '';
+for (const f of files) {
+  if (!f?.url) continue;
+  const info = await waitForPdfInfoFromDoc({ url: f.url, name: f.name || '' });
+  if (info.used && info.text) {
+    pdfText += `\n\n[${f.name || 'file'}]\n${info.text}`;
+  }
+}
+pdfText = pdfText.trim();
+
+// === C) Build location block from AI geo or GPS (+ reverse geocode) ===
+let aiGeo = null;
+try { aiGeo = JSON.parse(proof?.ai_analysis || '{}')?.geo || null; } catch {}
+
+const lat = Number.isFinite(aiGeo?.lat) ? Number(aiGeo.lat)
+          : (Number.isFinite(proof?.gps_lat) ? Number(proof.gps_lat) : null);
+const lon = Number.isFinite(aiGeo?.lon) ? Number(aiGeo.lon)
+          : (Number.isFinite(proof?.gps_lon) ? Number(proof.gps_lon) : null);
+
+let rgeo = null;
+if (Number.isFinite(lat) && Number.isFinite(lon)) {
+  try { rgeo = await reverseGeocode(lat, lon); } catch {}
+}
+
+const loc = {
+  lat, lon,
+  country:  aiGeo?.country  ?? rgeo?.country  ?? null,
+  state:    aiGeo?.state    ?? rgeo?.state    ?? null,
+  county:   aiGeo?.county   ?? rgeo?.county   ?? null,
+  city:     aiGeo?.city     ?? rgeo?.city     ?? null,
+  suburb:   aiGeo?.suburb   ?? rgeo?.suburb   ?? null,
+  postcode: aiGeo?.postcode ?? rgeo?.postcode ?? null,
+  address:  aiGeo?.address  ?? rgeo?.displayName ?? rgeo?.label ?? null,
+  provider: aiGeo?.provider ?? rgeo?.provider ?? rgeo?.source ?? null,
+};
+
+const locationBlock = loc ? [
+  'Known location:',
+  (Number.isFinite(loc.lat) && Number.isFinite(loc.lon))
+    ? `- Coords: ${loc.lat.toFixed(6)}, ${loc.lon.toFixed(6)}`
+    : '- Coords: n/a',
+  loc.address ? `- Address: ${loc.address}` : '',
+  loc.city ? `- City: ${loc.city}` : '',
+  loc.state ? `- State/Region: ${loc.state}` : '',
+  loc.country ? `- Country: ${loc.country}` : '',
+  loc.provider ? `- Source: ${loc.provider}` : '',
+].filter(Boolean).join('\n') : 'Known location: (none)';
+
+    const userText = String(req.body?.message || 'Analyze this proof for completeness and risks.').slice(0, 2000);
+
+    // Gather any images from proof; also BEFORE images from proposal docs (if present)
+    const proposalImages = collectProposalImages(proposal);
+    const proofImages = files.filter(isImageFile);
+    const hasAnyImages = proposalImages.length > 0 || proofImages.length > 0;
+
+    // 4) Create context block
     const context = [
-      'You are Agent 2 for LithiumX.',
-      'Answer ONLY using the proposal/bid fields and this specific proof (its text + any PDF extract below).',
-      'If the answer is not present, state that it is not in the submitted proof.',
-      '',
-      '--- PROPOSAL ---',
-      JSON.stringify({
-        org: proposal?.org_name || '',
-        title: proposal?.title || '',
-        summary: proposal?.summary || '',
-        budgetUSD: proposal?.amount_usd ?? 0,
-      }, null, 2),
-      '',
-      '--- BID ---',
-      JSON.stringify({
-        vendor: bid.vendor_name || '',
-        priceUSD: bid.price_usd ?? 0,
-        days: bid.days ?? 0,
-        notes: bid.notes || '',
-        milestones: (Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || '[]')),
-      }, null, 2),
-      '',
-      '--- PROOF ---',
-      JSON.stringify({
-        title: proof.title || '',
-        milestoneIndex: proof.milestone_index,
-        description: String(proof.description || '').slice(0, 4000),
-        files: files.map(f => ({ name: f.name, url: f.url })),
-      }, null, 2),
-      '',
-      pdfText ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText}` : `--- NO PDF TEXT AVAILABLE ---`,
-    ].join('\n');
+  'You are Agent 2 for LithiumX.',
+  'Answer ONLY using the provided bid/proposal fields and the submitted proof (description + extracted PDF text).',
+  'If something is not present in that material, say it is not stated in the submitted proof.',
+  '',
+  '--- PROPOSAL ---',
+  JSON.stringify({
+    org: proposal?.org_name || '',
+    title: proposal?.title || '',
+    summary: proposal?.summary || '',
+    budgetUSD: proposal?.amount_usd ?? 0,
+  }, null, 2),
+  '',
+  '--- BID ---',
+  JSON.stringify({
+    vendor: bid.vendor_name || '',
+    priceUSD: bid.price_usd ?? 0,
+    days: bid.days ?? 0,
+    notes: bid.notes || '',
+    milestones: (Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || '[]')),
+  }, null, 2),
+  '',
+  '--- PROOF ---',
+  JSON.stringify({
+    title: proof?.title || '',
+    description: proofDesc.slice(0, 4000),
+    files: files.map(f => ({ name: f.name, url: f.url })),
+  }, null, 2),
+  '',
+  '--- IMAGE/VIDEO METADATA ---',
+  metaBlock,
+  '',
 
-    // 4) Choose vision vs text
+  // >>> INSERTED LINES <<<
+  '--- KNOWN LOCATION ---',
+  locationBlock,
+  '',
+  // <<< END INSERTION <<<
+
+  pdfText
+    ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText.slice(0, 15000)}`
+    : `--- NO PDF TEXT AVAILABLE ---`,
+].join('\n');
+
+    // 5) Choose vision vs text model
     let stream;
-    if (imageFiles.length > 0) {
-      const systemMsg = 'Be concise. Use the proof context provided. Perform an image review if images are attached.';
-      const userVisionContent = [
-        { type: 'text', text: `User request: ${String(userMessages.at(-1)?.content || '').trim() || 'Analyze this proof.'}\n\nUse the CONTEXT and analyze ALL attached images.` },
-        ...imageFiles.slice(0, 6).map(f => ({ type: 'image_url', image_url: { url: f.url } })),
-        { type: 'text', text: `\n\n--- CONTEXT ---\n${context}` },
+    if (hasAnyImages) {
+      const beforeImgs = proposalImages.slice(0, 6);
+      const afterImgs  = proofImages.slice(0, 6);
+
+      const systemMsg = `
+You are Agent2 for LithiumX.
+
+You CAN analyze the attached images (URLs). You CANNOT browse the web or reverse-image-search.
+
+Task: Compare "BEFORE" (proposal) vs "AFTER" (proof) images to assess progress/changes and possible image reuse.
+
+ALWAYS provide:
+1) 1–2 sentence conclusion (done/partial/unclear).
+2) Bullets with:
+   • Evidence (visual cues, materials, measurements, signage, timestamps)
+   • Differences/Progress
+   • Possible reuse/duplicates
+   • Inconsistencies (warped text/repetitive textures)
+   • OCR snippets (short)
+   • Fit-to-proof (does AFTER match the milestone claim?)
+   • Next checks
+   • Confidence [0–1]
+
+Be concrete and cite visible cues.`.trim();
+
+      const content = [
+        { type: 'text', text: `User request: ${userText}\n\nCompare BEFORE (proposal docs) vs AFTER (proof) images.` },
       ];
+
+      if (beforeImgs.length) {
+        content.push({ type: 'text', text: 'BEFORE (from proposal):' });
+        for (const f of beforeImgs) content.push({ type: 'image_url', image_url: { url: f.url } });
+      } else {
+        content.push({ type: 'text', text: 'BEFORE: (none)' });
+      }
+
+      if (afterImgs.length) {
+        content.push({ type: 'text', text: 'AFTER (from proof):' });
+        for (const f of afterImgs) content.push({ type: 'image_url', image_url: { url: f.url } });
+      } else {
+        content.push({ type: 'text', text: 'AFTER: (none)' });
+      }
+
+      content.push({ type: 'text', text: `\n\n--- CONTEXT ---\n${context}` });
+
       stream = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         temperature: 0.2,
         stream: true,
         messages: [
           { role: 'system', content: systemMsg },
-          { role: 'user', content: userVisionContent },
+          { role: 'user', content },
         ],
       });
     } else {
-      const msgs = [
-        { role: 'system', content: 'Be concise. Use the proof context provided.' },
-        { role: 'user', content: `${String(userMessages.at(-1)?.content || '').trim() || 'Analyze this proof.'}\n\n--- CONTEXT ---\n${context}` },
-      ];
       stream = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         temperature: 0.2,
-        messages: msgs,
         stream: true,
+        messages: [
+          { role: 'system', content: 'Be concise. Cite specific items from the provided proof context.' },
+          { role: 'user', content: `${userText}\n\n--- CONTEXT ---\n${context}` },
+        ],
       });
     }
 
-    // === SSE streaming loop (buffer + footer) ===
-    let fullText = '';
+    // 6) Stream tokens
+    let full = '';
     for await (const part of stream) {
       const token = part?.choices?.[0]?.delta?.content || '';
       if (token) {
-        fullText += token;
+        full += token;
         res.write(`data: ${token}\n\n`);
       }
     }
 
-    // ---- Post-stream footer (simple) ----
+    // 7) Footer: low-confidence hint + next checks
+    const conf = extractConfidenceFromText(full);
+    const nextChecks = buildNextChecks({
+      hasAnyPdfText: false,
+      imageCount: proofImages.length,
+      ocrSeen: /[A-Za-z0-9]{3,}/.test(full || '')
+    });
+
+    if (conf !== null && conf < 0.35) {
+      res.write(`data: \n\n`);
+      res.write(`data: 🔎 Needs human review (low confidence: ${conf.toFixed(2)})\n\n`);
+    }
+    if (nextChecks.length) {
+      res.write(`data: \n\n`);
+      res.write(`data: Next checks:\n\n`);
+      for (const item of nextChecks) res.write(`data: • ${item}\n\n`);
+    }
+
     res.write(`data: [DONE]\n\n`);
     res.end();
   } catch (err) {
-    console.error('Proof chat SSE error:', err);
+    console.error('/proofs/:id/chat SSE error:', err);
     try {
       res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`);
       res.write(`data: [DONE]\n\n`);
       res.end();
     } catch {}
   }
-});
+}); 
 
 // ==============================
 // Routes — Vendor profile (fill once, used in Admin Vendors)
@@ -4446,13 +5217,11 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
           amount_usd,
           status,
           created_at,
-          -- one-line address display
           NULLIF(BTRIM(CONCAT_WS(', ',
             NULLIF(address, ''),
             NULLIF(city, ''),
             NULLIF(country, '')
           )), '') AS addr_display,
-          -- grouping key (prefer wallet, then contact, then org)
           COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) AS entity_key
         FROM proposals
         ${whereSql}
@@ -4503,86 +5272,6 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
       pool.query(listSql, listParams),
       pool.query(countSql, countParams),
     ]);
-
-    // --- Admin: ENTITY actions (body-based; matches frontend) -------------------
-function deriveEntityKey(body = {}) {
-  const id = String(body.id || '').trim().toLowerCase();
-  const wallet = String(body.ownerWallet || body.wallet || '').trim().toLowerCase();
-  const email  = String(body.contactEmail || body.primaryEmail || '').trim().toLowerCase();
-  const org    = String(body.orgName || body.organization || '').trim().toLowerCase();
-  return id || wallet || email || org || null;
-}
-
-app.post('/admin/entities/archive', adminGuard, async (req, res) => {
-  try {
-    const key = deriveEntityKey(req.body);
-    if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
-
-    const { rowCount } = await pool.query(`
-      UPDATE proposals
-         SET status = 'archived'
-       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
-         AND status <> 'archived'
-    `, [key]);
-
-    res.json({ ok: true, affected: rowCount });
-  } catch (e) {
-    console.error('archive entity error', e);
-    res.status(500).json({ error: 'Failed to archive entity' });
-  }
-});
-
-app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
-  try {
-    const key = deriveEntityKey(req.body);
-    if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
-
-    const toStatus = String(req.body?.toStatus || 'pending').toLowerCase();
-    if (!['pending','approved','rejected'].includes(toStatus)) {
-      return res.status(400).json({ error: 'Invalid toStatus' });
-    }
-
-    const { rowCount } = await pool.query(`
-      UPDATE proposals
-         SET status = $2
-       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
-         AND status = 'archived'
-    `, [key, toStatus]);
-
-    res.json({ ok: true, affected: rowCount, toStatus });
-  } catch (e) {
-    console.error('unarchive entity error', e);
-    res.status(500).json({ error: 'Failed to unarchive entity' });
-  }
-});
-
-app.delete('/admin/entities', adminGuard, async (req, res) => {
-  try {
-    const key = deriveEntityKey(req.body);
-    if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
-
-    const mode = String(req.query.mode || 'soft'); // soft | hard
-    if (mode === 'hard') {
-      const { rowCount } = await pool.query(`
-        DELETE FROM proposals
-         WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
-      `, [key]);
-      return res.json({ success: true, deleted: rowCount, mode: 'hard' });
-    }
-
-    const { rowCount } = await pool.query(`
-      UPDATE proposals
-         SET status = 'archived'
-       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
-         AND status <> 'archived'
-    `, [key]);
-
-    res.json({ success: true, archived: rowCount, mode: 'soft' });
-  } catch (e) {
-    console.error('delete entity error', e);
-    res.status(500).json({ error: 'Failed to delete entity' });
-  }
-});
 
     const items = list.rows.map(r => ({
       id: r.entity_key,
