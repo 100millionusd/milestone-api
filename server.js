@@ -1989,7 +1989,7 @@ app.post("/auth/verify", async (req, res) => {
   if (!nonce) return res.status(400).json({ error: "nonce not found or expired" });
 
   let recovered;
-  try { recovered = ethers.verifyMessage(nonce, signature); }
+  try { recovered = ethers.utils.verifyMessage(nonce, signature); }
   catch { return res.status(400).json({ error: "invalid signature" }); }
 
   if (norm(recovered) !== address) {
@@ -2044,7 +2044,7 @@ app.post("/auth/login", async (req, res) => {
   if (!nonce) return res.status(400).json({ error: "nonce not found or expired" });
 
   let recovered;
-  try { recovered = ethers.verifyMessage(nonce, signature); }
+  try { recovered = ethers.utils.verifyMessage(nonce, signature); }
   catch { return res.status(400).json({ error: "invalid signature" }); }
 
   if (norm(recovered) !== address) return res.status(401).json({ error: "signature does not match address" });
