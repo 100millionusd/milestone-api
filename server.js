@@ -2607,6 +2607,28 @@ if (typeof notifyBidSubmitted === "function") {
   notifyBidSubmitted(inserted, proposal, vendor).catch(() => null);
 }
 
+/* --- Audit: bid created (anchorable) --- */
+try {
+  const actorWallet = (req.user && (req.user.address || req.user.sub)) || null;
+  const actorRole   = (req.user && req.user.role) || 'vendor';
+
+  const ins = await pool.query(
+    `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
+     VALUES ($1, $2, $3, $4)
+     RETURNING audit_id`,
+    [ Number(inserted.bid_id ?? inserted.id), actorWallet, actorRole, { created: true } ]
+  );
+
+  // Enrich asynchronously: sets ipfs_cid + leaf_hash
+  if (typeof enrichAuditRow === 'function') {
+    enrichAuditRow(pool, ins.rows[0].audit_id).catch(err =>
+      console.error('audit enrich failed (create):', err)
+    );
+  }
+} catch (e) {
+  console.warn('create audit failed (non-fatal):', String(e).slice(0,200));
+}
+
 return res.status(201).json(toCamel(inserted));
 } catch (err) {
   console.error("POST /bids error:", err);
@@ -2615,7 +2637,7 @@ return res.status(201).json(toCamel(inserted));
 });
 
 // Approve / award bid (+ notify admin & vendor)
-app.post("/bids/:id/approve", adminGuard, async (req, res) => {
+eq, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
 
@@ -2894,25 +2916,27 @@ app.patch("/bids/:id/milestones", adminGuard, async (req, res) => {
       [bidId, JSON.stringify(norm)]
     );
 
-    // Audit row
-    const actorWallet = req.user?.sub || null;
-    const actorRole = req.user?.role || "admin";
-    const ins = await pool.query(
+ // Audit row
+const actorWallet = req.user?.sub || req.user?.address || null;
+const actorRole   = req.user?.role || "admin";
+
+const ins = await pool.query(
   `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
-   VALUES ($1, $2, $3, $4) RETURNING id`,
+   VALUES ($1, $2, $3, $4)
+   RETURNING audit_id`,
   [bidId, actorWallet, actorRole, { milestones: { from: current.milestones, to: norm } }]
 );
 
 // fire-and-forget enrichment (IPFS + hash)
-enrichAuditRow(pool, ins.rows[0].id).catch(err =>
+enrichAuditRow(pool, ins.rows[0].audit_id).catch(err =>
   console.error('audit enrich failed:', err)
 );
 
-    return res.json(toCamel(upd[0]));
-  } catch (err) {
-    console.error("PATCH /bids/:id/milestones failed", { bidId, err });
-    return res.status(500).json({ error: "Internal error updating milestones" });
-  }
+return res.json(toCamel(upd[0]));
+} catch (err) {
+  console.error("PATCH /bids/:id/milestones failed", { bidId, err });
+  return res.status(500).json({ error: "Internal error updating milestones" });
+}
 });
 
 // GET /audit?itemType=proposal&itemId=123  OR  /audit?itemType=bid&itemId=456
