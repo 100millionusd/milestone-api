@@ -1,0 +1,16 @@
+name: Anchor audits hourly
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # every hour on the hour (UTC)
+  workflow_dispatch:      # allow manual run from Actions tab
+
+jobs:
+  anchor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /admin/anchor
+        run: |
+          set -e
+          curl --fail --silent --show-error \
+            "https://milestone-api-production.up.railway.app/admin/anchor"
