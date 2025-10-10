@@ -3668,10 +3668,6 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
   }
 });
 
-// ==============================
-// Routes — Complete/Pay milestone (frontend-compatible)
-// (replace ONLY the /pay-milestone route below)
-// ==============================
 app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
   const bidId = Number(req.params.id);
   const { milestoneIndex } = req.body || {};
@@ -3682,8 +3678,19 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
 
   const client = await pool.connect();
   try {
-    // BEGIN + lock the bid row so two requests can’t pay the same milestone
     await client.query("BEGIN");
+
+    // 🚧 HARD STOP: allow only one payment per (bidId, milestoneIndex) in this tx
+    const { rows: lock } = await client.query(
+      "SELECT pg_try_advisory_xact_lock($1::bigint, $2::bigint) AS got",
+      [bidId, milestoneIndex]
+    );
+    if (!lock[0]?.got) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Payment already in progress or completed" });
+    }
+
+    // From here on, only ONE concurrent request can proceed.
     const { rows } = await client.query("SELECT * FROM bids WHERE bid_id=$1 FOR UPDATE", [ bidId ]);
     if (!rows[0]) {
       await client.query("ROLLBACK");
@@ -3707,17 +3714,18 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
       return res.status(409).json({ error: "Milestone already paid" });
     }
 
-    // (Your chain send function)
+    // 🔗 Send funds
     const receipt = await blockchainService.sendToken(
       bid.preferred_stablecoin,
       bid.wallet_address,
       ms.amount
     );
 
+    // ✅ Mark paid atomically in the same tx
     ms.paymentTxHash = receipt.hash;
     ms.paymentDate   = new Date().toISOString();
-
     await client.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [ JSON.stringify(milestones), bidId ]);
+
     await client.query("COMMIT");
 
     // --- unchanged: audit, notify, final fetch ---
