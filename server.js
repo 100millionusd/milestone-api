@@ -846,6 +846,47 @@ async function notifyPaymentReleased({ bid, proposal, msIndex, amount, txHash })
   ].filter(Boolean));
 }
 
+async function notifyIpfsMissing({ bid, proposal, cid, where, proofId = null, url = null }) {
+  try {
+    const subject = `🟥 IPFS content missing`;
+    const title   = proposal?.title || 'Project';
+    const bidStr  = `Bid ${bid?.bid_id ?? ''}`.trim();
+    const whereStr = where || 'unknown';
+
+    const en = [
+      '🟥 IPFS content missing',
+      `Project: ${title} — ${proposal?.org_name || ''}`,
+      `${bidStr}`,
+      `CID: ${cid}`,
+      `Where: ${whereStr}${proofId ? ` (proof ${proofId})` : ''}`,
+      url ? `URL: ${url}` : ''
+    ].filter(Boolean).join('\n');
+
+    const es = [
+      '🟥 Contenido IPFS ausente',
+      `Proyecto: ${title} — ${proposal?.org_name || ''}`,
+      `${bidStr}`,
+      `CID: ${cid}`,
+      `Dónde: ${whereStr}${proofId ? ` (prueba ${proofId})` : ''}`,
+      url ? `URL: ${url}` : ''
+    ].filter(Boolean).join('\n');
+
+    const { text, html } = bi(en, es);
+
+    await Promise.all([
+      TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
+      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      ...(ADMIN_WHATSAPP || []).map(n =>
+        TWILIO_WA_CONTENT_SID
+          ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": title, "2": "ipfs missing" })
+          : sendWhatsApp(n, text)
+      ),
+    ].filter(Boolean));
+  } catch (e) {
+    console.warn('notifyIpfsMissing failed:', String(e).slice(0,200));
+  }
+}
+
 // --- Image helpers for vision models ---
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|tiff|svg)(\?|$)/i;
 function isImageFile(f) {
@@ -1263,6 +1304,58 @@ function rewriteToGateway(u, base) {
 function toPublicGateway(u) {
   const pub = process.env.PINATA_PUBLIC_GATEWAY || "https://gateway.pinata.cloud/ipfs/";
   return rewriteToGateway(u, pub);
+}
+
+// --- IPFS liveness helpers ---------------------------------------------------
+function extractCidFromUrl(u) {
+  try {
+    const m = String(u || '').match(/\/ipfs\/([^/?#]+)/i);
+    return m ? m[1] : null;
+  } catch { return null; }
+}
+
+async function headOk(u, headers = {}) {
+  try {
+    const url = new URL(u);
+    const lib = url.protocol === 'https:' ? https : http;
+    const opts = {
+      method: 'HEAD',
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname + url.search,
+      headers,
+      timeout: 8000,
+    };
+    return await new Promise((resolve) => {
+      const req = lib.request(opts, (res) => resolve((res.statusCode || 0) < 400));
+      req.on('timeout', () => { try { req.destroy(); } catch {} resolve(false); });
+      req.on('error', () => resolve(false));
+      req.end();
+    });
+  } catch { return false; }
+}
+
+async function checkCidAlive(cid) {
+  if (!cid) return false;
+  // 1) your configured gateway (supports mypinata auth)
+  const baseHost = PINATA_GATEWAY.replace(/^https?:\/\//, '');
+  const primary = `https://${baseHost}/ipfs/${cid}`;
+  const headers = {};
+  if (/\.mypinata\.cloud$/i.test(baseHost)) {
+    if (PINATA_JWT) headers['Authorization'] = `Bearer ${PINATA_JWT}`;
+    if (PINATA_GATEWAY_TOKEN) headers['x-pinata-gateway-token'] = PINATA_GATEWAY_TOKEN;
+  }
+  if (await headOk(primary, headers)) return true;
+
+  // 2) public fallbacks
+  const fallbacks = [
+    `${(PINATA_PUBLIC_GATEWAY || 'https://gateway.pinata.cloud/ipfs/').replace(/\/+$/, '/')}${cid}`,
+    `https://ipfs.io/ipfs/${cid}`,
+    `https://cf-ipfs.com/ipfs/${cid}`,
+    `https://dweb.link/ipfs/${cid}`,
+  ];
+  for (const u of fallbacks) if (await headOk(u)) return true;
+  return false;
 }
 
 /** Fetch a URL into a Buffer (supports mypinata.cloud auth + public fallbacks) */
@@ -3151,6 +3244,147 @@ app.get('/admin/anchor/last', async (req, res) => {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
+
+// --- IPFS monitor: scans recent CIDs and records "ipfs_missing" once ----------
+const MONITOR_MINUTES       = Number(process.env.IPFS_MONITOR_INTERVAL_MIN || 15);  // 0 = disabled
+const MONITOR_LOOKBACK_DAYS = Number(process.env.IPFS_MONITOR_LOOKBACK_DAYS || 14);
+
+async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
+  const started = Date.now();
+  let checked = 0, flagged = 0;
+
+  // 1) audit rows (the JSON you pin per audit)
+  const { rows: auditRows } = await pool.query(`
+    SELECT audit_id, bid_id, ipfs_cid
+      FROM bid_audits
+     WHERE ipfs_cid IS NOT NULL
+       AND created_at >= NOW() - INTERVAL '${days} DAYS'
+  `);
+
+  for (const r of auditRows) {
+    const cid = r.ipfs_cid;
+    if (!cid) continue;
+    checked++;
+    const alive = await checkCidAlive(cid);
+    if (alive) continue;
+
+    // Already flagged for this bid+cid?
+    const { rows: exists } = await pool.query(
+      `SELECT 1
+         FROM bid_audits
+        WHERE bid_id=$1
+          AND changes ? 'ipfs_missing'
+          AND changes->'ipfs_missing'->>'cid' = $2
+        LIMIT 1`,
+      [ r.bid_id, cid ]
+    );
+    if (exists.length) continue;
+
+    // Write audit row
+    const ins = await pool.query(
+      `INSERT INTO bid_audits (bid_id, actor_role, actor_wallet, changes)
+       VALUES ($1, 'system', NULL, $2)
+       RETURNING audit_id`,
+      [ r.bid_id, { ipfs_missing: { cid, source: 'audit_ipfs_cid', seen: new Date().toISOString() } } ]
+    );
+    if (typeof enrichAuditRow === 'function') enrichAuditRow(pool, ins.rows[0].audit_id).catch(()=>{});
+
+    // Notify admins (best-effort)
+    const [{ rows: bRows }, { rows: pRows }] = await Promise.all([
+      pool.query('SELECT * FROM bids WHERE bid_id=$1', [ r.bid_id ]),
+      pool.query('SELECT p.* FROM bids b JOIN proposals p ON p.proposal_id=b.proposal_id WHERE b.bid_id=$1', [ r.bid_id ])
+    ]);
+    await notifyIpfsMissing({ bid: bRows[0], proposal: pRows[0], cid, where: 'audit' });
+
+    flagged++;
+  }
+
+  // 2) proof files (images/docs hosted on /ipfs/<cid>)
+  const { rows: proofRows } = await pool.query(`
+    SELECT proof_id, bid_id, files
+      FROM proofs
+     WHERE submitted_at >= NOW() - INTERVAL '${days} DAYS'
+  `);
+
+  for (const pr of proofRows) {
+    const files = Array.isArray(pr.files) ? pr.files :
+                  (typeof pr.files === 'string' ? JSON.parse(pr.files || '[]') : []);
+    for (const f of files) {
+      const cid = extractCidFromUrl(f?.url);
+      if (!cid) continue;
+      checked++;
+      const alive = await checkCidAlive(cid);
+      if (alive) continue;
+
+      const { rows: exists } = await pool.query(
+        `SELECT 1
+           FROM bid_audits
+          WHERE bid_id=$1
+            AND changes ? 'ipfs_missing'
+            AND changes->'ipfs_missing'->>'cid' = $2
+          LIMIT 1`,
+        [ pr.bid_id, cid ]
+      );
+      if (exists.length) continue;
+
+      const payload = {
+        ipfs_missing: {
+          cid,
+          source: 'proof_file',
+          proofId: pr.proof_id,
+          url: f?.url || null,
+          seen: new Date().toISOString()
+        }
+      };
+
+      const ins = await pool.query(
+        `INSERT INTO bid_audits (bid_id, actor_role, actor_wallet, changes)
+         VALUES ($1, 'system', NULL, $2)
+         RETURNING audit_id`,
+        [ pr.bid_id, payload ]
+      );
+      if (typeof enrichAuditRow === 'function') enrichAuditRow(pool, ins.rows[0].audit_id).catch(()=>{});
+
+      const [{ rows: bRows }, { rows: pRows }] = await Promise.all([
+        pool.query('SELECT * FROM bids WHERE bid_id=$1', [ pr.bid_id ]),
+        pool.query('SELECT p.* FROM bids b JOIN proposals p ON p.proposal_id=b.proposal_id WHERE b.bid_id=$1', [ pr.bid_id ])
+      ]);
+      await notifyIpfsMissing({
+        bid: bRows[0],
+        proposal: pRows[0],
+        cid,
+        where: 'proof file',
+        proofId: pr.proof_id,
+        url: f?.url || null
+      });
+
+      flagged++;
+    }
+  }
+
+  console.log(`[ipfs-monitor] lookback=${days}d checked=${checked} flagged=${flagged} in ${Date.now()-started}ms`);
+  return { checked, flagged, days };
+}
+
+// Manual trigger (useful for testing or external cron if you prefer)
+app.get('/admin/ipfs/monitor-run', adminGuard, async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(60, Number(req.query.days || MONITOR_LOOKBACK_DAYS)));
+    const out = await runIpfsMonitor({ days });
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// Optional: auto-run every MONITOR_MINUTES (single global timer; no per-project cron)
+if (MONITOR_MINUTES > 0) {
+  setTimeout(() => runIpfsMonitor().catch(()=>{}), 10_000); // first run ~10s after boot
+  setInterval(() => runIpfsMonitor().catch(()=>{}), MONITOR_MINUTES * 60 * 1000);
+  console.log(`[ipfs-monitor] enabled: every ${MONITOR_MINUTES} min, lookback ${MONITOR_LOOKBACK_DAYS} days`);
+} else {
+  console.log('[ipfs-monitor] disabled (IPFS_MONITOR_INTERVAL_MIN=0)');
+}
 
 // --- Bid Chat (SSE) ---------------------------------------------------------
 app.all('/bids/:id/chat', (req, res, next) => {
