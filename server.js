@@ -3367,7 +3367,7 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
 }
 
 // Manual trigger (useful for testing or external cron if you prefer)
-app.get('/admin/ipfs/monitor-run', adminGuard, async (req, res) => {
+app.get('/admin/ipfs/monitor-run', allowCron, async (req, res) => {
   try {
     const days = Math.max(1, Math.min(60, Number(req.query.days || MONITOR_LOOKBACK_DAYS)));
     const out = await runIpfsMonitor({ days });
