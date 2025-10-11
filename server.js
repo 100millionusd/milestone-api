@@ -1257,6 +1257,40 @@ async function pinataUploadJson(data) {
   return { cid, url: `https://${PINATA_GATEWAY}/ipfs/${cid}` };
 }
 
+// --- Check if a CID is still pinned on Pinata (returns true when MISSING/unpinned) ---
+async function isMissingOnPinata(cid) {
+  if (!cid) return false;
+
+  // We support either a JWT or key/secret (use whichever you already have configured)
+  const hasJwt = !!PINATA_JWT;
+  const hasKeys = !!PINATA_API_KEY && !!PINATA_SECRET_API_KEY;
+  if (!hasJwt && !hasKeys) {
+    // Not configured to query Pinata — fall back to 'alive' checks only
+    return false;
+  }
+
+  const url = `https://api.pinata.cloud/data/pinList?hashContains=${encodeURIComponent(cid)}&status=pinned&pageLimit=1`;
+
+  const headers = { Accept: "application/json" };
+  if (hasJwt) {
+    headers.Authorization = `Bearer ${PINATA_JWT}`;
+  } else {
+    headers.pinata_api_key = PINATA_API_KEY;
+    headers.pinata_secret_api_key = PINATA_SECRET_API_KEY;
+  }
+
+  try {
+    const { status, body } = await sendRequest("GET", url, headers);
+    if (status < 200 || status >= 300) return false; // treat Pinata API hiccups as "unknown" (don’t flag)
+    const json = JSON.parse(body || "{}");
+    const rows = json?.rows || json?.items || [];
+    // If zero pinned rows returned, consider it unpinned/deleted on Pinata
+    return !rows || rows.length === 0;
+  } catch {
+    return false; // network error => don't flag
+  }
+}
+
 // ==============================
 // HTTP helpers
 // ==============================
@@ -3290,10 +3324,15 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
     const cid = r.ipfs_cid;
     if (!cid) continue;
     checked++;
-    const alive = await checkCidAlive(cid);
-    if (alive) continue;
 
-    // Already flagged for this bid+cid?
+    // Two signals
+    const alive = await checkCidAlive(cid);                   // gateway availability
+    const missingOnPinata = await isMissingOnPinata(cid);     // Pinata pin state
+
+    // If it's alive everywhere AND still pinned => nothing to do
+    if (alive && !missingOnPinata) continue;
+
+    // Already flagged for this cid?
     const { rows: exists } = await pool.query(
       `SELECT 1
          FROM bid_audits
@@ -3305,12 +3344,24 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
     );
     if (exists.length) continue;
 
-    // Write audit row
+    // Choose a clear source for the finding
+    const source = missingOnPinata
+      ? (alive ? 'pinata_unpinned' : 'pinata_unpinned_and_dead')
+      : 'gateway_dead';
+
+    const payload = {
+      ipfs_missing: {
+        cid,
+        source,
+        seen: new Date().toISOString()
+      }
+    };
+
     const ins = await pool.query(
       `INSERT INTO bid_audits (bid_id, actor_role, actor_wallet, changes)
        VALUES ($1, 'system', NULL, $2)
        RETURNING audit_id`,
-      [ r.bid_id, { ipfs_missing: { cid, source: 'audit_ipfs_cid', seen: new Date().toISOString() } } ]
+      [ r.bid_id, payload ]
     );
     if (typeof enrichAuditRow === 'function') enrichAuditRow(pool, ins.rows[0].audit_id).catch(()=>{});
 
@@ -3319,7 +3370,7 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
       pool.query('SELECT * FROM bids WHERE bid_id=$1', [ r.bid_id ]),
       pool.query('SELECT p.* FROM bids b JOIN proposals p ON p.proposal_id=b.proposal_id WHERE b.bid_id=$1', [ r.bid_id ])
     ]);
-    await notifyIpfsMissing({ bid: bRows[0], proposal: pRows[0], cid, where: 'audit' });
+    await notifyIpfsMissing({ bid: bRows[0], proposal: pRows[0], cid, where: source });
 
     flagged++;
   }
@@ -3338,8 +3389,11 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
       const cid = extractCidFromUrl(f?.url);
       if (!cid) continue;
       checked++;
+
       const alive = await checkCidAlive(cid);
-      if (alive) continue;
+      const missingOnPinata = await isMissingOnPinata(cid);
+
+      if (alive && !missingOnPinata) continue;
 
       const { rows: exists } = await pool.query(
         `SELECT 1
@@ -3352,10 +3406,14 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
       );
       if (exists.length) continue;
 
+      const source = missingOnPinata
+        ? (alive ? 'pinata_unpinned' : 'pinata_unpinned_and_dead')
+        : 'gateway_dead';
+
       const payload = {
         ipfs_missing: {
           cid,
-          source: 'proof_file',
+          source,
           proofId: pr.proof_id,
           url: f?.url || null,
           seen: new Date().toISOString()
@@ -3378,7 +3436,7 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
         bid: bRows[0],
         proposal: pRows[0],
         cid,
-        where: 'proof file',
+        where: source,
         proofId: pr.proof_id,
         url: f?.url || null
       });
