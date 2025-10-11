@@ -2040,6 +2040,31 @@ function adminGuard(req, res, next) {
   next();
 }
 
+// ---- Cron auth helper (below adminGuard) ----
+const MONITOR_SECRET = (process.env.MONITOR_SECRET || "").trim();
+
+function allowCron(req, res, next) {
+  // 1) Admin JWT ok
+  const auth = req.get("authorization") || "";
+  const m = auth.match(/^bearer\s+(.+)/i);
+  if (m) {
+    const user = verifyJwt(m[1]);
+    if (user && (user.role === "admin" || isAdminAddress(user.sub))) {
+      req.user = user;
+      return next();
+    }
+  }
+
+  // 2) Shared secret ok (query ?secret=... or header x-cron-secret)
+  const sec = String(req.query.secret || req.get("x-cron-secret") || "").trim();
+  if (MONITOR_SECRET && sec && sec === MONITOR_SECRET) return next();
+
+  // 3) If admin enforcement is OFF, allow (same behavior as /admin/anchor)
+  if (!ENFORCE_JWT_ADMIN) return next();
+
+  return res.status(401).json({ error: "Unauthorized (need admin JWT or correct secret)" });
+}
+
 // Admin or bid owner guard (for /bids/:id/analyze/chat)
 async function adminOrBidOwnerGuard(req, res, next) {
   if (req.user?.role === 'admin') return next();
