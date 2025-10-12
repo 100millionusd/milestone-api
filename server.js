@@ -4774,35 +4774,46 @@ const { text: msg, html } = bi(en, es);
 // ==============================
 // Public — Geo feed (no auth)
 // ==============================
+// Public: safe geo for a bid (no auth)
 app.get("/public/geo/:bidId", async (req, res) => {
   try {
     const bidId = Number(req.params.bidId);
-    if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bidId" });
+    if (!Number.isInteger(bidId)) {
+      return res.status(400).json({ error: "Invalid bidId" });
+    }
 
     const { rows } = await pool.query(
-      `SELECT proof_id, bid_id, milestone_index, status, title, submitted_at, updated_at,
-              gps_lat, gps_lon, gps_alt
-         FROM proofs
-        WHERE bid_id = $1 AND status != 'rejected'
-        ORDER BY submitted_at DESC NULLS LAST, proof_id DESC`,
+      `
+      SELECT
+        proof_id, bid_id, milestone_index, status, title,
+        submitted_at, updated_at,
+        gps_lat, gps_lon, gps_alt,
+        capture_time            -- << include this
+      FROM proofs
+      WHERE bid_id = $1 AND status != 'rejected'
+      ORDER BY proof_id DESC
+      `,
       [bidId]
     );
 
-    const out = await Promise.all(rows.map(async r => ({
-      proofId: Number(r.proof_id),
-      bidId: Number(r.bid_id),
-      milestoneIndex: Number(r.milestone_index),
-      status: String(r.status || "pending"),
-      title: r.title || "",
-      submittedAt: r.submitted_at,
-      updatedAt: r.updated_at,
-      geoApprox: await buildSafeGeoForProof(r),
-    })));
+    const out = await Promise.all(
+      rows.map(async (r) => ({
+        proofId: Number(r.proof_id),
+        bidId: Number(r.bid_id),
+        milestoneIndex: Number(r.milestone_index),
+        status: String(r.status || "pending"),
+        title: r.title || "",
+        submittedAt: r.submitted_at,
+        updatedAt: r.updated_at,
+        captureTime: r.capture_time || null,              // << expose it
+        geoApprox: await buildSafeGeoForProof(r),         // { label, approx:{lat,lon}, ... }
+      }))
+    );
 
-    res.json(out);
+    return res.json(out);
   } catch (e) {
-    console.error("[GET /public/geo/:bidId] error:", e);
-    res.status(500).json({ error: "Internal error" });
+    console.error("[public/geo] error:", e);
+    return res.status(500).json({ error: "Internal error" });
   }
 });
 
