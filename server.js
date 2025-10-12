@@ -4775,6 +4775,7 @@ const { text: msg, html } = bi(en, es);
 // Public — Geo feed (no auth)
 // ==============================
 // Public: safe geo for a bid (no auth)
+// Public: safe geo for a bid (no auth)
 app.get("/public/geo/:bidId", async (req, res) => {
   try {
     const bidId = Number(req.params.bidId);
@@ -4782,13 +4783,46 @@ app.get("/public/geo/:bidId", async (req, res) => {
       return res.status(400).json({ error: "Invalid bidId" });
     }
 
+    // --- helpers (inline) ---
+    const normExifDate = (s) => {
+      if (!s) return null;
+      let v = String(s).trim();
+      // exiftool-style "YYYY:MM:DD HH:mm:ss"
+      if (/^\d{4}:\d{2}:\d{2}\s+\d{2}:\d{2}:\d{2}/.test(v)) {
+        v = v.replace(/^(\d{4}):(\d{2}):(\d{2})\s+/, "$1-$2-$3T") + "Z";
+      } else if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v)) {
+        v = v.replace(" ", "T") + "Z";
+      }
+      const d = new Date(v.endsWith("Z") || /[+-]\d{2}:\d{2}$/.test(v) ? v : v + "Z");
+      return Number.isNaN(d.getTime()) ? null : d.toISOString();
+    };
+
+    const deriveCaptureFromMeta = (meta) => {
+      const arr = Array.isArray(meta) ? meta : [];
+      for (const m of arr) {
+        const ex = m?.exif || {};
+        const cand =
+          ex.DateTimeOriginal ||
+          ex.CreateDate ||
+          ex.ModifyDate ||
+          ex.DateTime ||
+          (ex.GPSDateStamp && ex.GPSTimeStamp
+            ? `${ex.GPSDateStamp} ${ex.GPSTimeStamp}`
+            : null);
+        const iso = normExifDate(cand);
+        if (iso) return iso;
+      }
+      return null;
+    };
+
     const { rows } = await pool.query(
       `
       SELECT
         proof_id, bid_id, milestone_index, status, title,
         submitted_at, updated_at,
         gps_lat, gps_lon, gps_alt,
-        capture_time            -- << include this
+        capture_time,
+        file_meta
       FROM proofs
       WHERE bid_id = $1 AND status != 'rejected'
       ORDER BY proof_id DESC
@@ -4797,17 +4831,31 @@ app.get("/public/geo/:bidId", async (req, res) => {
     );
 
     const out = await Promise.all(
-      rows.map(async (r) => ({
-        proofId: Number(r.proof_id),
-        bidId: Number(r.bid_id),
-        milestoneIndex: Number(r.milestone_index),
-        status: String(r.status || "pending"),
-        title: r.title || "",
-        submittedAt: r.submitted_at,
-        updatedAt: r.updated_at,
-        captureTime: r.capture_time || null,              // << expose it
-        geoApprox: await buildSafeGeoForProof(r),         // { label, approx:{lat,lon}, ... }
-      }))
+      rows.map(async (r) => {
+        // capture time: prefer column; else derive from stored file_meta
+        let captureIso = r.capture_time || null;
+        if (!captureIso) {
+          let meta = null;
+          try { meta = typeof r.file_meta === "string" ? JSON.parse(r.file_meta) : r.file_meta; } catch {}
+          captureIso = deriveCaptureFromMeta(meta);
+          // best-effort backfill (don’t crash if it fails)
+          if (captureIso) {
+            pool.query("UPDATE proofs SET capture_time=$1 WHERE proof_id=$2", [captureIso, r.proof_id]).catch(()=>{});
+          }
+        }
+
+        return {
+          proofId: Number(r.proof_id),
+          bidId: Number(r.bid_id),
+          milestoneIndex: Number(r.milestone_index),
+          status: String(r.status || "pending"),
+          title: r.title || "",
+          submittedAt: r.submitted_at,
+          updatedAt: r.updated_at,
+          captureTime: captureIso,                        // << now populated when EXIF has it
+          geoApprox: await buildSafeGeoForProof(r),       // { label, approx:{lat,lon}, ... }
+        };
+      })
     );
 
     return res.json(out);
