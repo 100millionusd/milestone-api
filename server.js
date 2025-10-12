@@ -2645,6 +2645,42 @@ app.get("/bids", async (req, res) => {
     const role = (req.user?.role || "guest").toLowerCase();
     const caller = (req.user?.sub || "").toLowerCase();
 
+    // --- PUBLIC PAGE COMPAT: allow sanitized read for guests on a specific proposal ---
+if (SCOPE_BIDS_FOR_VENDOR && role !== 'admin' && !caller && Number.isFinite(pid)) {
+  const { rows } = await pool.query(
+    `SELECT bid_id, proposal_id, vendor_name, price_usd, days, status, created_at, updated_at, milestones
+       FROM bids
+      WHERE proposal_id = $1 AND status <> 'archived'
+      ORDER BY bid_id DESC`,
+    [pid]
+  );
+
+  // sanitize + parse milestones JSON (string or jsonb)
+  const out = rows.map(r => {
+    const ms = Array.isArray(r.milestones)
+      ? r.milestones
+      : (typeof r.milestones === 'string' ? JSON.parse(r.milestones || '[]') : []);
+    return {
+      bidId: r.bid_id,
+      proposalId: r.proposal_id,
+      vendorName: r.vendor_name,
+      priceUSD: Number(r.price_usd),
+      days: r.days,
+      status: r.status,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+      milestones: ms.map(m => ({
+        name: m?.name,
+        amount: Number(m?.amount ?? 0),
+        dueDate: m?.dueDate ?? m?.due_date ?? null,
+        completed: !!m?.completed
+      }))
+    };
+  });
+
+  return res.json(out);
+}
+
     if (SCOPE_BIDS_FOR_VENDOR && role !== "admin") {
       if (!caller) return res.status(401).json({ error: "Unauthorized" });
 
