@@ -4798,22 +4798,30 @@ app.get("/public/geo/:bidId", async (req, res) => {
     };
 
     const deriveCaptureFromMeta = (meta) => {
-      const arr = Array.isArray(meta) ? meta : [];
-      for (const m of arr) {
-        const ex = m?.exif || {};
-        const cand =
-          ex.DateTimeOriginal ||
-          ex.CreateDate ||
-          ex.ModifyDate ||
-          ex.DateTime ||
-          (ex.GPSDateStamp && ex.GPSTimeStamp
-            ? `${ex.GPSDateStamp} ${ex.GPSTimeStamp}`
-            : null);
-        const iso = normExifDate(cand);
-        if (iso) return iso;
-      }
-      return null;
-    };
+  const arr = Array.isArray(meta) ? meta : [];
+  for (const m of arr) {
+    const ex = m?.exif || {};
+    const cand =
+      // lowercase (what your extractor saved)
+      ex.createDate ||
+      ex.dateTimeOriginal ||
+      ex.modifyDate ||
+      ex.dateTime ||
+      // common CamelCase variants
+      ex.CreateDate ||
+      ex.DateTimeOriginal ||
+      ex.ModifyDate ||
+      ex.DateTime ||
+      // GPS combo
+      (ex.GPSDateStamp && ex.GPSTimeStamp
+        ? `${ex.GPSDateStamp} ${ex.GPSTimeStamp}`
+        : null);
+
+    const iso = normExifDate(cand);
+    if (iso) return iso;
+  }
+  return null;
+};
 
     const { rows } = await pool.query(
       `
