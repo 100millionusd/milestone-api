@@ -4771,11 +4771,93 @@ const { text: msg, html } = bi(en, es);
   }
 });
 
+// --- EXIF date normalization + extraction (robust) ---
+function normExifDate(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+
+  // EXIF style: 2024:09:30 14:22:11(.sss optional)
+  let m = s.match(/^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?$/);
+  if (m) {
+    const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`;
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  }
+
+  // ISO-ish already?
+  const d2 = new Date(s);
+  if (!Number.isNaN(d2.getTime())) return d2.toISOString();
+
+  return null;
+}
+function pick(obj, ...keys) {
+  for (const k of keys) {
+    if (obj && obj[k] != null && obj[k] !== '') return obj[k];
+  }
+  return null;
+}
+function extractAnyDateFromExif(exif) {
+  if (!exif || typeof exif !== 'object') return null;
+
+  // Common fields (both cases)
+  const direct =
+    pick(exif,
+      'createDate','CreateDate',
+      'dateTimeOriginal','DateTimeOriginal',
+      'modifyDate','ModifyDate',
+      'dateTime','DateTime'
+    ) ||
+    // sometimes nested
+    pick(exif?.Photo || {}, 'DateTimeOriginal') ||
+    pick(exif?.ExifIFD || {}, 'DateTimeOriginal') ||
+    pick(exif?.QuickTime || {}, 'CreateDate');
+
+  let iso = normExifDate(direct);
+  if (iso) return iso;
+
+  // GPS date+time pair
+  if (exif.GPSDateStamp && exif.GPSTimeStamp) {
+    iso = normExifDate(`${exif.GPSDateStamp} ${exif.GPSTimeStamp}`);
+    if (iso) return iso;
+  }
+
+  // Fallback: scan all string values that look like dates
+  const stack = [exif];
+  const seen = new Set();
+  while (stack.length) {
+    const cur = stack.pop();
+    if (!cur || typeof cur !== 'object' || seen.has(cur)) continue;
+    seen.add(cur);
+    for (const v of Object.values(cur)) {
+      if (typeof v === 'string') {
+        const tryIso = normExifDate(v);
+        if (tryIso) return tryIso;
+      } else if (v && typeof v === 'object') {
+        stack.push(v);
+      }
+    }
+  }
+  return null;
+}
+function deriveCaptureFromMeta(fileMeta) {
+  const arr = Array.isArray(fileMeta) ? fileMeta : [];
+  for (const m of arr) {
+    const iso = extractAnyDateFromExif(m?.exif || {});
+    if (iso) return iso;
+  }
+  return null;
+}
+function asArrayJson(v) {
+  if (Array.isArray(v)) return v;
+  if (typeof v === 'string') {
+    try { const j = JSON.parse(v); return Array.isArray(j) ? j : []; } catch { return []; }
+  }
+  return [];
+}
+
 // ==============================
 // Public — Geo feed (no auth)
 // ==============================
-// Public: safe geo for a bid (no auth)
-// Public: safe geo for a bid (no auth)
 app.get("/public/geo/:bidId", async (req, res) => {
   try {
     const bidId = Number(req.params.bidId);
@@ -4783,93 +4865,46 @@ app.get("/public/geo/:bidId", async (req, res) => {
       return res.status(400).json({ error: "Invalid bidId" });
     }
 
-    // --- helpers (inline) ---
-    const normExifDate = (s) => {
-      if (!s) return null;
-      let v = String(s).trim();
-      // exiftool-style "YYYY:MM:DD HH:mm:ss"
-      if (/^\d{4}:\d{2}:\d{2}\s+\d{2}:\d{2}:\d{2}/.test(v)) {
-        v = v.replace(/^(\d{4}):(\d{2}):(\d{2})\s+/, "$1-$2-$3T") + "Z";
-      } else if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v)) {
-        v = v.replace(" ", "T") + "Z";
-      }
-      const d = new Date(v.endsWith("Z") || /[+-]\d{2}:\d{2}$/.test(v) ? v : v + "Z");
-      return Number.isNaN(d.getTime()) ? null : d.toISOString();
-    };
-
-    const deriveCaptureFromMeta = (meta) => {
-  const arr = Array.isArray(meta) ? meta : [];
-  for (const m of arr) {
-    const ex = m?.exif || {};
-    const cand =
-      // lowercase (what your extractor saved)
-      ex.createDate ||
-      ex.dateTimeOriginal ||
-      ex.modifyDate ||
-      ex.dateTime ||
-      // common CamelCase variants
-      ex.CreateDate ||
-      ex.DateTimeOriginal ||
-      ex.ModifyDate ||
-      ex.DateTime ||
-      // GPS combo
-      (ex.GPSDateStamp && ex.GPSTimeStamp
-        ? `${ex.GPSDateStamp} ${ex.GPSTimeStamp}`
-        : null);
-
-    const iso = normExifDate(cand);
-    if (iso) return iso;
-  }
-  return null;
-};
-
+    // NOTE: must select file_meta + capture_time for the takenAt value
     const { rows } = await pool.query(
-      `
-      SELECT
-        proof_id, bid_id, milestone_index, status, title,
-        submitted_at, updated_at,
-        gps_lat, gps_lon, gps_alt,
-        capture_time,
-        file_meta
-      FROM proofs
-      WHERE bid_id = $1 AND status != 'rejected'
-      ORDER BY proof_id DESC
-      `,
+      `SELECT
+         proof_id, bid_id, milestone_index, status, title,
+         submitted_at, updated_at,
+         file_meta, capture_time,
+         gps_lat, gps_lon, gps_alt
+       FROM proofs
+       WHERE bid_id = $1 AND status != 'rejected'
+       ORDER BY proof_id DESC`,
       [bidId]
     );
 
-    const out = await Promise.all(
-      rows.map(async (r) => {
-        // capture time: prefer column; else derive from stored file_meta
-        let captureIso = r.capture_time || null;
-        if (!captureIso) {
-          let meta = null;
-          try { meta = typeof r.file_meta === "string" ? JSON.parse(r.file_meta) : r.file_meta; } catch {}
-          captureIso = deriveCaptureFromMeta(meta);
-          // best-effort backfill (don’t crash if it fails)
-          if (captureIso) {
-            pool.query("UPDATE proofs SET capture_time=$1 WHERE proof_id=$2", [captureIso, r.proof_id]).catch(()=>{});
-          }
-        }
+    const out = await Promise.all(rows.map(async (r) => {
+      // derive from EXIF if capture_time is missing
+      let meta = [];
+      if (Array.isArray(r.file_meta)) meta = r.file_meta;
+      else if (typeof r.file_meta === "string") {
+        try { meta = JSON.parse(r.file_meta) || []; } catch { meta = []; }
+      }
+      const derived = deriveCaptureFromMeta(meta);  // <-- requires helpers below
+      const captureTime = r.capture_time || derived || null;
 
-        return {
-          proofId: Number(r.proof_id),
-          bidId: Number(r.bid_id),
-          milestoneIndex: Number(r.milestone_index),
-          status: String(r.status || "pending"),
-          title: r.title || "",
-          submittedAt: r.submitted_at,
-          updatedAt: r.updated_at,
-          captureTime: captureIso,                        // << now populated when EXIF has it
-          geoApprox: await buildSafeGeoForProof(r),       // { label, approx:{lat,lon}, ... }
-        };
-      })
-    );
+      return {
+        proofId: Number(r.proof_id),
+        bidId: Number(r.bid_id),
+        milestoneIndex: Number(r.milestone_index),
+        status: String(r.status || "pending"),
+        title: r.title || "",
+        submittedAt: r.submitted_at,
+        updatedAt: r.updated_at,
+        geoApprox: await buildSafeGeoForProof(r),
+        captureTime, // <-- frontend reads this as takenAt
+      };
+    }));
 
-    return res.json(out);
+    res.json(out);
   } catch (e) {
-    console.error("[public/geo] error:", e);
-    return res.status(500).json({ error: "Internal error" });
+    console.error("[GET /public/geo/:bidId] error:", e);
+    res.status(500).json({ error: "Internal error" });
   }
 });
 
