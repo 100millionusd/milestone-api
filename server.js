@@ -4766,6 +4766,73 @@ const { text: msg, html } = bi(en, es);
   }
 });
 
+// ==============================
+// Public — Geo feed (no auth)
+// ==============================
+app.get("/public/geo/:bidId", async (req, res) => {
+  try {
+    const bidId = Number(req.params.bidId);
+    if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bidId" });
+
+    const { rows } = await pool.query(
+      `SELECT proof_id, bid_id, milestone_index, status, title, submitted_at, updated_at,
+              gps_lat, gps_lon, gps_alt
+         FROM proofs
+        WHERE bid_id = $1 AND status != 'rejected'
+        ORDER BY submitted_at DESC NULLS LAST, proof_id DESC`,
+      [bidId]
+    );
+
+    const out = await Promise.all(rows.map(async r => ({
+      proofId: Number(r.proof_id),
+      bidId: Number(r.bid_id),
+      milestoneIndex: Number(r.milestone_index),
+      status: String(r.status || "pending"),
+      title: r.title || "",
+      submittedAt: r.submitted_at,
+      updatedAt: r.updated_at,
+      geoApprox: await buildSafeGeoForProof(r),
+    })));
+
+    res.json(out);
+  } catch (e) {
+    console.error("[GET /public/geo/:bidId] error:", e);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+app.get("/public/geo/proof/:proofId", async (req, res) => {
+  try {
+    const proofId = Number(req.params.proofId);
+    if (!Number.isFinite(proofId)) return res.status(400).json({ error: "Invalid proofId" });
+
+    const { rows } = await pool.query(
+      `SELECT proof_id, bid_id, milestone_index, status, title, submitted_at, updated_at,
+              gps_lat, gps_lon, gps_alt
+         FROM proofs
+        WHERE proof_id = $1
+        LIMIT 1`,
+      [proofId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Proof not found" });
+
+    const r = rows[0];
+    res.json({
+      proofId: Number(r.proof_id),
+      bidId: Number(r.bid_id),
+      milestoneIndex: Number(r.milestone_index),
+      status: String(r.status || "pending"),
+      title: r.title || "",
+      submittedAt: r.submitted_at,
+      updatedAt: r.updated_at,
+      geoApprox: await buildSafeGeoForProof(r),
+    });
+  } catch (e) {
+    console.error("[GET /public/geo/proof/:proofId] error:", e);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // --- Latest proof status per milestone for a bid --------------------------------
 app.get('/bids/:bidId/proofs/latest-status', adminGuard, async (req, res) => {
   try {
