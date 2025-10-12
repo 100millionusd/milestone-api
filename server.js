@@ -1672,7 +1672,12 @@ const roundCoord = (n, places = 2) =>
 async function buildSafeGeoForProof(proofRow) {
   const lat = Number(proofRow.gps_lat ?? proofRow.gpsLat);
   const lon = Number(proofRow.gps_lon ?? proofRow.gpsLon);
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+
+  // ⬇️ ADD THESE GUARDS (reject NaN, out-of-range, and the (0,0) sentinel)
+  const inRange = (v, lo, hi) => Number.isFinite(v) && v >= lo && v <= hi;
+  if (!inRange(lat, -90, 90) || !inRange(lon, -180, 180) || (lat === 0 && lon === 0)) {
+    return null;
+  }
 
   const cacheKey = `${lat.toFixed(4)},${lon.toFixed(4)}`;
   let rg = _geoCache.get(cacheKey);
@@ -1689,7 +1694,7 @@ async function buildSafeGeoForProof(proofRow) {
   return {
     label,
     city, state, country,
-    approx: { lat: roundCoord(lat, 2), lon: roundCoord(lon, 2) }
+    approx: { lat: roundCoord(lat, 2), lon: roundCoord(lon, 2) } // ~1km rounding
   };
 }
 
