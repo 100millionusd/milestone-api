@@ -1624,6 +1624,36 @@ async function reverseGeocode(lat, lon) {
     } catch (_) {}
   }
 
+  // --- Safe public geo (city/state only; ~1 km rounding) ---
+const _geoCache = new Map();
+const roundCoord = (n, places = 2) =>
+  Number.isFinite(+n) ? Number((+n).toFixed(places)) : null;
+
+async function buildSafeGeoForProof(proofRow) {
+  const lat = Number(proofRow.gps_lat ?? proofRow.gpsLat);
+  const lon = Number(proofRow.gps_lon ?? proofRow.gpsLon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+
+  const cacheKey = `${lat.toFixed(4)},${lon.toFixed(4)}`;
+  let rg = _geoCache.get(cacheKey);
+  if (!rg) {
+    try { rg = await reverseGeocode(lat, lon); } catch { rg = null; }
+    _geoCache.set(cacheKey, rg);
+  }
+
+  const city    = rg?.city    || null;
+  const state   = rg?.state   || null;
+  const country = rg?.country || null;
+  const label   = rg?.label || [city, state, country].filter(Boolean).join(", ") || null;
+
+  // Only return rounded coords (privacy)
+  return {
+    label,
+    city, state, country,
+    approx: { lat: roundCoord(lat, 2), lon: roundCoord(lon, 2) }
+  };
+}
+
   // 2) Nominatim fallback (requires a UA; be a good citizen)
   try {
     const ua = process.env.NOMINATIM_UA || "LithiumX/1.0 (admin@yourdomain.com)";
@@ -6197,18 +6227,36 @@ app.get("/projects/:id/overview", async (req, res) => {
     );
 
     const bidIds = bidRows.map(b => b.bid_id);
-    let proofs = [];
-    if (bidIds.length) {
-      // Proofs (fields exist in your code paths)  // :contentReference[oaicite:6]{index=6}
-      const { rows: proofRows } = await pool.query(
-        `SELECT proof_id, bid_id, milestone_index, status, title, description, files, ai_analysis, submitted_at, updated_at
-           FROM proofs
-          WHERE bid_id = ANY($1::int[])
-          ORDER BY submitted_at ASC, proof_id ASC`,
-        [bidIds]
-      );
-      proofs = proofRows;
-    }
+
+// Load proofs for all bids of this project
+let proofs = [];
+if (bidIds.length) {
+  const { rows: proofRows } = await pool.query(
+    `SELECT proof_id, bid_id, milestone_index, title, description, status,
+            files, file_meta, gps_lat, gps_lon, capture_time, submitted_at, updated_at
+       FROM proofs
+      WHERE bid_id = ANY($1::bigint[])
+      ORDER BY submitted_at ASC`,
+    [ bidIds ]
+  );
+
+  // Sanitize + add safe geo (keeps submitted_at for your activity timeline)
+  proofs = await Promise.all(proofRows.map(async pr => ({
+    proof_id: pr.proof_id,
+    bid_id: pr.bid_id,
+    milestone_index: pr.milestone_index,
+    title: pr.title,
+    description: pr.description,
+    status: pr.status,
+    files: Array.isArray(pr.files)
+      ? pr.files
+      : (typeof pr.files === 'string' ? JSON.parse(pr.files || '[]') : []),
+    submitted_at: pr.submitted_at,
+    updated_at: pr.updated_at,
+    taken_at: pr.capture_time || null,          // EXIF-derived time you store
+    location: await buildSafeGeoForProof(pr)    // city/state/country + rounded coords
+  })));
+}
 
     // Build milestone list: combine bid.milestones JSON + proof status + payments (paymentTxHash)
     const approvedProof = new Set(
