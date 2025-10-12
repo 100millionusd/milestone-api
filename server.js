@@ -1624,36 +1624,6 @@ async function reverseGeocode(lat, lon) {
     } catch (_) {}
   }
 
-  // --- Safe public geo (city/state only; ~1 km rounding) ---
-const _geoCache = new Map();
-const roundCoord = (n, places = 2) =>
-  Number.isFinite(+n) ? Number((+n).toFixed(places)) : null;
-
-async function buildSafeGeoForProof(proofRow) {
-  const lat = Number(proofRow.gps_lat ?? proofRow.gpsLat);
-  const lon = Number(proofRow.gps_lon ?? proofRow.gpsLon);
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-
-  const cacheKey = `${lat.toFixed(4)},${lon.toFixed(4)}`;
-  let rg = _geoCache.get(cacheKey);
-  if (!rg) {
-    try { rg = await reverseGeocode(lat, lon); } catch { rg = null; }
-    _geoCache.set(cacheKey, rg);
-  }
-
-  const city    = rg?.city    || null;
-  const state   = rg?.state   || null;
-  const country = rg?.country || null;
-  const label   = rg?.label || [city, state, country].filter(Boolean).join(", ") || null;
-
-  // Only return rounded coords (privacy)
-  return {
-    label,
-    city, state, country,
-    approx: { lat: roundCoord(lat, 2), lon: roundCoord(lon, 2) }
-  };
-}
-
   // 2) Nominatim fallback (requires a UA; be a good citizen)
   try {
     const ua = process.env.NOMINATIM_UA || "LithiumX/1.0 (admin@yourdomain.com)";
@@ -1692,6 +1662,35 @@ async function buildSafeGeoForProof(proofRow) {
   } catch (_) {}
 
   return null;
+}
+
+// --- Safe public geo (city/state only; ~1 km rounding) ---
+const _geoCache = new Map();
+const roundCoord = (n, places = 2) =>
+  Number.isFinite(+n) ? Number((+n).toFixed(places)) : null;
+
+async function buildSafeGeoForProof(proofRow) {
+  const lat = Number(proofRow.gps_lat ?? proofRow.gpsLat);
+  const lon = Number(proofRow.gps_lon ?? proofRow.gpsLon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+
+  const cacheKey = `${lat.toFixed(4)},${lon.toFixed(4)}`;
+  let rg = _geoCache.get(cacheKey);
+  if (!rg) {
+    try { rg = await reverseGeocode(lat, lon); } catch { rg = null; }
+    _geoCache.set(cacheKey, rg);
+  }
+
+  const city    = rg?.city    || null;
+  const state   = rg?.state   || null;
+  const country = rg?.country || null;
+  const label   = rg?.label || [city, state, country].filter(Boolean).join(", ") || null;
+
+  return {
+    label,
+    city, state, country,
+    approx: { lat: roundCoord(lat, 2), lon: roundCoord(lon, 2) }
+  };
 }
 
 // ==============================
@@ -4455,6 +4454,60 @@ Hints:
   }
 });
 
+// Public: list proofs for one proposal (sanitized + geo for PublicGeoBadge)
+app.get("/proofs", async (req, res) => {
+  const proposalId = Number(req.query.proposalId);
+  if (!Number.isFinite(proposalId)) return res.json([]); // public page expects an array
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         p.proof_id,
+         p.bid_id,
+         p.milestone_index,
+         p.status,
+         p.title,
+         p.description,
+         p.files,
+         p.capture_time,
+         p.gps_lat,
+         p.gps_lon
+       FROM proofs p
+       JOIN bids b ON b.bid_id = p.bid_id
+      WHERE b.proposal_id = $1
+      ORDER BY p.submitted_at ASC NULLS LAST, p.proof_id ASC`,
+      [proposalId]
+    );
+
+    const out = await Promise.all(
+      rows.map(async (r) => {
+        const files = Array.isArray(r.files)
+          ? r.files
+          : (typeof r.files === "string" ? JSON.parse(r.files || "[]") : []);
+        // Safe city/state/country + rounded coords (or null if no GPS)
+        const safeGeo = await buildSafeGeoForProof(r);
+
+        return {
+          proofId: r.proof_id,
+          bidId: r.bid_id,
+          milestoneIndex: r.milestone_index,
+          status: r.status,
+          title: r.title,
+          publicText: r.description || null,
+          files,
+          takenAt: r.capture_time || null,
+          location: safeGeo,            // <-- used by <PublicGeoBadge geo={p.location} ... />
+        };
+      })
+    );
+
+    return res.json(out);
+  } catch (e) {
+    console.error("GET /proofs failed:", e);
+    return res.status(500).json({ error: "Failed to load proofs" });
+  }
+});
+
 // Normalized proofs feed for admin UI (newest first, camelCase fields)
 app.get("/proofs", adminGuard, async (req, res) => {
   try {
@@ -4484,18 +4537,19 @@ app.get("/proofs", adminGuard, async (req, res) => {
 
     const { rows } = await pool.query(sql, params);
 
-    const out = rows.map((r) => ({
-      proofId: Number(r.proof_id),
-      bidId: Number(r.bid_id),
-      milestoneIndex: Number(r.milestone_index),
-      status: String(r.status || "pending"),
-      title: r.title || "",
-      description: r.description || "",
-      files: Array.isArray(r.files) ? r.files : (r.files ? r.files : []),
-      aiAnalysis: r.ai_analysis ?? null,
-      submittedAt: r.submitted_at,
-      updatedAt: r.updated_at,
-    }));
+const out = await Promise.all(rows.map(async (r) => ({
+  proofId: Number(r.proof_id),
+  bidId: Number(r.bid_id),
+  milestoneIndex: Number(r.milestone_index),
+  status: String(r.status || "pending"),
+  title: r.title || "",
+  description: r.description || "",
+  files: Array.isArray(r.files) ? r.files : (r.files ? r.files : []),
+  aiAnalysis: r.ai_analysis ?? null,
+  submittedAt: r.submitted_at,
+  updatedAt: r.updated_at,
+  geoApprox: await buildSafeGeoForProof(r),
+})));
 
     console.log(`[GET /proofs] bidId=${Number.isInteger(bidId) ? bidId : 'ALL'} -> ${out.length}`);
     return res.json(out);
@@ -4512,7 +4566,12 @@ app.get("/proofs/:bidId", adminOrBidOwnerGuard, async (req, res) => {
       "SELECT * FROM proofs WHERE bid_id=$1 AND status != 'rejected' ORDER BY submitted_at DESC NULLS LAST",
       [ req.params.bidId ]
     );
-    res.json(mapRows(rows));
+    const out = await Promise.all(rows.map(async (r) => {
+  const camel = toCamel(r);
+  camel.geoApprox = await buildSafeGeoForProof(r); // uses gps_lat/lon if present
+  return camel;
+}));
+res.json(out);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
