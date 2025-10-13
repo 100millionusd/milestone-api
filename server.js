@@ -6475,21 +6475,6 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
   }
 });
 
-// ---- admin guard shim (do NOT remove until you confirm real guard name/placement) ----
-const ensureAdminGuard =
-  (typeof adminOnlyGuard !== 'undefined' && adminOnlyGuard) ||
-  (typeof adminOrProposalOwnerGuard !== 'undefined' && adminOrProposalOwnerGuard) ||
-  (typeof adminGuard !== 'undefined' && adminGuard) ||
-  ((req, res) => res.status(500).json({ error: 'admin_guard_missing' }));
-// --------------------------------------------------------------------------------------
-
-// ---- Oversight guard + db shims (keep above the routes) ----
-const ensureAdminGuard =
-  (typeof adminOnlyGuard !== 'undefined' && adminOnlyGuard) ||
-  (typeof adminOrProposalOwnerGuard !== 'undefined' && adminOrProposalOwnerGuard) ||
-  (typeof adminGuard !== 'undefined' && adminGuard) ||
-  ((req, res) => res.status(500).json({ error: 'admin_guard_missing' }));
-
 // Try to find your pg client; change to match your variable if needed.
 const __pool =
   (typeof pool !== 'undefined' && pool) ||
@@ -6498,7 +6483,7 @@ const __pool =
   null;
 
 // ---- /admin/oversight/* routes (admin only) ----
-app.get('/admin/oversight/summary', ensureAdminGuard, async (req, res) => {
+app.get('/admin/oversight/summary', adminOrProposalOwnerGuard, async (req, res) => {
   try {
     if (!__pool || !__pool.query) return res.status(500).json({ error: 'db_pool_missing' });
 
@@ -6537,7 +6522,7 @@ app.get('/admin/oversight/summary', ensureAdminGuard, async (req, res) => {
   }
 });
 
-app.get('/admin/oversight/queue', ensureAdminGuard, async (req, res) => {
+app.get('/admin/oversight/queue', adminOrProposalOwnerGuard, async (req, res) => {
   try {
     if (!__pool || !__pool.query) return res.status(500).json({ error: 'db_pool_missing' });
 
@@ -6580,7 +6565,7 @@ app.get('/admin/oversight/queue', ensureAdminGuard, async (req, res) => {
   }
 });
 
-app.get('/admin/oversight/alerts', ensureAdminGuard, async (req, res) => {
+app.get('/admin/oversight/alerts', adminOrProposalOwnerGuard, async (req, res) => {
   try {
     if (!__pool || !__pool.query) return res.status(500).json({ error: 'db_pool_missing' });
 
@@ -6602,7 +6587,7 @@ app.get('/admin/oversight/alerts', ensureAdminGuard, async (req, res) => {
   }
 });
 
-app.get('/admin/oversight/vendors', ensureAdminGuard, async (req, res) => {
+app.get('/admin/oversight/vendors', adminOrProposalOwnerGuard, async (req, res) => {
   try {
     if (!__pool || !__pool.query) return res.status(500).json({ error: 'db_pool_missing' });
 
@@ -6645,7 +6630,7 @@ app.get('/admin/oversight/vendors', ensureAdminGuard, async (req, res) => {
   }
 });
 
-app.get('/admin/oversight/payouts', ensureAdminGuard, async (req, res) => {
+app.get('/admin/oversight/payouts', adminOrProposalOwnerGuard, async (req, res) => {
   try {
     if (!__pool || !__pool.query) return res.status(500).json({ error: 'db_pool_missing' });
 
