@@ -6483,10 +6483,26 @@ const ensureAdminGuard =
   ((req, res) => res.status(500).json({ error: 'admin_guard_missing' }));
 // --------------------------------------------------------------------------------------
 
-// --- Oversight sub-endpoints (admin only) ---
-app.get('/admin/oversight/summary', ensureAdminGuard, async (req, res) => { ... });
+// ---- Oversight guard + db shims (keep above the routes) ----
+const ensureAdminGuard =
+  (typeof adminOnlyGuard !== 'undefined' && adminOnlyGuard) ||
+  (typeof adminOrProposalOwnerGuard !== 'undefined' && adminOrProposalOwnerGuard) ||
+  (typeof adminGuard !== 'undefined' && adminGuard) ||
+  ((req, res) => res.status(500).json({ error: 'admin_guard_missing' }));
+
+// Try to find your pg client; change to match your variable if needed.
+const __pool =
+  (typeof pool !== 'undefined' && pool) ||
+  (typeof db !== 'undefined' && db) ||
+  (typeof pgPool !== 'undefined' && pgPool) ||
+  null;
+
+// ---- /admin/oversight/* routes (admin only) ----
+app.get('/admin/oversight/summary', ensureAdminGuard, async (req, res) => {
   try {
-    const { rows: bidCounts } = await pool.query(`
+    if (!__pool || !__pool.query) return res.status(500).json({ error: 'db_pool_missing' });
+
+    const bidCounts = await __pool.query(`
       SELECT
         COUNT(*)::int AS total,
         COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
@@ -6495,7 +6511,7 @@ app.get('/admin/oversight/summary', ensureAdminGuard, async (req, res) => { ... 
       FROM bids;
     `);
 
-    const { rows: proofCounts } = await pool.query(`
+    const proofCounts = await __pool.query(`
       SELECT
         COUNT(*)::int AS total,
         COUNT(*) FILTER (WHERE status IN ('submitted','in_review'))::int AS in_review,
@@ -6504,17 +6520,16 @@ app.get('/admin/oversight/summary', ensureAdminGuard, async (req, res) => { ... 
       FROM proofs;
     `);
 
-    // last 7 days activity (audit already exists in your payload)
-    const { rows: last7 } = await pool.query(`
+    const last7 = await __pool.query(`
       SELECT COUNT(*)::int AS audit_events_7d
       FROM audit
       WHERE created_at >= NOW() - INTERVAL '7 days';
     `);
 
     res.json({
-      bids: bidCounts[0] || { total: 0, pending: 0, approved: 0, rejected: 0 },
-      proofs: proofCounts[0] || { total: 0, in_review: 0, approved: 0, rejected: 0 },
-      activity: last7[0] || { audit_events_7d: 0 }
+      bids: bidCounts.rows[0] || { total: 0, pending: 0, approved: 0, rejected: 0 },
+      proofs: proofCounts.rows[0] || { total: 0, in_review: 0, approved: 0, rejected: 0 },
+      activity: last7.rows[0] || { audit_events_7d: 0 }
     });
   } catch (e) {
     console.error('oversight/summary error', e);
@@ -6522,9 +6537,11 @@ app.get('/admin/oversight/summary', ensureAdminGuard, async (req, res) => { ... 
   }
 });
 
-app.get('/admin/oversight/queue',   ensureAdminGuard, async (req, res) => { ... });
+app.get('/admin/oversight/queue', ensureAdminGuard, async (req, res) => {
   try {
-    const { rows: pendingBids } = await pool.query(`
+    if (!__pool || !__pool.query) return res.status(500).json({ error: 'db_pool_missing' });
+
+    const pendingBids = await __pool.query(`
       SELECT id, vendor_name, created_at
       FROM bids
       WHERE status = 'pending'
@@ -6532,7 +6549,7 @@ app.get('/admin/oversight/queue',   ensureAdminGuard, async (req, res) => { ... 
       LIMIT 50;
     `);
 
-    const { rows: pendingProofs } = await pool.query(`
+    const pendingProofs = await __pool.query(`
       SELECT proof_id, bid_id, title, submitted_at
       FROM proofs
       WHERE status IN ('submitted','in_review')
@@ -6541,13 +6558,13 @@ app.get('/admin/oversight/queue',   ensureAdminGuard, async (req, res) => { ... 
     `);
 
     const queue = [
-      ...pendingBids.map(b => ({
+      ...pendingBids.rows.map(b => ({
         type: 'bid',
         id: b.id,
         vendorName: b.vendor_name,
         when: b.created_at
       })),
-      ...pendingProofs.map(p => ({
+      ...pendingProofs.rows.map(p => ({
         type: 'proof',
         proofId: p.proof_id,
         bidId: p.bid_id,
@@ -6563,10 +6580,11 @@ app.get('/admin/oversight/queue',   ensureAdminGuard, async (req, res) => { ... 
   }
 });
 
-app.get('/admin/oversight/alerts',  ensureAdminGuard, async (req, res) => { ... });
+app.get('/admin/oversight/alerts', ensureAdminGuard, async (req, res) => {
   try {
-    // Heuristic: alert on low-fit or explicit risks in Agent2 analysis
-    const { rows } = await pool.query(`
+    if (!__pool || !__pool.query) return res.status(500).json({ error: 'db_pool_missing' });
+
+    const rows = await __pool.query(`
       SELECT proof_id, bid_id, title, submitted_at,
              ai_analysis ->> 'fit' AS fit,
              ai_analysis ->> 'summary' AS summary
@@ -6576,17 +6594,19 @@ app.get('/admin/oversight/alerts',  ensureAdminGuard, async (req, res) => { ... 
       ORDER BY submitted_at DESC
       LIMIT 50;
     `);
-    res.json(rows);
+
+    res.json(rows.rows);
   } catch (e) {
     console.error('oversight/alerts error', e);
     res.status(500).json({ error: 'alerts_failed' });
   }
 });
 
-app.get('/admin/oversight/vendors', ensureAdminGuard, async (req, res) => { ... });
+app.get('/admin/oversight/vendors', ensureAdminGuard, async (req, res) => {
   try {
-    // Mirrors the Vendors admin summary you added earlier (#15 context)
-    const { rows } = await pool.query(`
+    if (!__pool || !__pool.query) return res.status(500).json({ error: 'db_pool_missing' });
+
+    const result = await __pool.query(`
       WITH bids_agg AS (
         SELECT
           COALESCE(vendor_name, 'Unknown') AS vendor_name,
@@ -6613,21 +6633,23 @@ app.get('/admin/oversight/vendors', ensureAdminGuard, async (req, res) => { ... 
         COALESCE(a.total_awarded_usd, 0) AS total_awarded_usd
       FROM bids_agg ba
       LEFT JOIN awarded a
-      ON a.vendor_name = ba.vendor_name AND a.wallet_address = ba.wallet_address
+        ON a.vendor_name = ba.vendor_name AND a.wallet_address = ba.wallet_address
       ORDER BY ba.last_bid_at DESC NULLS LAST
       LIMIT 100;
     `);
-    res.json(rows);
+
+    res.json(result.rows);
   } catch (e) {
     console.error('oversight/vendors error', e);
     res.status(500).json({ error: 'vendors_failed' });
   }
 });
 
-app.get('/admin/oversight/payouts', ensureAdminGuard, async (req, res) => { ... });
+app.get('/admin/oversight/payouts', ensureAdminGuard, async (req, res) => {
   try {
-    // "recent" from audit rows that have a blockchain tx
-    const { rows: recent } = await pool.query(`
+    if (!__pool || !__pool.query) return res.status(500).json({ error: 'db_pool_missing' });
+
+    const recent = await __pool.query(`
       SELECT created_at, bid_id, tx_hash, chain_id, contract_addr,
              COALESCE((changes->>'amountUSD')::numeric, NULL) AS amount_usd
       FROM audit
@@ -6636,11 +6658,9 @@ app.get('/admin/oversight/payouts', ensureAdminGuard, async (req, res) => { ... 
       LIMIT 50;
     `);
 
-    // "pending" (best-effort): approved milestones not paid yet
-    // Adjust table/columns if your schema differs.
     let pending = [];
     try {
-      const q = await pool.query(`
+      const q = await __pool.query(`
         SELECT bid_id, milestone_index, amount_usd, updated_at
         FROM milestones
         WHERE status = 'approved' AND (paid IS NULL OR paid = false)
@@ -6649,11 +6669,10 @@ app.get('/admin/oversight/payouts', ensureAdminGuard, async (req, res) => { ... 
       `);
       pending = q.rows || [];
     } catch (e2) {
-      // If you don't have a milestones table, just leave pending empty
       console.warn('payouts/pending skipped:', e2.message);
     }
 
-    res.json({ pending, recent });
+    res.json({ pending, recent: recent.rows });
   } catch (e) {
     console.error('oversight/payouts error', e);
     res.status(500).json({ error: 'payouts_failed' });
