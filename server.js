@@ -3410,6 +3410,180 @@ app.get('/admin/alerts', adminGuard, async (_req, res) => {
   }
 });
 
+// --- Admin Oversight: single payload for the dashboard ---
+app.get('/admin/oversight', adminGuard, async (req, res) => {
+  // If ENFORCE_JWT_ADMIN=false, adminGuard is a no-op. :contentReference[oaicite:4]{index=4}
+  try {
+    const out = {
+      tiles: {
+        openProofs: 0,
+        breachingSla: 0,
+        pendingPayouts: { count: 0, totalUSD: 0 },
+        escrowsLocked: 0,
+        p50CycleHours: 0,
+        revisionRatePct: 0
+      },
+      queue: [],
+      vendors: [],
+      alerts: [],
+      recent: [],
+      payouts: { pending: [], recent: [] }
+    };
+
+    // --- tiles: open proofs & SLA (pending > 48h) ---
+    {
+      const { rows } = await pool.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE status='pending')                    AS open_pending,
+          COUNT(*) FILTER (WHERE status='pending'
+                           AND submitted_at < NOW() - INTERVAL '48 hours') AS breaching
+        FROM proofs
+      `).catch(() => ({ rows:[{open_pending:0, breaching:0}] }));
+      out.tiles.openProofs   = Number(rows[0].open_pending || 0);
+      out.tiles.breachingSla = Number(rows[0].breaching || 0);
+    }
+
+    // --- tiles: pending payouts (best-effort) ---
+    {
+      const q = `
+        SELECT COUNT(*) AS cnt,
+               COALESCE(SUM(amount_usd),0) AS usd
+        FROM milestone_payments
+        WHERE status='pending'`;
+      const { rows } = await pool.query(q).catch(() => ({ rows:[{cnt:0, usd:0}] }));
+      out.tiles.pendingPayouts = { count: Number(rows[0].cnt||0), totalUSD: Number(rows[0].usd||0) };
+    }
+
+    // --- tiles: p50 approval cycle (hours) ---
+    {
+      const q = `
+        SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (
+                 ORDER BY EXTRACT(EPOCH FROM (COALESCE(approved_at, updated_at) - submitted_at)) / 3600.0
+               ) AS p50h
+        FROM proofs
+        WHERE status='approved' AND submitted_at IS NOT NULL`;
+      const { rows } = await pool.query(q).catch(() => ({ rows:[{p50h:0}] }));
+      out.tiles.p50CycleHours = Number(rows[0].p50h || 0);
+    }
+
+    // --- tiles: “revision rate” (fallback: rejected share among decided proofs) ---
+    {
+      const { rows } = await pool.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE status IN ('approved','rejected')) AS decided,
+          COUNT(*) FILTER (WHERE status='rejected') AS rej
+        FROM proofs
+      `).catch(() => ({ rows:[{decided:0, rej:0}] }));
+      const decided = Number(rows[0].decided||0);
+      const rej = Number(rows[0].rej||0);
+      out.tiles.revisionRatePct = decided ? Math.round(100*rej/decided) : 0;
+    }
+
+    // --- queue health: oldest pending proofs with context ---
+    {
+      const { rows } = await pool.query(`
+        SELECT p.proof_id, p.bid_id, p.milestone_index, p.status,
+               p.submitted_at, p.updated_at,
+               b.vendor_name, b.wallet_address, b.proposal_id,
+               pr.title AS project
+          FROM proofs p
+          JOIN bids b       ON b.bid_id=p.bid_id
+          JOIN proposals pr ON pr.proposal_id=b.proposal_id
+         WHERE p.status='pending'
+         ORDER BY p.submitted_at NULLS LAST, p.updated_at NULLS LAST
+         LIMIT 50
+      `).catch(() => ({ rows: [] }));
+      out.queue = rows.map(r => ({
+        id: r.proof_id,
+        vendor: r.vendor_name || r.wallet_address,
+        project: r.project,
+        milestone: Number(r.milestone_index)+1,
+        ageHours: r.submitted_at ? Math.max(0, (Date.now()-new Date(r.submitted_at).getTime())/3600000) : null,
+        status: r.status,
+        risk: (r.submitted_at && (Date.now()-new Date(r.submitted_at).getTime()) > 48*3600000) ? 'sla' : null,
+        actions: { bidId: r.bid_id, proposalId: r.proposal_id }
+      }));
+    }
+
+    // --- vendor performance: proofs & approvals per vendor ---
+    {
+      const { rows } = await pool.query(`
+        SELECT
+          b.vendor_name,
+          b.wallet_address,
+          COUNT(p.proof_id)                                 AS proofs,
+          COUNT(p.proof_id) FILTER (WHERE p.status='approved') AS approved,
+          COUNT(p.proof_id) FILTER (WHERE p.status='rejected') AS cr,
+          COUNT(DISTINCT b.bid_id)                          AS bids,
+          MAX(p.updated_at)                                 AS last_activity
+        FROM bids b
+        LEFT JOIN proofs p ON p.bid_id=b.bid_id
+        GROUP BY b.vendor_name, b.wallet_address
+        ORDER BY proofs DESC NULLS LAST, vendor_name ASC
+        LIMIT 200
+      `).catch(() => ({ rows: [] }));
+      out.vendors = rows.map(r => ({
+        vendor: r.vendor_name || '(unnamed)',
+        wallet: r.wallet_address,
+        proofs: Number(r.proofs||0),
+        approved: Number(r.approved||0),
+        cr: Number(r.cr||0),
+        approvalPct: Number(r.proofs||0) ? Math.round(100*Number(r.approved||0)/Number(r.proofs||0)) : 0,
+        bids: Number(r.bids||0),
+        lastActivity: r.last_activity
+      }));
+    }
+
+    // --- alerts feed (reusing your route shape) ---
+    try {
+      const { rows } = await pool.query(`
+        SELECT created_at, bid_id, changes
+          FROM bid_audits
+         WHERE changes ? 'ipfs_missing'
+         ORDER BY created_at DESC
+         LIMIT 20`);
+      out.alerts = rows.map(r => ({
+        type: 'ipfs_missing',
+        createdAt: r.created_at,
+        bidId: r.bid_id,
+        details: r.changes?.ipfs_missing || null
+      }));
+    } catch {}
+
+    // --- payouts (best-effort) ---
+    try {
+      const { rows: pend } = await pool.query(`
+        SELECT id, bid_id, milestone_index, amount_usd, created_at
+          FROM milestone_payments
+         WHERE status='pending'
+         ORDER BY created_at DESC LIMIT 20`);
+      const { rows: rec } = await pool.query(`
+        SELECT id, bid_id, milestone_index, amount_usd, released_at
+          FROM milestone_payments
+         WHERE status='released'
+         ORDER BY released_at DESC LIMIT 20`);
+      out.payouts.pending = pend || [];
+      out.payouts.recent  = rec  || [];
+    } catch {}
+
+    // --- recent activity (reusing your audits table) ---
+    try {
+      const { rows } = await pool.query(`
+        SELECT created_at, actor_role, actor_wallet, changes, bid_id
+          FROM bid_audits
+         ORDER BY created_at DESC
+         LIMIT 50`);
+      out.recent = rows;
+    } catch {}
+
+    res.set('Cache-Control','no-store');
+    return res.json(out);
+  } catch (e) {
+    console.error('oversight error', e);
+    return res.status(500).json({ error: 'Failed to build oversight' });
+  }
+});
+
 // --- IPFS monitor: scans recent CIDs and records "ipfs_missing" once ----------
 const MONITOR_MINUTES       = Number(process.env.IPFS_MONITOR_INTERVAL_MIN || 15);  // 0 = disabled
 const MONITOR_LOOKBACK_DAYS = Number(process.env.IPFS_MONITOR_LOOKBACK_DAYS || 14);
