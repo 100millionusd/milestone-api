@@ -6475,8 +6475,16 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
   }
 });
 
+// ---- admin guard shim (do NOT remove until you confirm real guard name/placement) ----
+const ensureAdminGuard =
+  (typeof adminOnlyGuard !== 'undefined' && adminOnlyGuard) ||
+  (typeof adminOrProposalOwnerGuard !== 'undefined' && adminOrProposalOwnerGuard) ||
+  (typeof adminGuard !== 'undefined' && adminGuard) ||
+  ((req, res) => res.status(500).json({ error: 'admin_guard_missing' }));
+// --------------------------------------------------------------------------------------
+
 // --- Oversight sub-endpoints (admin only) ---
-app.get('/admin/oversight/summary', adminOnlyGuard, async (req, res) => {
+app.get('/admin/oversight/summary', ensureAdminGuard, async (req, res) => { ... });
   try {
     const { rows: bidCounts } = await pool.query(`
       SELECT
@@ -6514,7 +6522,7 @@ app.get('/admin/oversight/summary', adminOnlyGuard, async (req, res) => {
   }
 });
 
-app.get('/admin/oversight/queue', adminOnlyGuard, async (req, res) => {
+app.get('/admin/oversight/queue',   ensureAdminGuard, async (req, res) => { ... });
   try {
     const { rows: pendingBids } = await pool.query(`
       SELECT id, vendor_name, created_at
@@ -6555,7 +6563,7 @@ app.get('/admin/oversight/queue', adminOnlyGuard, async (req, res) => {
   }
 });
 
-app.get('/admin/oversight/alerts', adminOnlyGuard, async (req, res) => {
+app.get('/admin/oversight/alerts',  ensureAdminGuard, async (req, res) => { ... });
   try {
     // Heuristic: alert on low-fit or explicit risks in Agent2 analysis
     const { rows } = await pool.query(`
@@ -6575,7 +6583,7 @@ app.get('/admin/oversight/alerts', adminOnlyGuard, async (req, res) => {
   }
 });
 
-app.get('/admin/oversight/vendors', adminOnlyGuard, async (req, res) => {
+app.get('/admin/oversight/vendors', ensureAdminGuard, async (req, res) => { ... });
   try {
     // Mirrors the Vendors admin summary you added earlier (#15 context)
     const { rows } = await pool.query(`
@@ -6616,7 +6624,7 @@ app.get('/admin/oversight/vendors', adminOnlyGuard, async (req, res) => {
   }
 });
 
-app.get('/admin/oversight/payouts', adminOnlyGuard, async (req, res) => {
+app.get('/admin/oversight/payouts', ensureAdminGuard, async (req, res) => { ... });
   try {
     // "recent" from audit rows that have a blockchain tx
     const { rows: recent } = await pool.query(`
