@@ -4320,18 +4320,70 @@ await pool.query(`
       return res.status(409).json({ error: "Milestone already paid" });
     }
 
-    // 2) **Idempotency gate** — only one request can pass this INSERT.
-    const ins = await pool.query(
-      `INSERT INTO milestone_payments (bid_id, milestone_index)
-       VALUES ($1, $2)
-       ON CONFLICT DO NOTHING
-       RETURNING 1`,
-      [bidId, milestoneIndex]
-    );
-    if (ins.rowCount === 0) {
-      // Someone else already inserted (in progress or done) ⇒ do not send again
-      return res.status(409).json({ error: "Payment already in progress or completed" });
-    }
+   // 2) **Idempotency gate** — create the row Oversight reads (one caller proceeds)
+const msAmountUSD = Number(ms.amount ?? 0);
+
+const gate = await pool.query(`
+  INSERT INTO milestone_payments (bid_id, milestone_index, amount_usd, status, created_at)
+  VALUES ($1, $2, $3, 'pending', NOW())
+  ON CONFLICT (bid_id, milestone_index) DO NOTHING
+  RETURNING id
+`, [bidId, milestoneIndex, msAmountUSD]);
+
+if (gate.rowCount === 0) {
+  // Someone else already inserted (in progress or done) ⇒ do not send again
+  return res.status(409).json({ error: "Payment already in progress or completed" });
+}
+
+// 3) Send the tokens (or simulate in dev)
+let txHash;
+try {
+  const token = String(bid.preferred_stablecoin || 'USDT').toUpperCase();
+  if (blockchainService.signer) {
+    const r = await blockchainService.sendToken(token, bid.wallet_address, msAmountUSD);
+    txHash = r.hash;
+  } else {
+    // dev fallback
+    txHash = 'dev_' + crypto.randomBytes(8).toString('hex');
+  }
+} catch (err) {
+  // leave the row as 'pending' so admin can retry
+  return res.status(502).json({ error: "Blockchain transfer failed", detail: String(err).slice(0,200) });
+}
+
+// 4) Mark RELEASED in milestone_payments + update bid.milestones JSON
+ms.paymentTxHash = txHash;
+ms.paymentDate   = new Date().toISOString();
+milestones[milestoneIndex] = ms;
+
+await pool.query(
+  `UPDATE bids SET milestones=$1 WHERE bid_id=$2`,
+  [ JSON.stringify(milestones), bidId ]
+);
+
+await pool.query(`
+  UPDATE milestone_payments
+     SET status='released',
+         tx_hash=$3,
+         released_at=NOW(),
+         amount_usd = COALESCE(amount_usd, $4)
+   WHERE bid_id=$1 AND milestone_index=$2
+`, [bidId, milestoneIndex, txHash, msAmountUSD]);
+
+// 5) Notify
+try {
+  const { rows: [proposal] } =
+    await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [ bid.proposal_id ]);
+  if (proposal && typeof notifyPaymentReleased === 'function') {
+    await notifyPaymentReleased({
+      bid, proposal, msIndex: milestoneIndex + 1, amount: msAmountUSD, txHash
+    });
+  }
+} catch (_) {}
+
+// 6) Return updated bid
+const { rows: [updated] } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [ bidId ]);
+return res.json(toCamel(updated));
 
     // ---- Oversight: record/refresh a PENDING payout ----
 const msAmountUSD = Number(ms?.amount ?? 0);
