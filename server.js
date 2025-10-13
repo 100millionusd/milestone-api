@@ -4474,7 +4474,7 @@ await writeAudit(bidId, req, {
       }
     }
 
-    const { rows: updated } = await pool.query(
+    const { rows: updated2 } = await pool.query(
       "SELECT * FROM bids WHERE bid_id=$1",
       [bidId]
     );
