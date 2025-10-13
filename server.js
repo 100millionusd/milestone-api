@@ -4320,18 +4320,15 @@ await pool.query(`
       return res.status(409).json({ error: "Milestone already paid" });
     }
 
-   // 2) **Idempotency gate** — create the row Oversight reads (one caller proceeds)
-const msAmountUSD = Number(ms.amount ?? 0);
-
-const gate = await pool.query(`
+// 2) **Idempotency gate** — create the 'pending' payout row Oversight reads
+const ins = await pool.query(`
   INSERT INTO milestone_payments (bid_id, milestone_index, amount_usd, status, created_at)
   VALUES ($1, $2, $3, 'pending', NOW())
   ON CONFLICT (bid_id, milestone_index) DO NOTHING
   RETURNING id
-`, [bidId, milestoneIndex, msAmountUSD]);
+`, [bidId, milestoneIndex, Number((ms && ms.amount) ?? 0)]);
 
-if (gate.rowCount === 0) {
-  // Someone else already inserted (in progress or done) ⇒ do not send again
+if (ins.rowCount === 0) {
   return res.status(409).json({ error: "Payment already in progress or completed" });
 }
 
