@@ -3374,6 +3374,42 @@ app.get('/admin/anchor/last', async (req, res) => {
   }
 });
 
+app.get('/admin/audit/recent', adminGuard, async (req, res) => {
+  try {
+    const take = Math.min(parseInt(req.query.take || '50', 10), 200);
+    const { rows } = await pool.query(`
+      SELECT ba.created_at, ba.actor_role, ba.actor_wallet, ba.changes, ba.bid_id,
+             ab.period_id, ab.tx_hash, ab.contract_addr, ab.chain_id
+        FROM bid_audits ba
+        LEFT JOIN audit_batches ab ON ab.id = ba.batch_id
+       ORDER BY ba.created_at DESC
+       LIMIT $1`, [take]);
+    res.set('Cache-Control','no-store');
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load recent audit' });
+  }
+});
+
+app.get('/admin/alerts', adminGuard, async (_req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT created_at, bid_id, changes
+        FROM bid_audits
+       WHERE changes ? 'ipfs_missing'
+       ORDER BY created_at DESC
+       LIMIT 100`);
+    res.json(rows.map(r => ({
+      type: 'ipfs_missing',
+      createdAt: r.created_at,
+      bidId: r.bid_id,
+      details: r.changes?.ipfs_missing || null
+    })));
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load alerts' });
+  }
+});
+
 // --- IPFS monitor: scans recent CIDs and records "ipfs_missing" once ----------
 const MONITOR_MINUTES       = Number(process.env.IPFS_MONITOR_INTERVAL_MIN || 15);  // 0 = disabled
 const MONITOR_LOOKBACK_DAYS = Number(process.env.IPFS_MONITOR_LOOKBACK_DAYS || 14);
