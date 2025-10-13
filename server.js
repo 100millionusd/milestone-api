@@ -6475,6 +6475,183 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
   }
 });
 
+// --- Oversight sub-endpoints (admin only) ---
+app.get('/admin/oversight/summary', adminOnlyGuard, async (req, res) => {
+  try {
+    const { rows: bidCounts } = await pool.query(`
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
+        COUNT(*) FILTER (WHERE status = 'approved')::int AS approved,
+        COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected
+      FROM bids;
+    `);
+
+    const { rows: proofCounts } = await pool.query(`
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE status IN ('submitted','in_review'))::int AS in_review,
+        COUNT(*) FILTER (WHERE status = 'approved')::int AS approved,
+        COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected
+      FROM proofs;
+    `);
+
+    // last 7 days activity (audit already exists in your payload)
+    const { rows: last7 } = await pool.query(`
+      SELECT COUNT(*)::int AS audit_events_7d
+      FROM audit
+      WHERE created_at >= NOW() - INTERVAL '7 days';
+    `);
+
+    res.json({
+      bids: bidCounts[0] || { total: 0, pending: 0, approved: 0, rejected: 0 },
+      proofs: proofCounts[0] || { total: 0, in_review: 0, approved: 0, rejected: 0 },
+      activity: last7[0] || { audit_events_7d: 0 }
+    });
+  } catch (e) {
+    console.error('oversight/summary error', e);
+    res.status(500).json({ error: 'summary_failed' });
+  }
+});
+
+app.get('/admin/oversight/queue', adminOnlyGuard, async (req, res) => {
+  try {
+    const { rows: pendingBids } = await pool.query(`
+      SELECT id, vendor_name, created_at
+      FROM bids
+      WHERE status = 'pending'
+      ORDER BY created_at DESC
+      LIMIT 50;
+    `);
+
+    const { rows: pendingProofs } = await pool.query(`
+      SELECT proof_id, bid_id, title, submitted_at
+      FROM proofs
+      WHERE status IN ('submitted','in_review')
+      ORDER BY submitted_at DESC
+      LIMIT 50;
+    `);
+
+    const queue = [
+      ...pendingBids.map(b => ({
+        type: 'bid',
+        id: b.id,
+        vendorName: b.vendor_name,
+        when: b.created_at
+      })),
+      ...pendingProofs.map(p => ({
+        type: 'proof',
+        proofId: p.proof_id,
+        bidId: p.bid_id,
+        title: p.title,
+        when: p.submitted_at
+      }))
+    ];
+
+    res.json(queue);
+  } catch (e) {
+    console.error('oversight/queue error', e);
+    res.status(500).json({ error: 'queue_failed' });
+  }
+});
+
+app.get('/admin/oversight/alerts', adminOnlyGuard, async (req, res) => {
+  try {
+    // Heuristic: alert on low-fit or explicit risks in Agent2 analysis
+    const { rows } = await pool.query(`
+      SELECT proof_id, bid_id, title, submitted_at,
+             ai_analysis ->> 'fit' AS fit,
+             ai_analysis ->> 'summary' AS summary
+      FROM proofs
+      WHERE (ai_analysis ->> 'fit') = 'low'
+         OR (ai_analysis ? 'risks' AND jsonb_array_length(ai_analysis->'risks') > 0)
+      ORDER BY submitted_at DESC
+      LIMIT 50;
+    `);
+    res.json(rows);
+  } catch (e) {
+    console.error('oversight/alerts error', e);
+    res.status(500).json({ error: 'alerts_failed' });
+  }
+});
+
+app.get('/admin/oversight/vendors', adminOnlyGuard, async (req, res) => {
+  try {
+    // Mirrors the Vendors admin summary you added earlier (#15 context)
+    const { rows } = await pool.query(`
+      WITH bids_agg AS (
+        SELECT
+          COALESCE(vendor_name, 'Unknown') AS vendor_name,
+          COALESCE(wallet_address, '0x') AS wallet_address,
+          COUNT(*)::int AS bids_count,
+          MAX(created_at) AS last_bid_at
+        FROM bids
+        GROUP BY 1,2
+      ),
+      awarded AS (
+        SELECT
+          b.vendor_name,
+          b.wallet_address,
+          COALESCE(SUM((b.amount_usd)::numeric), 0)::numeric AS total_awarded_usd
+        FROM bids b
+        WHERE b.status = 'approved'
+        GROUP BY 1,2
+      )
+      SELECT
+        ba.vendor_name,
+        ba.wallet_address,
+        ba.bids_count,
+        ba.last_bid_at,
+        COALESCE(a.total_awarded_usd, 0) AS total_awarded_usd
+      FROM bids_agg ba
+      LEFT JOIN awarded a
+      ON a.vendor_name = ba.vendor_name AND a.wallet_address = ba.wallet_address
+      ORDER BY ba.last_bid_at DESC NULLS LAST
+      LIMIT 100;
+    `);
+    res.json(rows);
+  } catch (e) {
+    console.error('oversight/vendors error', e);
+    res.status(500).json({ error: 'vendors_failed' });
+  }
+});
+
+app.get('/admin/oversight/payouts', adminOnlyGuard, async (req, res) => {
+  try {
+    // "recent" from audit rows that have a blockchain tx
+    const { rows: recent } = await pool.query(`
+      SELECT created_at, bid_id, tx_hash, chain_id, contract_addr,
+             COALESCE((changes->>'amountUSD')::numeric, NULL) AS amount_usd
+      FROM audit
+      WHERE tx_hash IS NOT NULL
+      ORDER BY created_at DESC
+      LIMIT 50;
+    `);
+
+    // "pending" (best-effort): approved milestones not paid yet
+    // Adjust table/columns if your schema differs.
+    let pending = [];
+    try {
+      const q = await pool.query(`
+        SELECT bid_id, milestone_index, amount_usd, updated_at
+        FROM milestones
+        WHERE status = 'approved' AND (paid IS NULL OR paid = false)
+        ORDER BY updated_at DESC
+        LIMIT 50;
+      `);
+      pending = q.rows || [];
+    } catch (e2) {
+      // If you don't have a milestones table, just leave pending empty
+      console.warn('payouts/pending skipped:', e2.message);
+    }
+
+    res.json({ pending, recent });
+  } catch (e) {
+    console.error('oversight/payouts error', e);
+    res.status(500).json({ error: 'payouts_failed' });
+  }
+});
+
 // ==============================
 // Projects Directory (list with aggregates)
 // ==============================
