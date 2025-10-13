@@ -6471,39 +6471,50 @@ const __pool =
   (typeof pgPool !== 'undefined' && pgPool) ||
   null;
 
-// ---- /admin/oversight/* routes (admin only) ----
-app.get('/admin/oversight/summary', adminOrProposalOwnerGuard, async (req, res) => {
+// ---- /admin/oversight/* routes (admin only) — FIXED ----
+
+// SUMMARY
+app.get('/admin/oversight/summary', adminGuard, async (req, res) => {
   try {
-    if (!__pool || !__pool.query) return res.status(500).json({ error: 'db_pool_missing' });
-
-    const bidCounts = await __pool.query(`
-      SELECT
-        COUNT(*)::int AS total,
-        COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
-        COUNT(*) FILTER (WHERE status = 'approved')::int AS approved,
-        COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected
-      FROM bids;
-    `);
-
-    const proofCounts = await __pool.query(`
-      SELECT
-        COUNT(*)::int AS total,
-        COUNT(*) FILTER (WHERE status IN ('submitted','in_review'))::int AS in_review,
-        COUNT(*) FILTER (WHERE status = 'approved')::int AS approved,
-        COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected
-      FROM proofs;
-    `);
-
-    const last7 = await __pool.query(`
-      SELECT COUNT(*)::int AS audit_events_7d
-      FROM audit
-      WHERE created_at >= NOW() - INTERVAL '7 days';
-    `);
+    const [proofs, payouts, p50, rev] = await Promise.all([
+      pool.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE status='pending') AS open_pending,
+          COUNT(*) FILTER (WHERE status='pending'
+            AND submitted_at < NOW() - INTERVAL '48 hours') AS breaching
+        FROM proofs
+      `).catch(() => ({ rows:[{ open_pending:0, breaching:0 }] })),
+      pool.query(`
+        SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_usd),0) AS usd
+        FROM milestone_payments
+        WHERE status='pending'
+      `).catch(() => ({ rows:[{ cnt:0, usd:0 }] })),
+      pool.query(`
+        SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (
+          ORDER BY EXTRACT(EPOCH FROM (updated_at - submitted_at))/3600.0
+        ) AS p50h
+        FROM proofs
+        WHERE status='approved' AND submitted_at IS NOT NULL AND updated_at IS NOT NULL
+      `).catch(() => ({ rows:[{ p50h:0 }] })),
+      pool.query(`
+        SELECT 
+          COUNT(*) FILTER (WHERE status IN ('approved','rejected')) AS decided,
+          COUNT(*) FILTER (WHERE status='rejected') AS rej
+        FROM proofs
+      `).catch(() => ({ rows:[{ decided:0, rej:0 }] })),
+    ]);
 
     res.json({
-      bids: bidCounts.rows[0] || { total: 0, pending: 0, approved: 0, rejected: 0 },
-      proofs: proofCounts.rows[0] || { total: 0, in_review: 0, approved: 0, rejected: 0 },
-      activity: last7.rows[0] || { audit_events_7d: 0 }
+      openProofs: Number(proofs.rows[0].open_pending||0),
+      breachingSla: Number(proofs.rows[0].breaching||0),
+      pendingPayouts: {
+        count: Number(payouts.rows[0].cnt||0),
+        totalUSD: Number(payouts.rows[0].usd||0),
+      },
+      p50CycleHours: Number(p50.rows[0].p50h||0),
+      revisionRatePct: (Number(rev.rows[0].decided||0)
+        ? Math.round(100*Number(rev.rows[0].rej)/Number(rev.rows[0].decided))
+        : 0),
     });
   } catch (e) {
     console.error('oversight/summary error', e);
@@ -6511,142 +6522,95 @@ app.get('/admin/oversight/summary', adminOrProposalOwnerGuard, async (req, res) 
   }
 });
 
-app.get('/admin/oversight/queue', adminOrProposalOwnerGuard, async (req, res) => {
+// QUEUE
+app.get('/admin/oversight/queue', adminGuard, async (req, res) => {
   try {
-    if (!__pool || !__pool.query) return res.status(500).json({ error: 'db_pool_missing' });
-
-    const pendingBids = await __pool.query(`
-      SELECT id, vendor_name, created_at
-      FROM bids
-      WHERE status = 'pending'
-      ORDER BY created_at DESC
-      LIMIT 50;
+    const { rows } = await pool.query(`
+      SELECT p.proof_id, p.bid_id, p.milestone_index, p.status,
+             p.submitted_at, p.updated_at,
+             b.vendor_name, b.wallet_address, b.proposal_id,
+             pr.title AS project
+        FROM proofs p
+        JOIN bids b       ON b.bid_id = p.bid_id
+        JOIN proposals pr ON pr.proposal_id = b.proposal_id
+       WHERE p.status='pending'
+       ORDER BY p.submitted_at NULLS LAST, p.updated_at NULLS LAST
+       LIMIT 100
     `);
-
-    const pendingProofs = await __pool.query(`
-      SELECT proof_id, bid_id, title, submitted_at
-      FROM proofs
-      WHERE status IN ('submitted','in_review')
-      ORDER BY submitted_at DESC
-      LIMIT 50;
-    `);
-
-    const queue = [
-      ...pendingBids.rows.map(b => ({
-        type: 'bid',
-        id: b.id,
-        vendorName: b.vendor_name,
-        when: b.created_at
-      })),
-      ...pendingProofs.rows.map(p => ({
-        type: 'proof',
-        proofId: p.proof_id,
-        bidId: p.bid_id,
-        title: p.title,
-        when: p.submitted_at
-      }))
-    ];
-
-    res.json(queue);
+    res.json(rows.map(r => ({
+      id: r.proof_id,                       // ← no “id” column, use proof_id
+      vendor: r.vendor_name || r.wallet_address,
+      project: r.project,
+      milestone: Number(r.milestone_index)+1,
+      ageHours: r.submitted_at
+        ? Math.max(0, (Date.now()-new Date(r.submitted_at).getTime())/3600000)
+        : null,
+      status: r.status,
+      risk: (r.submitted_at && (Date.now()-new Date(r.submitted_at).getTime()) > 48*3600000) ? 'sla' : null,
+      actions: { bidId: r.bid_id, proposalId: r.proposal_id },
+    })));
   } catch (e) {
     console.error('oversight/queue error', e);
     res.status(500).json({ error: 'queue_failed' });
   }
 });
 
-app.get('/admin/oversight/alerts', adminOrProposalOwnerGuard, async (req, res) => {
+// VENDORS
+app.get('/admin/oversight/vendors', adminGuard, async (req, res) => {
   try {
-    if (!__pool || !__pool.query) return res.status(500).json({ error: 'db_pool_missing' });
-
-    const rows = await __pool.query(`
-      SELECT proof_id, bid_id, title, submitted_at,
-             ai_analysis ->> 'fit' AS fit,
-             ai_analysis ->> 'summary' AS summary
-      FROM proofs
-      WHERE (ai_analysis ->> 'fit') = 'low'
-         OR (ai_analysis ? 'risks' AND jsonb_array_length(ai_analysis->'risks') > 0)
-      ORDER BY submitted_at DESC
-      LIMIT 50;
-    `);
-
-    res.json(rows.rows);
-  } catch (e) {
-    console.error('oversight/alerts error', e);
-    res.status(500).json({ error: 'alerts_failed' });
-  }
-});
-
-app.get('/admin/oversight/vendors', adminOrProposalOwnerGuard, async (req, res) => {
-  try {
-    if (!__pool || !__pool.query) return res.status(500).json({ error: 'db_pool_missing' });
-
-    const result = await __pool.query(`
-      WITH bids_agg AS (
-        SELECT
-          COALESCE(vendor_name, 'Unknown') AS vendor_name,
-          COALESCE(wallet_address, '0x') AS wallet_address,
-          COUNT(*)::int AS bids_count,
-          MAX(created_at) AS last_bid_at
-        FROM bids
-        GROUP BY 1,2
-      ),
-      awarded AS (
-        SELECT
-          b.vendor_name,
-          b.wallet_address,
-          COALESCE(SUM((b.amount_usd)::numeric), 0)::numeric AS total_awarded_usd
-        FROM bids b
-        WHERE b.status = 'approved'
-        GROUP BY 1,2
-      )
+    const { rows } = await pool.query(`
       SELECT
-        ba.vendor_name,
-        ba.wallet_address,
-        ba.bids_count,
-        ba.last_bid_at,
-        COALESCE(a.total_awarded_usd, 0) AS total_awarded_usd
-      FROM bids_agg ba
-      LEFT JOIN awarded a
-        ON a.vendor_name = ba.vendor_name AND a.wallet_address = ba.wallet_address
-      ORDER BY ba.last_bid_at DESC NULLS LAST
-      LIMIT 100;
+        b.vendor_name,
+        b.wallet_address,
+        COUNT(p.proof_id)                                 AS proofs,
+        COUNT(p.proof_id) FILTER (WHERE p.status='approved') AS approved,
+        COUNT(p.proof_id) FILTER (WHERE p.status='rejected') AS cr,
+        COUNT(DISTINCT b.bid_id)                          AS bids,
+        MAX(p.updated_at)                                 AS last_activity
+      FROM bids b
+      LEFT JOIN proofs p ON p.bid_id = b.bid_id
+      GROUP BY b.vendor_name, b.wallet_address
+      ORDER BY proofs DESC NULLS LAST, vendor_name ASC
+      LIMIT 200
     `);
-
-    res.json(result.rows);
+    res.json(rows.map(r => ({
+      vendor: r.vendor_name || '(unnamed)',
+      wallet: r.wallet_address,
+      proofs: Number(r.proofs||0),
+      approved: Number(r.approved||0),
+      cr: Number(r.cr||0),
+      approvalPct: Number(r.proofs||0)
+        ? Math.round(100*Number(r.approved||0)/Number(r.proofs||0))
+        : 0,
+      bids: Number(r.bids||0),
+      lastActivity: r.last_activity
+    })));
   } catch (e) {
     console.error('oversight/vendors error', e);
     res.status(500).json({ error: 'vendors_failed' });
   }
 });
 
-app.get('/admin/oversight/payouts', adminOrProposalOwnerGuard, async (req, res) => {
+// PAYOUTS
+app.get('/admin/oversight/payouts', adminGuard, async (req, res) => {
   try {
-    if (!__pool || !__pool.query) return res.status(500).json({ error: 'db_pool_missing' });
-
-    const recent = await __pool.query(`
-      SELECT created_at, bid_id, tx_hash, chain_id, contract_addr,
-             COALESCE((changes->>'amountUSD')::numeric, NULL) AS amount_usd
-      FROM audit
-      WHERE tx_hash IS NOT NULL
-      ORDER BY created_at DESC
-      LIMIT 50;
-    `);
-
-    let pending = [];
-    try {
-      const q = await __pool.query(`
-        SELECT bid_id, milestone_index, amount_usd, updated_at
-        FROM milestones
-        WHERE status = 'approved' AND (paid IS NULL OR paid = false)
-        ORDER BY updated_at DESC
-        LIMIT 50;
-      `);
-      pending = q.rows || [];
-    } catch (e2) {
-      console.warn('payouts/pending skipped:', e2.message);
-    }
-
-    res.json({ pending, recent: recent.rows });
+    const [pend, rec] = await Promise.all([
+      pool.query(`
+        SELECT id, bid_id, milestone_index, amount_usd, created_at
+          FROM milestone_payments
+         WHERE status='pending'
+         ORDER BY created_at DESC
+         LIMIT 50
+      `).catch(() => ({ rows: [] })),
+      pool.query(`
+        SELECT id, bid_id, milestone_index, amount_usd, released_at, tx_hash
+          FROM milestone_payments
+         WHERE status='released'
+         ORDER BY released_at DESC
+         LIMIT 50
+      `).catch(() => ({ rows: [] })),
+    ]);
+    res.json({ pending: pend.rows, recent: rec.rows });
   } catch (e) {
     console.error('oversight/payouts error', e);
     res.status(500).json({ error: 'payouts_failed' });
