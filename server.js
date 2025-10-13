@@ -4266,16 +4266,37 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
   }
 
   try {
-    // 0) Ensure the idempotency ledger exists (safe to run repeatedly)
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS milestone_payments (
-        bid_id BIGINT NOT NULL,
-        milestone_index INT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        tx_hash TEXT,
-        PRIMARY KEY (bid_id, milestone_index)
-      )
-    `);
+   // 0) Ensure the milestone_payments table matches Oversight expectations
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS milestone_payments (
+    id              BIGSERIAL PRIMARY KEY,
+    bid_id          BIGINT NOT NULL,
+    milestone_index INT    NOT NULL,
+    amount_usd      NUMERIC(18,2),
+    status          TEXT CHECK (status IN ('pending','released')) DEFAULT 'pending',
+    tx_hash         TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    released_at     TIMESTAMPTZ
+  );
+  -- idempotent upgrades for older schemas
+  ALTER TABLE milestone_payments
+    ADD COLUMN IF NOT EXISTS amount_usd NUMERIC(18,2),
+    ADD COLUMN IF NOT EXISTS status TEXT,
+    ADD COLUMN IF NOT EXISTS released_at TIMESTAMPTZ;
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+       WHERE conname = 'ux_milestone_payments_bid_ms'
+    ) THEN
+      ALTER TABLE milestone_payments
+        ADD CONSTRAINT ux_milestone_payments_bid_ms
+        UNIQUE (bid_id, milestone_index);
+    END IF;
+  END$$;
+  -- ensure status has the right default
+  ALTER TABLE milestone_payments ALTER COLUMN status SET DEFAULT 'pending';
+`);
 
     // 1) Load bid + milestone; bail if already paid (covers legacy too)
     const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
@@ -4312,12 +4333,58 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
       return res.status(409).json({ error: "Payment already in progress or completed" });
     }
 
+    // ---- Oversight: record/refresh a PENDING payout ----
+const msAmountUSD = Number(ms?.amount ?? 0);
+
+await pool.query(`
+  INSERT INTO milestone_payments (bid_id, milestone_index, amount_usd, status, created_at)
+  VALUES ($1,$2,$3,'pending', NOW())
+  ON CONFLICT (bid_id, milestone_index) DO UPDATE
+    SET amount_usd = EXCLUDED.amount_usd,
+        status     = CASE
+                       WHEN milestone_payments.status = 'released' THEN 'released'
+                       ELSE 'pending'
+                     END
+`, [bidId, milestoneIndex, msAmountUSD]);
+
     // 3) Execute the transfer
     const receipt = await blockchainService.sendToken(
       bid.preferred_stablecoin,
       bid.wallet_address,
       ms.amount
     );
+
+    // ---- Oversight: mark payout released ----
+await pool.query(`
+  UPDATE milestone_payments
+     SET status='released', tx_hash=$3, released_at=NOW()
+   WHERE bid_id=$1 AND milestone_index=$2
+`, [bidId, milestoneIndex, receipt.hash]);
+
+// Optional: notify admins/vendor about the released payment
+try {
+  const { rows: [proposal] } = await pool.query(
+    'SELECT * FROM proposals WHERE proposal_id=$1',
+    [bid.proposal_id]
+  );
+  if (proposal && typeof notifyPaymentReleased === 'function') {
+    await notifyPaymentReleased({
+      bid, proposal,
+      msIndex: milestoneIndex + 1,
+      amount: msAmountUSD,
+      txHash: receipt.hash
+    });
+  }
+} catch (_) { /* best-effort */ }
+
+// Optional: audit trail
+await writeAudit(bidId, req, {
+  payment_released: {
+    milestone_index: milestoneIndex,
+    amount_usd: msAmountUSD,
+    tx: receipt.hash
+  }
+});
 
     // 4) Persist "paid" in both places
     ms.paymentTxHash = receipt.hash;
