@@ -111,6 +111,60 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+// ---- Enrich bids with payment state from milestone_payments
+async function attachPaymentState(bids) {
+  if (!Array.isArray(bids) || bids.length === 0) return bids;
+
+  // Handle both snake_case and camelCase bid ids
+  const bidIds = bids
+    .map(b => Number(b.bidId ?? b.bid_id))
+    .filter(Boolean);
+
+  if (bidIds.length === 0) return bids;
+
+  const { rows: payRows } = await pool.query(
+    `SELECT bid_id, milestone_index, status, tx_hash
+       FROM milestone_payments
+      WHERE bid_id = ANY($1::bigint[])`,
+    [bidIds]
+  );
+
+  const byKey = new Map();
+  for (const r of payRows) {
+    byKey.set(`${Number(r.bid_id)}:${Number(r.milestone_index)}`, r);
+  }
+
+  return bids.map(b => {
+    const bidId = Number(b.bidId ?? b.bid_id);
+    let milestones = Array.isArray(b.milestones)
+      ? b.milestones
+      : JSON.parse(b.milestones || '[]');
+
+    milestones = milestones.map((m, i) => {
+      const hit = byKey.get(`${bidId}:${i}`);
+      if (!hit) return m;
+
+      if (hit.status === 'pending') {
+        // show the amber "Payment Pending" pill and hide the green button
+        return { ...m, paymentPending: true };
+      }
+      if (hit.status === 'released') {
+        // make sure the UI sees it as paid
+        const tx = hit.tx_hash || m.paymentTxHash || null;
+        return { ...m, paymentTxHash: tx, paid: true };
+      }
+      return m;
+    });
+
+    // Preserve original shape (camel or snake)
+    if ('bidId' in b) {
+      return { ...b, milestones };
+    } else {
+      return { ...b, milestones }; // if you normally stringify, do it in the route before res.json
+    }
+  });
+}
+
 // ==============================
 // DB bootstrap — vendor_profiles (create if missing)
 // ==============================
