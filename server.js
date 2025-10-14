@@ -4148,6 +4148,123 @@ app.post('/bids/:id/analyze', adminOrBidOwnerGuard, async (req, res) => {
   }
 });
 
+// ==============================
+// Routes — Proofs
+// ==============================
+app.get("/proofs", async (req, res) => {
+  try {
+    const bidId = Number(req.query.bidId);
+    const proposalId = Number(req.query.proposalId);
+    if (!Number.isFinite(bidId) && !Number.isFinite(proposalId)) {
+      return res.status(400).json({ error: "Provide bidId or proposalId" });
+    }
+
+    let rows;
+    if (Number.isFinite(bidId)) {
+      ({ rows } = await pool.query(
+        `SELECT p.*
+           FROM proofs p
+          WHERE p.bid_id = $1
+          ORDER BY p.proof_id ASC`,
+        [bidId]
+      ));
+    } else {
+      ({ rows } = await pool.query(
+        `SELECT p.*
+           FROM proofs p
+           JOIN bids b ON b.bid_id = p.bid_id
+          WHERE b.proposal_id = $1
+          ORDER BY p.proof_id ASC`,
+        [proposalId]
+      ));
+    }
+
+    // normalize for the frontend
+    const out = await Promise.all(rows.map(async r => {
+      const o = toCamel(r);
+      o.files      = coerceJson(o.files)      || [];
+      o.fileMeta   = coerceJson(o.fileMeta)   || [];
+      o.aiAnalysis = coerceJson(o.aiAnalysis) || null;
+      o.geo        = await buildSafeGeoForProof(o); // safe city/state/country (+rounded coords)
+      return o;
+    }));
+
+    res.json(out);
+  } catch (e) {
+    console.error("GET /proofs failed:", e);
+    res.status(500).json({ error: "Failed to load proofs" });
+  }
+});
+
+app.post("/proofs/:id/approve", adminGuard, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid proof id" });
+
+    const { rows: cur } = await pool.query(`SELECT * FROM proofs WHERE proof_id=$1`, [id]);
+    const proof = cur[0];
+    if (!proof) return res.status(404).json({ error: "Proof not found" });
+
+    const { rows: upd } = await pool.query(
+      `UPDATE proofs
+          SET status='approved', approved_at=NOW(), updated_at=NOW()
+        WHERE proof_id=$1
+      RETURNING *`,
+      [id]
+    );
+    const updated = upd[0];
+
+    await writeAudit(Number(proof.bid_id), req, {
+      proof_approved: { proofId: id, index: Number(proof.milestone_index) }
+    });
+
+    // notify
+    const [{ rows: bRows }, { rows: pRows }] = await Promise.all([
+      pool.query(`SELECT * FROM bids WHERE bid_id=$1`, [ proof.bid_id ]),
+      pool.query(`SELECT * FROM proposals WHERE proposal_id=(SELECT proposal_id FROM bids WHERE bid_id=$1)`, [ proof.bid_id ])
+    ]);
+    if (typeof notifyProofApproved === "function") {
+      const bid = bRows[0]; const proposal = pRows[0];
+      const msIndex = Number(updated.milestone_index) + 1;
+      notifyProofApproved({ proof: updated, bid, proposal, msIndex }).catch(() => {});
+    }
+
+    res.json(toCamel(updated));
+  } catch (e) {
+    console.error("POST /proofs/:id/approve failed:", e);
+    res.status(500).json({ error: "Failed to approve proof" });
+  }
+});
+
+app.post("/proofs/:id/reject", adminGuard, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const reason = String(req.body?.reason || "").trim() || null;
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid proof id" });
+
+    const { rows: cur } = await pool.query(`SELECT * FROM proofs WHERE proof_id=$1`, [id]);
+    const proof = cur[0];
+    if (!proof) return res.status(404).json({ error: "Proof not found" });
+
+    const { rows: upd } = await pool.query(
+      `UPDATE proofs
+          SET status='rejected', updated_at=NOW()
+        WHERE proof_id=$1
+      RETURNING *`,
+      [id]
+    );
+
+    await writeAudit(Number(proof.bid_id), req, {
+      proof_rejected: { proofId: id, index: Number(proof.milestone_index), reason }
+    });
+
+    res.json(toCamel(upd[0]));
+  } catch (e) {
+    console.error("POST /proofs/:id/reject failed:", e);
+    res.status(500).json({ error: "Failed to reject proof" });
+  }
+});
+
 // Legacy complete route
 app.put("/milestones/:bidId/:index/complete", async (req, res) => {
   try {
@@ -4254,9 +4371,6 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
   }
 });
 
-// ==============================
-// Routes — Complete/Pay milestone (idempotent)
-// ==============================
 // ==============================
 // Routes — Complete/Pay milestone (idempotent, fast-response)
 // ==============================
@@ -4443,7 +4557,7 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
 });
 
 // ==============================
-// Routes — Proofs (robust, with Agent2)
+//  — Proofs (robust, with Agent2)
 // ==============================
 app.post("/proofs", authRequired, async (req, res) => {
   // Accept legacy & new shapes
