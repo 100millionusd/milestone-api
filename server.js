@@ -6406,6 +6406,50 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
   }
 });
 
+// ADMIN: proofs page requires full bids + milestones + payment state
+app.get('/admin/proofs-bids', adminGuard, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         bid_id,
+         proposal_id,
+         vendor_name,
+         wallet_address,
+         milestones,
+         price_usd,
+         status,
+         created_at
+       FROM bids
+       ORDER BY created_at DESC NULLS LAST, bid_id DESC`
+    );
+
+    // Enrich with payment state (pending/released)
+    const enriched = await attachPaymentState(rows);
+
+    // Return camelCase keys the React page expects
+    const out = enriched.map(r => ({
+      bidId: r.bid_id,
+      proposalId: r.proposal_id,
+      vendorName: r.vendor_name,
+      walletAddress: r.wallet_address,
+      priceUsd: r.price_usd ?? null,
+      status: r.status ?? null,
+      createdAt: r.created_at,
+      milestones: Array.isArray(r.milestones)
+        ? r.milestones
+        : (typeof r.milestones === 'string'
+            ? (() => { try { return JSON.parse(r.milestones || '[]'); } catch { return []; } })()
+            : []
+          ),
+    }));
+
+    return res.json(out);
+  } catch (e) {
+    console.error('GET /admin/proofs-bids failed', e);
+    res.status(500).json({ error: 'Failed to fetch bids for proofs' });
+  }
+});
+
 // ADMIN: list proposers/entities that submitted proposals
 app.get('/admin/proposers', adminGuard, async (req, res) => {
   try {
