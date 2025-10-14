@@ -4781,7 +4781,17 @@ app.get("/proofs", async (req, res) => {
 // Normalized proofs feed for admin UI (newest first, camelCase fields)
 app.get("/proofs", adminGuard, async (req, res) => {
   try {
-    const bidId = Number(req.query.bidId);
+    let bidId = Number(req.query.bidId);
+    const proposalId = Number(req.query.proposalId);
+
+    // Fallback: resolve bidId from proposalId (so /projects/136 works even if it passes proposalId)
+    if (!Number.isFinite(bidId) && Number.isFinite(proposalId)) {
+      const { rows: [b] } = await pool.query(
+        `SELECT bid_id FROM bids WHERE proposal_id=$1 ORDER BY created_at DESC LIMIT 1`,
+        [proposalId]
+      );
+      if (b) bidId = Number(b.bid_id);
+    }
 
     const baseSql = `
       SELECT
@@ -4797,10 +4807,9 @@ app.get("/proofs", adminGuard, async (req, res) => {
         updated_at
       FROM proofs
     `;
-
     const params = [];
-    const where  = Number.isInteger(bidId) ? "WHERE bid_id = $1" : "";
-    if (Number.isInteger(bidId)) params.push(bidId);
+    const where  = Number.isFinite(bidId) ? "WHERE bid_id = $1" : "";
+    if (Number.isFinite(bidId)) params.push(bidId);
 
     const order  = "ORDER BY proof_id DESC";
     const sql    = [baseSql, where, order].filter(Boolean).join("\n");
