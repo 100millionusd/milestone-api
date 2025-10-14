@@ -4257,52 +4257,54 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
 // ==============================
 // Routes — Complete/Pay milestone (idempotent)
 // ==============================
+// ==============================
+// Routes — Complete/Pay milestone (idempotent, fast-response)
+// ==============================
 app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
   const bidId = Number(req.params.id);
   const { milestoneIndex } = req.body || {};
-  if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
+
+  if (!Number.isFinite(bidId)) {
+    return res.status(400).json({ error: "Invalid bid id" });
+  }
   if (!Number.isInteger(milestoneIndex) || milestoneIndex < 0) {
     return res.status(400).json({ error: "Invalid milestoneIndex" });
   }
 
   try {
-   // 0) Ensure the milestone_payments table matches Oversight expectations
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS milestone_payments (
-    id              BIGSERIAL PRIMARY KEY,
-    bid_id          BIGINT NOT NULL,
-    milestone_index INT    NOT NULL,
-    amount_usd      NUMERIC(18,2),
-    status          TEXT CHECK (status IN ('pending','released')) DEFAULT 'pending',
-    tx_hash         TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    released_at     TIMESTAMPTZ
-  );
-  -- idempotent upgrades for older schemas
-  ALTER TABLE milestone_payments
-    ADD COLUMN IF NOT EXISTS amount_usd NUMERIC(18,2),
-    ADD COLUMN IF NOT EXISTS status TEXT,
-    ADD COLUMN IF NOT EXISTS released_at TIMESTAMPTZ;
-  DO $$
-  BEGIN
-    IF NOT EXISTS (
-      SELECT 1 FROM pg_constraint
-       WHERE conname = 'ux_milestone_payments_bid_ms'
-    ) THEN
+    // 0) Ensure the milestone_payments table/constraint exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS milestone_payments (
+        id              BIGSERIAL PRIMARY KEY,
+        bid_id          BIGINT NOT NULL,
+        milestone_index INT    NOT NULL,
+        amount_usd      NUMERIC(18,2),
+        status          TEXT CHECK (status IN ('pending','released')) DEFAULT 'pending',
+        tx_hash         TEXT,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+        released_at     TIMESTAMPTZ
+      );
       ALTER TABLE milestone_payments
-        ADD CONSTRAINT ux_milestone_payments_bid_ms
-        UNIQUE (bid_id, milestone_index);
-    END IF;
-  END$$;
-  -- ensure status has the right default
-  ALTER TABLE milestone_payments ALTER COLUMN status SET DEFAULT 'pending';
-`);
+        ADD COLUMN IF NOT EXISTS amount_usd NUMERIC(18,2),
+        ADD COLUMN IF NOT EXISTS status TEXT,
+        ADD COLUMN IF NOT EXISTS released_at TIMESTAMPTZ;
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'ux_milestone_payments_bid_ms'
+        ) THEN
+          ALTER TABLE milestone_payments
+          ADD CONSTRAINT ux_milestone_payments_bid_ms UNIQUE (bid_id, milestone_index);
+        END IF;
+      END$$;
+      ALTER TABLE milestone_payments ALTER COLUMN status SET DEFAULT 'pending';
+    `);
 
-    // 1) Load bid + milestone; bail if already paid (covers legacy too)
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
-    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
+    // 1) Load bid + milestone; bail if not ready
+    const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    const bid = bids[0];
+    if (!bid) return res.status(404).json({ error: "Bid not found" });
 
-    const bid = rows[0];
     const milestones = Array.isArray(bid.milestones)
       ? bid.milestones
       : JSON.parse(bid.milestones || "[]");
@@ -4315,180 +4317,128 @@ await pool.query(`
     if (!ms.completed) {
       return res.status(400).json({ error: "Milestone not completed" });
     }
-    // legacy-safe "already paid" check
+
+    // Legacy "already paid" signals
     if (ms.paymentTxHash || ms.paymentDate || ms.status === "paid") {
       return res.status(409).json({ error: "Milestone already paid" });
     }
 
-// 2) **Idempotency gate** — create the 'pending' payout row Oversight reads
-const ins = await pool.query(`
-  INSERT INTO milestone_payments (bid_id, milestone_index, amount_usd, status, created_at)
-  VALUES ($1, $2, $3, 'pending', NOW())
-  ON CONFLICT (bid_id, milestone_index) DO NOTHING
-  RETURNING id
-`, [bidId, milestoneIndex, Number((ms && ms.amount) ?? 0)]);
-
-if (ins.rowCount === 0) {
-  return res.status(409).json({ error: "Payment already in progress or completed" });
-}
-
-// 3) Send the tokens (or simulate in dev)
-let txHash;
-try {
-  const token = String(bid.preferred_stablecoin || 'USDT').toUpperCase();
-  if (blockchainService.signer) {
-    const r = await blockchainService.sendToken(token, bid.wallet_address, msAmountUSD);
-    txHash = r.hash;
-  } else {
-    // dev fallback
-    txHash = 'dev_' + crypto.randomBytes(8).toString('hex');
-  }
-} catch (err) {
-  // leave the row as 'pending' so admin can retry
-  return res.status(502).json({ error: "Blockchain transfer failed", detail: String(err).slice(0,200) });
-}
-
-// 4) Mark RELEASED in milestone_payments + update bid.milestones JSON
-ms.paymentTxHash = txHash;
-ms.paymentDate   = new Date().toISOString();
-milestones[milestoneIndex] = ms;
-
-await pool.query(
-  `UPDATE bids SET milestones=$1 WHERE bid_id=$2`,
-  [ JSON.stringify(milestones), bidId ]
-);
-
-await pool.query(`
-  UPDATE milestone_payments
-     SET status='released',
-         tx_hash=$3,
-         released_at=NOW(),
-         amount_usd = COALESCE(amount_usd, $4)
-   WHERE bid_id=$1 AND milestone_index=$2
-`, [bidId, milestoneIndex, txHash, msAmountUSD]);
-
-// 5) Notify
-try {
-  const { rows: [proposal] } =
-    await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [ bid.proposal_id ]);
-  if (proposal && typeof notifyPaymentReleased === 'function') {
-    await notifyPaymentReleased({
-      bid, proposal, msIndex: milestoneIndex + 1, amount: msAmountUSD, txHash
-    });
-  }
-} catch (_) {}
-
-// 6) Return updated bid
-const { rows: [updated] } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [ bidId ]);
-return res.json(toCamel(updated));
-
-    // ---- Oversight: record/refresh a PENDING payout ----
-const msAmountUSD = Number(ms?.amount ?? 0);
-
-await pool.query(`
-  INSERT INTO milestone_payments (bid_id, milestone_index, amount_usd, status, created_at)
-  VALUES ($1,$2,$3,'pending', NOW())
-  ON CONFLICT (bid_id, milestone_index) DO UPDATE
-    SET amount_usd = EXCLUDED.amount_usd,
-        status     = CASE
-                       WHEN milestone_payments.status = 'released' THEN 'released'
-                       ELSE 'pending'
-                     END
-`, [bidId, milestoneIndex, msAmountUSD]);
-
-    // 3) Execute the transfer
-    const receipt = await blockchainService.sendToken(
-      bid.preferred_stablecoin,
-      bid.wallet_address,
-      ms.amount
+    // 2) Idempotency gate (create PENDING row once)
+    const msAmountUSD = Number(ms?.amount ?? 0); // <-- define BEFORE any use
+    const ins = await pool.query(
+      `INSERT INTO milestone_payments (bid_id, milestone_index, amount_usd, status, created_at)
+       VALUES ($1, $2, $3, 'pending', NOW())
+       ON CONFLICT (bid_id, milestone_index) DO NOTHING
+       RETURNING id`,
+      [bidId, milestoneIndex, msAmountUSD]
     );
 
-    // ---- Oversight: mark payout released ----
-await pool.query(`
-  UPDATE milestone_payments
-     SET status='released', tx_hash=$3, released_at=NOW()
-   WHERE bid_id=$1 AND milestone_index=$2
-`, [bidId, milestoneIndex, receipt.hash]);
-
-// Optional: notify admins/vendor about the released payment
-try {
-  const { rows: [proposal] } = await pool.query(
-    'SELECT * FROM proposals WHERE proposal_id=$1',
-    [bid.proposal_id]
-  );
-  if (proposal && typeof notifyPaymentReleased === 'function') {
-    await notifyPaymentReleased({
-      bid, proposal,
-      msIndex: milestoneIndex + 1,
-      amount: msAmountUSD,
-      txHash: receipt.hash
-    });
-  }
-} catch (_) { /* best-effort */ }
-
-// Optional: audit trail
-await writeAudit(bidId, req, {
-  payment_released: {
-    milestone_index: milestoneIndex,
-    amount_usd: msAmountUSD,
-    tx: receipt.hash
-  }
-});
-
-    // 4) Persist "paid" in both places
-    ms.paymentTxHash = receipt.hash;
-    ms.paymentDate = new Date().toISOString();
-
-    await pool.query(
-      "UPDATE bids SET milestones=$1 WHERE bid_id=$2",
-      [JSON.stringify(milestones), bidId]
-    );
-    await pool.query(
-      "UPDATE milestone_payments SET tx_hash=$3 WHERE bid_id=$1 AND milestone_index=$2",
-      [bidId, milestoneIndex, receipt.hash]
-    );
-
-    // 5) Notify & audit (unchanged)
-    await writeAudit(bidId, req, {
-      payment_released: {
-        index: milestoneIndex,
-        amount: ms.amount,
-        token: bid.preferred_stablecoin,
-        txHash: receipt.hash
-      }
-    });
-
-    if (process.env.NOTIFY_ENABLED === "true") {
-      const { rows: [proposal] } = await pool.query(
-        "SELECT * FROM proposals WHERE proposal_id=$1",
-        [bid.proposal_id]
+    if (ins.rowCount === 0) {
+      // someone already created the row (in progress or released)
+      const { rows: [existing] } = await pool.query(
+        `SELECT status, tx_hash FROM milestone_payments WHERE bid_id=$1 AND milestone_index=$2`,
+        [bidId, milestoneIndex]
       );
-      if (proposal) {
-        await notifyPaymentReleased({
-          bid,
-          proposal,
-          msIndex: milestoneIndex + 1,
-          amount: ms.amount,
-          txHash: receipt.hash
-        });
+      if (existing?.status === "released") {
+        return res.status(409).json({ error: "Milestone already paid", txHash: existing.tx_hash || null });
       }
+      return res.status(409).json({ error: "Payment already in progress", txHash: existing?.tx_hash || null });
     }
 
-    const { rows: updated2 } = await pool.query(
-      "SELECT * FROM bids WHERE bid_id=$1",
-      [bidId]
-    );
-    return res.json(toCamel(updated[0]));
+    // 3) Fire-and-forget transfer so the HTTP request returns fast
+    (async () => {
+      try {
+        const token = String(bid.preferred_stablecoin || "USDT").toUpperCase();
+
+        let txHash;
+        if (blockchainService?.transferSubmit) {
+          // New non-blocking helper you should expose in blockchainService:
+          // transferSubmit(symbol, to, amountUSD) -> { hash }
+          const r = await blockchainService.transferSubmit(token, bid.wallet_address, msAmountUSD);
+          txHash = r?.hash;
+        } else if (blockchainService?.sendToken) {
+          // Fallback: kick off sendToken, but DO NOT await confirmations here
+          // sendToken should return an object with .hash quickly.
+          const r = await blockchainService.sendToken(token, bid.wallet_address, msAmountUSD);
+          txHash = r?.hash;
+        } else {
+          // dev fallback
+          txHash = "dev_" + crypto.randomBytes(8).toString("hex");
+        }
+
+        if (txHash) {
+          await pool.query(
+            `UPDATE milestone_payments SET tx_hash=$3 WHERE bid_id=$1 AND milestone_index=$2`,
+            [bidId, milestoneIndex, txHash]
+          );
+        }
+
+        // Optional confirm (1 conf). MUST NOT block the HTTP response.
+        try {
+          if (blockchainService?.waitForConfirm && txHash && !txHash.startsWith("dev_")) {
+            await blockchainService.waitForConfirm(txHash, 1);
+          }
+        } catch (e) {
+          // Leave as pending; admin can retry if needed.
+          console.warn("waitForConfirm failed (left as pending)", e?.message || e);
+          return;
+        }
+
+        // 4) Mark released + legacy JSON fields
+        ms.paymentTxHash = txHash || ms.paymentTxHash || null;
+        ms.paymentDate = new Date().toISOString();
+        milestones[milestoneIndex] = ms;
+
+        await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
+        await pool.query(
+          `UPDATE milestone_payments
+             SET status='released', tx_hash=COALESCE(tx_hash,$3), released_at=NOW(), amount_usd=COALESCE(amount_usd,$4)
+           WHERE bid_id=$1 AND milestone_index=$2`,
+          [bidId, milestoneIndex, txHash || null, msAmountUSD]
+        );
+
+        // 5) Notify best-effort
+        try {
+          const { rows: [proposal] } = await pool.query(
+            "SELECT * FROM proposals WHERE proposal_id=$1",
+            [bid.proposal_id]
+          );
+          if (proposal && typeof notifyPaymentReleased === "function") {
+            await notifyPaymentReleased({
+              bid, proposal,
+              msIndex: milestoneIndex + 1,
+              amount: msAmountUSD,
+              txHash: txHash || null,
+            });
+          }
+        } catch (e) {
+          console.warn("notifyPaymentReleased failed", e?.message || e);
+        }
+
+        // Optional: audit
+        try {
+          await writeAudit(bidId, req, {
+            payment_released: {
+              milestone_index: milestoneIndex,
+              amount_usd: msAmountUSD,
+              tx: txHash || null,
+            },
+          });
+        } catch {}
+      } catch (e) {
+        console.error("Background pay-milestone failed (left pending)", e);
+        // Keep row as 'pending' so admin can retry safely.
+      }
+    })();
+
+    // 5) Return immediately to avoid proxy 502s on slow confirmations
+    return res.status(202).json({ ok: true, status: "pending" });
+
   } catch (err) {
-    // If transfer fails before we mark paid, remove the ledger row so a retry is possible
-    try {
-      await pool.query(
-        "DELETE FROM milestone_payments WHERE bid_id=$1 AND milestone_index=$2",
-        [Number(req.params.id), (req.body || {}).milestoneIndex]
-      );
-    } catch {}
     console.error("pay-milestone error", err);
-    return res.status(500).json({ error: "Internal error paying milestone" });
+    // Do NOT delete the pending row here; leaving it enables safe retries
+    const msg = err?.shortMessage || err?.reason || err?.message || "Internal error paying milestone";
+    return res.status(500).json({ error: msg });
   }
 });
 
