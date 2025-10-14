@@ -219,6 +219,25 @@ const pool = new Pool({
 })();
 
 // ==============================
+// DB bootstrap — proofs decision columns (approve/reject)
+// ==============================
+(async () => {
+  try {
+    await pool.query(`
+      ALTER TABLE proofs
+        ADD COLUMN IF NOT EXISTS approved_at   timestamptz,
+        ADD COLUMN IF NOT EXISTS approved_by   text,
+        ADD COLUMN IF NOT EXISTS rejected_at   timestamptz,
+        ADD COLUMN IF NOT EXISTS rejected_by   text,
+        ADD COLUMN IF NOT EXISTS decision_note text
+    `);
+    console.log('[db] proofs decision columns ready');
+  } catch (e) {
+    console.error('proofs decision cols init failed:', e);
+  }
+})();
+
+// ==============================
 // DB cleanup: collapse duplicate PENDING proofs per (bid, milestone) to the latest
 // and then enforce "at most one PENDING" going forward.
 // ==============================
