@@ -4478,6 +4478,19 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
       return res.status(409).json({ error: "Payment already in progress", txHash: existing?.tx_hash || null });
     }
 
+
+    // Mark payment as pending in the bid JSON immediately so the UI disables the Pay button
+try {
+  ms.paymentPending = true;
+  milestones[milestoneIndex] = ms;
+  await pool.query(
+    "UPDATE bids SET milestones=$1 WHERE bid_id=$2",
+    [JSON.stringify(milestones), bidId]
+  );
+} catch (e) {
+  console.warn("failed to mark paymentPending", e?.message || e);
+}
+
     // 3) Fire-and-forget transfer so the HTTP request returns fast
     (async () => {
       try {
@@ -4520,6 +4533,8 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
         // 4) Mark released + legacy JSON fields
         ms.paymentTxHash = txHash || ms.paymentTxHash || null;
         ms.paymentDate = new Date().toISOString();
+        ms.paymentPending = false;          // <<< clear pending
+        ms.status = "paid";                 // <<< optional legacy signal
         milestones[milestoneIndex] = ms;
 
         await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
