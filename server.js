@@ -3503,15 +3503,22 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
       out.tiles.breachingSla = Number(rows[0].breaching || 0);
     }
 
-    // tiles: pending payouts (best-effort)
-    {
-      const { rows } = await pool.query(`
-        SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_usd),0) AS usd
-        FROM milestone_payments
-        WHERE status='pending'
-      `).catch(() => ({ rows:[{ cnt:0, usd:0 }] }));
-      out.tiles.pendingPayouts = { count: Number(rows[0].cnt||0), totalUSD: Number(rows[0].usd||0) };
-    }
+    // tiles: pending payouts (ignore orphans)
+{
+  const { rows } = await pool.query(`
+    SELECT
+      COUNT(*)::int                            AS count,
+      COALESCE(SUM(mp.amount_usd), 0)::numeric AS total_usd
+    FROM milestone_payments mp
+    WHERE mp.status = 'pending'
+      AND EXISTS (SELECT 1 FROM bids b WHERE b.bid_id = mp.bid_id)
+  `).catch(() => ({ rows: [{ count: 0, total_usd: 0 }] }));
+
+  out.tiles.pendingPayouts = {
+    count: Number(rows[0].count || 0),
+    totalUSD: Number(rows[0].total_usd || 0),
+  };
+}
 
     // tiles: p50 approval cycle
     {
@@ -3691,6 +3698,35 @@ app.post('/admin/oversight/reconcile-payouts', adminGuard, async (req, res) => {
   } catch (error) {
     console.error("Reconcile payouts failed:", error);
     return res.status(500).json({ error: "Internal error during reconciliation" });
+  }
+});
+
+// Delete orphan milestone_payments rows (no matching bid)
+app.post('/admin/oversight/payouts/prune-orphans', adminGuard, async (req, res) => {
+  try {
+    // Return what we’re going to delete (for visibility)
+    const { rows: orphans } = await pool.query(`
+      SELECT mp.id, mp.bid_id, mp.milestone_index, mp.amount_usd, mp.status, mp.created_at
+      FROM milestone_payments mp
+      WHERE NOT EXISTS (SELECT 1 FROM bids b WHERE b.bid_id = mp.bid_id)
+      ORDER BY mp.created_at DESC
+    `);
+
+    if (orphans.length === 0) {
+      return res.json({ ok: true, deleted: 0, orphans: [] });
+    }
+
+    // Delete them
+    const { rows: deleted } = await pool.query(`
+      DELETE FROM milestone_payments mp
+      WHERE NOT EXISTS (SELECT 1 FROM bids b WHERE b.bid_id = mp.bid_id)
+      RETURNING mp.id, mp.bid_id, mp.milestone_index, mp.amount_usd, mp.status, mp.created_at
+    `);
+
+    return res.json({ ok: true, deleted: deleted.length, orphans: deleted });
+  } catch (e) {
+    console.error('prune-orphans failed', e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
