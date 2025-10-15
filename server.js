@@ -3646,6 +3646,54 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
   }
 });
 
+// (Place this below the GET /admin/oversight route in server.js)
+
+app.post('/admin/oversight/reconcile-payouts', adminGuard, async (req, res) => {
+  try {
+    // 1. Fetch all pending payouts that have a transaction hash
+    const { rows: pendingRows } = await pool.query(`
+      SELECT id, bid_id, milestone_index, tx_hash 
+      FROM milestone_payments 
+      WHERE status = 'pending' AND tx_hash IS NOT NULL
+    `);
+
+    if (pendingRows.length === 0) {
+      return res.json({ ok: true, message: "No pending payouts to reconcile.", updated: 0 });
+    }
+
+    let updatedCount = 0;
+    // 2. Check each pending payout's transaction on-chain
+    for (const row of pendingRows) {
+      const txHash = row.tx_hash;
+      try {
+        // Fetch the transaction receipt from the blockchain
+        const receipt = await blockchainService.provider.getTransactionReceipt(txHash);
+        if (receipt && receipt.confirmations >= 1 && receipt.status === 1) {
+          // Transaction is confirmed and successful
+          updatedCount++;
+          // Mark this payout as released in the database
+          await pool.query(`
+            UPDATE milestone_payments 
+            SET status='released', released_at=NOW() 
+            WHERE id=$1
+          `, [row.id]);
+
+          // (Optional: also update the related bid's milestone JSON to reflect released status)
+          // You could load the bid and update its milestones[payload.milestone_index].paymentPending = false, etc.
+        }
+      } catch (err) {
+        console.error(`Error checking receipt for tx ${txHash}:`, err);
+        // If an error occurs (e.g., network issue), skip this one for now
+      }
+    }
+
+    return res.json({ ok: true, updated: updatedCount });
+  } catch (error) {
+    console.error("Reconcile payouts failed:", error);
+    return res.status(500).json({ error: "Internal error during reconciliation" });
+  }
+});
+
 // --- IPFS monitor: scans recent CIDs and records "ipfs_missing" once ----------
 const MONITOR_MINUTES       = Number(process.env.IPFS_MONITOR_INTERVAL_MIN || 15);  // 0 = disabled
 const MONITOR_LOOKBACK_DAYS = Number(process.env.IPFS_MONITOR_LOOKBACK_DAYS || 14);
