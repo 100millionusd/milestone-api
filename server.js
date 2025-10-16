@@ -7226,7 +7226,7 @@ if (bidIds.length) {
             files, file_meta, gps_lat, gps_lon, capture_time, submitted_at, updated_at
        FROM proofs
       WHERE bid_id = ANY($1::bigint[])
-      ORDER BY submitted_at ASC`,
+      ORDER BY submitted_at DESC, proof_id DESC
     [ bidIds ]
   );
 
