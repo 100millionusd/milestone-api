@@ -2377,6 +2377,18 @@ app.post("/auth/logout", (req, res) => {
   res.json({ ok: true });
 });
 
+// TEMP TRACE: log hits to proofs/overview endpoints with querystrings
+app.use((req, res, next) => {
+  if (
+    req.path.startsWith('/proofs') ||
+    /^\/projects\/\d+\/overview$/.test(req.path) ||
+    /^\/api\/proofs/.test(req.path) // if you proxy through Next
+  ) {
+    console.log('[TRACE]', req.method, req.originalUrl);
+  }
+  next();
+});
+
 // ==============================
 // Routes — Health & Test
 // ==============================
