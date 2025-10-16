@@ -4320,8 +4320,50 @@ app.post('/bids/:id/analyze', adminOrBidOwnerGuard, async (req, res) => {
 // ==============================
 // Routes — Proofs
 // ==============================
-// forward to the canonical handler below
-app.get("/proofs", (req, res, next) => next());
+app.get("/proofs", async (req, res) => {
+  try {
+    const bidId = Number(req.query.bidId);
+    const proposalId = Number(req.query.proposalId);
+    if (!Number.isFinite(bidId) && !Number.isFinite(proposalId)) {
+      return res.status(400).json({ error: "Provide bidId or proposalId" });
+    }
+
+    let rows;
+    if (Number.isFinite(bidId)) {
+      ({ rows } = await pool.query(
+        `SELECT p.*
+           FROM proofs p
+          WHERE p.bid_id = $1
+          ORDER BY p.proof_id ASC`,
+        [bidId]
+      ));
+    } else {
+      ({ rows } = await pool.query(
+        `SELECT p.*
+           FROM proofs p
+           JOIN bids b ON b.bid_id = p.bid_id
+          WHERE b.proposal_id = $1
+          ORDER BY p.proof_id ASC`,
+        [proposalId]
+      ));
+    }
+
+    // normalize for the frontend
+    const out = await Promise.all(rows.map(async r => {
+      const o = toCamel(r);
+      o.files      = coerceJson(o.files)      || [];
+      o.fileMeta   = coerceJson(o.fileMeta)   || [];
+      o.aiAnalysis = coerceJson(o.aiAnalysis) || null;
+      o.geo        = await buildSafeGeoForProof(o); // safe city/state/country (+rounded coords)
+      return o;
+    }));
+
+    res.json(out);
+  } catch (e) {
+    console.error("GET /proofs failed:", e);
+    res.status(500).json({ error: "Failed to load proofs" });
+  }
+});
 
 app.post("/proofs/:id/approve", adminGuard, async (req, res) => {
   try {
@@ -4981,8 +5023,58 @@ Hints:
 });
 
 // Public: list proofs for one proposal (sanitized + geo for PublicGeoBadge)
-// forward to the canonical handler below
-app.get("/proofs", (req, res, next) => next());
+app.get("/proofs", async (req, res) => {
+  const proposalId = Number(req.query.proposalId);
+  if (!Number.isFinite(proposalId)) return res.json([]); // public page expects an array
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         p.proof_id,
+         p.bid_id,
+         p.milestone_index,
+         p.status,
+         p.title,
+         p.description,
+         p.files,
+         p.capture_time,
+         p.gps_lat,
+         p.gps_lon
+       FROM proofs p
+       JOIN bids b ON b.bid_id = p.bid_id
+      WHERE b.proposal_id = $1
+      ORDER BY p.submitted_at ASC NULLS LAST, p.proof_id ASC`,
+      [proposalId]
+    );
+
+    const out = await Promise.all(
+      rows.map(async (r) => {
+        const files = Array.isArray(r.files)
+          ? r.files
+          : (typeof r.files === "string" ? JSON.parse(r.files || "[]") : []);
+        // Safe city/state/country + rounded coords (or null if no GPS)
+        const safeGeo = await buildSafeGeoForProof(r);
+
+        return {
+          proofId: r.proof_id,
+          bidId: r.bid_id,
+          milestoneIndex: r.milestone_index,
+          status: r.status,
+          title: r.title,
+          publicText: r.description || null,
+          files,
+          takenAt: r.capture_time || null,
+          location: safeGeo,            // <-- used by <PublicGeoBadge geo={p.location} ... />
+        };
+      })
+    );
+
+    return res.json(out);
+  } catch (e) {
+    console.error("GET /proofs failed:", e);
+    return res.status(500).json({ error: "Failed to load proofs" });
+  }
+});
 
 // Normalized proofs feed for admin UI (newest first, camelCase fields)
 app.get("/proofs", adminGuard, async (req, res) => {
