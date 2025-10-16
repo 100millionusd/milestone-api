@@ -7222,13 +7222,13 @@ app.get("/projects/:id/overview", async (req, res) => {
 let proofs = [];
 if (bidIds.length) {
   const { rows: proofRows } = await pool.query(
-  `SELECT proof_id, bid_id, milestone_index, title, description, status,
-          files, file_meta, gps_lat, gps_lon, capture_time, submitted_at, updated_at
-     FROM proofs
-    WHERE bid_id = ANY($1::bigint[])
-    ORDER BY submitted_at DESC, proof_id DESC`,
-  [ bidIds ]
-);
+    `SELECT proof_id, bid_id, milestone_index, title, description, status,
+            files, file_meta, gps_lat, gps_lon, capture_time, submitted_at, updated_at
+       FROM proofs
+      WHERE bid_id = ANY($1::bigint[])
+      ORDER BY submitted_at DESC, proof_id DESC
+    [ bidIds ]
+  );
 
   // Sanitize + add safe geo (keeps submitted_at for your activity timeline)
   proofs = await Promise.all(proofRows.map(async pr => ({
