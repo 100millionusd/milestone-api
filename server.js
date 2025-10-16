@@ -4990,7 +4990,7 @@ app.get("/proofs", adminGuard, async (req, res) => {
     let bidId = Number(req.query.bidId);
     const proposalId = Number(req.query.proposalId);
 
-    // Fallback: resolve bidId from proposalId (so /projects/136 works even if it passes proposalId)
+    // Resolve bidId from proposalId if needed
     if (!Number.isFinite(bidId) && Number.isFinite(proposalId)) {
       const { rows: [b] } = await pool.query(
         `SELECT bid_id FROM bids WHERE proposal_id=$1 ORDER BY created_at DESC LIMIT 1`,
@@ -4999,44 +4999,77 @@ app.get("/proofs", adminGuard, async (req, res) => {
       if (b) bidId = Number(b.bid_id);
     }
 
-    const baseSql = `
+    // If we have a bidId: return EXACTLY ONE newest proof per milestone for this bid
+    if (Number.isFinite(bidId)) {
+      const { rows } = await pool.query(
+        `
+        WITH ranked AS (
+          SELECT p.*,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY p.bid_id, p.milestone_index
+                   ORDER BY COALESCE(p.updated_at, p.submitted_at) DESC, p.proof_id DESC
+                 ) rn
+          FROM proofs p
+          WHERE p.bid_id = $1
+        )
+        SELECT
+          proof_id, bid_id, milestone_index, status, title, description,
+          files, ai_analysis, submitted_at, updated_at
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY milestone_index;
+        `,
+        [bidId]
+      );
+
+      const out = await Promise.all(rows.map(async (r) => ({
+        proofId: Number(r.proof_id),
+        bidId: Number(r.bid_id),
+        milestoneIndex: Number(r.milestone_index),
+        status: String(r.status || "pending"),
+        title: r.title || "",
+        description: r.description || "",
+        files: Array.isArray(r.files)
+          ? r.files
+          : (typeof r.files === "string" ? JSON.parse(r.files || "[]") : []),
+        aiAnalysis: r.ai_analysis ?? null,
+        submittedAt: r.submitted_at,
+        updatedAt: r.updated_at,
+        geoApprox: await buildSafeGeoForProof(r),
+      })));
+
+      console.log(`[GET /proofs] latest-per-ms bidId=${bidId} -> ${out.length}`);
+      return res.json(out);
+    }
+
+    // Otherwise: global list, newest first (stable)
+    const { rows } = await pool.query(
+      `
       SELECT
-        proof_id,
-        bid_id,
-        milestone_index,
-        status,
-        title,
-        description,
-        files,
-        ai_analysis,
-        submitted_at,
-        updated_at
+        proof_id, bid_id, milestone_index, status, title, description,
+        files, ai_analysis, submitted_at, updated_at
       FROM proofs
-    `;
-    const params = [];
-    const where  = Number.isFinite(bidId) ? "WHERE bid_id = $1" : "";
-    if (Number.isFinite(bidId)) params.push(bidId);
+      ORDER BY COALESCE(updated_at, submitted_at) DESC, proof_id DESC;
+      `
+    );
 
-    const order  = "ORDER BY proof_id DESC";
-    const sql    = [baseSql, where, order].filter(Boolean).join("\n");
+    const out = await Promise.all(rows.map(async (r) => ({
+      proofId: Number(r.proof_id),
+      bidId: Number(r.bid_id),
+      milestoneIndex: Number(r.milestone_index),
+      status: String(r.status || "pending"),
+      title: r.title || "",
+      description: r.description || "",
+      files: Array.isArray(r.files)
+        ? r.files
+        : (typeof r.files === "string" ? JSON.parse(r.files || "[]") : []),
+      aiAnalysis: r.ai_analysis ?? null,
+      submittedAt: r.submitted_at,
+      updatedAt: r.updated_at,
+      geoApprox: await buildSafeGeoForProof(r),
+    })));
 
-    const { rows } = await pool.query(sql, params);
-
-const out = await Promise.all(rows.map(async (r) => ({
-  proofId: Number(r.proof_id),
-  bidId: Number(r.bid_id),
-  milestoneIndex: Number(r.milestone_index),
-  status: String(r.status || "pending"),
-  title: r.title || "",
-  description: r.description || "",
-  files: Array.isArray(r.files) ? r.files : (r.files ? r.files : []),
-  aiAnalysis: r.ai_analysis ?? null,
-  submittedAt: r.submitted_at,
-  updatedAt: r.updated_at,
-  geoApprox: await buildSafeGeoForProof(r),
-})));
-
-    console.log(`[GET /proofs] bidId=${Number.isInteger(bidId) ? bidId : 'ALL'} -> ${out.length}`);
+    console.log(`[GET /proofs] all -> ${out.length}`);
     return res.json(out);
   } catch (err) {
     console.error("[GET /proofs] error:", err);
