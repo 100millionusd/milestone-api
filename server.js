@@ -1580,11 +1580,9 @@ async function extractFileMetaFromUrl(file) {
   try {
     if (!file?.url) return null;
 
-    // Reuse your existing fetchAsBuffer helper
     const buf = await fetchAsBuffer(toPublicGateway(file.url));
     const sha256 = crypto.createHash("sha256").update(buf).digest("hex");
 
-    // Write to temp for exiftool
     const bare = (file.name || file.url).split("?")[0];
     const ext = path.extname(bare) || "";
     const tmp = path.join(os.tmpdir(), `exif-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
@@ -1617,6 +1615,7 @@ async function extractFileMetaFromUrl(file) {
     const suspectEdits = /photoshop|lightroom|gimp|snapseed|facetune|luminar|picsart|canva|after effects|premiere/i
       .test(String(exif?.software || ""));
 
+    // ✅ FINAL return with lat/lon
     return {
       url: file.url,
       name: file.name || null,
@@ -1625,8 +1624,12 @@ async function extractFileMetaFromUrl(file) {
       hashSha256: sha256,
       exif,
       suspectEdits,
+      lat: exif?.gpsLatitude ?? null,
+      lon: exif?.gpsLongitude ?? null,
     };
+
   } catch {
+    // ✅ Fallback return if something fails
     return {
       url: file?.url || null,
       name: file?.name || null,
@@ -1635,6 +1638,8 @@ async function extractFileMetaFromUrl(file) {
       hashSha256: null,
       exif: null,
       suspectEdits: false,
+      lat: null,
+      lon: null,
     };
   }
 }
