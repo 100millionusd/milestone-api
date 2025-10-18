@@ -484,6 +484,32 @@ async function sendWhatsAppTemplate(to, contentSid, vars) {
   );
 }
 
+// Notify admins when a *new* vendor signs in for the first time
+async function notifyVendorSignup({ wallet, vendorName, email, phone }) {
+  if (!NOTIFY_ENABLED) return;
+
+  const adminLink = APP_BASE_URL ? `${APP_BASE_URL.replace(/\/+$/,'')}/admin/vendors` : '';
+  const lines = [
+    '🆕 Vendor signup — approval needed',
+    `Wallet: ${wallet}`,
+    vendorName ? `Name: ${vendorName}` : null,
+    email ? `Email: ${email}` : null,
+    phone ? `Phone: ${phone}` : null,
+    adminLink ? `Admin: ${adminLink}` : null,
+  ].filter(Boolean);
+
+  // bilingual wrapper (you already have bi())
+  const en = lines.join('\n');
+  const es = lines.join('\n');
+  const { text, html } = bi(en, es);
+
+  await Promise.allSettled([
+    TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
+    MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, 'Vendor signup — approval needed', html) : null,
+    ...(ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, text)),
+  ].filter(Boolean));
+}
+
 // ==============================
 // Notifications — Proposals
 // ==============================
@@ -2284,20 +2310,32 @@ app.post("/auth/verify", async (req, res) => {
     maxAge: 7 * 24 * 3600 * 1000,
   });
 
-  // ⬇️ Auto-seed vendor_profiles row (non-fatal if it fails)
-  try {
-    const w = (address || '').toLowerCase();
-    if (w) {
-      await pool.query(
-        `INSERT INTO vendor_profiles (wallet_address, vendor_name, created_at, updated_at)
-         VALUES ($1, $2, NOW(), NOW())
-         ON CONFLICT (wallet_address) DO NOTHING`,
-        [w, '']
-      );
+  // ⬇️ Auto-seed vendor_profiles row with status='pending' and notify admins on FIRST signup
+try {
+  const w = (address || '').toLowerCase();
+  if (w) {
+    const { rows } = await pool.query(
+      `INSERT INTO vendor_profiles
+         (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at)
+       VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW())
+       ON CONFLICT (wallet_address) DO NOTHING
+       RETURNING wallet_address, vendor_name, email, phone`,
+      [w]
+    );
+
+    // Only on first insert (new vendor) → notify admins
+    if (rows.length) {
+      notifyVendorSignup({
+        wallet: rows[0].wallet_address,
+        vendorName: rows[0].vendor_name || '',
+        email: rows[0].email || '',
+        phone: rows[0].phone || '',
+      }).catch(() => null);
     }
-  } catch (e) {
-    console.warn('profile auto-seed failed (non-fatal):', String(e).slice(0,200));
   }
+} catch (e) {
+  console.warn('profile auto-seed failed (non-fatal):', String(e).slice(0,200));
+}
 
   nonces.delete(address);
   res.json({ address, role });
@@ -2337,20 +2375,32 @@ app.post("/auth/login", async (req, res) => {
     maxAge: 7 * 24 * 3600 * 1000,
   });
 
-  // ⬇️ Auto-seed vendor_profiles row (non-fatal if it fails)
-  try {
-    const w = (address || '').toLowerCase();
-    if (w) {
-      await pool.query(
-        `INSERT INTO vendor_profiles (wallet_address, vendor_name, created_at, updated_at)
-         VALUES ($1, $2, NOW(), NOW())
-         ON CONFLICT (wallet_address) DO NOTHING`,
-        [w, '']
-      );
+  // ⬇️ Auto-seed vendor_profiles row with status='pending' and notify admins on FIRST signup
+try {
+  const w = (address || '').toLowerCase();
+  if (w) {
+    const { rows } = await pool.query(
+      `INSERT INTO vendor_profiles
+         (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at)
+       VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW())
+       ON CONFLICT (wallet_address) DO NOTHING
+       RETURNING wallet_address, vendor_name, email, phone`,
+      [w]
+    );
+
+    // Only on first insert (new vendor) → notify admins
+    if (rows.length) {
+      notifyVendorSignup({
+        wallet: rows[0].wallet_address,
+        vendorName: rows[0].vendor_name || '',
+        email: rows[0].email || '',
+        phone: rows[0].phone || '',
+      }).catch(() => null);
     }
-  } catch (e) {
-    console.warn('profile auto-seed failed (non-fatal):', String(e).slice(0,200));
   }
+} catch (e) {
+  console.warn('profile auto-seed failed (non-fatal):', String(e).slice(0,200));
+}
 
   nonces.delete(address);
   res.json({ token, role });
@@ -2358,7 +2408,48 @@ app.post("/auth/login", async (req, res) => {
 
 app.get("/auth/role", (req, res) => {
   // ✅ Prefer req.user set by cookie OR Authorization: Bearer (works in Safari)
-  if (req.user) return res.json({ address: req.user.sub, role: req.user.role });
+  if (req.user) {
+  const address = String(req.user.sub || '');
+  let vendorStatus = 'pending';
+  if (req.user.role === 'vendor' && address) {
+    const { rows } = await pool.query(
+      `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+      [address]
+    );
+    vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
+  }
+  return res.json({ address, role: req.user.role, vendorStatus });
+}
+
+// legacy cookie fallback
+const token = req.cookies?.auth_token;
+const user = token ? verifyJwt(token) : null;
+if (user) {
+  const address = String(user.sub || '');
+  let vendorStatus = 'pending';
+  if (user.role === 'vendor' && address) {
+    const { rows } = await pool.query(
+      `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+      [address]
+    );
+    vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
+  }
+  return res.json({ address, role: user.role, vendorStatus });
+}
+
+// query fallback
+const address = norm(req.query.address);
+if (!address) return res.json({ role: "guest" });
+const role = isAdminAddress(address) ? "admin" : "vendor";
+let vendorStatus = 'pending';
+if (role === 'vendor') {
+  const { rows } = await pool.query(
+    `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+    [address]
+  );
+  vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
+}
+res.json({ address, role, vendorStatus });
 
   // legacy cookie fallback
   const token = req.cookies?.auth_token;
@@ -6693,6 +6784,74 @@ app.post('/admin/vendors/:wallet/unarchive', adminGuard, async (req, res) => {
   }
 });
 
+// Approve a vendor (admin)
+app.post('/admin/vendors/:wallet/approve', adminGuard, async (req, res) => {
+  try {
+    const wallet = String(req.params.wallet || '').toLowerCase();
+    if (!wallet) return res.status(400).json({ error: 'wallet required' });
+
+    const { rows } = await pool.query(
+      `UPDATE vendor_profiles
+         SET status='approved', updated_at=now()
+       WHERE lower(wallet_address)=lower($1)
+       RETURNING wallet_address, vendor_name, email, phone, telegram_chat_id, status`,
+      [wallet]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Vendor profile not found' });
+
+    // notify vendor (optional, fire-and-forget)
+    const v = rows[0];
+    const msg = `✅ Your LithiumX vendor account has been approved.\nWallet: ${v.wallet_address}`;
+    Promise.allSettled([
+      v.telegram_chat_id ? sendTelegram([String(v.telegram_chat_id)], msg) : null,
+      v.email ? (async () => {
+        const { text, html } = bi(msg, msg);
+        await sendEmail([v.email], 'Vendor account approved', text, html);
+      })() : null,
+    ]).catch(()=>null);
+
+    res.json({ ok: true, walletAddress: v.wallet_address, status: v.status });
+  } catch (e) {
+    console.error('POST /admin/vendors/:wallet/approve error', e);
+    res.status(500).json({ error: 'Failed to approve vendor' });
+  }
+});
+
+// Reject a vendor (admin)
+app.post('/admin/vendors/:wallet/reject', adminGuard, async (req, res) => {
+  try {
+    const wallet = String(req.params.wallet || '').toLowerCase();
+    if (!wallet) return res.status(400).json({ error: 'wallet required' });
+
+    const reason = String(req.body?.reason || '').trim() || null;
+
+    const { rows } = await pool.query(
+      `UPDATE vendor_profiles
+         SET status='rejected', updated_at=now()
+       WHERE lower(wallet_address)=lower($1)
+       RETURNING wallet_address, vendor_name, email, phone, telegram_chat_id, status`,
+      [wallet]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Vendor profile not found' });
+
+    // notify vendor (optional, fire-and-forget)
+    const v = rows[0];
+    const msg = `❌ Your LithiumX vendor account was not approved.${reason ? `\nReason: ${reason}` : ''}\nWallet: ${v.wallet_address}`;
+    Promise.allSettled([
+      v.telegram_chat_id ? sendTelegram([String(v.telegram_chat_id)], msg) : null,
+      v.email ? (async () => {
+        const { text, html } = bi(msg, msg);
+        await sendEmail([v.email], 'Vendor account not approved', text, html);
+      })() : null,
+    ]).catch(()=>null);
+
+    res.json({ ok: true, walletAddress: v.wallet_address, status: v.status });
+  } catch (e) {
+    console.error('POST /admin/vendors/:wallet/reject error', e);
+    res.status(500).json({ error: 'Failed to reject vendor' });
+  }
+});
+
 /** ADMIN: Delete a vendor profile by wallet (bids remain) */
 app.delete('/admin/vendors/:wallet', adminGuard, async (req, res) => {
   try {
@@ -7044,6 +7203,19 @@ app.get("/projects", async (req, res) => {
     const user = req.user || null;
     const isAdmin = String(user?.role || '').toLowerCase() === 'admin';
     const myWallet = String(user?.sub || '').toLowerCase();
+
+    // Require admin OR approved vendor
+if (!isAdmin) {
+  if (!myWallet) return res.status(401).json({ error: 'login_required' });
+  const { rows: st } = await pool.query(
+    `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+    [myWallet]
+  );
+  const status = (st[0]?.status || 'pending').toLowerCase();
+  if (status !== 'approved') {
+    return res.status(403).json({ error: 'vendor_not_approved' });
+  }
+}
 
     const where = [];
     const params = [];
