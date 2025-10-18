@@ -2468,6 +2468,11 @@ app.get("/auth/role", async (req, res) => {
   }
 });
 
+app.post("/auth/logout", (req, res) => {
+  res.clearCookie("auth_token");
+  res.json({ ok: true });
+}); 
+
 // ==============================
 // Routes — Health & Test
 // ==============================
