@@ -2406,7 +2406,7 @@ try {
   res.json({ token, role });
 });
 
-app.get("/auth/role", (req, res) => {
+app.get("/auth/role", async (req, res) => {
   // ✅ Prefer req.user set by cookie OR Authorization: Bearer (works in Safari)
   if (req.user) {
   const address = String(req.user.sub || '');
