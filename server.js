@@ -2254,6 +2254,38 @@ async function adminOrBidOwnerGuard(req, res, next) {
   }
 }
 
+// --- Require approved vendor or admin ---
+async function requireApprovedVendorOrAdmin(req, res, next) {
+  try {
+    if (!req.user) return res.status(401).json({ error: 'unauthorized' });
+
+    // Admins always ok
+    if (String(req.user.role || '').toLowerCase() === 'admin') return next();
+
+    // Only vendors past this point
+    if (String(req.user.role || '').toLowerCase() !== 'vendor') {
+      return res.status(403).json({ error: 'forbidden_role' });
+    }
+
+    const addr = String(req.user.sub || '').toLowerCase();
+    if (!addr) return res.status(401).json({ error: 'unauthorized' });
+
+    const { rows } = await pool.query(
+      `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+      [addr]
+    );
+    const status = (rows[0]?.status || 'pending').toLowerCase();
+    if (status !== 'approved') {
+      return res.status(403).json({ error: 'vendor_not_approved' });
+    }
+
+    return next();
+  } catch (e) {
+    console.error('requireApprovedVendorOrAdmin error', e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+}
+
 async function adminOrProposalOwnerGuard(req, res, next) {
   if (req.user?.role === 'admin') return next();
 
@@ -2941,7 +2973,7 @@ app.get("/bids/:id", async (req, res) => {
 });
 
 // Inline analysis on creation
-app.post("/bids", async (req, res) => {
+app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
   try {
     const { error, value } = bidSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
@@ -7189,7 +7221,7 @@ app.get('/admin/oversight/payouts', adminGuard, async (req, res) => {
 // ==============================
 // Projects Directory (list with aggregates)
 // ==============================
-app.get("/projects", async (req, res) => {
+app.get("/projects", requireApprovedVendorOrAdmin, async (req, res) => {
   try {
     // Pagination / filters / sorting
     const page = Math.max(parseInt(req.query.page || '1', 10), 1);
@@ -7361,7 +7393,7 @@ if (!isAdmin) {
 // ==============================
 // Project Overview (single project “everything”)
 // ==============================
-app.get("/projects/:id/overview", async (req, res) => {
+app.get("/projects/:id/overview", requireApprovedVendorOrAdmin, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid project id" });
 
