@@ -2407,65 +2407,65 @@ try {
 });
 
 app.get("/auth/role", async (req, res) => {
-  // ✅ Prefer req.user set by cookie OR Authorization: Bearer (works in Safari)
-  if (req.user) {
-  const address = String(req.user.sub || '');
-  let vendorStatus = 'pending';
-  if (req.user.role === 'vendor' && address) {
-    const { rows } = await pool.query(
-      `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-      [address]
-    );
-    vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
+  try {
+    // 1) Primary: req.user set by cookie/Bearer
+    if (req.user) {
+      const address = String(req.user.sub || '');
+      const role = req.user.role;
+      let vendorStatus = 'pending';
+
+      if (role === 'vendor' && address) {
+        const { rows } = await pool.query(
+          `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+          [address]
+        );
+        vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
+      }
+      return res.json({ address, role, vendorStatus });
+    }
+
+    // 2) Legacy cookie fallback (use unique names to avoid redeclare)
+    {
+      const legacyToken = req.cookies?.auth_token;
+      const legacyUser = legacyToken ? verifyJwt(legacyToken) : null;
+
+      if (legacyUser) {
+        const address = String(legacyUser.sub || '');
+        const role = legacyUser.role;
+        let vendorStatus = 'pending';
+
+        if (role === 'vendor' && address) {
+          const { rows } = await pool.query(
+            `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+            [address]
+          );
+          vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
+        }
+        return res.json({ address, role, vendorStatus });
+      }
+    }
+
+    // 3) Query fallback (?address=0x...)
+    {
+      const qAddress = norm(req.query.address);
+      if (!qAddress) return res.json({ role: "guest" });
+
+      const role = isAdminAddress(qAddress) ? "admin" : "vendor";
+      let vendorStatus = 'pending';
+
+      if (role === 'vendor') {
+        const { rows } = await pool.query(
+          `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+          [qAddress]
+        );
+        vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
+      }
+      return res.json({ address: qAddress, role, vendorStatus });
+    }
+  } catch (e) {
+    console.error('/auth/role error', e);
+    return res.status(500).json({ error: 'role_failed' });
   }
-  return res.json({ address, role: req.user.role, vendorStatus });
-}
-
-// legacy cookie fallback
-const token = req.cookies?.auth_token;
-const user = token ? verifyJwt(token) : null;
-if (user) {
-  const address = String(user.sub || '');
-  let vendorStatus = 'pending';
-  if (user.role === 'vendor' && address) {
-    const { rows } = await pool.query(
-      `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-      [address]
-    );
-    vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
-  }
-  return res.json({ address, role: user.role, vendorStatus });
-}
-
-// query fallback
-const address = norm(req.query.address);
-if (!address) return res.json({ role: "guest" });
-const role = isAdminAddress(address) ? "admin" : "vendor";
-let vendorStatus = 'pending';
-if (role === 'vendor') {
-  const { rows } = await pool.query(
-    `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-    [address]
-  );
-  vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
-}
-res.json({ address, role, vendorStatus });
-
-  // legacy cookie fallback
-  const token = req.cookies?.auth_token;
-  const user = token ? verifyJwt(token) : null;
-  if (user) return res.json({ address: user.sub, role: user.role });
-
-  // query fallback (unchanged)
-  const address = norm(req.query.address);
-  if (!address) return res.json({ role: "guest" });
-  const role = isAdminAddress(address) ? "admin" : "vendor";
-  res.json({ address, role });
-});
-
-app.post("/auth/logout", (req, res) => {
-  res.clearCookie("auth_token");
-  res.json({ ok: true });
 });
 
 // ==============================
