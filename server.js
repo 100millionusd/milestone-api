@@ -6837,15 +6837,22 @@ app.post('/admin/vendors/:wallet/approve', adminGuard, async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: 'Vendor profile not found' });
 
     // notify vendor (optional, fire-and-forget)
-    const v = rows[0];
-    const msg = `✅ Your LithiumX vendor account has been approved.\nWallet: ${v.wallet_address}`;
-    Promise.allSettled([
-      v.telegram_chat_id ? sendTelegram([String(v.telegram_chat_id)], msg) : null,
-      v.email ? (async () => {
+const v = rows[0];
+const wallet = v.wallet_address || v.walletAddress || '';
+const msg = `✅ Your LithiumX vendor account has been approved.
+✅ Tu cuenta de proveedor de LithiumX ha sido aprobada.
+Wallet / Cartera: ${wallet}`;
+
+Promise.allSettled([
+  v.telegram_chat_id ? sendTelegram([String(v.telegram_chat_id)], msg) : null,
+  v.email
+    ? (async () => {
+        const subject = 'Vendor account approved · Cuenta de proveedor aprobada';
         const { text, html } = bi(msg, msg);
-        await sendEmail([v.email], 'Vendor account approved', text, html);
-      })() : null,
-    ]).catch(()=>null);
+        await sendEmail([v.email], subject, text, html);
+      })()
+    : null,
+]).catch(() => null);
 
     res.json({ ok: true, walletAddress: v.wallet_address, status: v.status });
   } catch (e) {
