@@ -488,15 +488,23 @@ async function sendWhatsAppTemplate(to, contentSid, vars) {
 async function notifyVendorSignup({ wallet, vendorName, email, phone }) {
   if (!NOTIFY_ENABLED) return;
 
-  const adminLink = APP_BASE_URL ? `${APP_BASE_URL.replace(/\/+$/,'')}/admin/vendors` : '';
-  const lines = [
-    '🆕 Vendor signup — approval needed',
-    `Wallet: ${wallet}`,
-    vendorName ? `Name: ${vendorName}` : null,
-    email ? `Email: ${email}` : null,
-    phone ? `Phone: ${phone}` : null,
-    adminLink ? `Admin: ${adminLink}` : null,
-  ].filter(Boolean);
+  const enLines = [
+  '🆕 Vendor signup — approval needed',
+  `Wallet: ${wallet}`,
+  vendorName ? `Name: ${vendorName}` : null,
+  email ? `Email: ${email}` : null,
+  phone ? `Phone: ${phone}` : null,
+  adminLink ? `Admin: ${adminLink}` : null,
+].filter(Boolean);
+
+const esLines = [
+  '🆕 Registro de proveedor — se requiere aprobación',
+  `Billetera: ${wallet}`,
+  vendorName ? `Nombre: ${vendorName}` : null,
+  email ? `Correo electrónico: ${email}` : null,
+  phone ? `Teléfono: ${phone}` : null,
+  adminLink ? `Panel de administración: ${adminLink}` : null,
+].filter(Boolean);
 
   // bilingual wrapper (you already have bi())
   const en = lines.join('\n');
