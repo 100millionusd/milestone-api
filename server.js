@@ -7430,6 +7430,19 @@ app.get('/me/whats-new', authRequired, async (req, res) => {
   }
 });
 
+// Alias for legacy widget path
+app.get('/agent/digest', authRequired, (req, res) => {
+  const role = String(req.user?.role || '').toLowerCase();
+  const target = role === 'admin' ? '/admin/whats-new' : '/me/whats-new';
+
+  // Preserve query params like ?since=...&limit=...
+  const qs = new URLSearchParams();
+  if (req.query.since) qs.set('since', String(req.query.since));
+  if (req.query.limit) qs.set('limit', String(req.query.limit));
+
+  res.redirect(307, `${target}${qs.toString() ? `?${qs.toString()}` : ''}`);
+});
+
 // ==============================
 // Vendor — persist/read "last seen" for the widget
 // ==============================
