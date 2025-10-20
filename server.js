@@ -292,6 +292,28 @@ async function attachPaymentState(bids) {
 })();
 
 // ==============================
+// DB bootstrap — dashboard state for "what's new" widget
+// ==============================
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_dashboard_state (
+        wallet_address   text PRIMARY KEY,
+        last_seen_digest timestamptz NOT NULL DEFAULT now(),
+        updated_at       timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_user_dash_updated
+      ON user_dashboard_state (updated_at DESC);
+    `);
+    console.log('[db] user_dashboard_state ready');
+  } catch (e) {
+    console.error('user_dashboard_state init failed:', e);
+  }
+})();
+
+// ==============================
 // DB cleanup: collapse duplicate PENDING proofs per (bid, milestone) to the latest
 // and then enforce "at most one PENDING" going forward.
 // ==============================
@@ -7231,6 +7253,210 @@ app.get('/admin/oversight/payouts', adminGuard, async (req, res) => {
     console.error('oversight/payouts error', e);
     res.status(500).json({ error: 'payouts_failed' });
   }
+});
+
+// ==============================
+// Admin — what's new feed (proposals, bids, proofs, decisions, payments)
+// ==============================
+app.get('/admin/whats-new', adminGuard, async (req, res) => {
+  try {
+    const since = req.query.since ? new Date(String(req.query.since)) : null;
+    const hasSince = since && !Number.isNaN(since.getTime());
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '50'), 10), 1), 200);
+
+    const params = [];
+    if (hasSince) params.push(since.toISOString());
+    params.push(limit);
+
+    const where = hasSince ? 'WHERE ts > $1' : '';
+    const limPos = hasSince ? 2 : 1;
+
+    const sql = `
+      WITH events AS (
+        -- Proposals created
+        SELECT p.created_at AS ts, 'proposal_submitted' AS type,
+               p.proposal_id, NULL::bigint AS bid_id, NULL::int AS milestone_index,
+               p.owner_wallet AS actor_wallet,
+               p.title AS title, NULL::text AS vendor_name,
+               p.amount_usd AS amount_usd, NULL::numeric AS price_usd, p.status AS status
+          FROM proposals p
+
+        UNION ALL
+        -- Bids submitted
+        SELECT b.created_at AS ts, 'bid_submitted' AS type,
+               b.proposal_id, b.bid_id, NULL::int,
+               b.wallet_address, NULL::text,
+               b.vendor_name, NULL::numeric, b.price_usd, b.status
+          FROM bids b
+
+        UNION ALL
+        -- Proofs submitted
+        SELECT COALESCE(pr.submitted_at, pr.created_at) AS ts, 'proof_submitted' AS type,
+               b.proposal_id, pr.bid_id, pr.milestone_index,
+               b.wallet_address, NULL::text, NULL::text,
+               NULL::numeric, NULL::numeric, pr.status
+          FROM proofs pr
+          JOIN bids b ON b.bid_id = pr.bid_id
+
+        UNION ALL
+        -- Proof decisions (approved/rejected)
+        SELECT pr.updated_at AS ts, 'proof_decision' AS type,
+               b.proposal_id, pr.bid_id, pr.milestone_index,
+               NULL::text, NULL::text, NULL::text,
+               NULL::numeric, NULL::numeric, pr.status
+          FROM proofs pr
+          JOIN bids b ON b.bid_id = pr.bid_id
+         WHERE pr.status IN ('approved','rejected')
+
+        UNION ALL
+        -- Payments released
+        SELECT mp.released_at AS ts, 'payment_released' AS type,
+               b.proposal_id, mp.bid_id, mp.milestone_index,
+               NULL::text, NULL::text, NULL::text,
+               mp.amount_usd, NULL::numeric, 'released'
+          FROM milestone_payments mp
+          JOIN bids b ON b.bid_id = mp.bid_id
+         WHERE mp.released_at IS NOT NULL
+      )
+      SELECT *
+        FROM events
+       ${where}
+       ORDER BY ts DESC NULLS LAST
+       LIMIT $${limPos};
+    `;
+
+    const { rows } = await pool.query(sql, params);
+    res.json({ items: rows });
+  } catch (e) {
+    console.error('GET /admin/whats-new failed', e);
+    res.status(500).json({ error: 'Failed to build feed' });
+  }
+});
+
+// ==============================
+// Vendor — what's new (scoped to my wallet)
+// ==============================
+app.get('/me/whats-new', authRequired, async (req, res) => {
+  try {
+    const me = String(req.user?.sub || '').toLowerCase();
+    if (!me) return res.status(401).json({ error: 'unauthorized' });
+
+    const since = req.query.since ? new Date(String(req.query.since)) : null;
+    const hasSince = since && !Number.isNaN(since.getTime());
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '50'), 10), 1), 200);
+
+    const params = [me];
+    if (hasSince) params.push(since.toISOString());
+    params.push(limit);
+
+    const where = hasSince ? 'WHERE ts > $2' : '';
+    const limPos = hasSince ? 3 : 2;
+
+    const sql = `
+      WITH events AS (
+        -- Proposals I bid on
+        SELECT p.created_at AS ts, 'proposal_submitted' AS type,
+               p.proposal_id, NULL::bigint AS bid_id, NULL::int AS milestone_index,
+               p.owner_wallet AS actor_wallet,
+               p.title AS title, NULL::text AS vendor_name,
+               p.amount_usd AS amount_usd, NULL::numeric AS price_usd, p.status AS status
+          FROM proposals p
+          JOIN bids b ON b.proposal_id = p.proposal_id
+         WHERE lower(b.wallet_address) = lower($1)
+
+        UNION ALL
+        -- Proposals I own (if any)
+        SELECT p.created_at AS ts, 'proposal_submitted' AS type,
+               p.proposal_id, NULL::bigint AS bid_id, NULL::int AS milestone_index,
+               p.owner_wallet AS actor_wallet,
+               p.title AS title, NULL::text AS vendor_name,
+               p.amount_usd AS amount_usd, NULL::numeric AS price_usd, p.status AS status
+          FROM proposals p
+         WHERE lower(p.owner_wallet) = lower($1)
+
+        UNION ALL
+        -- My bids
+        SELECT b.created_at AS ts, 'bid_submitted' AS type,
+               b.proposal_id, b.bid_id, NULL::int,
+               b.wallet_address, NULL::text,
+               b.vendor_name, NULL::numeric, b.price_usd, b.status
+          FROM bids b
+         WHERE lower(b.wallet_address) = lower($1)
+
+        UNION ALL
+        -- My proofs
+        SELECT COALESCE(pr.submitted_at, pr.created_at) AS ts, 'proof_submitted' AS type,
+               b.proposal_id, pr.bid_id, pr.milestone_index,
+               b.wallet_address, NULL::text, NULL::text,
+               NULL::numeric, NULL::numeric, pr.status
+          FROM proofs pr
+          JOIN bids b ON b.bid_id = pr.bid_id
+         WHERE lower(b.wallet_address) = lower($1)
+
+        UNION ALL
+        -- Decisions on my proofs
+        SELECT pr.updated_at AS ts, 'proof_decision' AS type,
+               b.proposal_id, pr.bid_id, pr.milestone_index,
+               NULL::text, NULL::text, NULL::text,
+               NULL::numeric, NULL::numeric, pr.status
+          FROM proofs pr
+          JOIN bids b ON b.bid_id = pr.bid_id
+         WHERE lower(b.wallet_address) = lower($1)
+           AND pr.status IN ('approved','rejected')
+
+        UNION ALL
+        -- Payments released to my milestones
+        SELECT mp.released_at AS ts, 'payment_released' AS type,
+               b.proposal_id, mp.bid_id, mp.milestone_index,
+               NULL::text, NULL::text, NULL::text,
+               mp.amount_usd, NULL::numeric, 'released'
+          FROM milestone_payments mp
+          JOIN bids b ON b.bid_id = mp.bid_id
+         WHERE lower(b.wallet_address) = lower($1)
+           AND mp.released_at IS NOT NULL
+      )
+      SELECT *
+        FROM events
+       ${where}
+       ORDER BY ts DESC NULLS LAST
+       LIMIT $${limPos};
+    `;
+
+    const { rows } = await pool.query(sql, params);
+    res.json({ items: rows });
+  } catch (e) {
+    console.error('GET /me/whats-new failed', e);
+    res.status(500).json({ error: 'Failed to build feed' });
+  }
+});
+
+// ==============================
+// Vendor — persist/read "last seen" for the widget
+// ==============================
+app.get('/me/dashboard/last-seen', authRequired, async (req, res) => {
+  const me = String(req.user?.sub || '').toLowerCase();
+  if (!me) return res.status(401).json({ error: 'unauthorized' });
+  const { rows } = await pool.query(
+    `SELECT last_seen_digest FROM user_dashboard_state WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+    [me]
+  );
+  res.json({ lastSeen: rows[0]?.last_seen_digest || null });
+});
+
+app.post('/me/dashboard/last-seen', authRequired, async (req, res) => {
+  const me = String(req.user?.sub || '').toLowerCase();
+  if (!me) return res.status(401).json({ error: 'unauthorized' });
+  const t = req.body?.timestamp ? new Date(String(req.body.timestamp)) : new Date();
+  if (Number.isNaN(t.getTime())) return res.status(400).json({ error: 'invalid timestamp' });
+
+  await pool.query(
+    `INSERT INTO user_dashboard_state (wallet_address, last_seen_digest, updated_at)
+     VALUES ($1, $2, now())
+     ON CONFLICT (wallet_address) DO UPDATE
+       SET last_seen_digest = EXCLUDED.last_seen_digest, updated_at = now()`,
+    [me, t.toISOString()]
+  );
+  res.json({ ok: true, lastSeen: t.toISOString() });
 });
 
 // ==============================
