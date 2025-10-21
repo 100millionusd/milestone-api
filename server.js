@@ -3866,6 +3866,109 @@ app.post('/admin/oversight/reconcile-payouts', adminGuard, async (req, res) => {
   }
 });
 
+// Reconcile Safe multisig payments: flip 'pending' -> 'released' once executed on-chain
+app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
+  try {
+    const { rows: pending } = await pool.query(`
+      SELECT id, bid_id, milestone_index, amount_usd, safe_tx_hash
+      FROM milestone_payments
+      WHERE status='pending' AND safe_tx_hash IS NOT NULL
+    `);
+    if (!pending.length) return res.json({ ok: true, updated: 0 });
+
+    // Lazy import Safe API kit (ESM)
+    const apiKitMod   = await import('@safe-global/api-kit');
+    const { default: SafeApiKit } = apiKitMod;
+    const protocolKit = await import('@safe-global/protocol-kit');
+    const { EthersAdapter } = protocolKit;
+
+    // Ethers v5 provider for adapter (no signer needed just to read)
+    const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+    const ethAdapter = new EthersAdapter({ ethers, signerOrProvider: provider });
+    const api = new SafeApiKit({
+      txServiceUrl: (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global').trim(),
+      ethAdapter
+    });
+
+    let updated = 0;
+
+    for (const row of pending) {
+      if (!row.safe_tx_hash) continue;
+
+      let txResp;
+      try {
+        txResp = await api.getTransaction(row.safe_tx_hash);
+      } catch (e) {
+        console.warn('Safe getTransaction failed', row.safe_tx_hash, e?.message || e);
+        continue;
+      }
+
+      // The Transaction Service flags execution and carries the on-chain tx hash
+      const executed = txResp?.isExecuted && txResp?.transactionHash;
+      if (!executed) continue;
+
+      // Load bid + update milestone JSON
+      const { rows: bids } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [row.bid_id]);
+      const bid = bids[0];
+      if (!bid) continue;
+
+      const milestones = Array.isArray(bid.milestones)
+        ? bid.milestones
+        : JSON.parse(bid.milestones || '[]');
+
+      const ms = milestones[row.milestone_index] || {};
+      ms.paymentTxHash  = txResp.transactionHash;
+      ms.paymentDate    = new Date().toISOString();
+      ms.paymentPending = false;
+      ms.status         = 'paid';
+      milestones[row.milestone_index] = ms;
+
+      await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2', [JSON.stringify(milestones), row.bid_id]);
+
+      await pool.query(`
+        UPDATE milestone_payments
+        SET status='released',
+            tx_hash=$2,
+            released_at=NOW(),
+            amount_usd=COALESCE(amount_usd,$3)
+        WHERE id=$1
+      `, [row.id, txResp.transactionHash, row.amount_usd]);
+
+      updated++;
+    }
+
+    return res.json({ ok: true, updated });
+  } catch (e) {
+    console.error('reconcile-safe error', e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Quick status check for a Safe tx
+app.get('/safe/tx/:hash', adminGuard, async (req, res) => {
+  try {
+    const apiKitMod   = await import('@safe-global/api-kit');
+    const { default: SafeApiKit } = apiKitMod;
+    const protocolKit = await import('@safe-global/protocol-kit');
+    const { EthersAdapter } = protocolKit;
+    const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+    const ethAdapter = new EthersAdapter({ ethers, signerOrProvider: provider });
+    const api = new SafeApiKit({
+      txServiceUrl: (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global').trim(),
+      ethAdapter
+    });
+    const tx = await api.getTransaction(req.params.hash);
+    res.json({
+      safeTxHash: tx.safeTxHash,
+      isExecuted: tx.isExecuted,
+      txHash: tx.transactionHash || null,
+      confirmations: (tx.confirmations || []).length
+    });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e) });
+  }
+});
+
 // Delete orphan milestone_payments rows (no matching bid)
 app.post('/admin/oversight/payouts/prune-orphans', adminGuard, async (req, res) => {
   try {
