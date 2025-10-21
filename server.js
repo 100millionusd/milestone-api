@@ -49,6 +49,13 @@ const crypto = require("crypto");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
 const { enrichAuditRow } = require('./services/auditPinata');
+// --- Safe (Gnosis Safe) ---
+const { default: Safe, EthersAdapter } = require('@safe-global/protocol-kit');
+const SafeApiKit = require('@safe-global/api-kit').default;
+// Safe env
+const SAFE_ADDRESS       = (process.env.SAFE_ADDRESS || '').trim();
+const SAFE_TXSERVICE_URL = (process.env.SAFE_TXSERVICE_URL || '').trim();
+const SAFE_THRESHOLD_USD = Number(process.env.SAFE_THRESHOLD_USD || 0);
 
 // 🔐 auth utilities
 const cookieParser = require("cookie-parser");
