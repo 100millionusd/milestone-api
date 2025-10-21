@@ -4717,13 +4717,11 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
         amount_usd      NUMERIC(18,2),
         status          TEXT CHECK (status IN ('pending','released')) DEFAULT 'pending',
         tx_hash         TEXT,
+        safe_tx_hash    TEXT,
+        safe_nonce      BIGINT,
         created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
         released_at     TIMESTAMPTZ
       );
-      ALTER TABLE milestone_payments
-        ADD COLUMN IF NOT EXISTS amount_usd NUMERIC(18,2),
-        ADD COLUMN IF NOT EXISTS status TEXT,
-        ADD COLUMN IF NOT EXISTS released_at TIMESTAMPTZ;
       DO $$
       BEGIN
         IF NOT EXISTS (
@@ -4762,43 +4760,124 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
     // 2) Idempotency gate (create PENDING row once)
     const msAmountUSD = Number(ms?.amount ?? 0); // <-- define BEFORE any use
     const ins = await pool.query(
-      `INSERT INTO milestone_payments (bid_id, milestone_index, amount_usd, status, created_at)
-       VALUES ($1, $2, $3, 'pending', NOW())
-       ON CONFLICT (bid_id, milestone_index) DO NOTHING
-       RETURNING id`,
+      `
+      INSERT INTO milestone_payments (bid_id, milestone_index, amount_usd, status, created_at)
+      VALUES ($1, $2, $3, 'pending', NOW())
+      ON CONFLICT (bid_id, milestone_index) DO NOTHING
+      RETURNING id
+      `,
       [bidId, milestoneIndex, msAmountUSD]
     );
 
     if (ins.rowCount === 0) {
       // someone already created the row (in progress or released)
       const { rows: [existing] } = await pool.query(
-        `SELECT status, tx_hash FROM milestone_payments WHERE bid_id=$1 AND milestone_index=$2`,
+        `
+        SELECT status, tx_hash, safe_tx_hash
+        FROM milestone_payments
+        WHERE bid_id=$1 AND milestone_index=$2
+        `,
         [bidId, milestoneIndex]
       );
       if (existing?.status === "released") {
         return res.status(409).json({ error: "Milestone already paid", txHash: existing.tx_hash || null });
       }
-      return res.status(409).json({ error: "Payment already in progress", txHash: existing?.tx_hash || null });
+      return res.status(409).json({
+        error: "Payment already in progress",
+        txHash: existing?.tx_hash || null,
+        safeTxHash: existing?.safe_tx_hash || null
+      });
     }
 
-
-    // Mark payment as pending in the bid JSON immediately so the UI disables the Pay button
-try {
-  ms.paymentPending = true;
-  milestones[milestoneIndex] = ms;
-  await pool.query(
-    "UPDATE bids SET milestones=$1 WHERE bid_id=$2",
-    [JSON.stringify(milestones), bidId]
-  );
-} catch (e) {
-  console.warn("failed to mark paymentPending", e?.message || e);
-}
+    // 2.5) Mark payment as pending in the bid JSON immediately so the UI disables the Pay button
+    try {
+      ms.paymentPending = true;
+      milestones[milestoneIndex] = ms;
+      await pool.query(
+        "UPDATE bids SET milestones=$1 WHERE bid_id=$2",
+        [JSON.stringify(milestones), bidId]
+      );
+    } catch (e) {
+      console.warn("failed to mark paymentPending", e?.message || e);
+    }
 
     // 3) Fire-and-forget transfer so the HTTP request returns fast
     (async () => {
       try {
         const token = String(bid.preferred_stablecoin || "USDT").toUpperCase();
+        const SAFE_THRESHOLD_USD = Number(process.env.SAFE_THRESHOLD_USD || 0);
 
+        // ---- SAFE (multisig) path if threshold reached ----
+        if (SAFE_THRESHOLD_USD > 0 && msAmountUSD >= SAFE_THRESHOLD_USD && process.env.SAFE_ADDRESS) {
+          try {
+            // Dynamic imports (Safe SDKs are ESM)
+            const protocolKit = await import('@safe-global/protocol-kit');
+            const apiKitMod   = await import('@safe-global/api-kit');
+            const Safe        = protocolKit.default;
+            const { EthersAdapter } = protocolKit;
+            const SafeApiKit  = apiKitMod.default;
+
+            // Ethers v5 (matches rest of codebase)
+            const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+            const pk = process.env.PRIVATE_KEY?.startsWith("0x") ? process.env.PRIVATE_KEY : `0x${process.env.PRIVATE_KEY}`;
+            const signer = new ethers.Wallet(pk, provider);
+
+            // Resolve token + amount (USDC/USDT assume 1:1 USD; TOKENS[token].decimals is 6)
+            const tokenCfg = TOKENS[token];
+            if (!tokenCfg) throw new Error(`Unknown token ${token}`);
+            const decimals = Number(tokenCfg.decimals || 6);
+            const amountUnits = ethers.utils.parseUnits(String(msAmountUSD), decimals);
+
+            // Encode ERC20.transfer(to, amount)
+            const iface = new ethers.utils.Interface(ERC20_ABI);
+            const data  = iface.encodeFunctionData('transfer', [bid.wallet_address, amountUnits]);
+
+            // Init Safe clients
+            const ethAdapter = new EthersAdapter({ ethers, signerOrProvider: signer });
+            const safe       = await Safe.create({ ethAdapter, safeAddress: process.env.SAFE_ADDRESS });
+            const api        = new SafeApiKit({
+              txServiceUrl: (process.env.SAFE_TXSERVICE_URL || "https://safe-transaction-sepolia.safe.global").trim(),
+              ethAdapter
+            });
+
+            // Create + propose Safe tx
+            const safeTx = await safe.createTransaction({
+              safeTransactionData: { to: tokenCfg.address, value: '0', data }
+            });
+            const safeTxHash = await safe.getTransactionHash(safeTx);
+            const signature  = await safe.signTransaction(safeTx);
+            const senderAddr = await signer.getAddress();
+
+            await api.proposeTransaction({
+              safeAddress: process.env.SAFE_ADDRESS,
+              safeTransactionData: safeTx.data,
+              safeTxHash,
+              senderAddress: senderAddr,
+              senderSignature: signature.data
+            });
+
+            const nonce = Number(safeTx.data.nonce);
+
+            // Persist Safe refs; keep status 'pending' (execution comes later)
+            await pool.query(
+              `
+              UPDATE milestone_payments
+              SET safe_tx_hash=$3, safe_nonce=$4
+              WHERE bid_id=$1 AND milestone_index=$2
+              `,
+              [bidId, milestoneIndex, safeTxHash, Number.isFinite(nonce) ? nonce : null]
+            );
+
+            // Done for Safe path: DO NOT mark released here
+            return;
+          } catch (safeErr) {
+            console.error("SAFE propose failed; leaving pending", safeErr?.message || safeErr);
+            // Leave as pending; admin can retry
+            return;
+          }
+        }
+
+        // ---- EOA path (existing behavior) ----
         let txHash;
         if (blockchainService?.transferSubmit) {
           // New non-blocking helper you should expose in blockchainService:
@@ -4817,7 +4896,11 @@ try {
 
         if (txHash) {
           await pool.query(
-            `UPDATE milestone_payments SET tx_hash=$3 WHERE bid_id=$1 AND milestone_index=$2`,
+            `
+            UPDATE milestone_payments
+            SET tx_hash=$3
+            WHERE bid_id=$1 AND milestone_index=$2
+            `,
             [bidId, milestoneIndex, txHash]
           );
         }
@@ -4833,7 +4916,7 @@ try {
           return;
         }
 
-        // 4) Mark released + legacy JSON fields
+        // 4) Mark released + legacy JSON fields (EOA path only)
         ms.paymentTxHash = txHash || ms.paymentTxHash || null;
         ms.paymentDate = new Date().toISOString();
         ms.paymentPending = false;          // <<< clear pending
@@ -4842,9 +4925,14 @@ try {
 
         await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
         await pool.query(
-          `UPDATE milestone_payments
-             SET status='released', tx_hash=COALESCE(tx_hash,$3), released_at=NOW(), amount_usd=COALESCE(amount_usd,$4)
-           WHERE bid_id=$1 AND milestone_index=$2`,
+          `
+          UPDATE milestone_payments
+          SET status='released',
+              tx_hash=COALESCE(tx_hash,$3),
+              released_at=NOW(),
+              amount_usd=COALESCE(amount_usd,$4)
+          WHERE bid_id=$1 AND milestone_index=$2
+          `,
           [bidId, milestoneIndex, txHash || null, msAmountUSD]
         );
 
