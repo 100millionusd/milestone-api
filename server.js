@@ -759,6 +759,55 @@ function bi(en, es) {
 }
 
 // ==============================
+// Notifications — Payment pending approval
+// ==============================
+async function notifyPaymentPending({ bid, proposal, msIndex, amount, method = 'safe', txRef = null }) {
+  try {
+    const title     = proposal?.title || 'Project';
+    const vendorStr = `${bid.vendor_name || ''} (${bid.wallet_address || ''})`.trim();
+    const amountStr = `$${Number(amount || 0).toFixed(2)} USD`;
+    const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/bids/${bid.bid_id}` : null;
+    const subject   = method === 'safe'
+      ? '🔐 Payment pending approval'
+      : '🟨 Payment processing';
+
+    const en = [
+      subject,
+      `Project: ${title} — ${proposal?.org_name || ''}`,
+      `Vendor: ${vendorStr}`,
+      `Milestone: #${msIndex}  •  Amount: ${amountStr}`,
+      method === 'safe' ? 'Method: Safe multisig' : 'Method: Direct transfer',
+      txRef ? `Safe Tx: ${txRef}` : '',
+      adminLink ? `Admin: ${adminLink}` : ''
+    ].filter(Boolean).join('\n');
+
+    const es = [
+      method === 'safe' ? '🔐 Pago pendiente de aprobación' : '🟨 Pago en proceso',
+      `Proyecto: ${title} — ${proposal?.org_name || ''}`,
+      `Proveedor: ${vendorStr}`,
+      `Hito: #${msIndex}  •  Importe: ${amountStr}`,
+      method === 'safe' ? 'Método: Safe multisig' : 'Método: Transferencia directa',
+      txRef ? `Safe Tx: ${txRef}` : '',
+      adminLink ? `Admin: ${adminLink}` : ''
+    ].filter(Boolean).join('\n');
+
+    const { text, html } = bi(en, es);
+
+    await Promise.all([
+      TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
+      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      ...(ADMIN_WHATSAPP || []).map(n =>
+        TWILIO_WA_CONTENT_SID
+          ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": title, "2": "payment pending" })
+          : sendWhatsApp(n, text)
+      ),
+    ].filter(Boolean));
+  } catch (e) {
+    console.warn('notifyPaymentPending failed:', e);
+  }
+}
+
+// ==============================
 // Notifications — Bid Submitted
 // ==============================
 async function notifyBidSubmitted(bid, proposal, vendor) {
@@ -4907,6 +4956,43 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
     // 3) Fire-and-forget transfer so the HTTP request returns fast
     (async () => {
       try {
+            // Notify admins that a milestone payment is now pending (Safe/direct)
+    try {
+      const { rows: [proposal] } = await pool.query(
+        'SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1',
+        [bid.proposal_id]
+      );
+      if (proposal && typeof notifyPaymentPending === 'function') {
+        await notifyPaymentPending({
+          bid,
+          proposal,
+          msIndex: milestoneIndex + 1,
+          amount: msAmountUSD,
+          method: 'safe',   // set 'direct' if this one is not going through Safe
+          txRef: null       // if you have a Safe tx hash later, you can send a 2nd notify with txRef
+        });
+      }
+    } catch (e) {
+      console.warn('notifyPaymentPending failed', e?.message || e);
+    }
+        // After you get safeTxHash (or after updating milestone_payments with it)
+    try {
+      const { rows: [proposal] } = await pool.query(
+        'SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1',
+        [bid.proposal_id]
+      );
+      if (proposal && typeof notifyPaymentPending === 'function') {
+        await notifyPaymentPending({
+          bid,
+          proposal,
+          msIndex: milestoneIndex + 1,
+          amount: msAmountUSD,
+          method: 'safe',
+          txRef: safeTxHash   // <-- include it here if you have it
+        });
+      }
+    } catch {}
+
         const token = String(bid.preferred_stablecoin || "USDT").toUpperCase();
         const SAFE_THRESHOLD_USD = Number(process.env.SAFE_THRESHOLD_USD || 0);
 
