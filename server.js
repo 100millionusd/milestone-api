@@ -5031,7 +5031,7 @@ if (willUseSafe) {
       throw new Error(`Wrong network: ${network.name}`);
     }
 
-    // 5) Pick a signer that IS a Safe owner - WITH DEBUGGING
+    // 5) Pick a signer that IS a Safe owner
     const rawKeys = (process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
       .split(",").map(s => s.trim()).filter(Boolean)
       .map(k => (k.startsWith("0x") ? k : `0x${k}`));
@@ -5041,7 +5041,7 @@ if (willUseSafe) {
     console.log("[SAFE] === PRIVATE KEY DEBUGGING ===");
     console.log("[SAFE] Number of private keys found:", rawKeys.length);
 
-    // Get Safe owners first
+    // Get Safe owners
     const PK = await import("@safe-global/protocol-kit");
     const Safe = PK.default;
 
@@ -5077,19 +5077,13 @@ if (willUseSafe) {
 
     if (!signer) {
       console.error("[SAFE] ❌ NONE of the private keys correspond to Safe owners!");
-      console.error("[SAFE] Safe owners are:", ownersLc);
-      console.error("[SAFE] Available addresses from private keys:");
-      for (let i = 0; i < rawKeys.length; i++) {
-        const wallet = new ethers.Wallet(rawKeys[i]);
-        console.error(`[SAFE]   - ${wallet.address}`);
-      }
       throw new Error(`None of the PRIVATE_KEYS is a Safe owner`);
     }
 
     const safeSender = await signer.getAddress();
     console.log("[SAFE] using signer (owner):", safeSender);
 
-    // 6) Build Safe tx
+    // 6) Build Safe tx and compute hash
     const safe = await Safe.init({
       provider: RPC_URL,
       safeAddress: process.env.SAFE_ADDRESS
@@ -5098,9 +5092,34 @@ if (willUseSafe) {
     const transactions = [{ to: tokenAddr, value: "0", data }];
     const safeTx = await safe.createTransaction({ transactions });
 
-    // 7) Compute tx hash and sign
+    // 7) Compute tx hash and sign - WITH VERIFICATION
+    console.log("[SAFE] === SIGNATURE VERIFICATION ===");
     const safeTxHash = await safe.getTransactionHash(safeTx);
-    const senderSignature = await signer.signMessage(ethers.utils.arrayify(safeTxHash));
+    console.log("[SAFE] SafeTxHash to sign:", safeTxHash);
+
+    // Verify signer before signing
+    const signerAddressBefore = await signer.getAddress();
+    console.log("[SAFE] Signer address before signing:", signerAddressBefore);
+
+    // Sign the message
+    const messageBytes = ethers.utils.arrayify(safeTxHash);
+    console.log("[SAFE] Signing message...");
+    const senderSignature = await signer.signMessage(messageBytes);
+    console.log("[SAFE] Raw signature:", senderSignature);
+
+    // CRITICAL: Verify the signature
+    const recoveredAddress = ethers.utils.verifyMessage(messageBytes, senderSignature);
+    console.log("[SAFE] Recovered address from signature:", recoveredAddress);
+    console.log("[SAFE] Expected signer address:", signerAddressBefore);
+    
+    if (recoveredAddress.toLowerCase() !== signerAddressBefore.toLowerCase()) {
+      console.error("[SAFE] ❌ SIGNATURE VERIFICATION FAILED!");
+      console.error("[SAFE] Signature was created by:", recoveredAddress);
+      console.error("[SAFE] But expected:", signerAddressBefore);
+      throw new Error("Signature verification failed - wrong private key used");
+    }
+
+    console.log("[SAFE] ✅ Signature verified - created by correct signer");
 
     // 8) DIRECT API CALL
     console.log("[SAFE] Using direct API call...");
@@ -5138,6 +5157,17 @@ if (willUseSafe) {
     const correctedSafeTxHash = await safeWithCorrectNonce.getTransactionHash(safeTxWithNonce);
     const correctedSenderSignature = await signer.signMessage(ethers.utils.arrayify(correctedSafeTxHash));
     
+    // Verify the corrected signature too
+    const correctedRecoveredAddress = ethers.utils.verifyMessage(
+      ethers.utils.arrayify(correctedSafeTxHash), 
+      correctedSenderSignature
+    );
+    console.log("[SAFE] Corrected signature by:", correctedRecoveredAddress);
+    
+    if (correctedRecoveredAddress.toLowerCase() !== signerAddressBefore.toLowerCase()) {
+      throw new Error("Corrected signature also failed verification");
+    }
+
     console.log("[SAFE] Corrected SafeTxHash:", correctedSafeTxHash);
     console.log("[SAFE] Using nonce:", currentNonce);
 
