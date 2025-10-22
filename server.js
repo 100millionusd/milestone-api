@@ -5012,50 +5012,51 @@ if (willUseSafe) {
       amountUnits
     ]);
 
-    // ---- SAFE SDK imports (declare once) ----
-    const pkMod = await import('@safe-global/protocol-kit');
-    const { default: Safe, EthersAdapter } = pkMod;
-    const { default: SafeApiKit } = await import('@safe-global/api-kit');
+ // ---- SAFE SDK imports (same pattern as your working endpoints) ----
+const protocolKit = await import('@safe-global/protocol-kit');
+const { default: Safe, EthersAdapter } = protocolKit;
+const apiKitMod   = await import('@safe-global/api-kit');
+const SafeApiKit  = apiKitMod.default;
 
-    // ---- provider (one time) ----
-    const RPC_URL = process.env.SEPOLIA_RPC_URL;
-    const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
+// ---- provider (one time) ----
+const RPC_URL  = process.env.SEPOLIA_RPC_URL;
+const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
 
-    // ---- signer selection: support multiple keys ----
-    const keyListRaw = (process.env.PRIVATE_KEYS || process.env.PRIVATE_KEY || '')
-      .split(',')
-      .map(s => s.trim())
-      .filter(Boolean);
-    const keyList = keyListRaw.map(k => (k.startsWith('0x') ? k : `0x${k}`));
-    if (!keyList.length) throw new Error('No PRIVATE_KEYS/PRIVATE_KEY configured for Safe proposer');
+// ---- signer selection: support multiple keys ----
+const keyListRaw = (process.env.PRIVATE_KEYS || process.env.PRIVATE_KEY || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+const keyList = keyListRaw.map(k => (k.startsWith('0x') ? k : `0x${k}`));
+if (!keyList.length) throw new Error('No PRIVATE_KEYS/PRIVATE_KEY configured for Safe proposer');
 
-    // Read owners with a read-only adapter
-    const ethAdapterRO = new EthersAdapter({ ethers, signerOrProvider: provider });
-    const safeRO = await Safe.create({
-      ethAdapter: ethAdapterRO,
-      safeAddress: process.env.SAFE_ADDRESS
-    });
-    const ownersLc = (await safeRO.getOwners()).map(a => a.toLowerCase());
+// Read owners with a read-only adapter (NO signer here)
+const ethAdapterRO = new EthersAdapter({ ethers, signerOrProvider: provider });
+const safeRO = await Safe.create({
+  ethAdapter: ethAdapterRO,
+  safeAddress: process.env.SAFE_ADDRESS
+});
+const ownersLc = (await safeRO.getOwners()).map(a => a.toLowerCase());
 
-    // Pick the first configured key that IS an owner
-    let signer = null;
-    for (const k of keyList) {
-      const addr = new ethers.Wallet(k).address.toLowerCase();
-      if (ownersLc.includes(addr)) {
-        signer = new ethers.Wallet(k, provider);
-        break;
-      }
-    }
-    if (!signer) {
-      throw new Error(`None of the configured PRIVATE_KEYS match Safe owners. Owners: ${ownersLc.join(', ')}`);
-    }
+// Pick the first configured key that IS an owner
+let signer = null;
+for (const k of keyList) {
+  const addr = new ethers.Wallet(k).address.toLowerCase();
+  if (ownersLc.includes(addr)) {
+    signer = new ethers.Wallet(k, provider);
+    break;
+  }
+}
+if (!signer) {
+  throw new Error(`None of the configured PRIVATE_KEYS match Safe owners. Owners: ${ownersLc.join(', ')}`);
+}
 
-    // Final adapter & Safe bound to the chosen signer
-    const ethAdapter = new EthersAdapter({ ethers, signerOrProvider: signer });
-    const safe = await Safe.create({
-      ethAdapter,
-      safeAddress: process.env.SAFE_ADDRESS
-    });
+// Final adapter & Safe bound to the chosen signer
+const ethAdapter = new EthersAdapter({ ethers, signerOrProvider: signer });
+const safe = await Safe.create({
+  ethAdapter,
+  safeAddress: process.env.SAFE_ADDRESS
+});
 
     // Create & sign Safe transaction
     const safeTx = await safe.createTransaction({
