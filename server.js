@@ -5056,7 +5056,7 @@ if (willUseSafe) {
     const nonceFromTx = Number(safeTx.data.nonce);
     const explicitNonce = Number.isFinite(nonceFromTx) ? nonceFromTx : await safe.getNonce();
 
-    // 6) owner signature using ProtocolKit helper (avoids format mismatches)
+    // 6) owner signature using ProtocolKit helper (normalized for service)
     const safeWithSigner = await SafePK.init({
       provider: RPC_URL,
       safeAddress: process.env.SAFE_ADDRESS,
@@ -5066,7 +5066,7 @@ if (willUseSafe) {
     let senderSignature = await safeWithSigner.signTransactionHash(safeTxHash);
     senderSignature = typeof senderSignature === "string" ? senderSignature : senderSignature?.data;
 
-    // hard guards to avoid "0undefined" / bad hex
+    // guards to avoid "0undefined" / bad hex
     if (typeof senderSignature !== "string") throw new Error("[SAFE] missing signature from signTransactionHash()");
     if (!senderSignature.startsWith("0x")) throw new Error("[SAFE] signature must start with 0x");
     if (!/^(0x)[0-9a-fA-F]+$/.test(senderSignature)) throw new Error("[SAFE] signature must be hex");
@@ -5078,7 +5078,7 @@ if (willUseSafe) {
       (hexNoPrefix.length === 132 && senderSignature.toLowerCase().endsWith("01")) ? senderSignature :
       (() => { throw new Error(`[SAFE] unexpected signature length=${hexNoPrefix.length} (expected 130 or 132)`); })();
 
-    // sanity check: recovered address MUST match selected signer (strip "01" for recovery)
+    // sanity: recovered address MUST match selected signer (strip "01" for recovery)
     const sigForRecovery = senderSignatureForService.toLowerCase().endsWith("01")
       ? ("0x" + senderSignatureForService.slice(2, 132))
       : senderSignatureForService;
@@ -5088,24 +5088,52 @@ if (willUseSafe) {
       throw new Error(`[SAFE] signature mismatch: recovered ${recovered}, expected ${senderAddr}`);
     }
 
-    // 7) Propose via Safe API Kit (global tx-service + API key)
-    const { default: SafeApiKit } = await import("@safe-global/api-kit");
-    const apiKit = new SafeApiKit({
-      chainId: 11155111n,                  // Sepolia
-      apiKey: process.env.SAFE_API_KEY
-      // (optional) txServiceUrl: process.env.SAFE_TXSERVICE_URL
+    // 7) DIRECT POST to the global Safe Tx-Service (bypass ApiKit/viem)
+    const TX_SERVICE_BASE = (process.env.SAFE_TXSERVICE_URL || "https://api.safe.global/tx-service/sep")
+      .trim().replace(/\/+$/, "");
+    const safeAddrLc = String(process.env.SAFE_ADDRESS).trim().toLowerCase();
+
+    const body = {
+      to: tokenAddr,
+      value: "0",
+      data,                               // 0x…
+      operation: 0,                       // CALL
+      gasToken: "0x0000000000000000000000000000000000000000",
+      safeTxGas: 0,
+      baseGas: 0,
+      gasPrice: "0",
+      refundReceiver: "0x0000000000000000000000000000000000000000",
+      nonce: explicitNonce,
+      contractTransactionHash: safeTxHash,
+      sender: senderAddr,
+      signature: senderSignatureForService,
+      origin: "milestone-pay"
+    };
+
+    // Optional: quick Safe info check to fail early with a clear message
+    {
+      const info = await fetch(`${TX_SERVICE_BASE}/api/v1/safes/${safeAddrLc}/`, {
+        headers: { "Authorization": `Bearer ${process.env.SAFE_API_KEY}` }
+      });
+      if (!info.ok) {
+        const msg = await info.text().catch(() => "");
+        throw new Error(`[SAFE info] ${info.status} ${msg || info.statusText}`);
+      }
+    }
+
+    const resp = await fetch(`${TX_SERVICE_BASE}/api/v2/safes/${safeAddrLc}/multisig-transactions/`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "Authorization": `Bearer ${process.env.SAFE_API_KEY}`
+      },
+      body: JSON.stringify(body)
     });
 
-    // Ensure nonce is explicitly present to avoid downstream encoding issues
-    const safeTransactionData = { ...safeTx.data, nonce: explicitNonce };
-
-    await apiKit.proposeTransaction({
-      safeAddress: String(process.env.SAFE_ADDRESS),
-      safeTransactionData,
-      safeTxHash,
-      senderAddress: senderAddr,
-      senderSignature: senderSignatureForService
-    });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => "");
+      throw new Error(`TxService propose failed [${resp.status}] ${txt || resp.statusText}`);
+    }
 
     // 8) store safe_tx_hash immediately; nonce optional
     await pool.query(
