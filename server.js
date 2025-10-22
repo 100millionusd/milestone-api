@@ -5012,13 +5012,19 @@ if (willUseSafe) {
       amountUnits
     ]);
 
- // ---- SAFE SDK imports (correct) ----
-const { default: Safe, EthersAdapter } = await import('@safe-global/protocol-kit');
-const { default: SafeApiKit }          = await import('@safe-global/api-kit');
+// ---- SAFE SDK imports (works in your other endpoints) ----
+const protocolKit = await import('@safe-global/protocol-kit');
+const { default: Safe } = protocolKit;                                // Safe class
+const SafeApiKit = (await import('@safe-global/api-kit')).default;    // Tx service client
 
 // ---- provider (one time) ----
 const RPC_URL  = process.env.SEPOLIA_RPC_URL;
 const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
+
+// Sanity: make sure adapter is there
+if (typeof protocolKit.EthersAdapter !== 'function') {
+  throw new Error('Safe EthersAdapter missing/not a constructor. Check @safe-global/protocol-kit version.');
+}
 
 // ---- signer selection: support multiple keys ----
 const keyListRaw = (process.env.PRIVATE_KEYS || process.env.PRIVATE_KEY || '')
@@ -5029,7 +5035,7 @@ const keyList = keyListRaw.map(k => (k.startsWith('0x') ? k : `0x${k}`));
 if (!keyList.length) throw new Error('No PRIVATE_KEYS/PRIVATE_KEY configured for Safe proposer');
 
 // Read owners with a read-only adapter (NO signer here)
-const ethAdapterRO = new EthersAdapter({ ethers, signerOrProvider: provider });
+const ethAdapterRO = new protocolKit.EthersAdapter({ ethers, signerOrProvider: provider });
 const safeRO = await Safe.create({
   ethAdapter: ethAdapterRO,
   safeAddress: process.env.SAFE_ADDRESS
@@ -5050,7 +5056,7 @@ if (!signer) {
 }
 
 // Final adapter & Safe bound to the chosen signer
-const ethAdapter = new EthersAdapter({ ethers, signerOrProvider: signer });
+const ethAdapter = new protocolKit.EthersAdapter({ ethers, signerOrProvider: signer });
 const safe = await Safe.create({
   ethAdapter,
   safeAddress: process.env.SAFE_ADDRESS
