@@ -5012,11 +5012,10 @@ if (willUseSafe) {
       amountUnits
     ]);
 
- // ---- SAFE SDK imports (same pattern as your working endpoints) ----
-const protocolKit = await import('@safe-global/protocol-kit');
-const { default: Safe, EthersAdapter } = protocolKit;
-const apiKitMod   = await import('@safe-global/api-kit');
-const SafeApiKit  = apiKitMod.default;
+ // ---- SAFE SDK imports (FIXED) ----
+const { default: Safe }       = await import('@safe-global/protocol-kit');
+const { EthersAdapter }       = await import('@safe-global/ethers-adapters');
+const { default: SafeApiKit } = await import('@safe-global/api-kit');
 
 // ---- provider (one time) ----
 const RPC_URL  = process.env.SEPOLIA_RPC_URL;
