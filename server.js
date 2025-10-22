@@ -4962,214 +4962,222 @@ setImmediate(async () => {
       msAmountUSD >= Number(process.env.SAFE_THRESHOLD_USD || 0) &&
       !!process.env.SAFE_ADDRESS;
 
-// Notify admins that a milestone payment just entered "pending"
-try {
-  const { rows: [proposal] } = await pool.query(
-    'SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1',
-    [bid.proposal_id]
-  );
-  if (proposal && typeof notifyPaymentPending === 'function') {
-    await notifyPaymentPending({
-      bid,
-      proposal,
-      msIndex: milestoneIndex + 1,
-      amount: msAmountUSD,
-      method: willUseSafe ? 'safe' : 'direct', // <-- correct method here
-      txRef: null                                // no hash yet
-    });
-  }
-} catch (e) {
-  console.warn('notifyPaymentPending failed', e?.message || e);
-}
+    // Notify admins that a milestone payment just entered "pending"
+    try {
+      const { rows: [proposal] } = await pool.query(
+        'SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1',
+        [bid.proposal_id]
+      );
+      if (proposal && typeof notifyPaymentPending === 'function') {
+        await notifyPaymentPending({
+          bid,
+          proposal,
+          msIndex: milestoneIndex + 1,
+          amount: msAmountUSD,
+          method: willUseSafe ? 'safe' : 'direct',
+          txRef: null
+        });
+      }
+    } catch (e) {
+      console.warn('notifyPaymentPending failed', e?.message || e);
+    }
 
-        const token = String(bid.preferred_stablecoin || "USDT").toUpperCase();
-        const SAFE_THRESHOLD_USD = Number(process.env.SAFE_THRESHOLD_USD || 0);
+    // Preferred stablecoin symbol (e.g. USDT/USDC)
+    const token = String(bid.preferred_stablecoin || 'USDT').toUpperCase();
 
-        // ---- SAFE (multisig) path if threshold reached ----
-        if (SAFE_THRESHOLD_USD > 0 && msAmountUSD >= SAFE_THRESHOLD_USD && process.env.SAFE_ADDRESS) {
-          try {
-            // Dynamic imports (Safe SDKs are ESM)
-            const protocolKit = await import('@safe-global/protocol-kit');
-            const apiKitMod   = await import('@safe-global/api-kit');
-            const Safe        = protocolKit.default;
-            const { EthersAdapter } = protocolKit;
-            const SafeApiKit  = apiKitMod.default;
+    // ---------- SAFE PATH ----------
+    if (willUseSafe) {
+      try {
+        // Resolve token metadata
+        const tokenMeta   = (TOKENS && TOKENS[token]) || {};
+        const tokenAddr   = tokenMeta.address;
+        const tokenDec    = Number.isInteger(tokenMeta.decimals) ? tokenMeta.decimals : 6;
 
-            // Ethers v5 (matches rest of codebase)
-            const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
-            const pk = process.env.PRIVATE_KEY?.startsWith("0x") ? process.env.PRIVATE_KEY : `0x${process.env.PRIVATE_KEY}`;
-            const signer = new ethers.Wallet(pk, provider);
+        if (!tokenAddr) {
+          throw new Error(`Unknown token ${token} for Safe transfer (no address in TOKENS)`);
+        }
 
-            // Resolve token + amount (USDC/USDT assume 1:1 USD; TOKENS[token].decimals is 6)
-            const tokenCfg = TOKENS[token];
-            if (!tokenCfg) throw new Error(`Unknown token ${token}`);
-            const decimals = Number(tokenCfg.decimals || 6);
-            const amountUnits = ethers.utils.parseUnits(String(msAmountUSD), decimals);
-
-            // Encode ERC20.transfer(to, amount)
-            const iface = new ethers.utils.Interface(ERC20_ABI);
-            const data  = iface.encodeFunctionData('transfer', [bid.wallet_address, amountUnits]);
-
-            // Init Safe clients
-            const ethAdapter = new EthersAdapter({ ethers, signerOrProvider: signer });
-            const safe       = await Safe.create({ ethAdapter, safeAddress: process.env.SAFE_ADDRESS });
-            const api        = new SafeApiKit({
-              txServiceUrl: (process.env.SAFE_TXSERVICE_URL || "https://safe-transaction-sepolia.safe.global").trim(),
-              ethAdapter
-            });
-
-            // Create + propose Safe tx
-            const safeTx = await safe.createTransaction({
-              safeTransactionData: { to: tokenCfg.address, value: '0', data }
-            });
-            const safeTxHash = await safe.getTransactionHash(safeTx);
-            const signature  = await safe.signTransaction(safeTx);
-            const senderAddr = await signer.getAddress();
-
-            await api.proposeTransaction({
-              safeAddress: process.env.SAFE_ADDRESS,
-              safeTransactionData: safeTx.data,
-              safeTxHash,
-              senderAddress: senderAddr,
-              senderSignature: signature.data
-            });
-
-            const nonce = Number(safeTx.data.nonce);
-
- // Persist Safe refs; keep status 'pending' (execution comes later)
-await pool.query(
-  `
-  UPDATE milestone_payments
-  SET safe_tx_hash=$3, safe_nonce=$4
-  WHERE bid_id=$1 AND milestone_index=$2
-  `,
-  [bidId, milestoneIndex, safeTxHash, Number.isFinite(nonce) ? nonce : null]
-);
-
-// 🔔 Notify admins now that we have the Safe tx hash (so they can click/approve)
-try {
-  const { rows: [proposal] } = await pool.query(
-    'SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1',
-    [bid.proposal_id]
-  );
-  if (proposal && typeof notifyPaymentPending === 'function') {
-    await notifyPaymentPending({
-      bid,
-      proposal,
-      msIndex: milestoneIndex + 1,
-      amount: msAmountUSD,
-      method: 'safe',
-      txRef: safeTxHash   // <-- include Safe tx hash here
-    });
-  }
-} catch (e) {
-  console.warn('notifyPaymentPending (post-safe-hash) failed', e?.message || e);
-}
-
-// Done for Safe path: DO NOT mark released here
-return;
-
-        // ---- EOA path (existing behavior) ----
-        let txHash;
-        if (blockchainService?.transferSubmit) {
-          // New non-blocking helper you should expose in blockchainService:
-          // transferSubmit(symbol, to, amountUSD) -> { hash }
-          const r = await blockchainService.transferSubmit(token, bid.wallet_address, msAmountUSD);
-          txHash = r?.hash;
-        } else if (blockchainService?.sendToken) {
-          // Fallback: kick off sendToken, but DO NOT await confirmations here
-          // sendToken should return an object with .hash quickly.
-          const r = await blockchainService.sendToken(token, bid.wallet_address, msAmountUSD);
-          txHash = r?.hash;
+        // Convert amount (USD → token units). If you have your own converter, it can be used here.
+        let amountUnits;
+        if (typeof toTokenUnits === 'function') {
+          amountUnits = await toTokenUnits(token, msAmountUSD); // optional project helper
         } else {
-          // dev fallback
-          txHash = "dev_" + crypto.randomBytes(8).toString("hex");
+          // Fallback: treat msAmountUSD as "token amount" and just apply decimals
+          amountUnits = ethers.utils.parseUnits(String(msAmountUSD), tokenDec);
         }
 
-        if (txHash) {
-          await pool.query(
-            `
-            UPDATE milestone_payments
-            SET tx_hash=$3
-            WHERE bid_id=$1 AND milestone_index=$2
-            `,
-            [bidId, milestoneIndex, txHash]
-          );
-        }
+        // Encode ERC20.transfer(to, amount)
+        const erc20Iface = new ethers.utils.Interface(ERC20_ABI);
+        const data = erc20Iface.encodeFunctionData('transfer', [
+          bid.wallet_address,
+          amountUnits
+        ]);
 
-        // Optional confirm (1 conf). MUST NOT block the HTTP response.
-        try {
-          if (blockchainService?.waitForConfirm && txHash && !txHash.startsWith("dev_")) {
-            await blockchainService.waitForConfirm(txHash, 1);
+        // Prepare Safe clients
+        const protocolKit = await import('@safe-global/protocol-kit');
+        const apiKitMod   = await import('@safe-global/api-kit');
+        const { default: SafeApiKit } = apiKitMod;
+        const { default: Safe, EthersAdapter } = protocolKit;
+
+        const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+        const pk       = process.env.PRIVATE_KEY?.startsWith('0x')
+          ? process.env.PRIVATE_KEY
+          : `0x${process.env.PRIVATE_KEY}`;
+        const signer     = new ethers.Wallet(pk, provider);
+        const ethAdapter = new EthersAdapter({ ethers, signerOrProvider: signer });
+
+        const safe = await Safe.create({
+          ethAdapter,
+          safeAddress: process.env.SAFE_ADDRESS
+        });
+
+        // Create & sign Safe transaction
+        const safeTx = await safe.createTransaction({
+          safeTransactionData: {
+            to: tokenAddr,
+            value: '0',
+            data
           }
-        } catch (e) {
-          // Leave as pending; admin can retry if needed.
-          console.warn("waitForConfirm failed (left as pending)", e?.message || e);
-          return;
-        }
+        });
+        await safe.signTransaction(safeTx);
 
-        // 4) Mark released + legacy JSON fields (EOA path only)
-        ms.paymentTxHash = txHash || ms.paymentTxHash || null;
-        ms.paymentDate = new Date().toISOString();
-        ms.paymentPending = false;          // <<< clear pending
-        ms.status = "paid";                 // <<< optional legacy signal
-        milestones[milestoneIndex] = ms;
+        // Propose to the Safe Transaction Service
+        const api = new SafeApiKit({
+          txServiceUrl: (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global').trim(),
+          ethAdapter
+        });
 
-        await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
+        const sender = await signer.getAddress();
+        const safeTxHash = await api.proposeTransaction({
+          safeAddress: process.env.SAFE_ADDRESS,
+          safeTransaction: safeTx,
+          senderAddress: sender,
+          origin: 'milestone-pay'
+        });
+
+        // (Optional) read tx meta to get nonce
+        let safeNonce = null;
+        try {
+          const meta = await api.getTransaction(safeTxHash);
+          if (typeof meta?.nonce === 'number') safeNonce = meta.nonce;
+        } catch {}
+
+        // Persist Safe refs; keep status 'pending' (execution comes later)
         await pool.query(
           `
           UPDATE milestone_payments
-          SET status='released',
-              tx_hash=COALESCE(tx_hash,$3),
-              released_at=NOW(),
-              amount_usd=COALESCE(amount_usd,$4)
+          SET safe_tx_hash=$3, safe_nonce=$4
           WHERE bid_id=$1 AND milestone_index=$2
           `,
-          [bidId, milestoneIndex, txHash || null, msAmountUSD]
+          [bidId, milestoneIndex, safeTxHash, Number.isFinite(safeNonce) ? safeNonce : null]
         );
 
-        // 5) Notify best-effort
+        // Notify admins again, now including the Safe tx hash (so they can click/approve)
         try {
           const { rows: [proposal] } = await pool.query(
-            "SELECT * FROM proposals WHERE proposal_id=$1",
+            'SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1',
             [bid.proposal_id]
           );
-          if (proposal && typeof notifyPaymentReleased === "function") {
-            await notifyPaymentReleased({
-              bid, proposal,
+          if (proposal && typeof notifyPaymentPending === 'function') {
+            await notifyPaymentPending({
+              bid,
+              proposal,
               msIndex: milestoneIndex + 1,
               amount: msAmountUSD,
-              txHash: txHash || null,
+              method: 'safe',
+              txRef: safeTxHash
             });
           }
         } catch (e) {
-          console.warn("notifyPaymentReleased failed", e?.message || e);
+          console.warn('notifyPaymentPending (post-safe-hash) failed', e?.message || e);
         }
 
-        // Optional: audit
-        try {
-          await writeAudit(bidId, req, {
-            payment_released: {
-              milestone_index: milestoneIndex,
-              amount_usd: msAmountUSD,
-              tx: txHash || null,
-            },
-          });
-        } catch {}
-      } catch (e) {
-        console.error("Background pay-milestone failed (left pending)", e);
-        // Keep row as 'pending' so admin can retry safely.
+        // DONE for Safe path: do not mark released here
+        return;
+      } catch (safeErr) {
+        console.error('SAFE propose failed; leaving pending', safeErr?.message || safeErr);
+        // Leave as pending; admin can retry or fall back manually later
+        return;
       }
-    })();
+    }
 
-    // 5) Return immediately to avoid proxy 502s on slow confirmations
-    return res.status(202).json({ ok: true, status: "pending" });
+    // ---------- MANUAL/EOA PATH ----------
+    let txHash;
+    if (blockchainService?.transferSubmit) {
+      const r = await blockchainService.transferSubmit(token, bid.wallet_address, msAmountUSD);
+      txHash = r?.hash;
+    } else if (blockchainService?.sendToken) {
+      const r = await blockchainService.sendToken(token, bid.wallet_address, msAmountUSD);
+      txHash = r?.hash;
+    } else {
+      txHash = 'dev_' + crypto.randomBytes(8).toString('hex');
+    }
 
-  } catch (err) {
-    console.error("pay-milestone error", err);
-    // Do NOT delete the pending row here; leaving it enables safe retries
-    const msg = err?.shortMessage || err?.reason || err?.message || "Internal error paying milestone";
-    return res.status(500).json({ error: msg });
+    if (txHash) {
+      await pool.query(
+        `UPDATE milestone_payments SET tx_hash=$3 WHERE bid_id=$1 AND milestone_index=$2`,
+        [bidId, milestoneIndex, txHash]
+      );
+    }
+
+    // Optional confirm (1 conf). MUST NOT block the HTTP response.
+    try {
+      if (blockchainService?.waitForConfirm && txHash && !txHash.startsWith('dev_')) {
+        await blockchainService.waitForConfirm(txHash, 1);
+      }
+    } catch (e) {
+      console.warn('waitForConfirm failed (left as pending)', e?.message || e);
+      return;
+    }
+
+    // Mark released + legacy JSON fields
+    ms.paymentTxHash = txHash || ms.paymentTxHash || null;
+    ms.paymentDate = new Date().toISOString();
+    ms.paymentPending = false;          // clear pending
+    ms.status = 'paid';                 // optional legacy signal
+    milestones[milestoneIndex] = ms;
+
+    await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2', [JSON.stringify(milestones), bidId]);
+    await pool.query(
+      `
+      UPDATE milestone_payments
+         SET status='released', tx_hash=COALESCE(tx_hash,$3), released_at=NOW(), amount_usd=COALESCE(amount_usd,$4)
+       WHERE bid_id=$1 AND milestone_index=$2
+      `,
+      [bidId, milestoneIndex, txHash || null, msAmountUSD]
+    );
+
+    // Notify best-effort
+    try {
+      const { rows: [proposal] } = await pool.query(
+        'SELECT * FROM proposals WHERE proposal_id=$1',
+        [bid.proposal_id]
+      );
+      if (proposal && typeof notifyPaymentReleased === 'function') {
+        await notifyPaymentReleased({
+          bid, proposal,
+          msIndex: milestoneIndex + 1,
+          amount: msAmountUSD,
+          txHash: txHash || null
+        });
+      }
+    } catch (e) {
+      console.warn('notifyPaymentReleased failed', e?.message || e);
+    }
+
+    // Optional: audit
+    try {
+      await writeAudit(bidId, req, {
+        payment_released: {
+          milestone_index: milestoneIndex,
+          amount_usd: msAmountUSD,
+          tx: txHash || null
+        }
+      });
+    } catch {}
+  } catch (e) {
+    console.error('Background pay-milestone failed (left pending)', e);
+    // Keep row as 'pending' so admin can retry safely.
   }
 });
 
