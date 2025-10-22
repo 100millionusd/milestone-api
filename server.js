@@ -5031,13 +5031,17 @@ if (willUseSafe) {
       throw new Error(`Wrong network: ${network.name}`);
     }
 
-    // 5) Pick a signer that IS a Safe owner
+    // 5) Pick a signer that IS a Safe owner - WITH DEBUGGING
     const rawKeys = (process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
       .split(",").map(s => s.trim()).filter(Boolean)
       .map(k => (k.startsWith("0x") ? k : `0x${k}`));
+
     if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured for Safe proposer");
 
-    // Get Safe owners
+    console.log("[SAFE] === PRIVATE KEY DEBUGGING ===");
+    console.log("[SAFE] Number of private keys found:", rawKeys.length);
+
+    // Get Safe owners first
     const PK = await import("@safe-global/protocol-kit");
     const Safe = PK.default;
 
@@ -5046,18 +5050,41 @@ if (willUseSafe) {
       safeAddress: process.env.SAFE_ADDRESS
     });
     const ownersLc = (await safeRO.getOwners()).map(a => a.toLowerCase());
-    console.log("[SAFE] owners (lc):", ownersLc);
+    console.log("[SAFE] Safe owners (lc):", ownersLc);
+
+    // Debug: Show what addresses each private key generates
+    for (let i = 0; i < rawKeys.length; i++) {
+      const wallet = new ethers.Wallet(rawKeys[i]);
+      const address = wallet.address;
+      const isOwner = ownersLc.includes(address.toLowerCase());
+      console.log(`[SAFE] Key ${i}: ${address} | Is Owner: ${isOwner} | First 10 chars of key: ${rawKeys[i].substring(0, 10)}...`);
+    }
 
     // Choose first configured key that is an owner
     let signer = null;
-    for (const k of rawKeys) {
-      const addr = new ethers.Wallet(k).address.toLowerCase();
-      if (ownersLc.includes(addr)) { 
-        signer = new ethers.Wallet(k, provider); 
+    let selectedKeyIndex = -1;
+
+    for (let i = 0; i < rawKeys.length; i++) {
+      const wallet = new ethers.Wallet(rawKeys[i]);
+      const address = wallet.address.toLowerCase();
+      if (ownersLc.includes(address)) { 
+        signer = new ethers.Wallet(rawKeys[i], provider);
+        selectedKeyIndex = i;
+        console.log(`[SAFE] ✅ Selected key ${i} for address: ${wallet.address}`);
         break; 
       }
     }
-    if (!signer) throw new Error(`None of the PRIVATE_KEYS is a Safe owner`);
+
+    if (!signer) {
+      console.error("[SAFE] ❌ NONE of the private keys correspond to Safe owners!");
+      console.error("[SAFE] Safe owners are:", ownersLc);
+      console.error("[SAFE] Available addresses from private keys:");
+      for (let i = 0; i < rawKeys.length; i++) {
+        const wallet = new ethers.Wallet(rawKeys[i]);
+        console.error(`[SAFE]   - ${wallet.address}`);
+      }
+      throw new Error(`None of the PRIVATE_KEYS is a Safe owner`);
+    }
 
     const safeSender = await signer.getAddress();
     console.log("[SAFE] using signer (owner):", safeSender);
@@ -5075,13 +5102,13 @@ if (willUseSafe) {
     const safeTxHash = await safe.getTransactionHash(safeTx);
     const senderSignature = await signer.signMessage(ethers.utils.arrayify(safeTxHash));
 
-    // 8) DIRECT API CALL - Let Safe service compute the hash
+    // 8) DIRECT API CALL
     console.log("[SAFE] Using direct API call...");
 
     const txServiceUrl = "https://safe-transaction-sepolia.safe.global";
     const safeAddress = process.env.SAFE_ADDRESS;
 
-    // First, get the current Safe state to ensure we have the right nonce
+    // Get current nonce
     console.log("[SAFE] Fetching current Safe state...");
     const safeInfoResponse = await fetch(`${txServiceUrl}/api/v1/safes/${safeAddress}/`);
     
@@ -5093,7 +5120,7 @@ if (willUseSafe) {
     const currentNonce = parseInt(safeInfo.nonce);
     console.log("[SAFE] Current Safe nonce:", currentNonce);
 
-    // Rebuild the Safe transaction with the correct nonce from the service
+    // Rebuild with correct nonce
     const safeWithCorrectNonce = await Safe.init({
       provider: RPC_URL,
       safeAddress: process.env.SAFE_ADDRESS
@@ -5103,29 +5130,29 @@ if (willUseSafe) {
     const safeTxWithNonce = await safeWithCorrectNonce.createTransaction({ 
       transactions: transactionsWithNonce,
       options: {
-        nonce: currentNonce  // Use the actual current nonce from service
+        nonce: currentNonce
       }
     });
 
-    // Recompute the hash with correct nonce
+    // Recompute hash with correct nonce
     const correctedSafeTxHash = await safeWithCorrectNonce.getTransactionHash(safeTxWithNonce);
     const correctedSenderSignature = await signer.signMessage(ethers.utils.arrayify(correctedSafeTxHash));
     
     console.log("[SAFE] Corrected SafeTxHash:", correctedSafeTxHash);
     console.log("[SAFE] Using nonce:", currentNonce);
 
-    // Propose transaction via direct API with corrected hash
+    // Propose transaction
     const proposalData = {
       to: tokenAddr,
       value: "0",
       data: data,
-      operation: 0, // CALL operation
+      operation: 0,
       safeTxGas: 0,
       baseGas: 0,
       gasPrice: "0",
       gasToken: "0x0000000000000000000000000000000000000000",
       refundReceiver: "0x0000000000000000000000000000000000000000",
-      nonce: currentNonce, // Use the actual nonce
+      nonce: currentNonce,
       contractTransactionHash: correctedSafeTxHash,
       sender: safeSender,
       signature: correctedSenderSignature,
@@ -5146,77 +5173,6 @@ if (willUseSafe) {
     if (!response.ok) {
       const errorText = await response.text();
       console.error("[SAFE] API Error:", response.status, errorText);
-      
-      // If we still get hash mismatch, try the alternative approach
-      if (response.status === 422 && errorText.includes("does not match")) {
-        console.log("[SAFE] Hash mismatch detected, trying alternative approach...");
-        
-        // Alternative: Let service compute the hash by not providing contractTransactionHash
-        const alternativeProposalData = {
-          to: tokenAddr,
-          value: "0",
-          data: data,
-          operation: 0,
-          safeTxGas: 0,
-          baseGas: 0,
-          gasPrice: "0",
-          gasToken: "0x0000000000000000000000000000000000000000",
-          refundReceiver: "0x0000000000000000000000000000000000000000",
-          nonce: currentNonce,
-          // Remove contractTransactionHash - let service compute it
-          sender: safeSender,
-          signature: correctedSenderSignature,
-          origin: "milestone-pay"
-        };
-
-        console.log("[SAFE] Trying alternative (service-computed hash)...");
-        const altResponse = await fetch(`${txServiceUrl}/api/v1/safes/${safeAddress}/multisig-transactions/`, {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(alternativeProposalData)
-        });
-
-        if (!altResponse.ok) {
-          const altErrorText = await altResponse.text();
-          console.error("[SAFE] Alternative approach failed:", altResponse.status, altErrorText);
-          throw new Error(`Both approaches failed: ${response.status} and ${altResponse.status}`);
-        }
-
-        const altResult = await altResponse.json();
-        console.log("[SAFE] ✅ Transaction proposed successfully via alternative approach!");
-        console.log("[SAFE] Service-computed SafeTxHash:", altResult.safeTxHash);
-
-        // Use the service-computed hash for database storage
-        await pool.query(
-          `UPDATE milestone_payments
-             SET safe_tx_hash=$3, safe_nonce=$4
-           WHERE bid_id=$1 AND milestone_index=$2`,
-          [bidId, milestoneIndex, altResult.safeTxHash, currentNonce]
-        );
-
-        // 9) Re-notify with Safe tx hash
-        try {
-          const { rows: [proposal] } = await pool.query(
-            "SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1",
-            [bid.proposal_id]
-          );
-          if (proposal && typeof notifyPaymentPending === "function") {
-            await notifyPaymentPending({
-              bid,
-              proposal,
-              msIndex: milestoneIndex + 1,
-              amount: msAmountUSD,
-              method: "safe",
-              txRef: altResult.safeTxHash
-            });
-          }
-        } catch (e) {
-          console.warn("notifyPaymentPending failed", e?.message || e);
-        }
-
-        return; // Success with alternative approach
-      }
-      
       throw new Error(`API request failed: ${response.status}`);
     }
 
