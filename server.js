@@ -4994,175 +4994,164 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
         // Preferred stablecoin symbol (e.g. USDT/USDC)
         const token = String(bid.preferred_stablecoin || "USDT").toUpperCase();
 
-// ---------- SAFE PATH ----------
+// ---------- SAFE PATH (no ApiKit, no ProtocolKit, no viem) ----------
 if (willUseSafe) {
   try {
-    // 1) Resolve token + amount
+    const RPC_URL = process.env.SEPOLIA_RPC_URL;
+    const SAFE_ADDRESS = process.env.SAFE_ADDRESS;
+    const SAFE_API_KEY = process.env.SAFE_API_KEY;
+
+    if (!RPC_URL) throw new Error("SEPOLIA_RPC_URL not configured");
+    if (!SAFE_ADDRESS) throw new Error("SAFE_ADDRESS not configured");
+    if (!SAFE_API_KEY) throw new Error("SAFE_API_KEY not configured");
+
+    const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
+
+    // 0) Minimal Safe ABI (owners, nonce, hash)
+    const SAFE_ABI = [
+      "function getOwners() view returns (address[])",
+      "function nonce() view returns (uint256)",
+      "function getTransactionHash(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 _nonce) view returns (bytes32)"
+    ];
+    const ZERO = "0x0000000000000000000000000000000000000000";
+    const safeContract = new ethers.Contract(SAFE_ADDRESS, SAFE_ABI, provider);
+
+    // 1) pick an owner key from env
+    const rawKeys = (process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
+      .split(",").map(s => s.trim()).filter(Boolean)
+      .map(k => (k.startsWith("0x") ? k : `0x${k}`));
+    if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured");
+
+    // 2) verify signer is an owner
+    const ownersLc = (await safeContract.getOwners()).map(a => a.toLowerCase());
+    console.log("[SAFE] owners (lc):", ownersLc);
+
+    let signerWallet = null;
+    for (const k of rawKeys) {
+      const w = new ethers.Wallet(k, provider);
+      if (ownersLc.includes(w.address.toLowerCase())) { signerWallet = w; break; }
+    }
+    if (!signerWallet) throw new Error(`None of the provided keys is a Safe owner. Owners: ${ownersLc.join(", ")}`);
+
+    const senderAddr = await signerWallet.getAddress();
+    console.log("[SAFE] using signer (owner):", senderAddr);
+
+    // 3) resolve token + amount
     const tokenMeta = (TOKENS && TOKENS[token]) || {};
     const tokenAddr = tokenMeta.address;
-    const tokenDec = Number.isInteger(tokenMeta.decimals) ? tokenMeta.decimals : 6;
-    if (!tokenAddr) throw new Error(`Unknown token ${token} for Safe transfer (no address in TOKENS)`);
+    const tokenDec  = Number.isInteger(tokenMeta.decimals) ? tokenMeta.decimals : 6;
+    if (!tokenAddr) throw new Error(`Unknown token ${token} (no address in TOKENS)`);
 
     const amountUnits = typeof toTokenUnits === "function"
       ? await toTokenUnits(token, msAmountUSD)
       : ethers.utils.parseUnits(String(msAmountUSD), tokenDec);
 
-    // 2) Encode ERC20.transfer(to, amount)
+    // 4) encode ERC20.transfer(to, amount)
     const erc20Iface = new ethers.utils.Interface(ERC20_ABI);
-    const data = erc20Iface.encodeFunctionData("transfer", [
-      bid.wallet_address,
-      amountUnits
-    ]);
-
-    // 3) JSON-RPC provider
-    const RPC_URL = process.env.SEPOLIA_RPC_URL;
-    const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
-
-    // 4) Pick a signer that IS a Safe owner
-    const rawKeys = (process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
-      .split(",").map(s => s.trim()).filter(Boolean)
-      .map(k => (k.startsWith("0x") ? k : `0x${k}`));
-
-    if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured for Safe proposer");
-
-    // Get Safe owners
-    const PK = await import("@safe-global/protocol-kit");
-    const Safe = PK.default;
-
-    const safeRO = await Safe.init({
-      provider: RPC_URL,
-      safeAddress: process.env.SAFE_ADDRESS
-    });
-    const ownersLc = (await safeRO.getOwners()).map(a => a.toLowerCase());
-
-    // Choose first configured key that is an owner
-    let signer = null;
-    for (let i = 0; i < rawKeys.length; i++) {
-      const wallet = new ethers.Wallet(rawKeys[i]);
-      const address = wallet.address.toLowerCase();
-      if (ownersLc.includes(address)) { 
-        signer = new ethers.Wallet(rawKeys[i], provider);
-        console.log(`[SAFE] ✅ Selected key ${i} for address: ${wallet.address}`);
-        break; 
-      }
+    const data = erc20Iface.encodeFunctionData("transfer", [ bid.wallet_address, amountUnits ]);
+    if (typeof data !== "string" || !data.startsWith("0x")) {
+      throw new Error("[SAFE] invalid data payload for ERC20.transfer");
     }
 
-    if (!signer) throw new Error(`None of the PRIVATE_KEYS is a Safe owner`);
+    // 5) compute Safe tx hash directly via the Safe contract
+    const op = 0; // CALL
+    // pull current Safe nonce
+    const nonceBn = await safeContract.nonce();
+    const nonce = ethers.BigNumber.isBigNumber(nonceBn) ? nonceBn.toNumber() : Number(nonceBn);
+    if (!Number.isFinite(nonce)) throw new Error("[SAFE] invalid Safe nonce");
 
-    const safeSender = await signer.getAddress();
-    console.log("[SAFE] using signer (owner):", safeSender);
+    const safeTxHash = await safeContract.getTransactionHash(
+      tokenAddr,            // to
+      0,                    // value
+      data,                 // data
+      op,                   // operation
+      0,                    // safeTxGas
+      0,                    // baseGas
+      0,                    // gasPrice
+      ZERO,                 // gasToken
+      ZERO,                 // refundReceiver
+      nonce                 // _nonce
+    );
 
-    // 5) Get current nonce
-    const txServiceUrl = "https://safe-transaction-sepolia.safe.global";
-    const safeAddress = process.env.SAFE_ADDRESS;
-
-    console.log("[SAFE] Fetching current Safe state...");
-    const safeInfoResponse = await fetch(`${txServiceUrl}/api/v1/safes/${safeAddress}/`);
-    
-    if (!safeInfoResponse.ok) {
-      throw new Error(`Safe info failed: ${safeInfoResponse.status}`);
+    // 6) owner signature (ETH_SIGN / personal_sign) + normalize for Tx-Service
+    let senderSignature = await signerWallet.signMessage(ethers.utils.arrayify(safeTxHash));
+    if (typeof senderSignature !== "string" || !senderSignature.startsWith("0x")) {
+      throw new Error("[SAFE] missing/invalid signature hex");
     }
-    
-    const safeInfo = await safeInfoResponse.json();
-    const currentNonce = parseInt(safeInfo.nonce);
-    console.log("[SAFE] Current Safe nonce:", currentNonce);
+    // Append type suffix "01" if not present (Tx-Service expects it for eth_sign)
+    if (!senderSignature.toLowerCase().endsWith("01")) {
+      // 65-byte sig (130 hex chars) -> add '01'
+      const hexNoPrefix = senderSignature.slice(2);
+      if (hexNoPrefix.length !== 130) throw new Error(`[SAFE] unexpected signature length=${hexNoPrefix.length}`);
+      senderSignature = senderSignature + "01";
+    }
 
-    // 6) Build Safe tx with correct nonce
-    const safe = await Safe.init({
-      provider: RPC_URL,
-      safeAddress: process.env.SAFE_ADDRESS
-    });
+    // sanity: recover must match signer (strip '01' for recovery)
+    const sigForRecovery = "0x" + senderSignature.slice(2, 132);
+    const recovered = ethers.utils.verifyMessage(ethers.utils.arrayify(safeTxHash), sigForRecovery);
+    if (recovered.toLowerCase() !== senderAddr.toLowerCase()) {
+      throw new Error(`[SAFE] signature mismatch: recovered ${recovered}, expected ${senderAddr}`);
+    }
 
-    const transactions = [{ to: tokenAddr, value: "0", data }];
-    const safeTx = await safe.createTransaction({ 
-      transactions,
-      options: {
-        nonce: currentNonce
-      }
-    });
+    // 7) DIRECT POST to Safe Tx-Service (global base; no ApiKit/viem)
+    const TX_SERVICE_BASE = (process.env.SAFE_TXSERVICE_URL || "https://api.safe.global/tx-service/sepolia")
+      .trim().replace(/\/+$/, "");
+    const safeAddrLc = SAFE_ADDRESS.trim().toLowerCase();
 
-    // 7) Compute tx hash and sign (SIMPLE APPROACH)
-    const safeTxHash = await safe.getTransactionHash(safeTx);
-    console.log("[SAFE] SafeTxHash:", safeTxHash);
-
-    // Simple signing - let's see what the service expects
-    const senderSignature = await signer.signMessage(ethers.utils.arrayify(safeTxHash));
-    console.log("[SAFE] Signature:", senderSignature);
-
-    // 8) Propose transaction - try without contractTransactionHash first
-    console.log("[SAFE] Proposing transaction (letting service compute hash)...");
-
-    const proposalData = {
+    const body = {
       to: tokenAddr,
       value: "0",
-      data: data,
-      operation: 0,
+      data,                               // 0x…
+      operation: 0,                       // CALL
+      gasToken: ZERO,
       safeTxGas: 0,
       baseGas: 0,
       gasPrice: "0",
-      gasToken: "0x0000000000000000000000000000000000000000",
-      refundReceiver: "0x0000000000000000000000000000000000000000",
-      nonce: currentNonce,
-      // REMOVED: contractTransactionHash - let service compute it
-      sender: safeSender,
+      refundReceiver: ZERO,
+      nonce,
+      contractTransactionHash: safeTxHash,
+      sender: senderAddr,
       signature: senderSignature,
       origin: "milestone-pay"
     };
 
-    console.log("[SAFE] API Endpoint:", `${txServiceUrl}/api/v1/safes/${safeAddress}/multisig-transactions/`);
-    
-    const response = await fetch(`${txServiceUrl}/api/v1/safes/${safeAddress}/multisig-transactions/`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(proposalData)
-    });
+    console.log("[SAFE] using DIRECT POST path");
+    console.log("[SAFE] POST", `${TX_SERVICE_BASE}/api/v2/safes/${safeAddrLc}/multisig-transactions/`);
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("[SAFE] API Error:", response.status, errorText);
-      
-      // If that fails, try with the hash we computed
-      console.log("[SAFE] Trying with our computed hash...");
-      proposalData.contractTransactionHash = safeTxHash;
-      
-      const response2 = await fetch(`${txServiceUrl}/api/v1/safes/${safeAddress}/multisig-transactions/`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(proposalData)
+    // Optional: early info check
+    {
+      const info = await fetch(`${TX_SERVICE_BASE}/api/v1/safes/${safeAddrLc}/`, {
+        headers: { "Authorization": `Bearer ${SAFE_API_KEY}` }
       });
-
-      if (!response2.ok) {
-        const errorText2 = await response2.text();
-        console.error("[SAFE] Second attempt failed:", response2.status, errorText2);
-        throw new Error(`API request failed: ${response.status} and ${response2.status}`);
+      if (!info.ok) {
+        const msg = await info.text().catch(() => "");
+        throw new Error(`[SAFE info] ${info.status} ${msg || info.statusText}`);
       }
-
-      const result = await response2.json();
-      console.log("[SAFE] ✅ Transaction proposed successfully (with our hash)!");
-      console.log("[SAFE] SafeTxHash:", result.safeTxHash);
-      
-      // Store the result
-      await pool.query(
-        `UPDATE milestone_payments SET safe_tx_hash=$3, safe_nonce=$4 WHERE bid_id=$1 AND milestone_index=$2`,
-        [bidId, milestoneIndex, result.safeTxHash, currentNonce]
-      );
-    } else {
-      const result = await response.json();
-      console.log("[SAFE] ✅ Transaction proposed successfully (service computed hash)!");
-      console.log("[SAFE] SafeTxHash:", result.safeTxHash);
-      
-      // Store the result
-      await pool.query(
-        `UPDATE milestone_payments SET safe_tx_hash=$3, safe_nonce=$4 WHERE bid_id=$1 AND milestone_index=$2`,
-        [bidId, milestoneIndex, result.safeTxHash, currentNonce]
-      );
     }
 
-    // 9) Re-notify with Safe tx hash
+    const resp = await fetch(`${TX_SERVICE_BASE}/api/v2/safes/${safeAddrLc}/multisig-transactions/`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "Authorization": `Bearer ${SAFE_API_KEY}`
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => "");
+      throw new Error(`TxService propose failed [${resp.status}] ${txt || resp.statusText}`);
+    }
+
+    // 8) store safe_tx_hash + nonce
+    await pool.query(
+      `UPDATE milestone_payments
+         SET safe_tx_hash=$3, safe_nonce=$4
+       WHERE bid_id=$1 AND milestone_index=$2`,
+      [bidId, milestoneIndex, safeTxHash, nonce]
+    );
+
+    // 9) notify
     try {
       const { rows: [proposal] } = await pool.query(
         "SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1",
@@ -5175,18 +5164,17 @@ if (willUseSafe) {
           msIndex: milestoneIndex + 1,
           amount: msAmountUSD,
           method: "safe",
-          txRef: result.safeTxHash
+          txRef: safeTxHash
         });
       }
     } catch (e) {
-      console.warn("notifyPaymentPending failed", e?.message || e);
+      console.warn("notifyPaymentPending (post-safe-hash) failed", e?.message || e);
     }
 
-    return; // DO NOT mark released here
-
+    return;
   } catch (safeErr) {
     console.error("SAFE propose failed; leaving pending", safeErr?.message || safeErr);
-    return; // leave pending
+    return;
   }
 }
 
