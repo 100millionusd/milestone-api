@@ -5044,9 +5044,9 @@ if (willUseSafe) {
     console.log("[SAFE] using signer (owner):", senderAddr);
 
    // 7) Build Safe transaction with Protocol Kit v4 (with adapter)
-const PK = await import('@safe-global/protocol-kit');
-const { EthersAdapter } = PK;
-const SafeProto = PK.default;
+const protocolKit2 = await import('@safe-global/protocol-kit');
+const { EthersAdapter } = protocolKit2;
+const SafeProto = protocolKit2.default;
 
 const ethAdapter = new EthersAdapter({ ethers, signerOrProvider: signer });
 const safe = await SafeProto.create({
@@ -5061,17 +5061,6 @@ const safeTx = await safe.createTransaction({
 const safeTxHash = await safe.getTransactionHash(safeTx);
 const signature = await safe.signTransaction(safeTx);
 const senderAddr = await signer.getAddress();
-
-// 9) Propose to the Sepolia Tx Service (no chainId when txServiceUrl is set)
-const { default: SafeApiKit } = await import('@safe-global/api-kit');
-const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global')
-  .trim()
-  .replace(/\/+$/, '');
-
-const api = new SafeApiKit({
-  txServiceUrl,
-  ethAdapter,            // <-- important: pass the adapter here
-});
 
 // (Optional) quick preflight so you don’t get a blind 404
 try {
