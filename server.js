@@ -4997,110 +4997,162 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
 // ---------- SAFE PATH ----------
 if (willUseSafe) {
   try {
-    const RPC_URL  = process.env.SEPOLIA_RPC_URL;
-    const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
-
-    // 1) pick a Safe owner key from env (SAFE_OWNER_KEYS or fallback PRIVATE_KEYS)
-    const rawKeys = (process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
-      .split(",").map(s => s.trim()).filter(Boolean)
-      .map(k => (k.startsWith("0x") ? k : `0x${k}`));
-    if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured");
-
-    // 2) verify it is an owner
-    const PK = await import("@safe-global/protocol-kit");
-    const SafePK = PK.default;
-
-    const safeRO = await SafePK.init({
-      provider: RPC_URL,
-      safeAddress: process.env.SAFE_ADDRESS
-    });
-    const ownersLc = (await safeRO.getOwners()).map(a => a.toLowerCase());
-    console.log("[SAFE] owners (lc):", ownersLc);
-
-    let signerWallet = null;
-    for (const k of rawKeys) {
-      const w = new ethers.Wallet(k, provider);
-      if (ownersLc.includes(w.address.toLowerCase())) { signerWallet = w; break; }
-    }
-    if (!signerWallet) throw new Error(`None of the provided keys is a Safe owner. Owners: ${ownersLc.join(", ")}`);
-    const senderAddr = await signerWallet.getAddress();
-    console.log("[SAFE] using signer (owner):", senderAddr);
-
-    // 3) resolve token + amount
+    // 1) Resolve token + amount
     const tokenMeta = (TOKENS && TOKENS[token]) || {};
     const tokenAddr = tokenMeta.address;
-    const tokenDec  = Number.isInteger(tokenMeta.decimals) ? tokenMeta.decimals : 6;
-    if (!tokenAddr) throw new Error(`Unknown token ${token} (no address in TOKENS)`);
+    const tokenDec = Number.isInteger(tokenMeta.decimals) ? tokenMeta.decimals : 6;
+    if (!tokenAddr) throw new Error(`Unknown token ${token} for Safe transfer (no address in TOKENS)`);
 
     const amountUnits = typeof toTokenUnits === "function"
       ? await toTokenUnits(token, msAmountUSD)
       : ethers.utils.parseUnits(String(msAmountUSD), tokenDec);
 
-    // 4) encode ERC20.transfer(to, amount)
+    // 2) Encode ERC20.transfer(to, amount)
     const erc20Iface = new ethers.utils.Interface(ERC20_ABI);
     const data = erc20Iface.encodeFunctionData("transfer", [
       bid.wallet_address,
       amountUnits
     ]);
 
-    // 5) build Safe tx (read-only ProtocolKit)
-    const safe = await SafePK.init({ provider: RPC_URL, safeAddress: process.env.SAFE_ADDRESS });
+    // 3) JSON-RPC provider
+    const RPC_URL = process.env.SEPOLIA_RPC_URL;
+    const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
+
+    // 4) Network verification
+    const network = await provider.getNetwork();
+    console.log("[SAFE] Provider Network:", {
+      name: network.name,
+      chainId: network.chainId,
+      chainIdNumber: Number(network.chainId)
+    });
+
+    if (Number(network.chainId) !== 11155111) {
+      console.error("[SAFE] ❌ WRONG NETWORK! Expected 11155111 (Sepolia)");
+      throw new Error(`Wrong network: ${network.name}`);
+    }
+
+    // 5) Pick a signer that IS a Safe owner
+    const rawKeys = (process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
+      .split(",").map(s => s.trim()).filter(Boolean)
+      .map(k => (k.startsWith("0x") ? k : `0x${k}`));
+    if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured for Safe proposer");
+
+    // Get Safe owners
+    const PK = await import("@safe-global/protocol-kit");
+    const Safe = PK.default;
+
+    const safeRO = await Safe.init({
+      provider: RPC_URL,
+      safeAddress: process.env.SAFE_ADDRESS
+    });
+    const ownersLc = (await safeRO.getOwners()).map(a => a.toLowerCase());
+    console.log("[SAFE] owners (lc):", ownersLc);
+
+    // Choose first configured key that is an owner
+    let signer = null;
+    for (const k of rawKeys) {
+      const addr = new ethers.Wallet(k).address.toLowerCase();
+      if (ownersLc.includes(addr)) { 
+        signer = new ethers.Wallet(k, provider); 
+        break; 
+      }
+    }
+    if (!signer) throw new Error(`None of the PRIVATE_KEYS is a Safe owner`);
+
+    const safeSender = await signer.getAddress();
+    console.log("[SAFE] using signer (owner):", safeSender);
+
+    // 6) Build Safe tx
+    const safe = await Safe.init({
+      provider: RPC_URL,
+      safeAddress: process.env.SAFE_ADDRESS
+    });
+
     const transactions = [{ to: tokenAddr, value: "0", data }];
     const safeTx = await safe.createTransaction({ transactions });
 
-    const safeTxHash = await safe.getTransactionHash(safeTx);              // contractTransactionHash
-    const nonce      = Number(safeTx.data.nonce);                          // required by service
+    // 7) Compute tx hash and sign
+    const safeTxHash = await safe.getTransactionHash(safeTx);
+    const senderSignature = await signer.signMessage(ethers.utils.arrayify(safeTxHash));
 
-    // 6) owner signature using ProtocolKit helper (avoids format mismatches)
-const safeWithSigner = await SafePK.init({
-  provider: RPC_URL,
-  safeAddress: process.env.SAFE_ADDRESS,
-  signer: signerWallet
-});
-
-let senderSignature = await safeWithSigner.signTransactionHash(safeTxHash);
-// signTransactionHash may return an object in some versions; normalize to hex string
-senderSignature = typeof senderSignature === "string" ? senderSignature : senderSignature.data;
-
-// (optional) sanity check: the signature MUST recover to the selected signer
-// ProtocolKit's signature may include a trailing "01" (signature type). Strip it for recovery only.
-const sigHex = senderSignature.toLowerCase();
-const sigNoType = sigHex.endsWith("01") && sigHex.length === 136 ? ("0x" + sigHex.slice(2, 132)) : senderSignature;
-
-const recovered = ethers.utils.verifyMessage(ethers.utils.arrayify(safeTxHash), sigNoType);
-if (recovered.toLowerCase() !== senderAddr.toLowerCase()) {
-  throw new Error(`[SAFE] signature mismatch: recovered ${recovered}, expected ${senderAddr}`);
-}
-
-    // 7) Propose via Safe API Kit (global tx-service + API key)
-    if (!process.env.SAFE_API_KEY) {
-      throw new Error("SAFE_API_KEY not configured");
-    }
+    // 8) Initialize SafeApiKit WITH API KEY
     const { default: SafeApiKit } = await import("@safe-global/api-kit");
-    const apiKit = new SafeApiKit({
-      chainId: 11155111n,                  // Sepolia
-      apiKey: process.env.SAFE_API_KEY
-      // (optional) if you self-host a tx-service, pass txServiceUrl here
-      // txServiceUrl: process.env.SAFE_TXSERVICE_URL
+    
+    const txServiceUrl = "https://safe-transaction-sepolia.safe.global";
+    const chainId = 11155111;
+    const safeApiKey = process.env.SAFE_API_KEY;
+
+    console.log("[SAFE] Initializing SafeApiKit with API Key:", {
+      txServiceUrl,
+      chainId,
+      hasApiKey: !!safeApiKey
     });
 
-    await apiKit.proposeTransaction({
-      safeAddress: String(process.env.SAFE_ADDRESS),
-      safeTransactionData: safeTx.data,
+    const api = new SafeApiKit({
+      chainId,
+      txServiceUrl,
+      apiKey: safeApiKey // Include the API key
+    });
+
+    // 9) Test connection with API key
+    try {
+      console.log("[SAFE] Testing Safe info with API key...");
+      const safeInfo = await api.getSafeInfo(process.env.SAFE_ADDRESS);
+      console.log("[SAFE] ✅ SafeApiKit connected successfully with API key");
+      console.log("[SAFE] Safe threshold:", safeInfo.threshold);
+      console.log("[SAFE] Safe nonce:", safeInfo.nonce);
+    } catch (apiError) {
+      console.error("[SAFE] ❌ SafeApiKit failed with API key:", apiError.message);
+      
+      // Try without API key as fallback
+      console.log("[SAFE] Trying without API key...");
+      const apiWithoutKey = new SafeApiKit({
+        chainId,
+        txServiceUrl,
+        // No apiKey parameter
+      });
+      
+      try {
+        const safeInfo = await apiWithoutKey.getSafeInfo(process.env.SAFE_ADDRESS);
+        console.log("[SAFE] ✅ Connected without API key");
+        // Use the API without key
+        var api = apiWithoutKey;
+      } catch (noKeyError) {
+        console.error("[SAFE] ❌ Both with and without API key failed");
+        throw new Error(`Safe API connection failed: ${apiError.message}`);
+      }
+    }
+
+    // 10) Propose transaction
+    console.log("[SAFE] About to propose transaction...");
+    await api.proposeTransaction({
+      safeAddress: process.env.SAFE_ADDRESS,
       safeTxHash,
-      senderAddress: senderAddr,
-      senderSignature
+      safeTransactionData: safeTx.data,
+      senderAddress: safeSender,
+      senderSignature,
+      origin: "milestone-pay"
     });
 
-    // 8) store safe_tx_hash immediately; nonce optional
+    console.log("[SAFE] ✅ Transaction proposed successfully!");
+
+    // 11) Persist Safe refs
+    let safeNonce = null;
+    try {
+      const txMeta = await api.getTransaction(safeTxHash);
+      if (txMeta?.nonce != null) safeNonce = Number(txMeta.nonce);
+    } catch (e) {
+      console.warn("[SAFE] Could not fetch transaction nonce:", e.message);
+    }
+
     await pool.query(
       `UPDATE milestone_payments
          SET safe_tx_hash=$3, safe_nonce=$4
        WHERE bid_id=$1 AND milestone_index=$2`,
-      [bidId, milestoneIndex, safeTxHash, Number.isFinite(nonce) ? nonce : null]
+      [bidId, milestoneIndex, safeTxHash, Number.isFinite(safeNonce) ? safeNonce : null]
     );
 
-    // 9) notify with the Safe hash
+    // 12) Re-notify with Safe tx hash
     try {
       const { rows: [proposal] } = await pool.query(
         "SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1",
@@ -5117,15 +5169,14 @@ if (recovered.toLowerCase() !== senderAddr.toLowerCase()) {
         });
       }
     } catch (e) {
-      console.warn("notifyPaymentPending (post-safe-hash) failed", e?.message || e);
+      console.warn("notifyPaymentPending failed", e?.message || e);
     }
 
-    // DO NOT mark released here
-    return;
+    return; // DO NOT mark released here
+
   } catch (safeErr) {
     console.error("SAFE propose failed; leaving pending", safeErr?.message || safeErr);
-    // leave pending; reconcile-safe will pick it up
-    return;
+    return; // leave pending
   }
 }
 
