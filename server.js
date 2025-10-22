@@ -5043,50 +5043,52 @@ if (willUseSafe) {
     const senderAddr = (await signer.getAddress()).toLowerCase();
     console.log("[SAFE] using signer (owner):", senderAddr);
 
-    // 7) Build Safe transaction (read-only Safe; no signer)
-    const safe = await Safe.init({
-      provider: RPC_URL,
-      safeAddress: process.env.SAFE_ADDRESS
-    });
-    const transactions = [{ to: tokenAddr, value: "0", data }];
-    const safeTx = await safe.createTransaction({ transactions });
+   // 7) Build Safe transaction with Protocol Kit v4 (with adapter)
+const PK = await import('@safe-global/protocol-kit');
+const { EthersAdapter } = PK;
+const SafeProto = PK.default;
 
-    // 8) Hash + sign locally (no RPC personal_sign)
-    const safeTxHash = await safe.getTransactionHash(safeTx);
-    const senderSignature = await signer.signMessage(ethers.utils.arrayify(safeTxHash));
+const ethAdapter = new EthersAdapter({ ethers, signerOrProvider: signer });
+const safe = await SafeProto.create({
+  ethAdapter,
+  safeAddress: process.env.SAFE_ADDRESS,
+});
 
-    // 9) Propose to the Tx Service
-    const AK = await import("@safe-global/api-kit");
-    const SafeApiKit = AK.default;
+// 8) Create + sign Safe tx (v4 shape)
+const safeTx = await safe.createTransaction({
+  safeTransactionData: { to: tokenAddr, value: '0', data }
+});
+const safeTxHash = await safe.getTransactionHash(safeTx);
+const signature = await safe.signTransaction(safeTx);
+const senderAddr = await signer.getAddress();
 
-    const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global')
+// 9) Propose to the Sepolia Tx Service (no chainId when txServiceUrl is set)
+const { default: SafeApiKit } = await import('@safe-global/api-kit');
+const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global')
   .trim()
-  .replace(/\/+$/, ''); // no trailing slash
+  .replace(/\/+$/, '');
 
-// (Optional but super helpful) Preflight: verify the Safe exists on this service
+const api = new SafeApiKit({
+  txServiceUrl,
+  ethAdapter,            // <-- important: pass the adapter here
+});
+
+// (Optional) quick preflight so you don’t get a blind 404
 try {
   const ok = await fetch(`${txServiceUrl}/api/v1/safes/${process.env.SAFE_ADDRESS}/`);
-  if (!ok.ok) {
-    throw new Error(`TxService ${txServiceUrl} responded ${ok.status} for /safes/${process.env.SAFE_ADDRESS}/`);
-  }
+  if (!ok.ok) throw new Error(`TxService ${txServiceUrl} responded ${ok.status} for /safes/${process.env.SAFE_ADDRESS}/`);
 } catch (preflightErr) {
   throw new Error(`[TxService preflight] ${preflightErr.message || preflightErr}`);
 }
 
-// Important: do NOT pass chainId when txServiceUrl is provided
-const api = new SafeApiKit({
-  txServiceUrl,
-  apiKey: process.env.SAFE_API_KEY || undefined, // fine if undefined
+await api.proposeTransaction({
+  safeAddress: process.env.SAFE_ADDRESS,
+  safeTransactionData: safeTx.data,
+  safeTxHash,
+  senderAddress: senderAddr,
+  senderSignature: signature.data,
+  origin: 'milestone-pay',
 });
-
-    await api.proposeTransaction({
-      safeAddress: process.env.SAFE_ADDRESS,
-      safeTxHash,
-      safeTransactionData: safeTx.data, // Protocol Kit v4
-      senderAddress: senderAddr,
-      senderSignature,
-      origin: "milestone-pay"
-    });
 
     // 10) Persist Safe refs
     let safeNonce = null;
