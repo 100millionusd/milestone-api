@@ -5000,7 +5000,7 @@ if (willUseSafe) {
     // 1) Resolve token + amount
     const tokenMeta = (TOKENS && TOKENS[token]) || {};
     const tokenAddr = tokenMeta.address;
-    const tokenDec  = Number.isInteger(tokenMeta.decimals) ? tokenMeta.decimals : 6;
+    const tokenDec = Number.isInteger(tokenMeta.decimals) ? tokenMeta.decimals : 6;
     if (!tokenAddr) throw new Error(`Unknown token ${token} for Safe transfer (no address in TOKENS)`);
 
     const amountUnits = typeof toTokenUnits === "function"
@@ -5015,32 +5015,29 @@ if (willUseSafe) {
     ]);
 
     // 3) JSON-RPC provider
-    const RPC_URL  = process.env.SEPOLIA_RPC_URL;
+    const RPC_URL = process.env.SEPOLIA_RPC_URL;
     const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
 
-    // 🚨 NETWORK VERIFICATION 🚨
-const network = await provider.getNetwork();
-console.log("[SAFE] Provider Network:", {
-  name: network.name,
-  chainId: network.chainId,
-  chainIdNumber: Number(network.chainId)
-});
+    // 4) Network verification
+    const network = await provider.getNetwork();
+    console.log("[SAFE] Provider Network:", {
+      name: network.name,
+      chainId: network.chainId,
+      chainIdNumber: Number(network.chainId)
+    });
 
-// Verify we're on Sepolia
-if (Number(network.chainId) !== 11155111) {
-  console.error("[SAFE] ❌ WRONG NETWORK! Expected 11155111 (Sepolia), got:", Number(network.chainId));
-  throw new Error(`Wrong network: ${network.name} (chainId: ${network.chainId})`);
-} else {
-  console.log("[SAFE] ✅ Correct network: Sepolia");
-}
+    if (Number(network.chainId) !== 11155111) {
+      console.error("[SAFE] ❌ WRONG NETWORK! Expected 11155111 (Sepolia)");
+      throw new Error(`Wrong network: ${network.name}`);
+    }
 
-    // 4) Pick a signer that IS a Safe owner
+    // 5) Pick a signer that IS a Safe owner
     const rawKeys = (process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
       .split(",").map(s => s.trim()).filter(Boolean)
       .map(k => (k.startsWith("0x") ? k : `0x${k}`));
     if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured for Safe proposer");
 
-    // Owners from the Safe
+    // Get Safe owners
     const PK = await import("@safe-global/protocol-kit");
     const Safe = PK.default;
 
@@ -5055,14 +5052,17 @@ if (Number(network.chainId) !== 11155111) {
     let signer = null;
     for (const k of rawKeys) {
       const addr = new ethers.Wallet(k).address.toLowerCase();
-      if (ownersLc.includes(addr)) { signer = new ethers.Wallet(k, provider); break; }
+      if (ownersLc.includes(addr)) { 
+        signer = new ethers.Wallet(k, provider); 
+        break; 
+      }
     }
-    if (!signer) throw new Error(`None of the PRIVATE_KEYS is a Safe owner. Owners: ${ownersLc.join(", ")}`);
+    if (!signer) throw new Error(`None of the PRIVATE_KEYS is a Safe owner`);
 
     const safeSender = await signer.getAddress();
     console.log("[SAFE] using signer (owner):", safeSender);
 
-    // 5) Build Safe tx (read-only Safe for hashing)
+    // 6) Build Safe tx
     const safe = await Safe.init({
       provider: RPC_URL,
       safeAddress: process.env.SAFE_ADDRESS
@@ -5071,104 +5071,51 @@ if (Number(network.chainId) !== 11155111) {
     const transactions = [{ to: tokenAddr, value: "0", data }];
     const safeTx = await safe.createTransaction({ transactions });
 
-    // 6) Compute tx hash and sign it locally (eth_sign)
+    // 7) Compute tx hash and sign
     const safeTxHash = await safe.getTransactionHash(safeTx);
     const senderSignature = await signer.signMessage(ethers.utils.arrayify(safeTxHash));
 
-    // 7) Propose to the Transaction Service
-const { default: SafeApiKit } = await import("@safe-global/api-kit");
-const net = await provider.getNetwork();
-const chainId = Number(net.chainId);
-const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || "https://safe-transaction-sepolia.safe.global")
-  .trim()
-  .replace(/\/+$/, "");
+    // 8) Initialize SafeApiKit with CORRECT URL
+    const { default: SafeApiKit } = await import("@safe-global/api-kit");
+    const txServiceUrl = "https://safe-transaction-sepolia.safe.global/api/v1"; // 🚨 CRITICAL: Include /api/v1
+    
+    console.log("[SAFE] Initializing SafeApiKit with URL:", txServiceUrl);
+    
+    const api = new SafeApiKit({
+      chainId: 11155111, // Explicitly set Sepolia chainId
+      txServiceUrl,
+    });
 
-console.log("[SAFE] === NETWORK VERIFICATION ===");
-console.log("[SAFE] ChainId:", chainId);
-console.log("[SAFE] TxService URL:", txServiceUrl);
-console.log("[SAFE] Safe Address:", process.env.SAFE_ADDRESS);
+    // 9) Test connection
+    try {
+      const safeInfo = await api.getSafeInfo(process.env.SAFE_ADDRESS);
+      console.log("[SAFE] ✅ SafeApiKit connected successfully");
+    } catch (apiError) {
+      console.error("[SAFE] ❌ SafeApiKit failed:", apiError.message);
+      throw new Error(`Safe API connection failed: ${apiError.message}`);
+    }
 
-// TEST DIRECTLY WITH FETCH FIRST
-try {
-  const testUrl = `${txServiceUrl}/api/v1/safes/${process.env.SAFE_ADDRESS}/`;
-  console.log("[SAFE] Testing direct URL:", testUrl);
-  
-  const response = await fetch(testUrl);
-  console.log("[SAFE] Direct fetch status:", response.status);
-  
-  if (response.ok) {
-    const safeData = await response.json();
-    console.log("[SAFE] ✅ Direct fetch SUCCESS - Safe exists");
-    console.log("[SAFE] Safe nonce:", safeData.nonce);
-    console.log("[SAFE] Safe owners:", safeData.owners);
-  } else {
-    console.error("[SAFE] ❌ Direct fetch failed with status:", response.status);
-    const errorText = await response.text();
-    console.error("[SAFE] Error response:", errorText);
-  }
-} catch (fetchError) {
-  console.error("[SAFE] ❌ Direct fetch error:", fetchError.message);
-}
+    // 10) Propose transaction
+    console.log("[SAFE] Proposing transaction...");
+    await api.proposeTransaction({
+      safeAddress: process.env.SAFE_ADDRESS,
+      safeTxHash,
+      safeTransactionData: safeTx.data,
+      senderAddress: safeSender,
+      senderSignature,
+      origin: "milestone-pay"
+    });
 
-// Now try with SafeApiKit
-c// Now try with SafeApiKit - WITH EXPLICIT URL CONSTRUCTION
-console.log("[SAFE] Initializing SafeApiKit...");
+    console.log("[SAFE] ✅ Transaction proposed successfully!");
 
-// DEBUG: Let's see what URL SafeApiKit is actually using
-const testApi = new SafeApiKit({
-  chainId,
-  txServiceUrl,
-});
-
-// Manually test the exact URL SafeApiKit would use
-const manualUrl = `${txServiceUrl}/api/v1/safes/${process.env.SAFE_ADDRESS}/`;
-console.log("[SAFE] Manual URL that SafeApiKit should use:", manualUrl);
-
-try {
-  console.log("[SAFE] Testing SafeApiKit getSafeInfo...");
-  const safeInfo = await testApi.getSafeInfo(process.env.SAFE_ADDRESS);
-  console.log("[SAFE] ✅ SafeApiKit SUCCESS - Safe info retrieved");
-} catch (apiError) {
-  console.error("[SAFE] ❌ SafeApiKit failed:", apiError.message);
-  
-  // Try alternative: Maybe the API kit expects a different base URL?
-  const txServiceUrlV2 = "https://safe-transaction-sepolia.safe.global/api/v1";
-  console.log("[SAFE] Trying alternative URL:", txServiceUrlV2);
-  
-  const apiV2 = new SafeApiKit({
-    chainId,
-    txServiceUrl: txServiceUrlV2,
-  });
-  
-  try {
-    const safeInfoV2 = await apiV2.getSafeInfo(process.env.SAFE_ADDRESS);
-    console.log("[SAFE] ✅ Alternative URL SUCCESS!");
-    // Use apiV2 for the rest of the operations
-    var api = apiV2;
-  } catch (apiErrorV2) {
-    console.error("[SAFE] ❌ Alternative URL also failed:", apiErrorV2.message);
-    throw new Error(`SafeApiKit failed with both URLs: ${apiError.message}`);
-  }
-}
-
-// If we get here, we have a working API instance
-console.log("[SAFE] About to propose transaction...");
-
-await api.proposeTransaction({
-  safeAddress: process.env.SAFE_ADDRESS,
-  safeTxHash,
-  safeTransactionData: safeTx.data,
-  senderAddress: safeSender,
-  senderSignature,
-  origin: "milestone-pay"
-});
-
-    // 8) Persist Safe refs; keep status 'pending'
+    // 11) Persist Safe refs
     let safeNonce = null;
     try {
       const txMeta = await api.getTransaction(safeTxHash);
       if (txMeta?.nonce != null) safeNonce = Number(txMeta.nonce);
-    } catch {}
+    } catch (e) {
+      console.warn("[SAFE] Could not fetch transaction nonce:", e.message);
+    }
 
     await pool.query(
       `UPDATE milestone_payments
@@ -5177,7 +5124,7 @@ await api.proposeTransaction({
       [bidId, milestoneIndex, safeTxHash, Number.isFinite(safeNonce) ? safeNonce : null]
     );
 
-    // 9) Re-notify with Safe tx hash (best-effort)
+    // 12) Re-notify with Safe tx hash
     try {
       const { rows: [proposal] } = await pool.query(
         "SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1",
@@ -5194,10 +5141,11 @@ await api.proposeTransaction({
         });
       }
     } catch (e) {
-      console.warn("notifyPaymentPending (post-safe-hash) failed", e?.message || e);
+      console.warn("notifyPaymentPending failed", e?.message || e);
     }
 
     return; // DO NOT mark released here
+
   } catch (safeErr) {
     console.error("SAFE propose failed; leaving pending", safeErr?.message || safeErr);
     return; // leave pending
