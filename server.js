@@ -3924,14 +3924,16 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
 
     const { default: SafeApiKit } = await import('@safe-global/api-kit');
 
-    const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
-    const net = await provider.getNetwork();
-    const chainId = typeof net.chainId === 'bigint' ? net.chainId : BigInt(net.chainId);
+ const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+const net = await provider.getNetwork();
+const chainId = Number(net.chainId);
+const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global').trim();
 
-    const api = new SafeApiKit({
-      chainId,
-      txServiceUrl: (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global').trim()
-    });
+const api = new SafeApiKit({
+  chainId,
+  txServiceUrl,
+  apiKey: process.env.SAFE_API_KEY || undefined
+});
 
     let updated = 0;
 
@@ -3994,12 +3996,15 @@ app.get('/safe/tx/:hash', adminGuard, async (req, res) => {
 
 const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
 const net = await provider.getNetwork();
-const chainId = typeof net.chainId === 'bigint' ? net.chainId : BigInt(net.chainId);
+const chainId = Number(net.chainId);
+const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global').trim();
 
 const api = new SafeApiKit({
   chainId,
-  txServiceUrl: (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global').trim()
+  txServiceUrl,
+  apiKey: process.env.SAFE_API_KEY || undefined
 });
+
     const tx = await api.getTransaction(req.params.hash);
     res.json({
       safeTxHash: tx.safeTxHash,
@@ -5044,14 +5049,31 @@ if (willUseSafe) {
     const AK = await import("@safe-global/api-kit");
     const SafeApiKit = AK.default;
 
-    const net = await provider.getNetwork();
-    const chainIdBig = typeof net.chainId === "bigint" ? net.chainId : BigInt(net.chainId);
+ const net = await provider.getNetwork();
+// SafeApiKit expects a NUMBER, not BigInt
+const chainIdNum = Number(net.chainId);
+const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || "https://safe-transaction-sepolia.safe.global").trim();
 
-    const api = new SafeApiKit({
-      chainId: chainIdBig,
-      txServiceUrl: (process.env.SAFE_TXSERVICE_URL || "https://safe-transaction-sepolia.safe.global").trim(),
-      apiKey: process.env.SAFE_API_KEY || undefined // optional if txServiceUrl is set
-    });
+const api = new SafeApiKit({
+  chainId: chainIdNum,
+  txServiceUrl,
+  apiKey: process.env.SAFE_API_KEY || undefined, // ok if undefined
+});
+
+// Optional: ensure the Safe is indexed on this service (avoids 404)
+try {
+  await api.getSafeInfo(process.env.SAFE_ADDRESS);
+} catch (e) {
+  const msg = String(e?.message || "");
+  if (msg.includes("Not Found") || msg.includes("404")) {
+    throw new Error(
+      `Safe ${process.env.SAFE_ADDRESS} not found on ${txServiceUrl} (chainId=${chainIdNum}). ` +
+      `Wrong service URL or the Safe isn't indexed yet. Open the Safe once in the Safe app, or verify the correct txServiceUrl for this chain.`
+    );
+  } else {
+    throw e;
+  }
+}
 
     await api.proposeTransaction({
       safeAddress: process.env.SAFE_ADDRESS,
