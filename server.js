@@ -5018,6 +5018,22 @@ if (willUseSafe) {
     const RPC_URL  = process.env.SEPOLIA_RPC_URL;
     const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
 
+    // 🚨 NETWORK VERIFICATION 🚨
+const network = await provider.getNetwork();
+console.log("[SAFE] Provider Network:", {
+  name: network.name,
+  chainId: network.chainId,
+  chainIdNumber: Number(network.chainId)
+});
+
+// Verify we're on Sepolia
+if (Number(network.chainId) !== 11155111) {
+  console.error("[SAFE] ❌ WRONG NETWORK! Expected 11155111 (Sepolia), got:", Number(network.chainId));
+  throw new Error(`Wrong network: ${network.name} (chainId: ${network.chainId})`);
+} else {
+  console.log("[SAFE] ✅ Correct network: Sepolia");
+}
+
     // 4) Pick a signer that IS a Safe owner
     const rawKeys = (process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
       .split(",").map(s => s.trim()).filter(Boolean)
@@ -5061,26 +5077,52 @@ if (willUseSafe) {
 
     // 7) Propose to the Transaction Service
     const { default: SafeApiKit } = await import("@safe-global/api-kit");
-    const net = await provider.getNetwork();
-    const chainId = Number(net.chainId);
-    const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || "https://safe-transaction-sepolia.safe.global")
-      .trim()
-      .replace(/\/+$/, "");
+const net = await provider.getNetwork();
+const chainId = Number(net.chainId);
+const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || "https://safe-transaction-sepolia.safe.global")
+  .trim()
+  .replace(/\/+$/, "");
 
-    const api = new SafeApiKit({
-      chainId,
-      txServiceUrl,
-      apiKey: process.env.SAFE_API_KEY || undefined
-    });
+// 🚨 DEBUG LOGS ADDED HERE 🚨
+console.log("[SAFE] === DEBUG INFO ===");
+console.log("[SAFE] ChainId:", chainId);
+console.log("[SAFE] Network Name:", net.name);
+console.log("[SAFE] Safe Address:", process.env.SAFE_ADDRESS);
+console.log("[SAFE] TxService URL:", txServiceUrl);
+console.log("[SAFE] RPC URL:", RPC_URL);
+console.log("[SAFE] SafeTxHash:", safeTxHash);
+console.log("[SAFE] Signer Address:", safeSender);
 
-    await api.proposeTransaction({
-      safeAddress: process.env.SAFE_ADDRESS,
-      safeTxHash,
-      safeTransactionData: safeTx.data, // Protocol Kit v4
-      senderAddress: safeSender,
-      senderSignature,
-      origin: "milestone-pay"
-    });
+const api = new SafeApiKit({
+  chainId,
+  txServiceUrl,
+  apiKey: process.env.SAFE_API_KEY || undefined
+});
+
+// Test if Safe exists in transaction service
+try {
+  console.log("[SAFE] Testing Safe info endpoint...");
+  const safeInfo = await api.getSafeInfo(process.env.SAFE_ADDRESS);
+  console.log("[SAFE] ✅ Safe info retrieved successfully");
+  console.log("[SAFE] Safe threshold:", safeInfo.threshold);
+  console.log("[SAFE] Safe nonce:", safeInfo.nonce);
+  console.log("[SAFE] Safe owners:", safeInfo.owners);
+} catch (e) {
+  console.error("[SAFE] ❌ Failed to get Safe info:", e.message);
+  console.error("[SAFE] Full error:", e);
+  throw new Error(`Safe not found in transaction service: ${e.message}`);
+}
+
+console.log("[SAFE] About to propose transaction...");
+
+await api.proposeTransaction({
+  safeAddress: process.env.SAFE_ADDRESS,
+  safeTxHash,
+  safeTransactionData: safeTx.data,
+  senderAddress: safeSender,
+  senderSignature,
+  origin: "milestone-pay"
+});
 
     // 8) Persist Safe refs; keep status 'pending'
     let safeNonce = null;
