@@ -4992,7 +4992,7 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
         // Preferred stablecoin symbol (e.g. USDT/USDC)
         const token = String(bid.preferred_stablecoin || "USDT").toUpperCase();
 
- // ---------- SAFE PATH ----------
+// ---------- SAFE PATH ----------
 if (willUseSafe) {
   try {
     // 1) Resolve token + amount
@@ -5016,7 +5016,7 @@ if (willUseSafe) {
     const RPC_URL  = process.env.SEPOLIA_RPC_URL;
     const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
 
-    // 4) Pick a signer that IS a Safe owner (PRIVATE_KEYS supports comma list)
+    // 4) Choose a signer that IS an owner (PRIVATE_KEYS supports comma list)
     const rawKeys = (process.env.PRIVATE_KEYS || process.env.PRIVATE_KEY || "")
       .split(",").map(s => s.trim()).filter(Boolean)
       .map(k => (k.startsWith("0x") ? k : `0x${k}`));
@@ -5042,63 +5042,31 @@ if (willUseSafe) {
       throw new Error(`None of the configured PRIVATE_KEYS match Safe owners: ${ownersLc.join(", ")}`);
     }
 
-    // 5) Initialize Safe (read-only for building/hashing)
+    // 5) Build Safe transaction (read-only Safe instance is fine)
     const safe = await Safe.init({
       provider: RPC_URL,
       safeAddress: process.env.SAFE_ADDRESS
     });
 
-    // 6) Build Safe transaction
+    // Protocol Kit v4 shape: { transactions: [...] }
     const transactions = [{ to: tokenAddr, value: "0", data }];
     const safeTx = await safe.createTransaction({ transactions });
 
-    // 7) Compute hash and sign LOCALLY (no RPC personal_sign)
+    // 6) Compute hash and sign LOCALLY (no RPC personal_sign)
     const safeTxHash = await safe.getTransactionHash(safeTx);
     const senderAddr = await signer.getAddress();
-    const senderSignature = await signer.signMessage(ethers.utils.arrayify(safeTxHash)); // eth_sign style
+    const senderSignature = await signer.signMessage(ethers.utils.arrayify(safeTxHash)); // ETH_SIGN
 
-    // 8) Propose to the Safe Transaction Service
-    const AK = await import("@safe-global/api-kit");
-    const SafeApiKit = AK.default;
+    // 7) Propose to Transaction Service (Sepolia)
+    const { default: SafeApiKit } = await import("@safe-global/api-kit");
+    const net = await provider.getNetwork();
+    const chainId = typeof net.chainId === "bigint" ? net.chainId : BigInt(net.chainId);
 
-const net = await provider.getNetwork();
-const chainIdBig = typeof net.chainId === "bigint" ? net.chainId : BigInt(net.chainId);
-const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || "https://safe-transaction-sepolia.safe.global").trim();
-
-const api = new SafeApiKit({
-  chainId: chainIdBig,
-  txServiceUrl,
-  apiKey: process.env.SAFE_API_KEY || undefined, // ok if undefined
-});
-
-// Preflight: ensure the service knows the Safe, otherwise propose will 404
-try {
-  await api.getSafeInfo(process.env.SAFE_ADDRESS);
-} catch (e) {
-  console.error(
-    `Safe ${process.env.SAFE_ADDRESS} not found on ${txServiceUrl} (chainId=${chainIdBig}). ` +
-    `Open it once in the Safe app on the SAME network to trigger indexing.`,
-    e?.message || e
-  );
-  return; // leave pending; skip proposeTransaction
-}
-
-await api.proposeTransaction({ /* ... your existing payload ... */ });
-
-// Optional: ensure the Safe is indexed on this service (avoids 404)
-try {
-  await api.getSafeInfo(process.env.SAFE_ADDRESS);
-} catch (e) {
-  const msg = String(e?.message || "");
-  if (msg.includes("Not Found") || msg.includes("404")) {
-    throw new Error(
-      `Safe ${process.env.SAFE_ADDRESS} not found on ${txServiceUrl} (chainId=${chainIdNum}). ` +
-      `Wrong service URL or the Safe isn't indexed yet. Open the Safe once in the Safe app, or verify the correct txServiceUrl for this chain.`
-    );
-  } else {
-    throw e;
-  }
-}
+    const api = new SafeApiKit({
+      chainId,
+      txServiceUrl: (process.env.SAFE_TXSERVICE_URL || "https://safe-transaction-sepolia.safe.global").trim(),
+      apiKey: process.env.SAFE_API_KEY || undefined  // optional for direct txServiceUrl
+    });
 
     await api.proposeTransaction({
       safeAddress: process.env.SAFE_ADDRESS,
@@ -5109,7 +5077,7 @@ try {
       origin: "milestone-pay"
     });
 
-    // 9) Persist Safe refs; keep status 'pending'
+    // 8) Persist Safe refs; keep status 'pending'
     let safeNonce = null;
     try {
       const txMeta = await api.getTransaction(safeTxHash);
@@ -5122,7 +5090,7 @@ try {
       [bidId, milestoneIndex, safeTxHash, Number.isFinite(safeNonce) ? safeNonce : null]
     );
 
-    // 10) Re-notify including the Safe tx hash
+    // 9) Re-notify including Safe tx hash
     try {
       const { rows: [proposal] } = await pool.query(
         "SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1",
