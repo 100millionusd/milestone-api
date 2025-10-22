@@ -4994,7 +4994,7 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
         // Preferred stablecoin symbol (e.g. USDT/USDC)
         const token = String(bid.preferred_stablecoin || "USDT").toUpperCase();
 
-// ---------- SAFE PATH (direct POST; sep base; checksummed addr; hard self-verify) ----------
+// ---------- SAFE PATH (EIP-712; direct POST; sep base; checksummed addr; hard self-verify) ----------
 if (willUseSafe) {
   try {
     const RPC_URL = process.env.SEPOLIA_RPC_URL;
@@ -5010,20 +5010,17 @@ if (willUseSafe) {
 
     const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
 
-    // Minimal Safe ABI (owners, nonce, and tx hash)
+    // Minimal Safe ABI to read owners/nonce
     const SAFE_ABI = [
       "function getOwners() view returns (address[])",
-      "function nonce() view returns (uint256)",
-      "function getTransactionHash(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 _nonce) view returns (bytes32)"
+      "function nonce() view returns (uint256)"
     ];
     const ZERO = "0x0000000000000000000000000000000000000000";
     const safeContract = new ethers.Contract(SAFE_ADDRESS_CS, SAFE_ABI, provider);
 
-    // 1) pick an owner key from env
+    // 1) pick a Safe owner key from env
     const rawKeys = (process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
-      .split(",")
-      .map(s => s.trim())
-      .filter(Boolean)
+      .split(",").map(s => s.trim()).filter(Boolean)
       .map(k => (k.startsWith("0x") ? k : `0x${k}`));
     if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured");
 
@@ -5055,39 +5052,59 @@ if (willUseSafe) {
     const data = erc20Iface.encodeFunctionData("transfer", [ bid.wallet_address, amountUnits ]);
     if (typeof data !== "string" || !data.startsWith("0x")) throw new Error("[SAFE] invalid ERC20.transfer data");
 
-    // 5) compute Safe tx hash via contract
+    // 5) EIP-712 typed data (SafeTx)
+    const chainId = 11155111; // Sepolia
     const op = 0; // CALL
     const nonceBn = await safeContract.nonce();
     const nonce = ethers.BigNumber.isBigNumber(nonceBn) ? nonceBn.toNumber() : Number(nonceBn);
     if (!Number.isFinite(nonce)) throw new Error("[SAFE] invalid Safe nonce");
 
-    const safeTxHash = await safeContract.getTransactionHash(
-      tokenAddr, /* value */ 0, data, op,
-      /* safeTxGas */ 0, /* baseGas */ 0, /* gasPrice */ 0,
-      /* gasToken */ ZERO, /* refundReceiver */ ZERO,
-      /* _nonce */ nonce
-    );
+    const domain = { chainId, verifyingContract: SAFE_ADDRESS_CS };
+    const types = {
+      SafeTx: [
+        { name: "to",              type: "address" },
+        { name: "value",           type: "uint256" },
+        { name: "data",            type: "bytes" },
+        { name: "operation",       type: "uint8" },
+        { name: "safeTxGas",       type: "uint256" },
+        { name: "baseGas",         type: "uint256" },
+        { name: "gasPrice",        type: "uint256" },
+        { name: "gasToken",        type: "address" },
+        { name: "refundReceiver",  type: "address" },
+        { name: "nonce",           type: "uint256" }
+      ]
+    };
+    const value = {
+      to: tokenAddr,
+      value: "0",
+      data,
+      operation: op,
+      safeTxGas: "0",
+      baseGas: "0",
+      gasPrice: "0",
+      gasToken: ZERO,
+      refundReceiver: ZERO,
+      nonce: String(nonce)
+    };
 
-    // 6) sign the hash; SELF-VERIFY before posting
-    //    (we verify the raw 65-byte signature BEFORE appending "01")
-    const signatureRaw = await signerWallet.signMessage(ethers.utils.arrayify(safeTxHash));
-    if (typeof signatureRaw !== "string" || !signatureRaw.startsWith("0x")) {
-      throw new Error("[SAFE] missing/invalid signature hex");
-    }
-    const recovered = ethers.utils.verifyMessage(ethers.utils.arrayify(safeTxHash), signatureRaw);
+    // 6) sign typed data and SELF-VERIFY (EIP-712)
+    const signatureRaw = await signerWallet._signTypedData(domain, types, value); // 65-byte sig
+    const recovered = ethers.utils.verifyTypedData(domain, types, value, signatureRaw);
     if (recovered.toLowerCase() !== senderAddr.toLowerCase()) {
-      throw new Error(`[SAFE] signature mismatch BEFORE POST: recovered ${recovered}, expected ${senderAddr}`);
+      throw new Error(`[SAFE] EIP-712 signature mismatch BEFORE POST: recovered ${recovered}, expected ${senderAddr}`);
     }
 
-    // Normalize for Tx-Service: ETH_SIGN type suffix "01" (only if not already present)
-    const hexNoPrefix = signatureRaw.slice(2);
-    const senderSignature = hexNoPrefix.length === 130
-      ? (signatureRaw + "01")
-      : (signatureRaw.toLowerCase().endsWith("01") && hexNoPrefix.length === 132)
-        ? signatureRaw
-        : (() => { throw new Error(`[SAFE] unexpected signature length=${hexNoPrefix.length} (expected 130 or 132)`); })();
+    // 7) compute the contractTransactionHash (REQUIRED by Tx-Service)
+    const contractTransactionHash = ethers.utils._TypedDataEncoder.hash(domain, types, value);
 
-    // 7) direct POST to Safe Tx-Service (checksummed address; 'sep' base)
+    // Tx-Service expects EIP-712 signatures with type suffix "02"
+    const hexNoPrefix = signatureRaw.slice(2);
+    if (hexNoPrefix.length !== 130) {
+      throw new Error(`[SAFE] unexpected EIP-712 signature length=${hexNoPrefix.length} (expected 130)`);
+    }
+    const senderSignature = signatureRaw + "02";
+
+    // 8) DIRECT POST to Safe Tx-Service (checksummed address; 'sep' base)
     console.log("[SAFE] using DIRECT POST path");
     console.log("[SAFE] POST", `${TX_SERVICE_BASE}/api/v2/safes/${SAFE_ADDRESS_CS}/multisig-transactions/`);
 
@@ -5113,9 +5130,9 @@ if (willUseSafe) {
       gasPrice: "0",
       refundReceiver: ZERO,
       nonce,
-      contractTransactionHash: safeTxHash,
+      contractTransactionHash,          // <-- REQUIRED (this fixes the 422)
       sender: senderAddr,
-      signature: senderSignature,
+      signature: senderSignature,       // EIP-712 + "02"
       origin: "milestone-pay"
     };
 
@@ -5133,15 +5150,15 @@ if (willUseSafe) {
       throw new Error(`TxService propose failed [${resp.status}] ${txt || resp.statusText}`);
     }
 
-    // 8) store safe_tx_hash + nonce
+    // 9) store the tx hash + nonce (use the typed-data hash)
     await pool.query(
       `UPDATE milestone_payments
-          SET safe_tx_hash=$3, safe_nonce=$4
-        WHERE bid_id=$1 AND milestone_index=$2`,
-      [bidId, milestoneIndex, safeTxHash, nonce]
+         SET safe_tx_hash=$3, safe_nonce=$4
+       WHERE bid_id=$1 AND milestone_index=$2`,
+      [bidId, milestoneIndex, contractTransactionHash, nonce]
     );
 
-    // 9) notify
+    // 10) notify
     try {
       const { rows: [proposal] } = await pool.query(
         "SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1",
@@ -5154,7 +5171,7 @@ if (willUseSafe) {
           msIndex: milestoneIndex + 1,
           amount: msAmountUSD,
           method: "safe",
-          txRef: safeTxHash
+          txRef: contractTransactionHash
         });
       }
     } catch (e) {
@@ -5167,6 +5184,7 @@ if (willUseSafe) {
     return;
   }
 }
+
 
         // ---------- MANUAL/EOA PATH ----------
         let txHash;
