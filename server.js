@@ -5051,8 +5051,26 @@ if (willUseSafe) {
     const safeTxHash = await safe.getTransactionHash(safeTx);              // contractTransactionHash
     const nonce      = Number(safeTx.data.nonce);                          // required by service
 
-    // 6) local EOA signature (ETH_SIGN / personal_sign)
-    const senderSignature = await signerWallet.signMessage(ethers.utils.arrayify(safeTxHash));
+    // 6) owner signature using ProtocolKit helper (avoids format mismatches)
+const safeWithSigner = await SafePK.init({
+  provider: RPC_URL,
+  safeAddress: process.env.SAFE_ADDRESS,
+  signer: signerWallet
+});
+
+let senderSignature = await safeWithSigner.signTransactionHash(safeTxHash);
+// signTransactionHash may return an object in some versions; normalize to hex string
+senderSignature = typeof senderSignature === "string" ? senderSignature : senderSignature.data;
+
+// (optional) sanity check: the signature MUST recover to the selected signer
+// ProtocolKit's signature may include a trailing "01" (signature type). Strip it for recovery only.
+const sigHex = senderSignature.toLowerCase();
+const sigNoType = sigHex.endsWith("01") && sigHex.length === 136 ? ("0x" + sigHex.slice(2, 132)) : senderSignature;
+
+const recovered = ethers.utils.verifyMessage(ethers.utils.arrayify(safeTxHash), sigNoType);
+if (recovered.toLowerCase() !== senderAddr.toLowerCase()) {
+  throw new Error(`[SAFE] signature mismatch: recovered ${recovered}, expected ${senderAddr}`);
+}
 
     // 7) Propose via Safe API Kit (global tx-service + API key)
     if (!process.env.SAFE_API_KEY) {
