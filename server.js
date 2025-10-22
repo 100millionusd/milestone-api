@@ -5026,7 +5026,7 @@ if (willUseSafe) {
     // 3) Provider + select an owner signer from PRIVATE_KEYS/PRIVATE_KEY
     const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
 
-    const rawKeys = (process.env.PRIVATE_KEYS || process.env.PRIVATE_KEY || "")
+    const rawKeys = (process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
       .split(",").map(s => s.trim()).filter(Boolean)
       .map(k => (k.startsWith("0x") ? k : `0x${k}`));
     if (!rawKeys.length) throw new Error("No PRIVATE_KEYS/PRIVATE_KEY configured for Safe proposer");
