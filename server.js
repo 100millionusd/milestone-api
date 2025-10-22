@@ -5111,26 +5111,47 @@ try {
 }
 
 // Now try with SafeApiKit
+c// Now try with SafeApiKit - WITH EXPLICIT URL CONSTRUCTION
 console.log("[SAFE] Initializing SafeApiKit...");
-const api = new SafeApiKit({
+
+// DEBUG: Let's see what URL SafeApiKit is actually using
+const testApi = new SafeApiKit({
   chainId,
   txServiceUrl,
-  // Remove apiKey if you don't have one - comment out the next line
-  // apiKey: process.env.SAFE_API_KEY || undefined
 });
+
+// Manually test the exact URL SafeApiKit would use
+const manualUrl = `${txServiceUrl}/api/v1/safes/${process.env.SAFE_ADDRESS}/`;
+console.log("[SAFE] Manual URL that SafeApiKit should use:", manualUrl);
 
 try {
   console.log("[SAFE] Testing SafeApiKit getSafeInfo...");
-  const safeInfo = await api.getSafeInfo(process.env.SAFE_ADDRESS);
+  const safeInfo = await testApi.getSafeInfo(process.env.SAFE_ADDRESS);
   console.log("[SAFE] ✅ SafeApiKit SUCCESS - Safe info retrieved");
-  console.log("[SAFE] Safe threshold:", safeInfo.threshold);
-  console.log("[SAFE] Safe nonce:", safeInfo.nonce);
 } catch (apiError) {
   console.error("[SAFE] ❌ SafeApiKit failed:", apiError.message);
-  console.error("[SAFE] Full API error:", apiError);
-  throw new Error(`Safe not found in transaction service: ${apiError.message}`);
+  
+  // Try alternative: Maybe the API kit expects a different base URL?
+  const txServiceUrlV2 = "https://safe-transaction-sepolia.safe.global/api/v1";
+  console.log("[SAFE] Trying alternative URL:", txServiceUrlV2);
+  
+  const apiV2 = new SafeApiKit({
+    chainId,
+    txServiceUrl: txServiceUrlV2,
+  });
+  
+  try {
+    const safeInfoV2 = await apiV2.getSafeInfo(process.env.SAFE_ADDRESS);
+    console.log("[SAFE] ✅ Alternative URL SUCCESS!");
+    // Use apiV2 for the rest of the operations
+    var api = apiV2;
+  } catch (apiErrorV2) {
+    console.error("[SAFE] ❌ Alternative URL also failed:", apiErrorV2.message);
+    throw new Error(`SafeApiKit failed with both URLs: ${apiError.message}`);
+  }
 }
 
+// If we get here, we have a working API instance
 console.log("[SAFE] About to propose transaction...");
 
 await api.proposeTransaction({
