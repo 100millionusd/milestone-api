@@ -5018,17 +5018,55 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
             const { default: SafeApiKit } = apiKitMod;
             const { default: Safe, EthersAdapter } = protocolKit;
 
-            const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
-            const pk       = process.env.PRIVATE_KEY?.startsWith("0x")
-              ? process.env.PRIVATE_KEY
-              : `0x${process.env.PRIVATE_KEY}`;
-            const signer     = new ethers.Wallet(pk, provider);
-            const ethAdapter = new EthersAdapter({ ethers, signerOrProvider: signer });
+ // ---- signer selection: support multiple keys ----
+const RPC_URL = process.env.SEPOLIA_RPC_URL;
+const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
 
-            const safe = await Safe.create({
-              ethAdapter,
-              safeAddress: process.env.SAFE_ADDRESS
-            });
+// Allow comma-separated keys in PRIVATE_KEYS, fallback to PRIVATE_KEY
+const keyListRaw = (process.env.PRIVATE_KEYS || process.env.PRIVATE_KEY || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// Normalize to 0x-prefixed
+const keyList = keyListRaw.map(k => k.startsWith('0x') ? k : `0x${k}`);
+
+if (!keyList.length) {
+  throw new Error('No PRIVATE_KEYS/PRIVATE_KEY configured for Safe proposer');
+}
+
+// Build a Safe instance with a temporary adapter (provider only) to read owners
+const protocolKit = await import('@safe-global/protocol-kit');
+const { default: Safe, EthersAdapter } = protocolKit;
+const ethAdapterRO = new EthersAdapter({ ethers, signerOrProvider: provider });
+const safeRO = await Safe.create({
+  ethAdapter: ethAdapterRO,
+  safeAddress: process.env.SAFE_ADDRESS
+});
+const ownersLc = (await safeRO.getOwners()).map(a => a.toLowerCase());
+
+// Pick the first key that is actually an owner of the Safe
+let signer = null;
+let pickedKey = null;
+for (const k of keyList) {
+  const addr = new ethers.Wallet(k).address.toLowerCase();
+  if (ownersLc.includes(addr)) {
+    pickedKey = k;
+    signer = new ethers.Wallet(k, provider);
+    break;
+  }
+}
+if (!signer) {
+  // Optional: allow delegates; otherwise, fail fast with a clear error
+  throw new Error(`None of the configured PRIVATE_KEYS match Safe owners. Owners: ${ownersLc.join(', ')}`);
+}
+
+// Final adapter & Safe bound to the chosen signer
+const ethAdapter = new EthersAdapter({ ethers, signerOrProvider: signer });
+const safe = await Safe.create({
+  ethAdapter,
+  safeAddress: process.env.SAFE_ADDRESS
+});
 
             // Create & sign Safe transaction
             const safeTx = await safe.createTransaction({
