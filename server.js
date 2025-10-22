@@ -3924,16 +3924,28 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
 
     const { default: SafeApiKit } = await import('@safe-global/api-kit');
 
- const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
 const net = await provider.getNetwork();
-const chainId = Number(net.chainId);
+const chainId = (typeof net.chainId === 'bigint') ? net.chainId : BigInt(net.chainId);
 const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global').trim();
 
 const api = new SafeApiKit({
   chainId,
   txServiceUrl,
-  apiKey: process.env.SAFE_API_KEY || undefined
+  apiKey: process.env.SAFE_API_KEY || undefined  // ok if undefined when txServiceUrl is set
 });
+
+// Preflight: make sure the service has indexed this Safe BEFORE proposing
+try {
+  await api.getSafeInfo(process.env.SAFE_ADDRESS);
+} catch (e) {
+  console.error(
+    `Safe ${process.env.SAFE_ADDRESS} not found on ${txServiceUrl} (chainId=${chainId}). ` +
+    `Open it once in the Safe app on the same network to trigger indexing.`,
+    e?.message || e
+  );
+  return; // leave pending; skip proposeTransaction
+}
 
     let updated = 0;
 
@@ -5049,16 +5061,29 @@ if (willUseSafe) {
     const AK = await import("@safe-global/api-kit");
     const SafeApiKit = AK.default;
 
- const net = await provider.getNetwork();
-// SafeApiKit expects a NUMBER, not BigInt
-const chainIdNum = Number(net.chainId);
+const net = await provider.getNetwork();
+const chainIdBig = typeof net.chainId === "bigint" ? net.chainId : BigInt(net.chainId);
 const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || "https://safe-transaction-sepolia.safe.global").trim();
 
 const api = new SafeApiKit({
-  chainId: chainIdNum,
+  chainId: chainIdBig,
   txServiceUrl,
   apiKey: process.env.SAFE_API_KEY || undefined, // ok if undefined
 });
+
+// Preflight: ensure the service knows the Safe, otherwise propose will 404
+try {
+  await api.getSafeInfo(process.env.SAFE_ADDRESS);
+} catch (e) {
+  console.error(
+    `Safe ${process.env.SAFE_ADDRESS} not found on ${txServiceUrl} (chainId=${chainIdBig}). ` +
+    `Open it once in the Safe app on the SAME network to trigger indexing.`,
+    e?.message || e
+  );
+  return; // leave pending; skip proposeTransaction
+}
+
+await api.proposeTransaction({ /* ... your existing payload ... */ });
 
 // Optional: ensure the Safe is indexed on this service (avoids 404)
 try {
