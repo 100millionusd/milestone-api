@@ -5038,9 +5038,6 @@ if (willUseSafe) {
 
     if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured for Safe proposer");
 
-    console.log("[SAFE] === PRIVATE KEY DEBUGGING ===");
-    console.log("[SAFE] Number of private keys found:", rawKeys.length);
-
     // Get Safe owners
     const PK = await import("@safe-global/protocol-kit");
     const Safe = PK.default;
@@ -5052,82 +5049,28 @@ if (willUseSafe) {
     const ownersLc = (await safeRO.getOwners()).map(a => a.toLowerCase());
     console.log("[SAFE] Safe owners (lc):", ownersLc);
 
-    // Debug: Show what addresses each private key generates
-    for (let i = 0; i < rawKeys.length; i++) {
-      const wallet = new ethers.Wallet(rawKeys[i]);
-      const address = wallet.address;
-      const isOwner = ownersLc.includes(address.toLowerCase());
-      console.log(`[SAFE] Key ${i}: ${address} | Is Owner: ${isOwner} | First 10 chars of key: ${rawKeys[i].substring(0, 10)}...`);
-    }
-
     // Choose first configured key that is an owner
     let signer = null;
-    let selectedKeyIndex = -1;
-
     for (let i = 0; i < rawKeys.length; i++) {
       const wallet = new ethers.Wallet(rawKeys[i]);
       const address = wallet.address.toLowerCase();
       if (ownersLc.includes(address)) { 
         signer = new ethers.Wallet(rawKeys[i], provider);
-        selectedKeyIndex = i;
         console.log(`[SAFE] ✅ Selected key ${i} for address: ${wallet.address}`);
         break; 
       }
     }
 
-    if (!signer) {
-      console.error("[SAFE] ❌ NONE of the private keys correspond to Safe owners!");
-      throw new Error(`None of the PRIVATE_KEYS is a Safe owner`);
-    }
+    if (!signer) throw new Error(`None of the PRIVATE_KEYS is a Safe owner`);
 
     const safeSender = await signer.getAddress();
     console.log("[SAFE] using signer (owner):", safeSender);
 
-    // 6) Build Safe tx and compute hash
-    const safe = await Safe.init({
-      provider: RPC_URL,
-      safeAddress: process.env.SAFE_ADDRESS
-    });
-
-    const transactions = [{ to: tokenAddr, value: "0", data }];
-    const safeTx = await safe.createTransaction({ transactions });
-
-    // 7) Compute tx hash and sign - WITH VERIFICATION
-    console.log("[SAFE] === SIGNATURE VERIFICATION ===");
-    const safeTxHash = await safe.getTransactionHash(safeTx);
-    console.log("[SAFE] SafeTxHash to sign:", safeTxHash);
-
-    // Verify signer before signing
-    const signerAddressBefore = await signer.getAddress();
-    console.log("[SAFE] Signer address before signing:", signerAddressBefore);
-
-    // Sign the message
-    const messageBytes = ethers.utils.arrayify(safeTxHash);
-    console.log("[SAFE] Signing message...");
-    const senderSignature = await signer.signMessage(messageBytes);
-    console.log("[SAFE] Raw signature:", senderSignature);
-
-    // CRITICAL: Verify the signature
-    const recoveredAddress = ethers.utils.verifyMessage(messageBytes, senderSignature);
-    console.log("[SAFE] Recovered address from signature:", recoveredAddress);
-    console.log("[SAFE] Expected signer address:", signerAddressBefore);
-    
-    if (recoveredAddress.toLowerCase() !== signerAddressBefore.toLowerCase()) {
-      console.error("[SAFE] ❌ SIGNATURE VERIFICATION FAILED!");
-      console.error("[SAFE] Signature was created by:", recoveredAddress);
-      console.error("[SAFE] But expected:", signerAddressBefore);
-      throw new Error("Signature verification failed - wrong private key used");
-    }
-
-    console.log("[SAFE] ✅ Signature verified - created by correct signer");
-
-    // 8) DIRECT API CALL
-    console.log("[SAFE] Using direct API call...");
-
+    // 6) Build Safe tx with current nonce first
     const txServiceUrl = "https://safe-transaction-sepolia.safe.global";
     const safeAddress = process.env.SAFE_ADDRESS;
 
-    // Get current nonce
+    // Get current nonce FIRST
     console.log("[SAFE] Fetching current Safe state...");
     const safeInfoResponse = await fetch(`${txServiceUrl}/api/v1/safes/${safeAddress}/`);
     
@@ -5139,39 +5082,60 @@ if (willUseSafe) {
     const currentNonce = parseInt(safeInfo.nonce);
     console.log("[SAFE] Current Safe nonce:", currentNonce);
 
-    // Rebuild with correct nonce
-    const safeWithCorrectNonce = await Safe.init({
+    // Build Safe transaction with correct nonce
+    const safe = await Safe.init({
       provider: RPC_URL,
       safeAddress: process.env.SAFE_ADDRESS
     });
 
-    const transactionsWithNonce = [{ to: tokenAddr, value: "0", data }];
-    const safeTxWithNonce = await safeWithCorrectNonce.createTransaction({ 
-      transactions: transactionsWithNonce,
+    const transactions = [{ to: tokenAddr, value: "0", data }];
+    const safeTx = await safe.createTransaction({ 
+      transactions,
       options: {
         nonce: currentNonce
       }
     });
 
-    // Recompute hash with correct nonce
-    const correctedSafeTxHash = await safeWithCorrectNonce.getTransactionHash(safeTxWithNonce);
-    const correctedSenderSignature = await signer.signMessage(ethers.utils.arrayify(correctedSafeTxHash));
-    
-    // Verify the corrected signature too
-    const correctedRecoveredAddress = ethers.utils.verifyMessage(
-      ethers.utils.arrayify(correctedSafeTxHash), 
-      correctedSenderSignature
+    // 7) Compute tx hash and sign using EIP-712 TYPED DATA
+    console.log("[SAFE] Using EIP-712 typed data signing...");
+
+    const safeTxHash = await safe.getTransactionHash(safeTx);
+    const typedData = safe.getTypedData(safeTx, safeTxHash);
+
+    console.log("[SAFE] EIP-712 Domain:", typedData.domain);
+    console.log("[SAFE] EIP-712 Message:", typedData.message);
+
+    // Sign using EIP-712 typed data
+    console.log("[SAFE] Signing EIP-712 typed data...");
+    const senderSignature = await signer._signTypedData(
+      typedData.domain,
+      typedData.types,
+      typedData.message
     );
-    console.log("[SAFE] Corrected signature by:", correctedRecoveredAddress);
-    
-    if (correctedRecoveredAddress.toLowerCase() !== signerAddressBefore.toLowerCase()) {
-      throw new Error("Corrected signature also failed verification");
+
+    console.log("[SAFE] EIP-712 signature:", senderSignature);
+
+    // Verify the EIP-712 signature
+    const recoveredAddress = ethers.utils.verifyTypedData(
+      typedData.domain,
+      typedData.types,
+      typedData.message,
+      senderSignature
+    );
+
+    console.log("[SAFE] Recovered address from EIP-712:", recoveredAddress);
+    console.log("[SAFE] Expected signer:", safeSender);
+    console.log("[SAFE] EIP-712 signature valid:", recoveredAddress.toLowerCase() === safeSender.toLowerCase());
+
+    if (recoveredAddress.toLowerCase() !== safeSender.toLowerCase()) {
+      throw new Error("EIP-712 signature verification failed");
     }
 
-    console.log("[SAFE] Corrected SafeTxHash:", correctedSafeTxHash);
-    console.log("[SAFE] Using nonce:", currentNonce);
+    console.log("[SAFE] ✅ EIP-712 signature verified");
 
-    // Propose transaction
+    // 8) Propose transaction with EIP-712 signature
+    console.log("[SAFE] Proposing transaction with EIP-712 signature...");
+
     const proposalData = {
       to: tokenAddr,
       value: "0",
@@ -5183,13 +5147,12 @@ if (willUseSafe) {
       gasToken: "0x0000000000000000000000000000000000000000",
       refundReceiver: "0x0000000000000000000000000000000000000000",
       nonce: currentNonce,
-      contractTransactionHash: correctedSafeTxHash,
+      contractTransactionHash: safeTxHash,
       sender: safeSender,
-      signature: correctedSenderSignature,
+      signature: senderSignature,
       origin: "milestone-pay"
     };
 
-    console.log("[SAFE] Proposing transaction...");
     console.log("[SAFE] API Endpoint:", `${txServiceUrl}/api/v1/safes/${safeAddress}/multisig-transactions/`);
     
     const response = await fetch(`${txServiceUrl}/api/v1/safes/${safeAddress}/multisig-transactions/`, {
