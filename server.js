@@ -3924,15 +3924,11 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
 
     const { default: SafeApiKit } = await import('@safe-global/api-kit');
 
-const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
-const net = await provider.getNetwork();
-const chainId = (typeof net.chainId === 'bigint') ? net.chainId : BigInt(net.chainId);
 const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global').trim();
 
 const api = new SafeApiKit({
-  chainId,
   txServiceUrl,
-  apiKey: process.env.SAFE_API_KEY || undefined  // ok if undefined when txServiceUrl is set
+  apiKey: process.env.SAFE_API_KEY || undefined
 });
 
 // Preflight: make sure the service has indexed this Safe BEFORE proposing
@@ -4002,22 +3998,20 @@ try {
 });
 
 // Quick status check for a Safe tx
+// Quick status check for a Safe tx
 app.get('/safe/tx/:hash', adminGuard, async (req, res) => {
   try {
     const { default: SafeApiKit } = await import('@safe-global/api-kit');
 
-const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
-const net = await provider.getNetwork();
-const chainId = Number(net.chainId);
-const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global').trim();
+    const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global').trim();
 
-const api = new SafeApiKit({
-  chainId,
-  txServiceUrl,
-  apiKey: process.env.SAFE_API_KEY || undefined
-});
+    const api = new SafeApiKit({
+      txServiceUrl,
+      apiKey: process.env.SAFE_API_KEY || undefined // optional
+    });
 
     const tx = await api.getTransaction(req.params.hash);
+
     res.json({
       safeTxHash: tx.safeTxHash,
       isExecuted: tx.isExecuted,
