@@ -4954,7 +4954,7 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
     }
 
     // 3) Fire-and-forget transfer so the HTTP request returns fast
-    (async () => {
+    ;(async () => {
       try {
  // Decide if this payment will go via Safe (based on threshold + address)
 const willUseSafe =
