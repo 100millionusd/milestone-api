@@ -4956,42 +4956,31 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
     // 3) Fire-and-forget transfer so the HTTP request returns fast
     (async () => {
       try {
-            // Notify admins that a milestone payment is now pending (Safe/direct)
-    try {
-      const { rows: [proposal] } = await pool.query(
-        'SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1',
-        [bid.proposal_id]
-      );
-      if (proposal && typeof notifyPaymentPending === 'function') {
-        await notifyPaymentPending({
-          bid,
-          proposal,
-          msIndex: milestoneIndex + 1,
-          amount: msAmountUSD,
-          method: 'safe',   // set 'direct' if this one is not going through Safe
-          txRef: null       // if you have a Safe tx hash later, you can send a 2nd notify with txRef
-        });
-      }
-    } catch (e) {
-      console.warn('notifyPaymentPending failed', e?.message || e);
-    }
-        // After you get safeTxHash (or after updating milestone_payments with it)
-    try {
-      const { rows: [proposal] } = await pool.query(
-        'SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1',
-        [bid.proposal_id]
-      );
-      if (proposal && typeof notifyPaymentPending === 'function') {
-        await notifyPaymentPending({
-          bid,
-          proposal,
-          msIndex: milestoneIndex + 1,
-          amount: msAmountUSD,
-          method: 'safe',
-          txRef: safeTxHash   // <-- include it here if you have it
-        });
-      }
-    } catch {}
+ // Decide if this payment will go via Safe (based on threshold + address)
+const willUseSafe =
+  Number(process.env.SAFE_THRESHOLD_USD || 0) > 0 &&
+  msAmountUSD >= Number(process.env.SAFE_THRESHOLD_USD || 0) &&
+  !!process.env.SAFE_ADDRESS;
+
+// Notify admins that a milestone payment just entered "pending"
+try {
+  const { rows: [proposal] } = await pool.query(
+    'SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1',
+    [bid.proposal_id]
+  );
+  if (proposal && typeof notifyPaymentPending === 'function') {
+    await notifyPaymentPending({
+      bid,
+      proposal,
+      msIndex: milestoneIndex + 1,
+      amount: msAmountUSD,
+      method: willUseSafe ? 'safe' : 'direct', // <-- correct method here
+      txRef: null                                // no hash yet
+    });
+  }
+} catch (e) {
+  console.warn('notifyPaymentPending failed', e?.message || e);
+}
 
         const token = String(bid.preferred_stablecoin || "USDT").toUpperCase();
         const SAFE_THRESHOLD_USD = Number(process.env.SAFE_THRESHOLD_USD || 0);
@@ -5047,24 +5036,38 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
 
             const nonce = Number(safeTx.data.nonce);
 
-            // Persist Safe refs; keep status 'pending' (execution comes later)
-            await pool.query(
-              `
-              UPDATE milestone_payments
-              SET safe_tx_hash=$3, safe_nonce=$4
-              WHERE bid_id=$1 AND milestone_index=$2
-              `,
-              [bidId, milestoneIndex, safeTxHash, Number.isFinite(nonce) ? nonce : null]
-            );
+ // Persist Safe refs; keep status 'pending' (execution comes later)
+await pool.query(
+  `
+  UPDATE milestone_payments
+  SET safe_tx_hash=$3, safe_nonce=$4
+  WHERE bid_id=$1 AND milestone_index=$2
+  `,
+  [bidId, milestoneIndex, safeTxHash, Number.isFinite(nonce) ? nonce : null]
+);
 
-            // Done for Safe path: DO NOT mark released here
-            return;
-          } catch (safeErr) {
-            console.error("SAFE propose failed; leaving pending", safeErr?.message || safeErr);
-            // Leave as pending; admin can retry
-            return;
-          }
-        }
+// 🔔 Notify admins now that we have the Safe tx hash (so they can click/approve)
+try {
+  const { rows: [proposal] } = await pool.query(
+    'SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1',
+    [bid.proposal_id]
+  );
+  if (proposal && typeof notifyPaymentPending === 'function') {
+    await notifyPaymentPending({
+      bid,
+      proposal,
+      msIndex: milestoneIndex + 1,
+      amount: msAmountUSD,
+      method: 'safe',
+      txRef: safeTxHash   // <-- include Safe tx hash here
+    });
+  }
+} catch (e) {
+  console.warn('notifyPaymentPending (post-safe-hash) failed', e?.message || e);
+}
+
+// Done for Safe path: DO NOT mark released here
+return;
 
         // ---- EOA path (existing behavior) ----
         let txHash;
