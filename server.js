@@ -5076,41 +5076,59 @@ if (Number(network.chainId) !== 11155111) {
     const senderSignature = await signer.signMessage(ethers.utils.arrayify(safeTxHash));
 
     // 7) Propose to the Transaction Service
-    const { default: SafeApiKit } = await import("@safe-global/api-kit");
+const { default: SafeApiKit } = await import("@safe-global/api-kit");
 const net = await provider.getNetwork();
 const chainId = Number(net.chainId);
 const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || "https://safe-transaction-sepolia.safe.global")
   .trim()
   .replace(/\/+$/, "");
 
-// 🚨 DEBUG LOGS ADDED HERE 🚨
-console.log("[SAFE] === DEBUG INFO ===");
+console.log("[SAFE] === NETWORK VERIFICATION ===");
 console.log("[SAFE] ChainId:", chainId);
-console.log("[SAFE] Network Name:", net.name);
-console.log("[SAFE] Safe Address:", process.env.SAFE_ADDRESS);
 console.log("[SAFE] TxService URL:", txServiceUrl);
-console.log("[SAFE] RPC URL:", RPC_URL);
-console.log("[SAFE] SafeTxHash:", safeTxHash);
-console.log("[SAFE] Signer Address:", safeSender);
+console.log("[SAFE] Safe Address:", process.env.SAFE_ADDRESS);
 
+// TEST DIRECTLY WITH FETCH FIRST
+try {
+  const testUrl = `${txServiceUrl}/api/v1/safes/${process.env.SAFE_ADDRESS}/`;
+  console.log("[SAFE] Testing direct URL:", testUrl);
+  
+  const response = await fetch(testUrl);
+  console.log("[SAFE] Direct fetch status:", response.status);
+  
+  if (response.ok) {
+    const safeData = await response.json();
+    console.log("[SAFE] ✅ Direct fetch SUCCESS - Safe exists");
+    console.log("[SAFE] Safe nonce:", safeData.nonce);
+    console.log("[SAFE] Safe owners:", safeData.owners);
+  } else {
+    console.error("[SAFE] ❌ Direct fetch failed with status:", response.status);
+    const errorText = await response.text();
+    console.error("[SAFE] Error response:", errorText);
+  }
+} catch (fetchError) {
+  console.error("[SAFE] ❌ Direct fetch error:", fetchError.message);
+}
+
+// Now try with SafeApiKit
+console.log("[SAFE] Initializing SafeApiKit...");
 const api = new SafeApiKit({
   chainId,
   txServiceUrl,
-  apiKey: process.env.SAFE_API_KEY || undefined
+  // Remove apiKey if you don't have one - comment out the next line
+  // apiKey: process.env.SAFE_API_KEY || undefined
 });
 
-// Test if Safe exists in transaction service
 try {
-  console.log("[SAFE] Testing Safe info endpoint...");
+  console.log("[SAFE] Testing SafeApiKit getSafeInfo...");
   const safeInfo = await api.getSafeInfo(process.env.SAFE_ADDRESS);
-  console.log("[SAFE] ✅ Safe info retrieved successfully");
+  console.log("[SAFE] ✅ SafeApiKit SUCCESS - Safe info retrieved");
   console.log("[SAFE] Safe threshold:", safeInfo.threshold);
   console.log("[SAFE] Safe nonce:", safeInfo.nonce);
-  console.log("[SAFE] Safe owners:", safeInfo.owners);
-} catch (e) {
-  console.error("[SAFE] ❌ Failed to get Safe info:", e.message);
-  console.error("[SAFE] Full error:", e);
-  throw new Error(`Safe not found in transaction service: ${e.message}`);
+} catch (apiError) {
+  console.error("[SAFE] ❌ SafeApiKit failed:", apiError.message);
+  console.error("[SAFE] Full API error:", apiError);
+  throw new Error(`Safe not found in transaction service: ${apiError.message}`);
 }
 
 console.log("[SAFE] About to propose transaction...");
