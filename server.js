@@ -5060,7 +5060,6 @@ const safeTx = await safe.createTransaction({
 });
 const safeTxHash = await safe.getTransactionHash(safeTx);
 const signature = await safe.signTransaction(safeTx);
-const senderAddr = await signer.getAddress();
 
 // (Optional) quick preflight so you don’t get a blind 404
 try {
