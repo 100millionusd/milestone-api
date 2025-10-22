@@ -5075,9 +5075,9 @@ if (willUseSafe) {
     const safeTxHash = await safe.getTransactionHash(safeTx);
     const senderSignature = await signer.signMessage(ethers.utils.arrayify(safeTxHash));
 
-    // 8) Initialize SafeApiKit WITH API KEY
+    // 8) Initialize SafeApiKit WITH API KEY (FIXED VERSION)
     const { default: SafeApiKit } = await import("@safe-global/api-kit");
-    
+
     const txServiceUrl = "https://safe-transaction-sepolia.safe.global";
     const chainId = 11155111;
     const safeApiKey = process.env.SAFE_API_KEY;
@@ -5088,14 +5088,15 @@ if (willUseSafe) {
       hasApiKey: !!safeApiKey
     });
 
-    const api = new SafeApiKit({
-      chainId,
-      txServiceUrl,
-      apiKey: safeApiKey // Include the API key
-    });
+    let api; // Declare without initializing
 
-    // 9) Test connection with API key
     try {
+      api = new SafeApiKit({
+        chainId,
+        txServiceUrl,
+        apiKey: safeApiKey
+      });
+
       console.log("[SAFE] Testing Safe info with API key...");
       const safeInfo = await api.getSafeInfo(process.env.SAFE_ADDRESS);
       console.log("[SAFE] ✅ SafeApiKit connected successfully with API key");
@@ -5115,15 +5116,14 @@ if (willUseSafe) {
       try {
         const safeInfo = await apiWithoutKey.getSafeInfo(process.env.SAFE_ADDRESS);
         console.log("[SAFE] ✅ Connected without API key");
-        // Use the API without key
-        var api = apiWithoutKey;
+        api = apiWithoutKey; // Assign the working instance
       } catch (noKeyError) {
         console.error("[SAFE] ❌ Both with and without API key failed");
         throw new Error(`Safe API connection failed: ${apiError.message}`);
       }
     }
 
-    // 10) Propose transaction
+    // 9) Propose transaction
     console.log("[SAFE] About to propose transaction...");
     await api.proposeTransaction({
       safeAddress: process.env.SAFE_ADDRESS,
@@ -5136,7 +5136,7 @@ if (willUseSafe) {
 
     console.log("[SAFE] ✅ Transaction proposed successfully!");
 
-    // 11) Persist Safe refs
+    // 10) Persist Safe refs
     let safeNonce = null;
     try {
       const txMeta = await api.getTransaction(safeTxHash);
@@ -5152,7 +5152,7 @@ if (willUseSafe) {
       [bidId, milestoneIndex, safeTxHash, Number.isFinite(safeNonce) ? safeNonce : null]
     );
 
-    // 12) Re-notify with Safe tx hash
+    // 11) Re-notify with Safe tx hash
     try {
       const { rows: [proposal] } = await pool.query(
         "SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1",
