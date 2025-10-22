@@ -3922,11 +3922,16 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
     `);
     if (!pending.length) return res.json({ ok: true, updated: 0 });
 
-    const { default: SafeApiKit } = await import('@safe-global/api-kit');
-
-const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global').trim();
+ const { default: SafeApiKit } = await import('@safe-global/api-kit');
+const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+const net = await provider.getNetwork();
+const chainId = Number(net.chainId);
+const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global')
+  .trim()
+  .replace(/\/+$/, '');
 
 const api = new SafeApiKit({
+  chainId,
   txServiceUrl,
   apiKey: process.env.SAFE_API_KEY || undefined
 });
@@ -3998,20 +4003,23 @@ try {
 });
 
 // Quick status check for a Safe tx
-// Quick status check for a Safe tx
 app.get('/safe/tx/:hash', adminGuard, async (req, res) => {
   try {
     const { default: SafeApiKit } = await import('@safe-global/api-kit');
-
-    const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global').trim();
+    const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+    const net = await provider.getNetwork();
+    const chainId = Number(net.chainId);
+    const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global')
+      .trim()
+      .replace(/\/+$/, '');
 
     const api = new SafeApiKit({
+      chainId,
       txServiceUrl,
-      apiKey: process.env.SAFE_API_KEY || undefined // optional
+      apiKey: process.env.SAFE_API_KEY || undefined
     });
 
     const tx = await api.getTransaction(req.params.hash);
-
     res.json({
       safeTxHash: tx.safeTxHash,
       isExecuted: tx.isExecuted,
@@ -5006,11 +5014,17 @@ if (willUseSafe) {
       amountUnits
     ]);
 
-    // 3) Provider
+    // 3) JSON-RPC provider
     const RPC_URL  = process.env.SEPOLIA_RPC_URL;
     const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
 
-    // 4) Read Safe owners (read-only)
+    // 4) Pick a signer that IS a Safe owner
+    const rawKeys = (process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
+      .split(",").map(s => s.trim()).filter(Boolean)
+      .map(k => (k.startsWith("0x") ? k : `0x${k}`));
+    if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured for Safe proposer");
+
+    // Owners from the Safe
     const PK = await import("@safe-global/protocol-kit");
     const Safe = PK.default;
 
@@ -5021,69 +5035,60 @@ if (willUseSafe) {
     const ownersLc = (await safeRO.getOwners()).map(a => a.toLowerCase());
     console.log("[SAFE] owners (lc):", ownersLc);
 
-    // 5) Load only Safe owner keys from env (NEVER use PRIVATE_KEY here)
-    const rawKeys = String(process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
-      .split(",").map(s => s.trim()).filter(Boolean)
-      .map(k => (k.startsWith("0x") ? k : `0x${k}`));
-
-    const envAddrs = rawKeys.map(k => new ethers.Wallet(k).address);
-    console.log("[SAFE] env keys -> addresses:", envAddrs);
-
-    if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured for Safe proposer");
-
-    // 6) Pick the first configured key that IS an owner
+    // Choose first configured key that is an owner
     let signer = null;
     for (const k of rawKeys) {
       const addr = new ethers.Wallet(k).address.toLowerCase();
       if (ownersLc.includes(addr)) { signer = new ethers.Wallet(k, provider); break; }
     }
-    if (!signer) {
-      throw new Error(`None of the provided SAFE_OWNER_KEYS/PRIVATE_KEYS is a Safe owner. Owners: ${ownersLc.join(", ")}`);
-    }
-    const senderAddr = (await signer.getAddress()).toLowerCase();
-    console.log("[SAFE] using signer (owner):", senderAddr);
+    if (!signer) throw new Error(`None of the PRIVATE_KEYS is a Safe owner. Owners: ${ownersLc.join(", ")}`);
 
-   // 7) Build Safe transaction with Protocol Kit v4 (with adapter)
-const protocolKit2 = await import('@safe-global/protocol-kit');
-const { EthersAdapter } = protocolKit2;
-const SafeProto = protocolKit2.default;
+    const safeSender = await signer.getAddress();
+    console.log("[SAFE] using signer (owner):", safeSender);
 
-const ethAdapter = new EthersAdapter({ ethers, signerOrProvider: signer });
-const safe = await SafeProto.create({
-  ethAdapter,
-  safeAddress: process.env.SAFE_ADDRESS,
-});
+    // 5) Build Safe tx (read-only Safe for hashing)
+    const safe = await Safe.init({
+      provider: RPC_URL,
+      safeAddress: process.env.SAFE_ADDRESS
+    });
 
-// 8) Create + sign Safe tx (v4 shape)
-const safeTx = await safe.createTransaction({
-  safeTransactionData: { to: tokenAddr, value: '0', data }
-});
-const safeTxHash = await safe.getTransactionHash(safeTx);
-const signature = await safe.signTransaction(safeTx);
+    const transactions = [{ to: tokenAddr, value: "0", data }];
+    const safeTx = await safe.createTransaction({ transactions });
 
-// (Optional) quick preflight so you don’t get a blind 404
-try {
-  const ok = await fetch(`${txServiceUrl}/api/v1/safes/${process.env.SAFE_ADDRESS}/`);
-  if (!ok.ok) throw new Error(`TxService ${txServiceUrl} responded ${ok.status} for /safes/${process.env.SAFE_ADDRESS}/`);
-} catch (preflightErr) {
-  throw new Error(`[TxService preflight] ${preflightErr.message || preflightErr}`);
-}
+    // 6) Compute tx hash and sign it locally (eth_sign)
+    const safeTxHash = await safe.getTransactionHash(safeTx);
+    const senderSignature = await signer.signMessage(ethers.utils.arrayify(safeTxHash));
 
-await api.proposeTransaction({
-  safeAddress: process.env.SAFE_ADDRESS,
-  safeTransactionData: safeTx.data,
-  safeTxHash,
-  senderAddress: senderAddr,
-  senderSignature: signature.data,
-  origin: 'milestone-pay',
-});
+    // 7) Propose to the Transaction Service
+    const { default: SafeApiKit } = await import("@safe-global/api-kit");
+    const net = await provider.getNetwork();
+    const chainId = Number(net.chainId);
+    const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || "https://safe-transaction-sepolia.safe.global")
+      .trim()
+      .replace(/\/+$/, "");
 
-    // 10) Persist Safe refs
+    const api = new SafeApiKit({
+      chainId,
+      txServiceUrl,
+      apiKey: process.env.SAFE_API_KEY || undefined
+    });
+
+    await api.proposeTransaction({
+      safeAddress: process.env.SAFE_ADDRESS,
+      safeTxHash,
+      safeTransactionData: safeTx.data, // Protocol Kit v4
+      senderAddress: safeSender,
+      senderSignature,
+      origin: "milestone-pay"
+    });
+
+    // 8) Persist Safe refs; keep status 'pending'
     let safeNonce = null;
     try {
       const txMeta = await api.getTransaction(safeTxHash);
       if (txMeta?.nonce != null) safeNonce = Number(txMeta.nonce);
     } catch {}
+
     await pool.query(
       `UPDATE milestone_payments
          SET safe_tx_hash=$3, safe_nonce=$4
@@ -5091,7 +5096,7 @@ await api.proposeTransaction({
       [bidId, milestoneIndex, safeTxHash, Number.isFinite(safeNonce) ? safeNonce : null]
     );
 
-    // 11) Re-notify including Safe tx hash (best-effort)
+    // 9) Re-notify with Safe tx hash (best-effort)
     try {
       const { rows: [proposal] } = await pool.query(
         "SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1",
@@ -5111,7 +5116,7 @@ await api.proposeTransaction({
       console.warn("notifyPaymentPending (post-safe-hash) failed", e?.message || e);
     }
 
-    return; // Safe path ends here; do not mark released
+    return; // DO NOT mark released here
   } catch (safeErr) {
     console.error("SAFE propose failed; leaving pending", safeErr?.message || safeErr);
     return; // leave pending
