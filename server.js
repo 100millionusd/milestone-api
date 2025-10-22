@@ -5076,24 +5076,43 @@ if (willUseSafe) {
     const senderSignature = await signer.signMessage(ethers.utils.arrayify(safeTxHash));
 
     // 8) Initialize SafeApiKit with CORRECT URL
-    const { default: SafeApiKit } = await import("@safe-global/api-kit");
-    const txServiceUrl = "https://safe-transaction-sepolia.safe.global/api/v1"; // 🚨 CRITICAL: Include /api/v1
+    // 8) Initialize SafeApiKit - ALTERNATIVE APPROACH
+const { default: SafeApiKit } = await import("@safe-global/api-kit");
+
+// Try multiple possible URL formats
+const urlAttempts = [
+  "https://safe-transaction-sepolia.safe.global/api", // Try without /v1
+  "https://safe-transaction-sepolia.safe.global/api/v1", // Standard
+  "https://safe-transaction-sepolia.safe.global", // Root domain
+];
+
+let api;
+let lastError;
+
+for (const txServiceUrl of urlAttempts) {
+  try {
+    console.log("[SAFE] Trying URL:", txServiceUrl);
     
-    console.log("[SAFE] Initializing SafeApiKit with URL:", txServiceUrl);
-    
-    const api = new SafeApiKit({
-      chainId: 11155111, // Explicitly set Sepolia chainId
+    api = new SafeApiKit({
+      chainId: 11155111,
       txServiceUrl,
     });
 
-    // 9) Test connection
-    try {
-      const safeInfo = await api.getSafeInfo(process.env.SAFE_ADDRESS);
-      console.log("[SAFE] ✅ SafeApiKit connected successfully");
-    } catch (apiError) {
-      console.error("[SAFE] ❌ SafeApiKit failed:", apiError.message);
-      throw new Error(`Safe API connection failed: ${apiError.message}`);
-    }
+    // Test the connection
+    const safeInfo = await api.getSafeInfo(process.env.SAFE_ADDRESS);
+    console.log("[SAFE] ✅ Success with URL:", txServiceUrl);
+    break; // Success, exit loop
+  } catch (error) {
+    lastError = error;
+    console.log("[SAFE] ❌ Failed with URL:", txServiceUrl, error.message);
+    continue; // Try next URL
+  }
+}
+
+if (!api) {
+  console.error("[SAFE] All URL attempts failed");
+  throw new Error(`Safe API connection failed: ${lastError?.message}`);
+}
 
     // 10) Propose transaction
     console.log("[SAFE] Proposing transaction...");
