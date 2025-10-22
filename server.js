@@ -5036,89 +5036,83 @@ if (willUseSafe) {
     }
     if (!signer) throw new Error(`None of the configured PRIVATE_KEYS match Safe owners: ${ownersLc.join(", ")}`);
 
-    // 5) Bind Safe to signer
-    const safe = await Safe.init({
-      provider: RPC_URL,
-      signer: await signer.getAddress(),   // pass the signer address
-      safeAddress: process.env.SAFE_ADDRESS
+    // 5) Initialize Safe (READ-ONLY; do NOT pass signer, avoids RPC personal_sign)
+const safe = await Safe.init({
+  provider: RPC_URL,
+  safeAddress: process.env.SAFE_ADDRESS
+});
+
+// 6) Build Safe transaction (same as before)
+const transactions = [{
+  to: tokenAddr,
+  value: '0',
+  data
+}];
+const safeTx = await safe.createTransaction({ transactions });
+
+// 7) Compute tx hash and sign it LOCALLY with ethers (no RPC signing)
+const safeTxHash = await safe.getTransactionHash(safeTx);
+const senderAddr = await signer.getAddress();
+const senderSignature = await signer.signMessage(ethers.utils.arrayify(safeTxHash)); // ETH_SIGN style
+
+// 8) Propose to the Transaction Service using the local signature
+const AK = await import('@safe-global/api-kit');
+const SafeApiKit = AK.default;
+
+const net = await provider.getNetwork();
+const chainIdBig = typeof net.chainId === 'bigint' ? net.chainId : BigInt(net.chainId);
+
+const api = new SafeApiKit({
+  chainId: chainIdBig,
+  // Optional overrides if you use custom infra:
+  // apiKey: process.env.SAFE_API_KEY,
+  // txServiceUrl: (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global').trim()
+});
+
+await api.proposeTransaction({
+  safeAddress: process.env.SAFE_ADDRESS,
+  safeTxHash,
+  safeTransactionData: safeTx.data,   // Protocol Kit v4: pass safeTx.data
+  senderAddress: senderAddr,
+  senderSignature,                    // <-- our local signature
+  origin: 'milestone-pay'
+});
+
+// 9) Persist Safe refs; keep status 'pending' (execution comes later)
+let safeNonce = null;
+try {
+  const txMeta = await api.getTransaction(safeTxHash);
+  if (txMeta?.nonce != null) safeNonce = Number(txMeta.nonce);
+} catch {}
+await pool.query(
+  `UPDATE milestone_payments
+     SET safe_tx_hash=$3, safe_nonce=$4
+   WHERE bid_id=$1 AND milestone_index=$2`,
+  [bidId, milestoneIndex, safeTxHash, Number.isFinite(safeNonce) ? safeNonce : null]
+);
+
+// 10) Re-notify with the Safe tx hash so admins can confirm in the Safe app
+try {
+  const { rows: [proposal] } = await pool.query(
+    'SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1',
+    [bid.proposal_id]
+  );
+  if (proposal && typeof notifyPaymentPending === 'function') {
+    await notifyPaymentPending({
+      bid,
+      proposal,
+      msIndex: milestoneIndex + 1,
+      amount: msAmountUSD,
+      method: 'safe',
+      txRef: safeTxHash
     });
-
-    // 6) Build Safe tx (single ERC20 transfer)
-    const transactions = [{
-      to: tokenAddr,
-      value: "0",
-      data
-    }];
-    const safeTx = await safe.createTransaction({ transactions });
-
-    // 7) Hash + signature (needed for propose)
-    const safeTxHash = await safe.getTransactionHash(safeTx);
-    const senderSig  = await safe.signHash(safeTxHash); // returns { data: '0x...' }
-    const senderAddr = await signer.getAddress();
-
-    // 8) Propose to Transaction Service
-    const AK = await import("@safe-global/api-kit");
-    const SafeApiKit = AK.default;
-
-    const net = await provider.getNetwork();
-    const chainIdBig = typeof net.chainId === "bigint" ? net.chainId : BigInt(net.chainId);
-
-    const api = new SafeApiKit({
-      chainId: chainIdBig,
-      // If you have a Safe API key and/or a custom service, set them:
-      // apiKey: process.env.SAFE_API_KEY,
-      // txServiceUrl: (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global').trim()
-    });
-
-    await api.proposeTransaction({
-      safeAddress: process.env.SAFE_ADDRESS,
-      safeTxHash: safeTxHash,
-      safeTransactionData: safeTx.data,    // NOTE: .data in v3/v4
-      senderAddress: senderAddr,
-      senderSignature: senderSig.data,
-      origin: "milestone-pay"
-    });
-
-    // 9) Persist Safe refs; keep status 'pending' (execution comes later)
-    let safeNonce = null;
-    try {
-      const tx = await api.getTransaction(safeTxHash);
-      if (tx?.nonce != null) safeNonce = Number(tx.nonce); // may be string in v4
-    } catch {}
-    await pool.query(
-      `UPDATE milestone_payments
-         SET safe_tx_hash=$3, safe_nonce=$4
-       WHERE bid_id=$1 AND milestone_index=$2`,
-      [bidId, milestoneIndex, safeTxHash, Number.isFinite(safeNonce) ? safeNonce : null]
-    );
-
-    // 10) Re-notify admins with the Safe tx hash (clickable in Safe UI)
-    try {
-      const { rows: [proposal] } = await pool.query(
-        "SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1",
-        [bid.proposal_id]
-      );
-      if (proposal && typeof notifyPaymentPending === "function") {
-        await notifyPaymentPending({
-          bid, proposal,
-          msIndex: milestoneIndex + 1,
-          amount: msAmountUSD,
-          method: "safe",
-          txRef: safeTxHash
-        });
-      }
-    } catch (e) {
-      console.warn("notifyPaymentPending (post-safe-hash) failed", e?.message || e);
-    }
-
-    // DO NOT mark released here (execution happens after confirmations)
-    return;
-  } catch (safeErr) {
-    console.error("SAFE propose failed; leaving pending", safeErr?.message || safeErr);
-    // Leave row as pending so you can retry/execute later
-    return;
   }
+} catch (e) {
+  console.warn('notifyPaymentPending (post-safe-hash) failed', e?.message || e);
 }
+
+// DO NOT mark released here; execution happens after multisig confirmations
+return;
 
         // ---------- MANUAL/EOA PATH ----------
         let txHash;
