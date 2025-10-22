@@ -5059,15 +5059,25 @@ if (willUseSafe) {
     const AK = await import("@safe-global/api-kit");
     const SafeApiKit = AK.default;
 
-    const net = await provider.getNetwork();
-    const chainId = Number(net.chainId);
-    const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || "https://safe-transaction-sepolia.safe.global").trim();
+    const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global')
+  .trim()
+  .replace(/\/+$/, ''); // no trailing slash
 
-    const api = new SafeApiKit({
-      chainId,
-      txServiceUrl,
-      apiKey: process.env.SAFE_API_KEY || undefined
-    });
+// (Optional but super helpful) Preflight: verify the Safe exists on this service
+try {
+  const ok = await fetch(`${txServiceUrl}/api/v1/safes/${process.env.SAFE_ADDRESS}/`);
+  if (!ok.ok) {
+    throw new Error(`TxService ${txServiceUrl} responded ${ok.status} for /safes/${process.env.SAFE_ADDRESS}/`);
+  }
+} catch (preflightErr) {
+  throw new Error(`[TxService preflight] ${preflightErr.message || preflightErr}`);
+}
+
+// Important: do NOT pass chainId when txServiceUrl is provided
+const api = new SafeApiKit({
+  txServiceUrl,
+  apiKey: process.env.SAFE_API_KEY || undefined, // fine if undefined
+});
 
     await api.proposeTransaction({
       safeAddress: process.env.SAFE_ADDRESS,
