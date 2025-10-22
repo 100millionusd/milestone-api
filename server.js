@@ -4953,14 +4953,14 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
       console.warn("failed to mark paymentPending", e?.message || e);
     }
 
-    // 3) Fire-and-forget transfer so the HTTP request returns fast
-    ;(async () => {
-      try {
- // Decide if this payment will go via Safe (based on threshold + address)
-const willUseSafe =
-  Number(process.env.SAFE_THRESHOLD_USD || 0) > 0 &&
-  msAmountUSD >= Number(process.env.SAFE_THRESHOLD_USD || 0) &&
-  !!process.env.SAFE_ADDRESS;
+// 3) Fire-and-forget transfer so the HTTP request returns fast
+setImmediate(async () => {
+  try {
+    // Decide if this payment will go via Safe (based on threshold + address)
+    const willUseSafe =
+      Number(process.env.SAFE_THRESHOLD_USD || 0) > 0 &&
+      msAmountUSD >= Number(process.env.SAFE_THRESHOLD_USD || 0) &&
+      !!process.env.SAFE_ADDRESS;
 
 // Notify admins that a milestone payment just entered "pending"
 try {
