@@ -4994,23 +4994,23 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
         // Preferred stablecoin symbol (e.g. USDT/USDC)
         const token = String(bid.preferred_stablecoin || "USDT").toUpperCase();
 
-// ---------- SAFE PATH (direct POST; checksummed addr; global base) ----------
+// ---------- SAFE PATH (direct POST; checksummed addr; sep base; no ApiKit/ProtocolKit) ----------
 if (willUseSafe) {
   try {
     const RPC_URL = process.env.SEPOLIA_RPC_URL;
-    const SAFE_ADDRESS_CS = ethers.utils.getAddress(String(process.env.SAFE_ADDRESS || "").trim());
     const SAFE_API_KEY = process.env.SAFE_API_KEY;
-    if (!RPC_URL) throw new Error("SEPOLIA_RPC_URL not configured");
-    if (!SAFE_ADDRESS_CS) throw new Error("SAFE_ADDRESS not configured");
-    if (!SAFE_API_KEY) throw new Error("SAFE_API_KEY not configured");
+    const SAFE_ADDRESS_CS = ethers.utils.getAddress(String(process.env.SAFE_ADDRESS || "").trim()); // checksummed
+    const TX_SERVICE_BASE = (process.env.SAFE_TXSERVICE_URL || "https://api.safe.global/tx-service/sep")
+      .trim()
+      .replace(/\/+$/, "");
 
-    // Use global base or an override if you set one (but make it the global URL!)
-    const TX_SERVICE_BASE = (process.env.SAFE_TXSERVICE_URL || "https://api.safe.global/tx-service/sepolia")
-      .trim().replace(/\/+$/, "");
+    if (!RPC_URL) throw new Error("SEPOLIA_RPC_URL not configured");
+    if (!SAFE_API_KEY) throw new Error("SAFE_API_KEY not configured");
+    if (!SAFE_ADDRESS_CS) throw new Error("SAFE_ADDRESS not configured");
 
     const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
 
-    // Minimal Safe ABI
+    // Minimal Safe ABI to read owners/nonce and compute the transaction hash
     const SAFE_ABI = [
       "function getOwners() view returns (address[])",
       "function nonce() view returns (uint256)",
@@ -5019,9 +5019,11 @@ if (willUseSafe) {
     const ZERO = "0x0000000000000000000000000000000000000000";
     const safeContract = new ethers.Contract(SAFE_ADDRESS_CS, SAFE_ABI, provider);
 
-    // 1) pick an owner key
+    // 1) pick a Safe owner key from env
     const rawKeys = (process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
-      .split(",").map(s => s.trim()).filter(Boolean)
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean)
       .map(k => (k.startsWith("0x") ? k : `0x${k}`));
     if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured");
 
@@ -5050,7 +5052,7 @@ if (willUseSafe) {
 
     // 4) encode ERC20.transfer(to, amount)
     const erc20Iface = new ethers.utils.Interface(ERC20_ABI);
-    const data = erc20Iface.encodeFunctionData("transfer", [ bid.wallet_address, amountUnits ]);
+    const data = erc20Iface.encodeFunctionData("transfer", [bid.wallet_address, amountUnits]);
     if (typeof data !== "string" || !data.startsWith("0x")) throw new Error("[SAFE] invalid ERC20.transfer data");
 
     // 5) compute Safe tx hash via contract
@@ -5071,21 +5073,21 @@ if (willUseSafe) {
     if (!senderSignature.toLowerCase().endsWith("01")) {
       const hexNoPrefix = senderSignature.slice(2);
       if (hexNoPrefix.length !== 130) throw new Error(`[SAFE] unexpected signature length=${hexNoPrefix.length}`);
-      senderSignature = senderSignature + "01"; // add type suffix
+      senderSignature = senderSignature + "01"; // add eth_sign type suffix
     }
 
-    // sanity: recovered must match signer (strip type for recovery)
+    // sanity: recover must match signer (strip '01' for recovery)
     const sigForRecovery = "0x" + senderSignature.slice(2, 132);
     const recovered = ethers.utils.verifyMessage(ethers.utils.arrayify(safeTxHash), sigForRecovery);
     if (recovered.toLowerCase() !== senderAddr.toLowerCase()) {
       throw new Error(`[SAFE] signature mismatch: recovered ${recovered}, expected ${senderAddr}`);
     }
 
-    // 7) DIRECT POST (checksummed address in the path!)
+    // 7) DIRECT POST to Safe Tx-Service (checksummed address; 'sep' base)
     console.log("[SAFE] using DIRECT POST path");
     console.log("[SAFE] POST", `${TX_SERVICE_BASE}/api/v2/safes/${SAFE_ADDRESS_CS}/multisig-transactions/`);
 
-    // optional early info check
+    // Optional: early Safe info check for clearer errors
     {
       const info = await fetch(`${TX_SERVICE_BASE}/api/v1/safes/${SAFE_ADDRESS_CS}/`, {
         headers: { "Authorization": `Bearer ${SAFE_API_KEY}` }
@@ -5135,7 +5137,7 @@ if (willUseSafe) {
       [bidId, milestoneIndex, safeTxHash, nonce]
     );
 
-    // 9) notify
+    // 9) notify (don’t mark released here)
     try {
       const { rows: [proposal] } = await pool.query(
         "SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1",
