@@ -5269,49 +5269,103 @@ if (willUseSafe) {
       throw new Error(`TxService propose failed [${resp.status}] ${txt || resp.statusText}`);
     }
 
-    // 9) store the tx hash + nonce (use the typed-data hash)
+   // 9) store the tx hash + nonce (use the typed-data hash)
+await pool.query(
+  `UPDATE milestone_payments
+     SET safe_tx_hash=$3, safe_nonce=$4
+   WHERE bid_id=$1 AND milestone_index=$2`,
+  [bidId, milestoneIndex, contractTransactionHash, nonce]
+);
+
+// === A) Write in-flight markers into bids.milestones so UI hides buttons & can poll ===
+try {
+  const { rows } = await pool.query(
+    'SELECT milestones FROM bids WHERE bid_id=$1 LIMIT 1',
+    [bidId]
+  );
+  const milestonesJson = rows?.[0]?.milestones;
+  const milestonesArr = Array.isArray(milestonesJson)
+    ? milestonesJson
+    : JSON.parse(milestonesJson || '[]');
+
+  const ms = { ...(milestonesArr[milestoneIndex] || {}) };
+
+  // Markers the UI looks for to treat as "in-flight"
+  ms.safePaymentTxHash = contractTransactionHash;      // Client polls /safe/tx/:hash with this
+  ms.safeTxHash = ms.safeTxHash || contractTransactionHash;
+  ms.safeNonce = nonce;
+  ms.safeStatus = 'submitted';
+  ms.paymentPending = true;
+  if (!ms.status || ms.status === 'approved') ms.status = 'pending';
+
+  milestonesArr[milestoneIndex] = ms;
+
+  await pool.query(
+    'UPDATE bids SET milestones=$1 WHERE bid_id=$2',
+    [JSON.stringify(milestonesArr), bidId]
+  );
+} catch (e) {
+  console.warn('Failed to persist in-flight markers to milestones JSON', e?.message || e);
+}
+
+// === B) Immediate executed check: if already executed -> mark as PAID now ===
+try {
+  const txResp = await safeApi.getTransaction(contractTransactionHash);
+  const executed = !!(txResp?.isExecuted || txResp?.transactionHash);
+
+  if (executed) {
+    const finalTxHash = txResp.transactionHash || contractTransactionHash;
+
+    // DB: finalize milestone_payments
     await pool.query(
       `UPDATE milestone_payments
-         SET safe_tx_hash=$3, safe_nonce=$4
+         SET status='released', tx_hash=$3, released_at=NOW()
        WHERE bid_id=$1 AND milestone_index=$2`,
-      [bidId, milestoneIndex, contractTransactionHash, nonce]
+      [bidId, milestoneIndex, finalTxHash]
     );
 
-    // 🔥 NEW: Immediately check if Safe transaction is already executed (edge case)
-try {
-  const txResp = await api.getTransaction(contractTransactionHash);
-  if (txResp?.isExecuted && txResp?.transactionHash) {
-    // Transaction was already executed - mark as released immediately
-    await pool.query(
-      `UPDATE milestone_payments 
-       SET status='released', tx_hash=$3, released_at=NOW() 
-       WHERE bid_id=$1 AND milestone_index=$2`,
-      [bidId, milestoneIndex, txResp.transactionHash]
+    // DB: finalize bids.milestones so UI shows Paid (and never shows buttons)
+    const { rows: rows2 } = await pool.query(
+      'SELECT milestones FROM bids WHERE bid_id=$1 LIMIT 1',
+      [bidId]
     );
-    
-    // Update bid milestones
-    const ms = milestones[milestoneIndex];
-    ms.paymentTxHash = txResp.transactionHash;
-    ms.paymentDate = new Date().toISOString();
-    ms.paymentPending = false;
-    ms.status = "paid";
-    milestones[milestoneIndex] = ms;
-    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
-    
-    // Send release notification
-    if (proposal && typeof notifyPaymentReleased === "function") {
+    const milestonesJson2 = rows2?.[0]?.milestones;
+    const milestones2 = Array.isArray(milestonesJson2)
+      ? milestonesJson2
+      : JSON.parse(milestonesJson2 || '[]');
+
+    const ms2 = { ...(milestones2[milestoneIndex] || {}) };
+
+    // Fields the UI treats as "PAID"
+    ms2.paymentTxHash = finalTxHash;                   // strong paid signal
+    ms2.paymentDate = new Date().toISOString();        // also paid signal
+    ms2.paidAt = ms2.paidAt || ms2.paymentDate;        // optional, but helps
+    ms2.paymentPending = false;
+    ms2.status = 'paid';                               // also in isPaid() set
+
+    milestones2[milestoneIndex] = ms2;
+
+    await pool.query(
+      'UPDATE bids SET milestones=$1 WHERE bid_id=$2',
+      [JSON.stringify(milestones2), bidId]
+    );
+
+    // notify release (optional)
+    if (proposal && typeof notifyPaymentReleased === 'function') {
       await notifyPaymentReleased({
-        bid, proposal,
+        bid,
+        proposal,
         msIndex: milestoneIndex + 1,
         amount: msAmountUSD,
-        txHash: txResp.transactionHash
+        txHash: finalTxHash,
       });
     }
-    
-    return res.json({ ok: true, status: "released", txHash: txResp.transactionHash });
+
+    // Return early: already paid.
+    return res.json({ ok: true, status: 'released', txHash: finalTxHash });
   }
 } catch (e) {
-  console.warn("Immediate Safe execution check failed, proceeding with pending", e?.message || e);
+  console.warn('Immediate Safe execution check failed, proceeding with pending', e?.message || e);
 }
 
     // 10) notify
