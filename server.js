@@ -4013,10 +4013,13 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
 // Quick status check for a Safe tx
 app.get('/safe/tx/:hash', adminGuard, async (req, res) => {
   try {
+    const safeTxHash = String(req.params.hash);
     const { default: SafeApiKit } = await import('@safe-global/api-kit');
-    const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
-    const net = await provider.getNetwork();
-    const chainId = Number(net.chainId);
+
+    // Prefer explicit chainId; default to Sepolia (11155111)
+    const chainId = Number(process.env.SAFE_CHAIN_ID || 11155111);
+
+    // Accept either the canonical tx-service domain or your custom one
     const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global')
       .trim()
       .replace(/\/+$/, '');
@@ -4024,18 +4027,32 @@ app.get('/safe/tx/:hash', adminGuard, async (req, res) => {
     const api = new SafeApiKit({
       chainId,
       txServiceUrl,
-      apiKey: process.env.SAFE_API_KEY || undefined
+      apiKey: process.env.SAFE_API_KEY || undefined,
     });
 
-    const tx = await api.getTransaction(req.params.hash);
-    res.json({
+    const tx = await api.getTransaction(safeTxHash);
+
+    return res.json({
       safeTxHash: tx.safeTxHash,
-      isExecuted: tx.isExecuted,
+      isExecuted: !!tx.isExecuted,
       txHash: tx.transactionHash || null,
-      confirmations: (tx.confirmations || []).length
+      confirmations: Array.isArray(tx.confirmations) ? tx.confirmations.length : 0,
     });
-  } catch (e) {
-    res.status(400).json({ error: String(e?.message || e) });
+  } catch (err) {
+    const msg = String(err?.message || err);
+
+    // If the tx isn't known yet, treat as "not executed" so the client keeps polling
+    if (/404|not\s*found/i.test(msg)) {
+      return res.json({
+        safeTxHash: req.params.hash,
+        isExecuted: false,
+        txHash: null,
+        confirmations: 0,
+      });
+    }
+
+    // Anything else is a server error
+    return res.status(500).json({ error: msg });
   }
 });
 
@@ -5310,59 +5327,51 @@ try {
 
 // === B) Immediate executed check: if already executed -> mark as PAID now ===
 try {
-  const txResp = await safeApi.getTransaction(contractTransactionHash);
-  const executed = !!(txResp?.isExecuted || txResp?.transactionHash);
+  // Use the same base you already defined earlier in this handler
+  // (you have TX_SERVICE_BASE = process.env.SAFE_TXSERVICE_URL || "https://api.safe.global/tx-service/sep")
+  const url = `${TX_SERVICE_BASE}/api/v1/multisig-transactions/${contractTransactionHash}`;
+  const r = await fetch(url);
+  if (r.ok) {
+    const t = await r.json();
+    const executed = !!(t?.is_executed || t?.transaction_hash);
+    if (executed) {
+      const finalTxHash = t.transaction_hash || contractTransactionHash;
 
-  if (executed) {
-    const finalTxHash = txResp.transactionHash || contractTransactionHash;
+      // milestone_payments → released
+      await pool.query(
+        `UPDATE milestone_payments
+           SET status='released', tx_hash=$3, released_at=NOW()
+         WHERE bid_id=$1 AND milestone_index=$2`,
+        [bidId, milestoneIndex, finalTxHash]
+      );
 
-    // DB: finalize milestone_payments
-    await pool.query(
-      `UPDATE milestone_payments
-         SET status='released', tx_hash=$3, released_at=NOW()
-       WHERE bid_id=$1 AND milestone_index=$2`,
-      [bidId, milestoneIndex, finalTxHash]
-    );
-
-    // DB: finalize bids.milestones so UI shows Paid (and never shows buttons)
-    const { rows: rows2 } = await pool.query(
-      'SELECT milestones FROM bids WHERE bid_id=$1 LIMIT 1',
-      [bidId]
-    );
-    const milestonesJson2 = rows2?.[0]?.milestones;
-    const milestones2 = Array.isArray(milestonesJson2)
-      ? milestonesJson2
-      : JSON.parse(milestonesJson2 || '[]');
-
-    const ms2 = { ...(milestones2[milestoneIndex] || {}) };
-
-    // Fields the UI treats as "PAID"
-    ms2.paymentTxHash = finalTxHash;                   // strong paid signal
-    ms2.paymentDate = new Date().toISOString();        // also paid signal
-    ms2.paidAt = ms2.paidAt || ms2.paymentDate;        // optional, but helps
-    ms2.paymentPending = false;
-    ms2.status = 'paid';                               // also in isPaid() set
-
-    milestones2[milestoneIndex] = ms2;
-
-    await pool.query(
-      'UPDATE bids SET milestones=$1 WHERE bid_id=$2',
-      [JSON.stringify(milestones2), bidId]
-    );
-
-    // notify release (optional)
-    if (proposal && typeof notifyPaymentReleased === 'function') {
-      await notifyPaymentReleased({
-        bid,
-        proposal,
-        msIndex: milestoneIndex + 1,
-        amount: msAmountUSD,
-        txHash: finalTxHash,
+      // bids.milestones → write fields the UI's isPaid() detects
+      const iso = new Date().toISOString();
+      await upsertMilestoneFields(bidId, milestoneIndex, {
+        paymentTxHash: finalTxHash,
+        paymentDate: iso,
+        paidAt: iso,
+        paid: true,
+        status: 'paid',
+        paymentPending: false,
       });
-    }
 
-    // Return early: already paid.
-    return res.json({ ok: true, status: 'released', txHash: finalTxHash });
+      // best-effort notify
+      if (proposal && typeof notifyPaymentReleased === 'function') {
+        await notifyPaymentReleased({
+          bid,
+          proposal,
+          msIndex: milestoneIndex + 1,
+          amount: msAmountUSD,
+          txHash: finalTxHash,
+        });
+      }
+
+      return res.json({ ok: true, status: 'released', txHash: finalTxHash });
+    }
+  } else {
+    const txt = await r.text().catch(() => '');
+    console.warn('Immediate Safe check HTTP failed', r.status, txt || r.statusText);
   }
 } catch (e) {
   console.warn('Immediate Safe execution check failed, proceeding with pending', e?.message || e);
