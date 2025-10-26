@@ -3913,6 +3913,7 @@ app.post('/admin/oversight/reconcile-payouts', adminGuard, async (req, res) => {
 });
 
 // Reconcile Safe multisig payments: flip 'pending' -> 'released' once executed on-chain
+// Reconcile Safe multisig payments: flip 'pending' -> 'released' once executed on-chain
 app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
   try {
     const { rows: pending } = await pool.query(`
@@ -3922,31 +3923,19 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
     `);
     if (!pending.length) return res.json({ ok: true, updated: 0 });
 
- const { default: SafeApiKit } = await import('@safe-global/api-kit');
-const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
-const net = await provider.getNetwork();
-const chainId = Number(net.chainId);
-const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global')
-  .trim()
-  .replace(/\/+$/, '');
+    const { default: SafeApiKit } = await import('@safe-global/api-kit');
+    const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+    const net = await provider.getNetwork();
+    const chainId = Number(net.chainId);
+    const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global')
+      .trim()
+      .replace(/\/+$/, '');
 
-const api = new SafeApiKit({
-  chainId,
-  txServiceUrl,
-  apiKey: process.env.SAFE_API_KEY || undefined
-});
-
-// Preflight: make sure the service has indexed this Safe BEFORE proposing
-try {
-  await api.getSafeInfo(process.env.SAFE_ADDRESS);
-} catch (e) {
-  console.error(
-    `Safe ${process.env.SAFE_ADDRESS} not found on ${txServiceUrl} (chainId=${chainId}). ` +
-    `Open it once in the Safe app on the same network to trigger indexing.`,
-    e?.message || e
-  );
-  return; // leave pending; skip proposeTransaction
-}
+    const api = new SafeApiKit({
+      chainId,
+      txServiceUrl,
+      apiKey: process.env.SAFE_API_KEY || undefined
+    });
 
     let updated = 0;
 
@@ -3991,6 +3980,25 @@ try {
             amount_usd=COALESCE(amount_usd,$3)
         WHERE id=$1
       `, [row.id, txResp.transactionHash, row.amount_usd]);
+
+      // 🔥 NEW: Send payment released notification for Safe transactions
+      try {
+        const { rows: [proposal] } = await pool.query(
+          "SELECT * FROM proposals WHERE proposal_id=$1",
+          [bid.proposal_id]
+        );
+        if (proposal && typeof notifyPaymentReleased === "function") {
+          await notifyPaymentReleased({
+            bid, 
+            proposal,
+            msIndex: row.milestone_index + 1,
+            amount: row.amount_usd,
+            txHash: txResp.transactionHash
+          });
+        }
+      } catch (notifyErr) {
+        console.warn("notifyPaymentReleased failed for Safe transaction", notifyErr?.message || notifyErr);
+      }
 
       updated++;
     }
@@ -4223,6 +4231,117 @@ if (MONITOR_MINUTES > 0) {
   console.log(`[ipfs-monitor] enabled: every ${MONITOR_MINUTES} min, lookback ${MONITOR_LOOKBACK_DAYS} days`);
 } else {
   console.log('[ipfs-monitor] disabled (IPFS_MONITOR_INTERVAL_MIN=0)');
+}
+
+// --- Auto-reconcile Safe transactions (every 10 minutes) ---
+const SAFE_RECONCILE_MINUTES = Number(process.env.SAFE_RECONCILE_MINUTES || 10);
+
+async function autoReconcileSafeTransactions() {
+  try {
+    const { rows: pending } = await pool.query(`
+      SELECT COUNT(*) as count 
+      FROM milestone_payments 
+      WHERE status='pending' AND safe_tx_hash IS NOT NULL
+    `);
+    
+    if (Number(pending[0]?.count || 0) > 0) {
+      console.log(`[safe-reconcile] Checking ${pending[0].count} pending Safe transactions...`);
+      
+      // Use the same logic as the reconcile-safe endpoint
+      const { default: SafeApiKit } = await import('@safe-global/api-kit');
+      const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+      const net = await provider.getNetwork();
+      const chainId = Number(net.chainId);
+      const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://safe-transaction-sepolia.safe.global')
+        .trim()
+        .replace(/\/+$/, '');
+
+      const api = new SafeApiKit({
+        chainId,
+        txServiceUrl,
+        apiKey: process.env.SAFE_API_KEY || undefined
+      });
+
+      const { rows: pendingTxs } = await pool.query(`
+        SELECT id, bid_id, milestone_index, amount_usd, safe_tx_hash
+        FROM milestone_payments
+        WHERE status='pending' AND safe_tx_hash IS NOT NULL
+      `);
+
+      let updated = 0;
+      for (const row of pendingTxs) {
+        let txResp;
+        try {
+          txResp = await api.getTransaction(row.safe_tx_hash);
+        } catch (e) {
+          continue;
+        }
+
+        const executed = txResp?.isExecuted && txResp?.transactionHash;
+        if (!executed) continue;
+
+        // Update payment status (same logic as above)
+        const { rows: bids } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [row.bid_id]);
+        const bid = bids[0];
+        if (!bid) continue;
+
+        const milestones = Array.isArray(bid.milestones)
+          ? bid.milestones
+          : JSON.parse(bid.milestones || '[]');
+
+        const ms = milestones[row.milestone_index] || {};
+        ms.paymentTxHash = txResp.transactionHash;
+        ms.paymentDate = new Date().toISOString();
+        ms.paymentPending = false;
+        ms.status = 'paid';
+        milestones[row.milestone_index] = ms;
+
+        await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2', [JSON.stringify(milestones), row.bid_id]);
+        await pool.query(
+          `UPDATE milestone_payments
+           SET status='released', tx_hash=$2, released_at=NOW()
+           WHERE id=$1`,
+          [row.id, txResp.transactionHash]
+        );
+
+        // Send notification
+        try {
+          const { rows: [proposal] } = await pool.query(
+            "SELECT * FROM proposals WHERE proposal_id=$1",
+            [bid.proposal_id]
+          );
+          if (proposal && typeof notifyPaymentReleased === "function") {
+            await notifyPaymentReleased({
+              bid, 
+              proposal,
+              msIndex: row.milestone_index + 1,
+              amount: row.amount_usd,
+              txHash: txResp.transactionHash
+            });
+          }
+        } catch (notifyErr) {
+          console.warn("Auto-reconcile notification failed", notifyErr);
+        }
+
+        updated++;
+      }
+
+      if (updated > 0) {
+        console.log(`[safe-reconcile] Updated ${updated} Safe transactions to released`);
+      }
+    }
+  } catch (e) {
+    console.error('Auto-reconcile Safe transactions failed', e);
+  }
+}
+
+// Start auto-reconciliation if enabled
+if (SAFE_RECONCILE_MINUTES > 0) {
+  setTimeout(() => autoReconcileSafeTransactions().catch(() => {}), 30_000); // First run after 30s
+  setInterval(() => autoReconcileSafeTransactions().catch(() => {}), SAFE_RECONCILE_MINUTES * 60 * 1000);
+  console.log(`[safe-reconcile] enabled: every ${SAFE_RECONCILE_MINUTES} minutes`);
+} else {
+  console.log('[safe-reconcile] disabled (SAFE_RECONCILE_MINUTES=0)');
 }
 
 // --- Bid Chat (SSE) ---------------------------------------------------------
@@ -5157,6 +5276,43 @@ if (willUseSafe) {
        WHERE bid_id=$1 AND milestone_index=$2`,
       [bidId, milestoneIndex, contractTransactionHash, nonce]
     );
+
+    // 🔥 NEW: Immediately check if Safe transaction is already executed (edge case)
+try {
+  const txResp = await api.getTransaction(contractTransactionHash);
+  if (txResp?.isExecuted && txResp?.transactionHash) {
+    // Transaction was already executed - mark as released immediately
+    await pool.query(
+      `UPDATE milestone_payments 
+       SET status='released', tx_hash=$3, released_at=NOW() 
+       WHERE bid_id=$1 AND milestone_index=$2`,
+      [bidId, milestoneIndex, txResp.transactionHash]
+    );
+    
+    // Update bid milestones
+    const ms = milestones[milestoneIndex];
+    ms.paymentTxHash = txResp.transactionHash;
+    ms.paymentDate = new Date().toISOString();
+    ms.paymentPending = false;
+    ms.status = "paid";
+    milestones[milestoneIndex] = ms;
+    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
+    
+    // Send release notification
+    if (proposal && typeof notifyPaymentReleased === "function") {
+      await notifyPaymentReleased({
+        bid, proposal,
+        msIndex: milestoneIndex + 1,
+        amount: msAmountUSD,
+        txHash: txResp.transactionHash
+      });
+    }
+    
+    return res.json({ ok: true, status: "released", txHash: txResp.transactionHash });
+  }
+} catch (e) {
+  console.warn("Immediate Safe execution check failed, proceeding with pending", e?.message || e);
+}
 
     // 10) notify
     try {
