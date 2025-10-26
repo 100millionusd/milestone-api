@@ -115,6 +115,82 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+// ---- Safe Tx overlay helpers (response-time hydration) ----
+const SAFE_LOOKUPS_PER_REQUEST = 5; // cap to avoid hammering
+const SAFE_CACHE_TTL_MS = 15_000;   // 15s cache to smooth bursts
+
+const _safeStatusCache = new Map(); // key: safeTxHash -> { at, isExecuted, txHash }
+
+async function _getSafeTxStatus(safeTxHash) {
+  const now = Date.now();
+  const cached = _safeStatusCache.get(safeTxHash);
+  if (cached && now - cached.at < SAFE_CACHE_TTL_MS) return cached;
+
+  // Use the SAME base you use to POST (keep domains consistent!)
+  const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://api.safe.global/tx-service/sep')
+    .trim()
+    .replace(/\/+$/, '');
+
+  const { default: SafeApiKit } = await import('@safe-global/api-kit');
+  const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+  const net = await provider.getNetwork();
+  const chainId = Number(net.chainId);
+
+  const api = new SafeApiKit({
+    chainId,
+    txServiceUrl,
+    apiKey: process.env.SAFE_API_KEY || undefined
+  });
+
+  try {
+    const tx = await api.getTransaction(safeTxHash);
+    const out = {
+      at: now,
+      isExecuted: !!(tx?.isExecuted || tx?.transactionHash),
+      txHash: tx?.transactionHash || null,
+    };
+    _safeStatusCache.set(safeTxHash, out);
+    return out;
+  } catch (e) {
+    const out = { at: now, isExecuted: false, txHash: null };
+    _safeStatusCache.set(safeTxHash, out);
+    return out;
+  }
+}
+
+// Best-effort background DB finalize (don’t await in overlay)
+async function _finalizePaidInDb({ bidId, milestoneIndex, txHash }) {
+  try {
+    // bids.milestones
+    const { rows: b } = await pool.query('SELECT milestones FROM bids WHERE bid_id=$1', [bidId]);
+    if (!b[0]) return;
+    const arr = Array.isArray(b[0].milestones) ? b[0].milestones : JSON.parse(b[0].milestones || '[]');
+    const ms = { ...(arr[milestoneIndex] || {}) };
+    const iso = new Date().toISOString();
+
+    ms.paymentTxHash = ms.paymentTxHash || txHash || null;
+    ms.paymentDate   = ms.paymentDate   || iso;
+    ms.paidAt        = ms.paidAt        || ms.paymentDate;
+    ms.paymentPending = false;
+    ms.status = 'paid';
+
+    arr[milestoneIndex] = ms;
+    await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2', [JSON.stringify(arr), bidId]);
+
+    // milestone_payments
+    await pool.query(
+      `UPDATE milestone_payments
+         SET status='released',
+             tx_hash=COALESCE($3, tx_hash),
+             released_at=COALESCE(released_at, NOW())
+       WHERE bid_id=$1 AND milestone_index=$2 AND status='pending'`,
+      [bidId, milestoneIndex, txHash || null]
+    );
+  } catch (e) {
+    console.warn('[overlay finalize] DB finalize failed', e?.message || e);
+  }
+}
+
 // --- Overlay "Paid" status from milestone_payments into bid.milestones for responses ---
 async function overlayPaidFromMp(bid, pool) {
   const bidId = bid.bid_id ?? bid.bidId;
@@ -134,14 +210,18 @@ async function overlayPaidFromMp(bid, pool) {
 
   const byIdx = new Map(mpRows.map(r => [Number(r.milestone_index), r]));
 
+  // We’ll allow at most N Safe lookups per request for still-pending rows
+  let lookupsLeft = SAFE_LOOKUPS_PER_REQUEST;
+  const promises = [];
+
   for (let i = 0; i < msArr.length; i++) {
     const mp = byIdx.get(i);
     if (!mp) continue;
 
     const s = String(mp.status || '').toLowerCase();
-    const released = s === 'released' || !!mp.tx_hash || !!mp.released_at;
+    const alreadyReleased = s === 'released' || !!mp.tx_hash || !!mp.released_at;
 
-    if (released) {
+    if (alreadyReleased) {
       const paidIso = mp.released_at
         ? new Date(mp.released_at).toISOString()
         : new Date().toISOString();
@@ -155,8 +235,44 @@ async function overlayPaidFromMp(bid, pool) {
         paymentPending: false,
         status: 'paid',
       };
+      continue;
+    }
+
+    // Still pending but has a Safe tx → check live status (bounded + cached)
+    if (mp.safe_tx_hash && lookupsLeft > 0) {
+      lookupsLeft--;
+      promises.push(
+        (async (idx, safeHash) => {
+          const st = await _getSafeTxStatus(safeHash);
+          if (st?.isExecuted) {
+            const iso = new Date().toISOString();
+            // Show as PAID in this response immediately
+            msArr[idx] = {
+              ...(msArr[idx] || {}),
+              paymentTxHash: msArr[idx]?.paymentTxHash || st.txHash || null,
+              safePaymentTxHash: msArr[idx]?.safePaymentTxHash || safeHash,
+              paymentDate: msArr[idx]?.paymentDate || iso,
+              paidAt: msArr[idx]?.paidAt || iso,
+              paymentPending: false,
+              status: 'paid',
+            };
+            // Best-effort DB update in background
+            _finalizePaidInDb({ bidId, milestoneIndex: idx, txHash: st.txHash }).catch(() => {});
+          } else {
+            // Keep it visibly "in-flight" so UI hides pay buttons
+            msArr[idx] = {
+              ...(msArr[idx] || {}),
+              safePaymentTxHash: msArr[idx]?.safePaymentTxHash || safeHash,
+              safeTxHash: msArr[idx]?.safeTxHash || safeHash,
+              safeNonce: msArr[idx]?.safeNonce ?? mp.safe_nonce ?? null,
+              safeStatus: msArr[idx]?.safeStatus || 'submitted',
+              paymentPending: true,
+            };
+          }
+        })(i, mp.safe_tx_hash)
+      );
     } else if (mp.safe_tx_hash) {
-      // not released yet → show in-flight so buttons stay hidden
+      // Out of lookup budget → still show in-flight markers
       msArr[i] = {
         ...(msArr[i] || {}),
         safePaymentTxHash: msArr[i]?.safePaymentTxHash || mp.safe_tx_hash,
@@ -166,6 +282,11 @@ async function overlayPaidFromMp(bid, pool) {
         paymentPending: true,
       };
     }
+  }
+
+  if (promises.length) {
+    // We don't await in the route; but here it's safe because overlay is awaited already
+    await Promise.all(promises);
   }
 
   return { ...bid, milestones: msArr };
@@ -3008,9 +3129,6 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
   }
 });
 
-// ==============================
-// Routes — Bids
-// ==============================
 // ==============================
 // Routes — Bids
 // ==============================
