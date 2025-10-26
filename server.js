@@ -3985,7 +3985,6 @@ app.post('/admin/oversight/reconcile-payouts', adminGuard, async (req, res) => {
 });
 
 // Reconcile Safe multisig payments: flip 'pending' -> 'released' once executed on-chain
-// Reconcile Safe multisig payments: flip 'pending' -> 'released' once executed on-chain
 app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
   try {
     const { rows: pending } = await pool.query(`
@@ -4018,15 +4017,15 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
       try {
         txResp = await api.getTransaction(row.safe_tx_hash);
       } catch (e) {
-        console.warn('Safe getTransaction failed', row.safe_tx_hash, e?.message || e);
+        console.warn('[reconcile-safe] getTransaction failed', row.safe_tx_hash, e?.message || e);
         continue;
       }
 
-      // The Transaction Service flags execution and carries the on-chain tx hash
-      const executed = txResp?.isExecuted && txResp?.transactionHash;
+      // must be executed on-chain (service provides transactionHash when executed)
+      const executed = !!(txResp?.isExecuted && txResp?.transactionHash);
       if (!executed) continue;
 
-      // Load bid + update milestone JSON
+      // --- Update bids.milestones (UI reads this) ---
       const { rows: bids } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [row.bid_id]);
       const bid = bids[0];
       if (!bid) continue;
@@ -4035,41 +4034,52 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
         ? bid.milestones
         : JSON.parse(bid.milestones || '[]');
 
-      const ms = milestones[row.milestone_index] || {};
-      ms.paymentTxHash  = txResp.transactionHash;
-      ms.paymentDate    = new Date().toISOString();
-      ms.paymentPending = false;
-      ms.status         = 'paid';
-      milestones[row.milestone_index] = ms;
+      const idx = Number(row.milestone_index);
+      const ms = { ...(milestones[idx] || {}) };
+      const iso = new Date().toISOString();
 
-      await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2', [JSON.stringify(milestones), row.bid_id]);
+      // ✅ set ALL paid markers the UI checks
+      ms.paymentTxHash     = ms.paymentTxHash     || txResp.transactionHash;
+      ms.safePaymentTxHash = ms.safePaymentTxHash || row.safe_tx_hash; // keep Safe ref
+      ms.paymentDate       = ms.paymentDate       || iso;
+      ms.paidAt            = ms.paidAt            || ms.paymentDate;
+      ms.paymentPending    = false;
+      ms.status            = 'paid';
 
+      milestones[idx] = ms;
+
+      await pool.query(
+        'UPDATE bids SET milestones=$1 WHERE bid_id=$2',
+        [JSON.stringify(milestones), row.bid_id]
+      );
+
+      // --- milestone_payments → released ---
       await pool.query(`
         UPDATE milestone_payments
-        SET status='released',
-            tx_hash=$2,
-            released_at=NOW(),
-            amount_usd=COALESCE(amount_usd,$3)
-        WHERE id=$1
+           SET status='released',
+               tx_hash=$2,
+               released_at=NOW(),
+               amount_usd=COALESCE(amount_usd,$3)
+         WHERE id=$1
       `, [row.id, txResp.transactionHash, row.amount_usd]);
 
-      // 🔥 NEW: Send payment released notification for Safe transactions
+      // (optional) notify
       try {
         const { rows: [proposal] } = await pool.query(
-          "SELECT * FROM proposals WHERE proposal_id=$1",
+          'SELECT * FROM proposals WHERE proposal_id=$1',
           [bid.proposal_id]
         );
-        if (proposal && typeof notifyPaymentReleased === "function") {
+        if (proposal && typeof notifyPaymentReleased === 'function') {
           await notifyPaymentReleased({
-            bid, 
+            bid,
             proposal,
-            msIndex: row.milestone_index + 1,
+            msIndex: idx + 1,
             amount: row.amount_usd,
             txHash: txResp.transactionHash
           });
         }
-      } catch (notifyErr) {
-        console.warn("notifyPaymentReleased failed for Safe transaction", notifyErr?.message || notifyErr);
+      } catch (e) {
+        console.warn('[reconcile-safe] notify failed', e?.message || e);
       }
 
       updated++;
@@ -4077,10 +4087,11 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
 
     return res.json({ ok: true, updated });
   } catch (e) {
-    console.error('reconcile-safe error', e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    console.error('[reconcile-safe] fatal', e);
+    return res.status(500).json({ error: e?.message || String(e) });
   }
 });
+
 
 // Quick status check for a Safe tx
 app.get('/safe/tx/:hash', adminGuard, async (req, res) => {
