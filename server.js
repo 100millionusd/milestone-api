@@ -4092,6 +4092,94 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
   }
 });
 
+// Force-finalize a milestone as PAID using an executed on-chain tx hash
+// POST /admin/oversight/finalize-chain-tx  { bidId, milestoneIndex, txHash }
+app.post('/admin/oversight/finalize-chain-tx', adminGuard, async (req, res) => {
+  try {
+    const bidId = Number(req.body?.bidId);
+    const milestoneIndex = Number(req.body?.milestoneIndex);
+    const txHash = String(req.body?.txHash || '').trim();
+
+    if (!Number.isFinite(bidId) || !Number.isFinite(milestoneIndex) || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+      return res.status(400).json({ error: 'bidId, milestoneIndex, txHash required' });
+    }
+
+    // 1) Verify on-chain receipt is successful
+    const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+    const receipt = await provider.getTransactionReceipt(txHash);
+    if (!receipt || receipt.status !== 1) {
+      return res.status(400).json({ error: 'tx not found or not successful on-chain' });
+    }
+
+    // 2) Load bid + milestones JSON
+    const { rows: bids } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [bidId]);
+    const bid = bids[0];
+    if (!bid) return res.status(404).json({ error: 'Bid not found' });
+
+    const milestones = Array.isArray(bid.milestones)
+      ? bid.milestones
+      : JSON.parse(bid.milestones || '[]');
+
+    if (!milestones[milestoneIndex]) {
+      return res.status(400).json({ error: 'Invalid milestoneIndex for this bid' });
+    }
+
+    // 3) Flip milestone -> PAID (preserve Safe refs if present)
+    const ms = { ...(milestones[milestoneIndex] || {}) };
+    const iso = new Date().toISOString();
+
+    ms.paymentTxHash  = ms.paymentTxHash || txHash;
+    ms.paymentDate    = ms.paymentDate || iso;
+    ms.paidAt         = ms.paidAt || ms.paymentDate;
+    ms.paymentPending = false;
+    ms.status         = 'paid';
+
+    milestones[milestoneIndex] = ms;
+
+    await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2', [JSON.stringify(milestones), bidId]);
+
+    // 4) Update or insert milestone_payments row as released
+    const { rowCount } = await pool.query(
+      `UPDATE milestone_payments
+          SET status='released', tx_hash=$3, released_at=NOW()
+        WHERE bid_id=$1 AND milestone_index=$2`,
+      [bidId, milestoneIndex, txHash]
+    );
+
+    if (rowCount === 0) {
+      await pool.query(
+        `INSERT INTO milestone_payments
+          (bid_id, milestone_index, created_at, tx_hash, status, released_at)
+         VALUES ($1,$2,NOW(),$3,'released',NOW())`,
+        [bidId, milestoneIndex, txHash]
+      );
+    }
+
+    // 5) Optional: notify
+    try {
+      const { rows: [proposal] } = await pool.query(
+        'SELECT * FROM proposals WHERE proposal_id=$1',
+        [bid.proposal_id]
+      );
+      if (proposal && typeof notifyPaymentReleased === 'function') {
+        await notifyPaymentReleased({
+          bid, proposal,
+          msIndex: milestoneIndex + 1,
+          amount: ms.amount || null,
+          txHash
+        });
+      }
+    } catch (e) {
+      console.warn('notifyPaymentReleased failed', e?.message || e);
+    }
+
+    return res.json({ ok: true, bidId, milestoneIndex, txHash });
+  } catch (e) {
+    console.error('finalize-chain-tx failed', e);
+    return res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
 
 // Quick status check for a Safe tx
 app.get('/safe/tx/:hash', adminGuard, async (req, res) => {
