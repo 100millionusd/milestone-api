@@ -3011,50 +3011,54 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
 // ==============================
 // Routes — Bids
 // ==============================
+// ==============================
+// Routes — Bids
+// ==============================
 app.get("/bids", async (req, res) => {
   try {
     const pid = Number(req.query.proposalId);
 
-    // secure scoping when flag ON and caller is not admin
+    // role / caller (if your auth middleware sets req.user)
     const role = (req.user?.role || "guest").toLowerCase();
     const caller = (req.user?.sub || "").toLowerCase();
 
-    // --- PUBLIC PAGE COMPAT: allow sanitized read for guests on a specific proposal ---
-if (SCOPE_BIDS_FOR_VENDOR && role !== 'admin' && !caller && Number.isFinite(pid)) {
-  const { rows } = await pool.query(
-    `SELECT bid_id, proposal_id, vendor_name, price_usd, days, status, created_at, updated_at, milestones
-       FROM bids
-      WHERE proposal_id = $1 AND status <> 'archived'
-      ORDER BY bid_id DESC`,
-    [pid]
-  );
+    // --- PUBLIC PAGE (guest + specific proposal) — keep sanitized shape ---
+    if (SCOPE_BIDS_FOR_VENDOR && role !== 'admin' && !caller && Number.isFinite(pid)) {
+      const { rows } = await pool.query(
+        `SELECT bid_id, proposal_id, vendor_name, price_usd, days, status, created_at, updated_at, milestones
+           FROM bids
+          WHERE proposal_id = $1 AND status <> 'archived'
+          ORDER BY bid_id DESC`,
+        [pid]
+      );
 
-  // sanitize + parse milestones JSON (string or jsonb)
-  const out = rows.map(r => {
-    const ms = Array.isArray(r.milestones)
-      ? r.milestones
-      : (typeof r.milestones === 'string' ? JSON.parse(r.milestones || '[]') : []);
-    return {
-      bidId: r.bid_id,
-      proposalId: r.proposal_id,
-      vendorName: r.vendor_name,
-      priceUSD: Number(r.price_usd),
-      days: r.days,
-      status: r.status,
-      createdAt: r.created_at,
-      updatedAt: r.updated_at,
-      milestones: ms.map(m => ({
-        name: m?.name,
-        amount: Number(m?.amount ?? 0),
-        dueDate: m?.dueDate ?? m?.due_date ?? null,
-        completed: !!m?.completed
-      }))
-    };
-  });
+      // keep the public sanitized payload (no payment metadata here)
+      const out = rows.map(r => {
+        const ms = Array.isArray(r.milestones)
+          ? r.milestones
+          : (typeof r.milestones === 'string' ? JSON.parse(r.milestones || '[]') : []);
+        return {
+          bidId: r.bid_id,
+          proposalId: r.proposal_id,
+          vendorName: r.vendor_name,
+          priceUSD: Number(r.price_usd),
+          days: r.days,
+          status: r.status,
+          createdAt: r.created_at,
+          updatedAt: r.updated_at,
+          milestones: ms.map(m => ({
+            name: m?.name,
+            amount: Number(m?.amount ?? 0),
+            dueDate: m?.dueDate ?? m?.due_date ?? null,
+            completed: !!m?.completed
+          }))
+        };
+      });
 
-  return res.json(out);
-}
+      return res.json(out);
+    }
 
+    // --- VENDOR-SCOPED (non-admin) ---
     if (SCOPE_BIDS_FOR_VENDOR && role !== "admin") {
       if (!caller) return res.status(401).json({ error: "Unauthorized" });
 
@@ -3063,41 +3067,49 @@ if (SCOPE_BIDS_FOR_VENDOR && role !== 'admin' && !caller && Number.isFinite(pid)
           "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) AND proposal_id=$2 ORDER BY bid_id DESC",
           [caller, pid]
         );
-        return res.json(mapRows(rows));
+        const hydrated = await Promise.all(rows.map(r => overlayPaidFromMp(r, pool)));
+        return res.json(mapRows(hydrated));
       } else {
         const { rows } = await pool.query(
           "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) ORDER BY bid_id DESC",
           [caller]
         );
-        return res.json(mapRows(rows));
+        const hydrated = await Promise.all(rows.map(r => overlayPaidFromMp(r, pool)));
+        return res.json(mapRows(hydrated));
       }
     }
 
-    // Admin or flag OFF: existing behavior
+    // --- ADMIN (or flag OFF): return all bids, hydrated ---
     if (Number.isFinite(pid)) {
-      const { rows } = await pool.query("SELECT * FROM bids WHERE proposal_id=$1 ORDER BY bid_id DESC", [ pid ]);
-      return res.json(mapRows(rows));
+      const { rows } = await pool.query(
+        "SELECT * FROM bids WHERE proposal_id=$1 ORDER BY bid_id DESC",
+        [pid]
+      );
+      const hydrated = await Promise.all(rows.map(r => overlayPaidFromMp(r, pool)));
+      return res.json(mapRows(hydrated));
     } else {
       const { rows } = await pool.query("SELECT * FROM bids ORDER BY bid_id DESC");
-      return res.json(mapRows(rows));
+      const hydrated = await Promise.all(rows.map(r => overlayPaidFromMp(r, pool)));
+      return res.json(mapRows(hydrated));
     }
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message || "Failed to load bids" });
   }
 });
 
 app.get("/bids/:id", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+
   try {
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ id ]);
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
 
     const bid = rows[0];
-    const role = (req.user?.role || "guest").toLowerCase();
-    const caller = (req.user?.sub || "").toLowerCase();
 
     // enforce ownership when flag ON and not admin
+    const role = (req.user?.role || "guest").toLowerCase();
+    const caller = (req.user?.sub || "").toLowerCase();
     if (SCOPE_BIDS_FOR_VENDOR && role !== "admin") {
       if (!caller) return res.status(401).json({ error: "Unauthorized" });
       if ((bid.wallet_address || "").toLowerCase() !== caller) {
@@ -3105,9 +3117,13 @@ app.get("/bids/:id", async (req, res) => {
       }
     }
 
-    return res.json(toCamel(bid));
+    // ★ Hydrate this single bid from milestone_payments (brings Safe 'paid' into milestones)
+    const hydrated = await overlayPaidFromMp(bid, pool);
+
+    // keep your existing shape/casing
+    return res.json(toCamel(hydrated));
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message || "Failed to load bid" });
   }
 });
 
