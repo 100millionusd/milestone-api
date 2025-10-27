@@ -118,6 +118,12 @@ const pool = new Pool({
 // ---- Safe Tx overlay helpers (response-time hydration) ----
 const SAFE_CACHE_TTL_MS = 5_000;
 
+// ADD THIS — define once
+const SAFE_LOOKUPS_PER_REQUEST =
+  process.env.SAFE_LOOKUPS_PER_REQUEST !== undefined
+    ? Math.max(0, Math.floor(Number(process.env.SAFE_LOOKUPS_PER_REQUEST)))
+    : 8;
+
 const _safeStatusCache = new Map(); // key: safeTxHash -> { at, isExecuted, txHash }
 const _safeTxUrlBase = (process.env.SAFE_TXSERVICE_URL || 'https://api.safe.global/tx-service/sep')
   .trim()
@@ -216,108 +222,132 @@ async function overlayPaidFromMp(bid, pool) {
   const bidId = bid.bid_id ?? bid.bidId;
   if (!bidId) return bid;
 
-  const msArr = Array.isArray(bid.milestones)
+  let msArr = Array.isArray(bid.milestones)
     ? bid.milestones
     : JSON.parse(bid.milestones || '[]');
 
+  // get the newest row per milestone_index
   const { rows: mpRows } = await pool.query(
-    `SELECT milestone_index, status, tx_hash, safe_tx_hash, released_at, safe_nonce
+    `SELECT DISTINCT ON (milestone_index)
+           milestone_index, status, tx_hash, safe_tx_hash, released_at, safe_nonce, created_at, id
        FROM milestone_payments
-      WHERE bid_id = $1`,
+      WHERE bid_id = $1
+      ORDER BY milestone_index, created_at DESC, id DESC`,
     [bidId]
   );
-  if (!mpRows.length) return { ...bid, milestones: msArr };
+
+  if (!mpRows.length) {
+    return { ...bid, milestones: msArr };
+  }
 
   const byIdx = new Map(mpRows.map(r => [Number(r.milestone_index), r]));
 
-  // First: apply already released & mark in-flight
-  const pendingSafe = [];
+  // Pass 1: mark already-released as paid (no network calls)
   for (let i = 0; i < msArr.length; i++) {
-    const mp = byIdx.get(i);
-    if (!mp) continue;
+    const r = byIdx.get(i);
+    if (!r) continue;
 
-    const s = String(mp.status || '').toLowerCase();
-    const alreadyReleased = s === 'released' || !!mp.tx_hash || !!mp.released_at;
+    const s = String(r.status || '').toLowerCase();
+    const alreadyReleased = s === 'released' || !!r.tx_hash || !!r.released_at;
 
     if (alreadyReleased) {
-      const paidIso = mp.released_at
-        ? new Date(mp.released_at).toISOString()
+      const paidIso = r.released_at
+        ? new Date(r.released_at).toISOString()
         : new Date().toISOString();
 
       msArr[i] = {
         ...(msArr[i] || {}),
-        paymentTxHash:     msArr[i]?.paymentTxHash     || mp.tx_hash || mp.safe_tx_hash || null,
-        safePaymentTxHash: msArr[i]?.safePaymentTxHash || mp.safe_tx_hash || null,
-        paymentDate:       msArr[i]?.paymentDate       || paidIso,
-        paidAt:            msArr[i]?.paidAt            || paidIso,
-        paymentPending:    false,
-        status:            'paid',
+        paymentTxHash: msArr[i]?.paymentTxHash || r.tx_hash || null,
+        safePaymentTxHash: msArr[i]?.safePaymentTxHash || r.safe_tx_hash || null,
+        paymentDate: msArr[i]?.paymentDate || paidIso,
+        paidAt: msArr[i]?.paidAt || paidIso,
+        paymentPending: false,
+        status: 'paid',
       };
-      continue;
-    }
-
-    if (mp.safe_tx_hash) {
-      msArr[i] = {
-        ...(msArr[i] || {}),
-        safePaymentTxHash: msArr[i]?.safePaymentTxHash || mp.safe_tx_hash,
-        safeTxHash:        msArr[i]?.safeTxHash        || mp.safe_tx_hash,
-        safeNonce:         msArr[i]?.safeNonce ?? mp.safe_nonce ?? null,
-        safeStatus:        msArr[i]?.safeStatus || 'submitted',
-        paymentPending:    true,
-      };
-      pendingSafe.push(i);
     }
   }
 
-  // Second: for each pending safe, check execution; if no, try NONCE FALLBACK
-  for (const idx of pendingSafe) {
-    const mp = byIdx.get(idx);
-    const safeHash = mp?.safe_tx_hash;
-    const nonce = mp?.safe_nonce;
+  // Build list of still-pending-with-safe rows, newest first
+  let lookupsLeft = SAFE_LOOKUPS_PER_REQUEST;
+  const pending = mpRows
+    .filter(r => {
+      const s = String(r.status || '').toLowerCase();
+      const alreadyReleased = s === 'released' || !!r.tx_hash || !!r.released_at;
+      return !alreadyReleased && r.safe_tx_hash != null;
+    })
+    .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
 
-    let st = null;
-    if (safeHash) {
-      st = await _getSafeTxStatus(safeHash);
-    }
+  // Pass 2: spend lookup budget; handle replaced Safe tx at same nonce
+  const tasks = [];
+  for (const r of pending) {
+    if (lookupsLeft <= 0) break;
+    lookupsLeft--;
 
-    if (st?.isExecuted) {
-      const iso = new Date().toISOString();
-      msArr[idx] = {
-        ...(msArr[idx] || {}),
-        paymentTxHash:     msArr[idx]?.paymentTxHash     || st.txHash || null,
-        safePaymentTxHash: msArr[idx]?.safePaymentTxHash || safeHash,
-        paymentDate:       msArr[idx]?.paymentDate       || iso,
-        paidAt:            msArr[idx]?.paidAt            || iso,
-        paymentPending:    false,
-        status:            'paid',
-      };
-      _finalizePaidInDb({ bidId, milestoneIndex: idx, txHash: st.txHash, safeTxHash: safeHash }).catch(()=>{});
-    } else if (nonce !== null && nonce !== undefined) {
-      // NEW: check if a *different* hash at this NONCE got executed
-      const byNonce = await _findExecutedByNonce(nonce);
-      if (byNonce?.isExecuted) {
+    const idx = Number(r.milestone_index);
+    const safeHash = r.safe_tx_hash;
+    const nonce = r.safe_nonce ?? null;
+
+    tasks.push((async () => {
+      const st = await _getSafeTxStatus(safeHash);
+      if (st?.isExecuted) {
         const iso = new Date().toISOString();
         msArr[idx] = {
           ...(msArr[idx] || {}),
-          paymentTxHash:     msArr[idx]?.paymentTxHash     || byNonce.txHash || null,
-          safePaymentTxHash: byNonce.safeTxHash, // swap to the new safe hash
-          paymentDate:       msArr[idx]?.paymentDate       || iso,
-          paidAt:            msArr[idx]?.paidAt            || iso,
-          paymentPending:    false,
-          status:            'paid',
+          paymentTxHash: msArr[idx]?.paymentTxHash || st.txHash || null,
+          safePaymentTxHash: msArr[idx]?.safePaymentTxHash || safeHash,
+          paymentDate: msArr[idx]?.paymentDate || iso,
+          paidAt: msArr[idx]?.paidAt || iso,
+          paymentPending: false,
+          status: 'paid',
         };
-        _finalizePaidInDb({
-          bidId,
-          milestoneIndex: idx,
-          txHash: byNonce.txHash,
-          safeTxHash: byNonce.safeTxHash
-        }).catch(()=>{});
+        _finalizePaidInDb({ bidId, milestoneIndex: idx, txHash: st.txHash, safeTxHash: safeHash }).catch(() => {});
+        return;
       }
-    }
 
-    // small delay to avoid tx-service rate limiting
-    await new Promise(r => setTimeout(r, 150));
+      // Fallback: if a different Safe tx at the SAME NONCE got executed (rebroadcast / replacement)
+      const alt = await _findExecutedByNonce(nonce);
+      if (alt?.isExecuted) {
+        const iso = new Date().toISOString();
+        msArr[idx] = {
+          ...(msArr[idx] || {}),
+          paymentTxHash: msArr[idx]?.paymentTxHash || alt.txHash || null,
+          safePaymentTxHash: msArr[idx]?.safePaymentTxHash || alt.safeTxHash,
+          paymentDate: msArr[idx]?.paymentDate || iso,
+          paidAt: msArr[idx]?.paidAt || iso,
+          paymentPending: false,
+          status: 'paid',
+        };
+        _finalizePaidInDb({ bidId, milestoneIndex: idx, txHash: alt.txHash, safeTxHash: alt.safeTxHash }).catch(() => {});
+        return;
+      }
+
+      // Still pending — keep in-flight markers
+      msArr[idx] = {
+        ...(msArr[idx] || {}),
+        safePaymentTxHash: msArr[idx]?.safePaymentTxHash || safeHash,
+        safeTxHash: msArr[idx]?.safeTxHash || safeHash,
+        safeNonce: msArr[idx]?.safeNonce ?? nonce,
+        safeStatus: msArr[idx]?.safeStatus || 'submitted',
+        paymentPending: true,
+      };
+    })());
   }
+
+  // Any remaining pending we didn’t check (budget spent) → leave as submitted
+  for (const r of pending.slice(SAFE_LOOKUPS_PER_REQUEST)) {
+    const idx = Number(r.milestone_index);
+    if (!Number.isFinite(idx)) continue;
+    msArr[idx] = {
+      ...(msArr[idx] || {}),
+      safePaymentTxHash: msArr[idx]?.safePaymentTxHash || r.safe_tx_hash,
+      safeTxHash: msArr[idx]?.safeTxHash || r.safe_tx_hash,
+      safeNonce: msArr[idx]?.safeNonce ?? r.safe_nonce ?? null,
+      safeStatus: msArr[idx]?.safeStatus || 'submitted',
+      paymentPending: true,
+    };
+  }
+
+  if (tasks.length) await Promise.all(tasks);
 
   return { ...bid, milestones: msArr };
 }
