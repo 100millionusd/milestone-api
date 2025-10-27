@@ -116,28 +116,25 @@ const pool = new Pool({
 });
 
 // ---- Safe Tx overlay helpers (response-time hydration) ----
-const SAFE_CACHE_TTL_MS = 5_000; // tighter cache so executed txs flip quickly
+const SAFE_CACHE_TTL_MS = 5_000;
 
 const _safeStatusCache = new Map(); // key: safeTxHash -> { at, isExecuted, txHash }
+const _safeTxUrlBase = (process.env.SAFE_TXSERVICE_URL || 'https://api.safe.global/tx-service/sep')
+  .trim()
+  .replace(/\/+$/, '');
+const SAFE_ADDRESS = (process.env.SAFE_ADDRESS || process.env.SAFE_WALLET || '0xedd1F37FD3eaACb596CDF00102187DA0cc884D93').trim();
 
 async function _getSafeTxStatus(safeTxHash) {
   const now = Date.now();
   const cached = _safeStatusCache.get(safeTxHash);
   if (cached && now - cached.at < SAFE_CACHE_TTL_MS) return cached;
 
-  // Use the SAME base you use to POST (keep domains consistent!)
-  const txServiceUrl = (process.env.SAFE_TXSERVICE_URL || 'https://api.safe.global/tx-service/sep')
-    .trim()
-    .replace(/\/+$/, '');
-
   const { default: SafeApiKit } = await import('@safe-global/api-kit');
   const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
   const net = await provider.getNetwork();
-  const chainId = Number(net.chainId);
-
   const api = new SafeApiKit({
-    chainId,
-    txServiceUrl,
+    chainId: Number(net.chainId),
+    txServiceUrl: _safeTxUrlBase,
     apiKey: process.env.SAFE_API_KEY || undefined
   });
 
@@ -150,23 +147,47 @@ async function _getSafeTxStatus(safeTxHash) {
     };
     _safeStatusCache.set(safeTxHash, out);
     return out;
-  } catch (e) {
+  } catch {
     const out = { at: now, isExecuted: false, txHash: null };
     _safeStatusCache.set(safeTxHash, out);
     return out;
   }
 }
 
-// Best-effort background DB finalize (don’t await in overlay)
-async function _finalizePaidInDb({ bidId, milestoneIndex, txHash }) {
+// NEW: If a different SafeTx at the same NONCE got executed (rebroadcast), find it
+async function _findExecutedByNonce(nonce) {
+  if (nonce === null || nonce === undefined) return null;
+  // Using tx-service REST directly because api-kit doesn’t expose this filter nicely
+  const url = `${_safeTxUrlBase}/api/v1/safes/${SAFE_ADDRESS}/multisig-transactions/?nonce=${Number(nonce)}&ordering=-submissionDate&limit=10`;
   try {
-    // bids.milestones
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const j = await r.json();
+    const hit = (j?.results || []).find(
+      t => t?.is_executed || t?.transaction_hash
+    );
+    if (!hit) return null;
+    return {
+      safeTxHash: hit.safe_tx_hash,
+      isExecuted: !!(hit.is_executed || hit.transaction_hash),
+      txHash: hit.transaction_hash || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Finalize DB (fire-and-forget)
+async function _finalizePaidInDb({ bidId, milestoneIndex, txHash, safeTxHash }) {
+  try {
+    // Update milestone JSON
     const { rows: b } = await pool.query('SELECT milestones FROM bids WHERE bid_id=$1', [bidId]);
     if (!b[0]) return;
     const arr = Array.isArray(b[0].milestones) ? b[0].milestones : JSON.parse(b[0].milestones || '[]');
     const ms = { ...(arr[milestoneIndex] || {}) };
     const iso = new Date().toISOString();
 
+    if (safeTxHash && !ms.safePaymentTxHash) ms.safePaymentTxHash = safeTxHash;
     ms.paymentTxHash  = ms.paymentTxHash || txHash || null;
     ms.paymentDate    = ms.paymentDate   || iso;
     ms.paidAt         = ms.paidAt        || ms.paymentDate;
@@ -176,14 +197,15 @@ async function _finalizePaidInDb({ bidId, milestoneIndex, txHash }) {
     arr[milestoneIndex] = ms;
     await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2', [JSON.stringify(arr), bidId]);
 
-    // milestone_payments
+    // Update milestone_payments (also switch to the new safe_tx_hash if the hash changed)
     await pool.query(
       `UPDATE milestone_payments
          SET status='released',
+             safe_tx_hash = COALESCE($4, safe_tx_hash),
              tx_hash=COALESCE($3, tx_hash),
              released_at=COALESCE(released_at, NOW())
-       WHERE bid_id=$1 AND milestone_index=$2 AND status='pending'`,
-      [bidId, milestoneIndex, txHash || null]
+       WHERE bid_id=$1 AND milestone_index=$2`,
+      [bidId, milestoneIndex, txHash || null, safeTxHash || null]
     );
   } catch (e) {
     console.warn('[overlay finalize] DB finalize failed', e?.message || e);
@@ -209,8 +231,8 @@ async function overlayPaidFromMp(bid, pool) {
 
   const byIdx = new Map(mpRows.map(r => [Number(r.milestone_index), r]));
 
-  // 1) First pass: apply already-released & mark in-flight, collect pending-safe idxs
-  const pendingSafeIdx = [];
+  // First: apply already released & mark in-flight
+  const pendingSafe = [];
   for (let i = 0; i < msArr.length; i++) {
     const mp = byIdx.get(i);
     if (!mp) continue;
@@ -225,18 +247,17 @@ async function overlayPaidFromMp(bid, pool) {
 
       msArr[i] = {
         ...(msArr[i] || {}),
-        paymentTxHash:   msArr[i]?.paymentTxHash   || mp.tx_hash || mp.safe_tx_hash || null,
+        paymentTxHash:     msArr[i]?.paymentTxHash     || mp.tx_hash || mp.safe_tx_hash || null,
         safePaymentTxHash: msArr[i]?.safePaymentTxHash || mp.safe_tx_hash || null,
-        paymentDate:     msArr[i]?.paymentDate     || paidIso,
-        paidAt:          msArr[i]?.paidAt          || paidIso,
-        paymentPending:  false,
-        status:          'paid',
+        paymentDate:       msArr[i]?.paymentDate       || paidIso,
+        paidAt:            msArr[i]?.paidAt            || paidIso,
+        paymentPending:    false,
+        status:            'paid',
       };
       continue;
     }
 
     if (mp.safe_tx_hash) {
-      // show in-flight immediately so buttons stay hidden
       msArr[i] = {
         ...(msArr[i] || {}),
         safePaymentTxHash: msArr[i]?.safePaymentTxHash || mp.safe_tx_hash,
@@ -245,16 +266,21 @@ async function overlayPaidFromMp(bid, pool) {
         safeStatus:        msArr[i]?.safeStatus || 'submitted',
         paymentPending:    true,
       };
-      pendingSafeIdx.push(i);
+      pendingSafe.push(i);
     }
   }
 
-  // 2) Second pass: live-check ALL pending-safe milestones sequentially (no starvation)
-  for (const idx of pendingSafeIdx) {
-    const safeHash = byIdx.get(idx)?.safe_tx_hash;
-    if (!safeHash) continue;
+  // Second: for each pending safe, check execution; if no, try NONCE FALLBACK
+  for (const idx of pendingSafe) {
+    const mp = byIdx.get(idx);
+    const safeHash = mp?.safe_tx_hash;
+    const nonce = mp?.safe_nonce;
 
-    const st = await _getSafeTxStatus(safeHash);
+    let st = null;
+    if (safeHash) {
+      st = await _getSafeTxStatus(safeHash);
+    }
+
     if (st?.isExecuted) {
       const iso = new Date().toISOString();
       msArr[idx] = {
@@ -266,11 +292,31 @@ async function overlayPaidFromMp(bid, pool) {
         paymentPending:    false,
         status:            'paid',
       };
-      // finalize DB in background (fire-and-forget)
-      _finalizePaidInDb({ bidId, milestoneIndex: idx, txHash: st.txHash }).catch(() => {});
+      _finalizePaidInDb({ bidId, milestoneIndex: idx, txHash: st.txHash, safeTxHash: safeHash }).catch(()=>{});
+    } else if (nonce !== null && nonce !== undefined) {
+      // NEW: check if a *different* hash at this NONCE got executed
+      const byNonce = await _findExecutedByNonce(nonce);
+      if (byNonce?.isExecuted) {
+        const iso = new Date().toISOString();
+        msArr[idx] = {
+          ...(msArr[idx] || {}),
+          paymentTxHash:     msArr[idx]?.paymentTxHash     || byNonce.txHash || null,
+          safePaymentTxHash: byNonce.safeTxHash, // swap to the new safe hash
+          paymentDate:       msArr[idx]?.paymentDate       || iso,
+          paidAt:            msArr[idx]?.paidAt            || iso,
+          paymentPending:    false,
+          status:            'paid',
+        };
+        _finalizePaidInDb({
+          bidId,
+          milestoneIndex: idx,
+          txHash: byNonce.txHash,
+          safeTxHash: byNonce.safeTxHash
+        }).catch(()=>{});
+      }
     }
 
-    // tiny delay to avoid rate limits
+    // small delay to avoid tx-service rate limiting
     await new Promise(r => setTimeout(r, 150));
   }
 
