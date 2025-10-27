@@ -49,9 +49,9 @@ const crypto = require("crypto");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
 const { enrichAuditRow } = require('./services/auditPinata');
-// Safe env
-const SAFE_ADDRESS       = (process.env.SAFE_ADDRESS || '').trim();
-const SAFE_TXSERVICE_URL = (process.env.SAFE_TXSERVICE_URL || '').trim();
+// ==== SAFE CONFIG (define once, near the top) ====
+const SAFE_ADDRESS       = (process.env.SAFE_ADDRESS || process.env.SAFE_WALLET || '0xedd1F37FD3eaACb596CDF00102187DA0cc884D93').trim();
+const SAFE_TXSERVICE_URL = (process.env.SAFE_TXSERVICE_URL || 'https://api.safe.global/tx-service/sep').trim().replace(/\/+$/, '');
 const SAFE_THRESHOLD_USD = Number(process.env.SAFE_THRESHOLD_USD || 0);
 
 // 🔐 auth utilities
@@ -122,7 +122,6 @@ const _safeStatusCache = new Map(); // key: safeTxHash -> { at, isExecuted, txHa
 const _safeTxUrlBase = (process.env.SAFE_TXSERVICE_URL || 'https://api.safe.global/tx-service/sep')
   .trim()
   .replace(/\/+$/, '');
-const SAFE_ADDRESS = (process.env.SAFE_ADDRESS || process.env.SAFE_WALLET || '0xedd1F37FD3eaACb596CDF00102187DA0cc884D93').trim();
 
 async function _getSafeTxStatus(safeTxHash) {
   const now = Date.now();
