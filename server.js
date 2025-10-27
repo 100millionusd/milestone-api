@@ -159,31 +159,36 @@ const SAFE_LOOKUPS_PER_REQUEST =
     ? Math.max(0, Math.floor(Number(process.env.SAFE_LOOKUPS_PER_REQUEST)))
     : 8;
 
-const _safeStatusCache = new Map(); // key: safeTxHash -> { at, isExecuted, txHash }
-const _safeTxUrlBase = (process.env.SAFE_TXSERVICE_URL || 'https://api.safe.global/tx-service/sep')
-  .trim()
-  .replace(/\/+$/, '');
+// Cache: safeTxHash -> { at, isExecuted, txHash }
+const _safeStatusCache = _safeStatusCache || new Map();
+const SAFE_CACHE_TTL_MS = typeof SAFE_CACHE_TTL_MS === 'number' ? SAFE_CACHE_TTL_MS : 5_000;
+const _safeTxUrlBase = (_safeTxUrlBase || (process.env.SAFE_TXSERVICE_URL || 'https://api.safe.global/tx-service/sep').trim().replace(/\/+$/, ''));
 
 async function _getSafeTxStatus(safeTxHash) {
   const now = Date.now();
   const cached = _safeStatusCache.get(safeTxHash);
   if (cached && now - cached.at < SAFE_CACHE_TTL_MS) return cached;
 
-  const { default: SafeApiKit } = await import('@safe-global/api-kit');
-  const provider = new ethers.providers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
-  const net = await provider.getNetwork();
-  const api = new SafeApiKit({
-    chainId: Number(net.chainId),
-    txServiceUrl: _safeTxUrlBase,
-    apiKey: process.env.SAFE_API_KEY || undefined
-  });
+  const url = `${_safeTxUrlBase}/api/v1/multisig-transactions/${safeTxHash}`;
+  const headers = process.env.SAFE_API_KEY ? { Authorization: `Bearer ${process.env.SAFE_API_KEY}` } : {};
+  const fetcher = (typeof safeFetchRL === 'function') ? safeFetchRL : fetch;
 
   try {
-    const tx = await api.getTransaction(safeTxHash);
+    const r = await fetcher(url, { headers });
+    if (!r.ok) throw new Error(String(r.status));
+    const t = await r.json();
+
+    const statusStr = String(t?.tx_status || t?.status || "").toLowerCase();
     const out = {
       at: now,
-      isExecuted: !!(tx?.isExecuted || tx?.transactionHash),
-      txHash: tx?.transactionHash || null,
+      isExecuted:
+        !!t?.is_executed ||
+        !!t?.isExecuted ||
+        !!t?.execution_date ||
+        !!t?.executionDate ||
+        !!t?.transaction_hash ||
+        statusStr === 'success' || statusStr === 'executed' || statusStr === 'successful',
+      txHash: t?.transaction_hash || t?.tx_hash || t?.transactionHash || null,
     };
     _safeStatusCache.set(safeTxHash, out);
     return out;
@@ -197,20 +202,28 @@ async function _getSafeTxStatus(safeTxHash) {
 // NEW: If a different SafeTx at the same NONCE got executed (rebroadcast), find it
 async function _findExecutedByNonce(nonce) {
   if (nonce === null || nonce === undefined) return null;
-  // Using tx-service REST directly because api-kit doesn’t expose this filter nicely
+
+  const SAFE_ADDRESS = (process.env.SAFE_ADDRESS || process.env.SAFE_WALLET || '').trim();
+  if (!SAFE_ADDRESS) return null;
+
   const url = `${_safeTxUrlBase}/api/v1/safes/${SAFE_ADDRESS}/multisig-transactions/?nonce=${Number(nonce)}&ordering=-submissionDate&limit=10`;
+  const headers = process.env.SAFE_API_KEY ? { Authorization: `Bearer ${process.env.SAFE_API_KEY}` } : {};
+  const fetcher = (typeof safeFetchRL === 'function') ? safeFetchRL : fetch;
+
   try {
-    const r = await fetch(url);
+    const r = await fetcher(url, { headers });
     if (!r.ok) return null;
     const j = await r.json();
-    const hit = (j?.results || []).find(
-      t => t?.is_executed || t?.transaction_hash
+
+    const hit = (j?.results || []).find(t =>
+      t?.is_executed || t?.isExecuted || t?.transaction_hash || t?.transactionHash || t?.execution_date || t?.executionDate
     );
     if (!hit) return null;
+
     return {
-      safeTxHash: hit.safe_tx_hash,
-      isExecuted: !!(hit.is_executed || hit.transaction_hash),
-      txHash: hit.transaction_hash || null,
+      safeTxHash: hit.safe_tx_hash || hit.safeTxHash,
+      isExecuted: true,
+      txHash: hit.transaction_hash || hit.tx_hash || hit.transactionHash || null,
     };
   } catch {
     return null;
