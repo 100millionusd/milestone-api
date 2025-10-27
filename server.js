@@ -7706,32 +7706,34 @@ app.get('/admin/proofs-bids', adminGuard, async (req, res) => {
        ORDER BY created_at DESC NULLS LAST, bid_id DESC`
     );
 
-    // Enrich with payment state (pending/released)
-    const enriched = await attachPaymentState(rows);
+// Hydrate with Safe overlay so executed txs flip to PAID immediately
+const hydrated = await Promise.all(
+  rows.map(b => overlayPaidFromMp(b, pool).catch(() => b)) // don't let one failure kill the list
+);
 
-    // Return camelCase keys the React page expects
-    const out = enriched.map(r => ({
-      bidId: r.bid_id,
-      proposalId: r.proposal_id,
-      vendorName: r.vendor_name,
-      walletAddress: r.wallet_address,
-      priceUsd: r.price_usd ?? null,
-      status: r.status ?? null,
-      createdAt: r.created_at,
-      milestones: Array.isArray(r.milestones)
-        ? r.milestones
-        : (typeof r.milestones === 'string'
-            ? (() => { try { return JSON.parse(r.milestones || '[]'); } catch { return []; } })()
-            : []
-          ),
-    }));
+// Return camelCase keys the React page expects
+const out = hydrated.map(r => ({
+  bidId: r.bid_id,
+  proposalId: r.proposal_id,
+  vendorName: r.vendor_name,
+  walletAddress: r.wallet_address,
+  priceUsd: r.price_usd ?? null,
+  status: r.status ?? null,
+  createdAt: r.created_at,
+  milestones: Array.isArray(r.milestones)
+    ? r.milestones
+    : (typeof r.milestones === 'string'
+        ? (() => { try { return JSON.parse(r.milestones || '[]'); } catch { return []; } })()
+        : []
+      ),
+}));
 
-    return res.json(out);
-  } catch (e) {
-    console.error('GET /admin/proofs-bids failed', e);
-    res.status(500).json({ error: 'Failed to fetch bids for proofs' });
-  }
-});
+// Make sure Netlify / browsers don’t cache this list
+res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+res.set('Pragma', 'no-cache');
+res.set('Expires', '0');
+
+return res.json(out);
 
 // ADMIN: list proposers/entities that submitted proposals
 app.get('/admin/proposers', adminGuard, async (req, res) => {
