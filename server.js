@@ -54,6 +54,41 @@ const SAFE_ADDRESS       = (process.env.SAFE_ADDRESS || process.env.SAFE_WALLET 
 const SAFE_TXSERVICE_URL = (process.env.SAFE_TXSERVICE_URL || 'https://api.safe.global/tx-service/sep').trim().replace(/\/+$/, '');
 const SAFE_THRESHOLD_USD = Number(process.env.SAFE_THRESHOLD_USD || 0);
 
+// --- Safe TxService rate-limit aware fetch (+auth) ---
+const SAFE_MAX_RETRIES = Number(process.env.SAFE_MAX_RETRIES || 4);
+const SAFE_BASE_BACKOFF_MS = Number(process.env.SAFE_BASE_BACKOFF_MS || 400);
+
+const _safeWait = (ms) => new Promise((r) => setTimeout(r, ms));
+const _parseRetryAfter = (val) => {
+  if (!val) return null;
+  const s = Number(val);
+  if (Number.isFinite(s)) return s * 1000;
+  const d = Date.parse(val);
+  if (Number.isFinite(d)) return Math.max(0, d - Date.now());
+  return null;
+};
+
+async function safeFetchRL(url, opts = {}, attempt = 0) {
+  const headers = {
+    Accept: "application/json",
+    ...(opts.headers || {}),
+  };
+  // add API key if present
+  if (process.env.SAFE_API_KEY) headers.Authorization = `Bearer ${process.env.SAFE_API_KEY}`;
+
+  const res = await fetch(url, { ...opts, headers });
+
+  if ((res.status === 429 || res.status === 503) && attempt < SAFE_MAX_RETRIES) {
+    const ra = res.headers.get("retry-after");
+    const delay =
+      _parseRetryAfter(ra) ??
+      Math.min(SAFE_BASE_BACKOFF_MS * (2 ** attempt) + Math.floor(Math.random() * 150), 5000);
+    await _safeWait(delay);
+    return safeFetchRL(url, opts, attempt + 1);
+  }
+  return res;
+}
+
 // 🔐 auth utilities
 const cookieParser = require("cookie-parser");
 const jwt = require("jsonwebtoken");
@@ -5699,52 +5734,65 @@ try {
 try {
   // Use the same base you already defined earlier in this handler
   // (you have TX_SERVICE_BASE = process.env.SAFE_TXSERVICE_URL || "https://api.safe.global/tx-service/sep")
-  const url = `${TX_SERVICE_BASE}/api/v1/multisig-transactions/${contractTransactionHash}`;
-  const r = await fetch(url);
-  if (r.ok) {
-    const t = await r.json();
-    const executed = !!(t?.is_executed || t?.transaction_hash);
-    if (executed) {
-      const finalTxHash = t.transaction_hash || contractTransactionHash;
+ const url = `${TX_SERVICE_BASE}/api/v1/multisig-transactions/${contractTransactionHash}`;
+const r = await safeFetchRL(url); // adds backoff + Authorization (if present)
 
-      // milestone_payments → released
-      await pool.query(
-        `UPDATE milestone_payments
-           SET status='released', tx_hash=$3, released_at=NOW()
-         WHERE bid_id=$1 AND milestone_index=$2`,
-        [bidId, milestoneIndex, finalTxHash]
-      );
+if (r.ok) {
+  const t = await r.json();
 
-      // bids.milestones → write fields the UI's isPaid() detects
-      const iso = new Date().toISOString();
-      await upsertMilestoneFields(bidId, milestoneIndex, {
-        paymentTxHash: finalTxHash,
-        paymentDate: iso,
-        paidAt: iso,
-        paid: true,
-        status: 'paid',
-        paymentPending: false,
+  // Normalize execution signals across API variants
+  const statusStr = String(t?.tx_status || t?.status || "").toLowerCase();
+  const executed =
+    !!t?.is_executed ||
+    !!t?.isExecuted ||
+    !!t?.execution_date ||
+    !!t?.executionDate ||
+    !!t?.transaction_hash ||
+    statusStr === "success" ||
+    statusStr === "executed" ||
+    statusStr === "successful";
+
+  if (executed) {
+    const finalTxHash =
+      t.transaction_hash || t.transactionHash || t.tx_hash || t.txHash || contractTransactionHash;
+
+    // milestone_payments → released
+    await pool.query(
+      `UPDATE milestone_payments
+         SET status='released', tx_hash=$3, released_at=NOW()
+       WHERE bid_id=$1 AND milestone_index=$2`,
+      [bidId, milestoneIndex, finalTxHash]
+    );
+
+    // bids.milestones → fields the UI's isPaid() detects
+    const iso = new Date().toISOString();
+    await upsertMilestoneFields(bidId, milestoneIndex, {
+      paymentTxHash: finalTxHash,
+      paymentDate: iso,
+      paidAt: iso,
+      paid: true,
+      status: 'paid',
+      paymentPending: false,
+    });
+
+    // best-effort notify
+    if (proposal && typeof notifyPaymentReleased === 'function') {
+      await notifyPaymentReleased({
+        bid,
+        proposal,
+        msIndex: milestoneIndex + 1,
+        amount: msAmountUSD,
+        txHash: finalTxHash,
       });
-
-      // best-effort notify
-      if (proposal && typeof notifyPaymentReleased === 'function') {
-        await notifyPaymentReleased({
-          bid,
-          proposal,
-          msIndex: milestoneIndex + 1,
-          amount: msAmountUSD,
-          txHash: finalTxHash,
-        });
-      }
-
-      return res.json({ ok: true, status: 'released', txHash: finalTxHash });
     }
-  } else {
-    const txt = await r.text().catch(() => '');
-    console.warn('Immediate Safe check HTTP failed', r.status, txt || r.statusText);
+
+    return res.json({ ok: true, status: 'released', txHash: finalTxHash });
   }
-} catch (e) {
-  console.warn('Immediate Safe execution check failed, proceeding with pending', e?.message || e);
+
+  // Not executed yet → fall through to pending path below (no error)
+} else {
+  const txt = await r.text().catch(() => '');
+  console.warn('Immediate Safe check HTTP failed', r.status, txt || r.statusText);
 }
 
     // 10) notify
