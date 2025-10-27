@@ -116,8 +116,7 @@ const pool = new Pool({
 });
 
 // ---- Safe Tx overlay helpers (response-time hydration) ----
-const SAFE_LOOKUPS_PER_REQUEST = 5; // cap to avoid hammering
-const SAFE_CACHE_TTL_MS = 15_000;   // 15s cache to smooth bursts
+const SAFE_CACHE_TTL_MS = 5_000; // tighter cache so executed txs flip quickly
 
 const _safeStatusCache = new Map(); // key: safeTxHash -> { at, isExecuted, txHash }
 
@@ -168,11 +167,11 @@ async function _finalizePaidInDb({ bidId, milestoneIndex, txHash }) {
     const ms = { ...(arr[milestoneIndex] || {}) };
     const iso = new Date().toISOString();
 
-    ms.paymentTxHash = ms.paymentTxHash || txHash || null;
-    ms.paymentDate   = ms.paymentDate   || iso;
-    ms.paidAt        = ms.paidAt        || ms.paymentDate;
+    ms.paymentTxHash  = ms.paymentTxHash || txHash || null;
+    ms.paymentDate    = ms.paymentDate   || iso;
+    ms.paidAt         = ms.paidAt        || ms.paymentDate;
     ms.paymentPending = false;
-    ms.status = 'paid';
+    ms.status         = 'paid';
 
     arr[milestoneIndex] = ms;
     await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2', [JSON.stringify(arr), bidId]);
@@ -210,10 +209,8 @@ async function overlayPaidFromMp(bid, pool) {
 
   const byIdx = new Map(mpRows.map(r => [Number(r.milestone_index), r]));
 
-  // We’ll allow at most N Safe lookups per request for still-pending rows
-  let lookupsLeft = SAFE_LOOKUPS_PER_REQUEST;
-  const promises = [];
-
+  // 1) First pass: apply already-released & mark in-flight, collect pending-safe idxs
+  const pendingSafeIdx = [];
   for (let i = 0; i < msArr.length; i++) {
     const mp = byIdx.get(i);
     if (!mp) continue;
@@ -228,65 +225,53 @@ async function overlayPaidFromMp(bid, pool) {
 
       msArr[i] = {
         ...(msArr[i] || {}),
-        paymentTxHash: msArr[i]?.paymentTxHash || mp.tx_hash || mp.safe_tx_hash || null,
+        paymentTxHash:   msArr[i]?.paymentTxHash   || mp.tx_hash || mp.safe_tx_hash || null,
         safePaymentTxHash: msArr[i]?.safePaymentTxHash || mp.safe_tx_hash || null,
-        paymentDate: msArr[i]?.paymentDate || paidIso,
-        paidAt: msArr[i]?.paidAt || paidIso,
-        paymentPending: false,
-        status: 'paid',
+        paymentDate:     msArr[i]?.paymentDate     || paidIso,
+        paidAt:          msArr[i]?.paidAt          || paidIso,
+        paymentPending:  false,
+        status:          'paid',
       };
       continue;
     }
 
-    // Still pending but has a Safe tx → check live status (bounded + cached)
-    if (mp.safe_tx_hash && lookupsLeft > 0) {
-      lookupsLeft--;
-      promises.push(
-        (async (idx, safeHash) => {
-          const st = await _getSafeTxStatus(safeHash);
-          if (st?.isExecuted) {
-            const iso = new Date().toISOString();
-            // Show as PAID in this response immediately
-            msArr[idx] = {
-              ...(msArr[idx] || {}),
-              paymentTxHash: msArr[idx]?.paymentTxHash || st.txHash || null,
-              safePaymentTxHash: msArr[idx]?.safePaymentTxHash || safeHash,
-              paymentDate: msArr[idx]?.paymentDate || iso,
-              paidAt: msArr[idx]?.paidAt || iso,
-              paymentPending: false,
-              status: 'paid',
-            };
-            // Best-effort DB update in background
-            _finalizePaidInDb({ bidId, milestoneIndex: idx, txHash: st.txHash }).catch(() => {});
-          } else {
-            // Keep it visibly "in-flight" so UI hides pay buttons
-            msArr[idx] = {
-              ...(msArr[idx] || {}),
-              safePaymentTxHash: msArr[idx]?.safePaymentTxHash || safeHash,
-              safeTxHash: msArr[idx]?.safeTxHash || safeHash,
-              safeNonce: msArr[idx]?.safeNonce ?? mp.safe_nonce ?? null,
-              safeStatus: msArr[idx]?.safeStatus || 'submitted',
-              paymentPending: true,
-            };
-          }
-        })(i, mp.safe_tx_hash)
-      );
-    } else if (mp.safe_tx_hash) {
-      // Out of lookup budget → still show in-flight markers
+    if (mp.safe_tx_hash) {
+      // show in-flight immediately so buttons stay hidden
       msArr[i] = {
         ...(msArr[i] || {}),
         safePaymentTxHash: msArr[i]?.safePaymentTxHash || mp.safe_tx_hash,
-        safeTxHash: msArr[i]?.safeTxHash || mp.safe_tx_hash,
-        safeNonce: msArr[i]?.safeNonce ?? mp.safe_nonce ?? null,
-        safeStatus: msArr[i]?.safeStatus || 'submitted',
-        paymentPending: true,
+        safeTxHash:        msArr[i]?.safeTxHash        || mp.safe_tx_hash,
+        safeNonce:         msArr[i]?.safeNonce ?? mp.safe_nonce ?? null,
+        safeStatus:        msArr[i]?.safeStatus || 'submitted',
+        paymentPending:    true,
       };
+      pendingSafeIdx.push(i);
     }
   }
 
-  if (promises.length) {
-    // We don't await in the route; but here it's safe because overlay is awaited already
-    await Promise.all(promises);
+  // 2) Second pass: live-check ALL pending-safe milestones sequentially (no starvation)
+  for (const idx of pendingSafeIdx) {
+    const safeHash = byIdx.get(idx)?.safe_tx_hash;
+    if (!safeHash) continue;
+
+    const st = await _getSafeTxStatus(safeHash);
+    if (st?.isExecuted) {
+      const iso = new Date().toISOString();
+      msArr[idx] = {
+        ...(msArr[idx] || {}),
+        paymentTxHash:     msArr[idx]?.paymentTxHash     || st.txHash || null,
+        safePaymentTxHash: msArr[idx]?.safePaymentTxHash || safeHash,
+        paymentDate:       msArr[idx]?.paymentDate       || iso,
+        paidAt:            msArr[idx]?.paidAt            || iso,
+        paymentPending:    false,
+        status:            'paid',
+      };
+      // finalize DB in background (fire-and-forget)
+      _finalizePaidInDb({ bidId, milestoneIndex: idx, txHash: st.txHash }).catch(() => {});
+    }
+
+    // tiny delay to avoid rate limits
+    await new Promise(r => setTimeout(r, 150));
   }
 
   return { ...bid, milestones: msArr };
