@@ -7691,6 +7691,9 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
 // ADMIN: proofs page requires full bids + milestones + payment state
 app.get('/admin/proofs-bids', adminGuard, async (req, res) => {
   try {
+    // Optional: auto-drain a few pending SAFE payments each load
+    // await autoDrainPendingSafePayments(pool);
+
     const { rows } = await pool.query(
       `SELECT
          bid_id,
@@ -7705,34 +7708,39 @@ app.get('/admin/proofs-bids', adminGuard, async (req, res) => {
        ORDER BY created_at DESC NULLS LAST, bid_id DESC`
     );
 
-// Hydrate with Safe overlay so executed txs flip to PAID immediately
-const hydrated = await Promise.all(
-  rows.map(b => overlayPaidFromMp(b, pool).catch(() => b)) // don't let one failure kill the list
-);
+    // Hydrate with Safe overlay so executed txs flip to PAID immediately
+    const hydrated = await Promise.all(
+      rows.map(b => overlayPaidFromMp(b, pool).catch(() => b)) // don't let one failure kill the list
+    );
 
-// Return camelCase keys the React page expects
-const out = hydrated.map(r => ({
-  bidId: r.bid_id,
-  proposalId: r.proposal_id,
-  vendorName: r.vendor_name,
-  walletAddress: r.wallet_address,
-  priceUsd: r.price_usd ?? null,
-  status: r.status ?? null,
-  createdAt: r.created_at,
-  milestones: Array.isArray(r.milestones)
-    ? r.milestones
-    : (typeof r.milestones === 'string'
-        ? (() => { try { return JSON.parse(r.milestones || '[]'); } catch { return []; } })()
-        : []
-      ),
-}));
+    // Return camelCase keys the React page expects
+    const out = hydrated.map(r => ({
+      bidId: Number(r.bid_id),
+      proposalId: Number(r.proposal_id),
+      vendorName: r.vendor_name,
+      walletAddress: r.wallet_address,
+      priceUsd: r.price_usd == null ? null : Number(r.price_usd),
+      status: r.status ?? null,
+      createdAt: r.created_at,
+      milestones: Array.isArray(r.milestones)
+        ? r.milestones
+        : (typeof r.milestones === 'string'
+            ? (() => { try { return JSON.parse(r.milestones || '[]'); } catch { return []; } })()
+            : []
+          ),
+    }));
 
-// Make sure Netlify / browsers don’t cache this list
-res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
-res.set('Pragma', 'no-cache');
-res.set('Expires', '0');
+    // Make sure Netlify / browsers don’t cache this list
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
 
-return res.json(out);
+    return res.json(out);
+  } catch (e) {
+    console.error('GET /admin/proofs-bids failed', e);
+    return res.status(500).json({ error: 'Failed to fetch bids for proofs' });
+  }
+});
 
 // ADMIN: list proposers/entities that submitted proposals
 app.get('/admin/proposers', adminGuard, async (req, res) => {
