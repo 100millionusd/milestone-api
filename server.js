@@ -5800,8 +5800,7 @@ try {
 
         return res.json({ ok: true, status: 'released', txHash: finalTxHash });
       }
-
-      // Not executed yet → fall through to the pending path below
+      // Not executed yet → fall through to pending below
     } else {
       const txt = await r.text().catch(() => '');
       console.warn('Immediate Safe check HTTP failed', r.status, txt || r.statusText);
