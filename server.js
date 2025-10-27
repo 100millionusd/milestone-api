@@ -151,18 +151,18 @@ const pool = new Pool({
 });
 
 // ---- Safe Tx overlay helpers (response-time hydration) ----
-const SAFE_CACHE_TTL_MS = 5_000;
+const SAFE_CACHE_TTL_MS = Number(process.env.SAFE_CACHE_TTL_MS || 5000);
 
-// ADD THIS — define once
 const SAFE_LOOKUPS_PER_REQUEST =
   process.env.SAFE_LOOKUPS_PER_REQUEST !== undefined
     ? Math.max(0, Math.floor(Number(process.env.SAFE_LOOKUPS_PER_REQUEST)))
     : 8;
 
-// Cache: safeTxHash -> { at, isExecuted, txHash }
-const _safeStatusCache = _safeStatusCache || new Map();
-const SAFE_CACHE_TTL_MS = typeof SAFE_CACHE_TTL_MS === 'number' ? SAFE_CACHE_TTL_MS : 5_000;
-const _safeTxUrlBase = (_safeTxUrlBase || (process.env.SAFE_TXSERVICE_URL || 'https://api.safe.global/tx-service/sep').trim().replace(/\/+$/, ''));
+const _safeStatusCache = new Map(); // key: safeTxHash -> { at, isExecuted, txHash }
+
+const _safeTxUrlBase = (process.env.SAFE_TXSERVICE_URL || 'https://api.safe.global/tx-service/eth')
+  .trim()
+  .replace(/\/+$/, '');
 
 async function _getSafeTxStatus(safeTxHash) {
   const now = Date.now();
