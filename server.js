@@ -5733,61 +5733,58 @@ try {
 // === B) Immediate executed check: if already executed -> mark as PAID now ===
 try {
   // Use the same base you already defined earlier in this handler
-  // (you have TX_SERVICE_BASE = process.env.SAFE_TXSERVICE_URL || "https://api.safe.global/tx-service/sep")
- const url = `${TX_SERVICE_BASE}/api/v1/multisig-transactions/${contractTransactionHash}`;
-const r = await safeFetchRL(url); // adds backoff + Authorization (if present)
+ // Immediate Safe execution check (rate-limited + robust)
+try {
+  const url = `${TX_SERVICE_BASE}/api/v1/multisig-transactions/${contractTransactionHash}`;
+  const r = await safeFetchRL(url); // ← use the rate-limited fetch
+  if (r.ok) {
+    const t = await r.json().catch(() => null);
+    const executed = !!(t?.is_executed || t?.transaction_hash);
+    if (executed) {
+      const finalTxHash = t.transaction_hash || contractTransactionHash;
 
-if (r.ok) {
-  const t = await r.json();
+      // milestone_payments → released
+      await pool.query(
+        `UPDATE milestone_payments
+           SET status='released', tx_hash=$3, released_at=NOW()
+         WHERE bid_id=$1 AND milestone_index=$2`,
+        [bidId, milestoneIndex, finalTxHash]
+      );
 
-  // Normalize execution signals across API variants
-  const statusStr = String(t?.tx_status || t?.status || "").toLowerCase();
-  const executed =
-    !!t?.is_executed ||
-    !!t?.isExecuted ||
-    !!t?.execution_date ||
-    !!t?.executionDate ||
-    !!t?.transaction_hash ||
-    statusStr === "success" ||
-    statusStr === "executed" ||
-    statusStr === "successful";
-
-  if (executed) {
-    const finalTxHash =
-      t.transaction_hash || t.transactionHash || t.tx_hash || t.txHash || contractTransactionHash;
-
-    // milestone_payments → released
-    await pool.query(
-      `UPDATE milestone_payments
-         SET status='released', tx_hash=$3, released_at=NOW()
-       WHERE bid_id=$1 AND milestone_index=$2`,
-      [bidId, milestoneIndex, finalTxHash]
-    );
-
-    // bids.milestones → fields the UI's isPaid() detects
-    const iso = new Date().toISOString();
-    await upsertMilestoneFields(bidId, milestoneIndex, {
-      paymentTxHash: finalTxHash,
-      paymentDate: iso,
-      paidAt: iso,
-      paid: true,
-      status: 'paid',
-      paymentPending: false,
-    });
-
-    // best-effort notify
-    if (proposal && typeof notifyPaymentReleased === 'function') {
-      await notifyPaymentReleased({
-        bid,
-        proposal,
-        msIndex: milestoneIndex + 1,
-        amount: msAmountUSD,
-        txHash: finalTxHash,
+      // bids.milestones → write fields the UI's isPaid() detects
+      const iso = new Date().toISOString();
+      await upsertMilestoneFields(bidId, milestoneIndex, {
+        paymentTxHash: finalTxHash,
+        paymentDate: iso,
+        paidAt: iso,
+        paid: true,
+        status: 'paid',
+        paymentPending: false,
       });
-    }
 
-    return res.json({ ok: true, status: 'released', txHash: finalTxHash });
+      // best-effort notify (fire-and-forget is fine)
+      if (proposal && typeof notifyPaymentReleased === 'function') {
+        try {
+          await notifyPaymentReleased({
+            bid,
+            proposal,
+            msIndex: milestoneIndex + 1,
+            amount: msAmountUSD,
+            txHash: finalTxHash,
+          });
+        } catch {}
+      }
+
+      return res.json({ ok: true, status: 'released', txHash: finalTxHash });
+    }
+  } else {
+    // Handle 429/other errors from TxService gracefully
+    const txt = await r.text().catch(() => '');
+    console.warn('Immediate Safe check HTTP failed', r.status, txt || r.statusText);
   }
+} catch (e) {
+  console.warn('Immediate Safe execution check failed, proceeding with pending', e?.message || e);
+}
 
   // Not executed yet → fall through to pending path below (no error)
 } else {
