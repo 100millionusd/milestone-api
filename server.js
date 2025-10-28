@@ -8913,25 +8913,18 @@ if (bidIds.length) {
     updated_at: prj.updated_at
   },
   bids: {
-    total: (bidRows || []).length,
-    approved: (bidRows || []).filter(b => String(b.status).toLowerCase() === 'approved').length,
-    // IMPORTANT: include ALL attachments
-    items: bidsOut || []).map(r => ({
-      ...r,                         // keep snake_case fields as-is
-      doc: r.doc || null,           // single legacy doc (or null)
-      files: Array.isArray(r.files) // multi-file array (or empty)
-        ? r.files
-        : (r.files ? r.files : [])
-    }))
+    total: bidsOut.length,
+    approved: bidsOut.filter(b => String(b.status).toLowerCase() === 'approved').length,
+    items: bidsOut
   },
   milestones,
   proofs,
   activity
 });
-  } catch (err) {
-    console.error("GET /projects/:id/overview error", err);
-    res.status(500).json({ error: "Server error" });
-  }
+} catch (err) {
+  console.error("GET /projects/:id/overview error", err);
+  res.status(500).json({ error: "Server error" });
+}
 });
 
 // ==============================
