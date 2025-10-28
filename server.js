@@ -3373,17 +3373,20 @@ app.get("/bids/:id", async (req, res) => {
 // Inline analysis on creation
 app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
   try {
+    // validate request
     const { error, value } = bidSchema.validate(req.body);
-        // Pick a doc for back-compat/Agent2 (prefer a PDF from files, else first file, else provided doc)
-    const docCompat =
-      value.doc
-      || (Array.isArray(value.files) && (value.files.find(f => /\.pdf($|\?)/i.test((f.name || ""))) || value.files[0]))
-      || null;
-
     if (error) return res.status(400).json({ error: error.message });
-    let inserted;
 
-        const insertQ = `
+    // pick a doc for back-compat/Agent2 (prefer PDF from files, else first file, else provided doc)
+    const docCompat =
+      value.doc ||
+      (Array.isArray(value.files) &&
+        (value.files.find(f => /\.pdf($|\?)/i.test(String(f?.name || ""))) || value.files[0])) ||
+      null;
+
+    let inserted; // ← declare once
+
+    const insertQ = `
       INSERT INTO bids (
         proposal_id,
         vendor_name,
@@ -3410,46 +3413,38 @@ app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
       value.walletAddress,
       value.preferredStablecoin,
       JSON.stringify(value.milestones || []),
-      docCompat ? JSON.stringify(docCompat) : null,   // ← back-compat single doc
-      JSON.stringify(value.files || []),              // ← NEW multi-file column
+      docCompat ? JSON.stringify(docCompat) : null, // back-compat single doc
+      JSON.stringify(value.files || []),            // multi-file column
     ];
 
-    const insertVals = [
-      value.proposalId,
-      value.vendorName,
-      value.priceUSD,
-      value.days,
-      value.notes,
-      value.walletAddress,
-      value.preferredStablecoin,
-      JSON.stringify(value.milestones || []),
-      docCompat ? JSON.stringify(docCompat) : null,   // ← back-compat single doc
-      JSON.stringify(value.files || []),              // ← NEW multi-file column
-    ];
-    
     const { rows } = await pool.query(insertQ, insertVals);
     inserted = rows[0];
 
-
-    // Fetch proposal
-    const { rows: pr } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ inserted.proposal_id ]);
+    // fetch proposal
+    const { rows: pr } = await pool.query(
+      "SELECT * FROM proposals WHERE proposal_id=$1",
+      [ inserted.proposal_id ]
+    );
     const prop = pr[0] || null;
 
-    // Inline Agent2 analysis with deadline
+    // inline Agent2 analysis with deadline
     const INLINE_ANALYSIS_DEADLINE_MS = Number(process.env.AGENT2_INLINE_TIMEOUT_MS || 12000);
+
     const analysis = await withTimeout(
-      prop ? runAgent2OnBid(inserted, prop) : Promise.resolve({
-        status: "error",
-        summary: "Proposal not found for analysis.",
-        risks: [],
-        fit: "low",
-        milestoneNotes: [],
-        confidence: 0,
-        pdfUsed: false,
-        pdfChars: 0,
-        pdfSnippet: null,
-        pdfDebug: { reason: "proposal_missing" },
-      }),
+      prop
+        ? runAgent2OnBid(inserted, prop)
+        : Promise.resolve({
+            status: "error",
+            summary: "Proposal not found for analysis.",
+            risks: [],
+            fit: "low",
+            milestoneNotes: [],
+            confidence: 0,
+            pdfUsed: false,
+            pdfChars: 0,
+            pdfSnippet: null,
+            pdfDebug: { reason: "proposal_missing" },
+          }),
       INLINE_ANALYSIS_DEADLINE_MS,
       () => ({
         status: "error",
@@ -3465,52 +3460,48 @@ app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
       })
     );
 
-  await pool.query("UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2", [
-  JSON.stringify(analysis),
-  inserted.bid_id
-]);
-inserted.ai_analysis = analysis;
-
-// Load vendor + proposal for notifications
-const [{ rows: vp }, { rows: prj }] = await Promise.all([
-  pool.query(`SELECT * FROM vendor_profiles WHERE lower(wallet_address)=lower($1)`, [ inserted.wallet_address ]),
-  pool.query(`SELECT * FROM proposals WHERE proposal_id=$1`, [ inserted.proposal_id ])
-]);
-const vendor = vp[0] || null;
-const proposal = prj[0] || null;
-
-// Fire-and-forget notifications so the HTTP response isn’t delayed
-if (typeof notifyBidSubmitted === "function") {
-  notifyBidSubmitted(inserted, proposal, vendor).catch(() => null);
-}
-
-/* --- Audit: bid created (anchorable) --- */
-try {
-  const actorWallet = (req.user && (req.user.address || req.user.sub)) || null;
-  const actorRole   = (req.user && req.user.role) || 'vendor';
-
-  const ins = await pool.query(
-    `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
-     VALUES ($1, $2, $3, $4)
-     RETURNING audit_id`,
-    [ Number(inserted.bid_id ?? inserted.id), actorWallet, actorRole, { created: true } ]
-  );
-
-  // Enrich asynchronously: sets ipfs_cid + leaf_hash
-  if (typeof enrichAuditRow === 'function') {
-    enrichAuditRow(pool, ins.rows[0].audit_id).catch(err =>
-      console.error('audit enrich failed (create):', err)
+    await pool.query(
+      "UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2",
+      [ JSON.stringify(analysis), inserted.bid_id ]
     );
-  }
-} catch (e) {
-  console.warn('create audit failed (non-fatal):', String(e).slice(0,200));
-}
+    inserted.ai_analysis = analysis;
 
-return res.status(201).json(toCamel(inserted));
-} catch (err) {
-  console.error("POST /bids error:", err);
-  return res.status(500).json({ error: err.message });
-}
+    // vendor + proposal for notifications
+    const [{ rows: vp }, { rows: prj }] = await Promise.all([
+      pool.query(
+        "SELECT * FROM vendor_profiles WHERE lower(wallet_address)=lower($1)",
+        [ inserted.wallet_address ]
+      ),
+      pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ inserted.proposal_id ]),
+    ]);
+    const vendor   = vp[0]  || null;
+    const proposal = prj[0] || null;
+
+    if (typeof notifyBidSubmitted === "function") {
+      notifyBidSubmitted(inserted, proposal, vendor).catch(() => null);
+    }
+
+    // audit
+    try {
+      const actorWallet = (req.user && (req.user.address || req.user.sub)) || null;
+      const actorRole   = (req.user && req.user.role) || "vendor";
+
+      const ins = await pool.query(
+        `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
+         VALUES ($1,$2,$3,$4)
+         RETURNING audit_id`,
+        [ Number(inserted.bid_id ?? inserted.id), actorWallet, actorRole, { created: true } ]
+      );
+      if (typeof enrichAuditRow === "function") {
+        enrichAuditRow(pool, ins.rows[0].audit_id).catch(() => null);
+      }
+    } catch {}
+
+    return res.status(201).json(toCamel(inserted));
+  } catch (err) {
+    console.error("POST /bids error:", err);
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // Approve / award bid (+ notify admin & vendor)
