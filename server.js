@@ -3381,6 +3381,7 @@ app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
       || null;
 
     if (error) return res.status(400).json({ error: error.message });
+    let inserted;
 
         const insertQ = `
       INSERT INTO bids (
@@ -3412,6 +3413,23 @@ app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
       docCompat ? JSON.stringify(docCompat) : null,   // ← back-compat single doc
       JSON.stringify(value.files || []),              // ← NEW multi-file column
     ];
+
+    const insertVals = [
+      value.proposalId,
+      value.vendorName,
+      value.priceUSD,
+      value.days,
+      value.notes,
+      value.walletAddress,
+      value.preferredStablecoin,
+      JSON.stringify(value.milestones || []),
+      docCompat ? JSON.stringify(docCompat) : null,   // ← back-compat single doc
+      JSON.stringify(value.files || []),              // ← NEW multi-file column
+    ];
+    
+    const { rows } = await pool.query(insertQ, insertVals);
+    inserted = rows[0];
+
 
     // Fetch proposal
     const { rows: pr } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ inserted.proposal_id ]);
