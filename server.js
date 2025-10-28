@@ -7678,10 +7678,6 @@ app.get("/vendor/payments", async (_req, res) => {
   }
 });
 
-// ==============================
-// Routes — Admin helpers
-// ==============================
-
 /** ADMIN: list bids (optional filter by vendor wallet)
  *  GET /admin/bids
  *  GET /admin/bids?vendorWallet=0xabc...
@@ -7703,6 +7699,8 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
         b.price_usd,
         b.status,
         b.created_at,
+        b.doc,              -- << include single legacy doc
+        b.files,            -- << include multi-file array (json/jsonb)
         COALESCE(p.title, 'Untitled Project') AS project_title
       FROM bids b
       LEFT JOIN proposals p ON p.proposal_id = b.proposal_id
@@ -7721,16 +7719,28 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
       pool.query(countSql, [vendorWallet]),
     ]);
 
-    const items = list.rows.map(r => ({
-      id: r.bid_id,
-      projectId: r.proposal_id,
-      projectTitle: r.project_title,
-      vendorWallet: r.vendor_wallet,
-      vendorName: r.vendor_name,
-      amountUSD: r.price_usd,
-      status: r.status,
-      createdAt: new Date(r.created_at).toISOString(),
-    }));
+    // Robust JSON coercion (handles jsonb, json text, null)
+    const items = list.rows.map(r => {
+      let doc = r.doc;
+      if (typeof doc === 'string') { try { doc = JSON.parse(doc); } catch {} }
+
+      let files = r.files;
+      if (typeof files === 'string') { try { files = JSON.parse(files); } catch {} }
+      if (!Array.isArray(files)) files = files ? [files] : [];
+
+      return {
+        id: r.bid_id,
+        projectId: r.proposal_id,
+        projectTitle: r.project_title,
+        vendorWallet: r.vendor_wallet,
+        vendorName: r.vendor_name,
+        amountUSD: r.price_usd,
+        status: r.status,
+        createdAt: new Date(r.created_at).toISOString(),
+        doc: doc || null,   // << expose doc
+        files,              // << expose files[]
+      };
+    });
 
     res.json({ items, total: count.rows[0].cnt, page, pageSize: limit });
   } catch (e) {
@@ -8770,17 +8780,25 @@ app.get("/projects/:id/overview", requireApprovedVendorOrAdmin, async (req, res)
       return res.status(403).json({ error: "Forbidden" });
     }
 
-    // Bids for this proposal
-    const { rows: bidRows } = await pool.query(
-      `SELECT bid_id, proposal_id, vendor_name, wallet_address, price_usd, days, notes,
-              preferred_stablecoin, milestones, status, created_at, updated_at
-         FROM bids
-        WHERE proposal_id = $1
-        ORDER BY created_at ASC`,
-      [id]
-    );
+  // Bids for this proposal
+const { rows: bidRows } = await pool.query(
+  `SELECT bid_id, proposal_id, vendor_name, wallet_address, price_usd, days, notes,
+          preferred_stablecoin, milestones, status, created_at, updated_at,
+          doc, files
+     FROM bids
+    WHERE proposal_id = $1
+    ORDER BY created_at ASC`,
+  [id]
+);
 
-    const bidIds = bidRows.map(b => b.bid_id);
+// normalize attachments: files = array, doc = single (or null)
+const bidsOut = bidRows.map(r => ({
+  ...r,
+  files: Array.isArray(r.files) ? r.files : (r.files ? r.files : []),
+  doc: r.doc || null,
+}));
+
+const bidIds = bidsOut.map(b => b.bid_id);
 
 // Load proofs for all bids of this project
 let proofs = [];
@@ -8868,25 +8886,32 @@ if (bidIds.length) {
       ...paymentsActivity
     ].filter(Boolean).sort((a,b) => new Date(a.at).getTime() - new Date(b.at).getTime());
 
-    return res.json({
-      proposal: {
-        id: prj.proposal_id,
-        title: prj.title,
-        status: prj.status,
-        owner_wallet: prj.owner_wallet,
-        owner_email: prj.owner_email,
-        created_at: prj.created_at,
-        updated_at: prj.updated_at
-      },
-      bids: {
-        total: bidRows.length,
-        approved: bidRows.filter(b => String(b.status).toLowerCase() === 'approved').length,
-        items: bidRows // snake_case; your pages can render as-is
-      },
-      milestones,
-      proofs,
-      activity
-    });
+ return res.json({
+  proposal: {
+    id: prj.proposal_id,
+    title: prj.title,
+    status: prj.status,
+    owner_wallet: prj.owner_wallet,
+    owner_email: prj.owner_email,
+    created_at: prj.created_at,
+    updated_at: prj.updated_at
+  },
+  bids: {
+    total: (bidRows || []).length,
+    approved: (bidRows || []).filter(b => String(b.status).toLowerCase() === 'approved').length,
+    // IMPORTANT: include ALL attachments
+    items: (bidRows || []).map(r => ({
+      ...r,                         // keep snake_case fields as-is
+      doc: r.doc || null,           // single legacy doc (or null)
+      files: Array.isArray(r.files) // multi-file array (or empty)
+        ? r.files
+        : (r.files ? r.files : [])
+    }))
+  },
+  milestones,
+  proofs,
+  activity
+});
   } catch (err) {
     console.error("GET /projects/:id/overview error", err);
     res.status(500).json({ error: "Server error" });
