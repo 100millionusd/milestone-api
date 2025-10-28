@@ -7691,23 +7691,23 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
     const offset = (page - 1) * limit;
 
     const listSql = `
-      SELECT
-        b.bid_id,
-        b.proposal_id,
-        LOWER(b.wallet_address) AS vendor_wallet,
-        b.vendor_name,
-        b.price_usd,
-        b.status,
-        b.created_at,
-        b.doc,              -- << include single legacy doc
-        b.files,            -- << include multi-file array (json/jsonb)
-        COALESCE(p.title, 'Untitled Project') AS project_title
-      FROM bids b
-      LEFT JOIN proposals p ON p.proposal_id = b.proposal_id
-      WHERE ($1::text IS NULL OR LOWER(b.wallet_address) = $1)
-      ORDER BY b.created_at DESC NULLS LAST, b.bid_id DESC
-      LIMIT $2 OFFSET $3
-    `;
+  SELECT
+    b.bid_id,
+    b.proposal_id,
+    LOWER(b.wallet_address) AS vendor_wallet,
+    b.vendor_name,
+    b.price_usd,
+    b.status,
+    b.created_at,
+    b.doc,
+    COALESCE(b.files, '[]'::jsonb) AS files,
+    COALESCE(p.title, 'Untitled Project') AS project_title
+  FROM bids b
+  LEFT JOIN proposals p ON p.proposal_id = b.proposal_id
+  WHERE ($1::text IS NULL OR LOWER(b.wallet_address) = $1)
+  ORDER BY b.created_at DESC NULLS LAST, b.bid_id DESC
+  LIMIT $2 OFFSET $3
+`;
     const countSql = `
       SELECT COUNT(*)::int AS cnt
       FROM bids b
@@ -8780,11 +8780,22 @@ app.get("/projects/:id/overview", requireApprovedVendorOrAdmin, async (req, res)
       return res.status(403).json({ error: "Forbidden" });
     }
 
-  // Bids for this proposal
+ // Bids for this proposal (include doc + files)
 const { rows: bidRows } = await pool.query(
-  `SELECT bid_id, proposal_id, vendor_name, wallet_address, price_usd, days, notes,
-          preferred_stablecoin, milestones, status, created_at, updated_at,
-          doc, files
+  `SELECT bid_id,
+          proposal_id,
+          vendor_name,
+          wallet_address,
+          price_usd,
+          days,
+          notes,
+          preferred_stablecoin,
+          milestones,
+          status,
+          created_at,
+          updated_at,
+          doc,
+          COALESCE(files, '[]'::jsonb) AS files
      FROM bids
     WHERE proposal_id = $1
     ORDER BY created_at ASC`,
