@@ -8802,12 +8802,17 @@ const { rows: bidRows } = await pool.query(
   [id]
 );
 
-// normalize attachments: files = array, doc = single (or null)
-const bidsOut = bidRows.map(r => ({
-  ...r,
-  files: Array.isArray(r.files) ? r.files : (r.files ? r.files : []),
-  doc: r.doc || null,
-}));
+// normalize attachments: ensure files is an array; parse json text; keep doc object or null
+const bidsOut = bidRows.map(r => {
+  let doc = r.doc;
+  if (typeof doc === 'string') { try { doc = JSON.parse(doc); } catch {} }
+
+  let files = r.files;
+  if (typeof files === 'string') { try { files = JSON.parse(files); } catch {} }
+  if (!Array.isArray(files)) files = files ? [files] : [];
+
+  return { ...r, doc: doc || null, files };
+});
 
 const bidIds = bidsOut.map(b => b.bid_id);
 
@@ -8849,7 +8854,7 @@ if (bidIds.length) {
 
     const msItems = [];
     const paymentsActivity = [];
-    for (const b of bidRows) {
+    for (const b of bidsOut) {
       const arr = Array.isArray(b.milestones) ? b.milestones
                 : typeof b.milestones === 'string' ? JSON.parse(b.milestones || '[]')
                 : [];
@@ -8892,7 +8897,7 @@ if (bidIds.length) {
     const activity = [
       { type: 'proposal_created', at: prj.created_at, actor_role: 'owner' },
       // You don't persist approved_at; status flip happens but no timestamp. We skip it here.  // :contentReference[oaicite:7]{index=7}
-      ...bidRows.map(b => ({ type: 'bid_submitted', at: b.created_at, bid_id: b.bid_id, actor_role: 'vendor', vendor_name: b.vendor_name })),
+      ...bidsOut.map(b => ({ type: 'bid_submitted', at: b.created_at, bid_id: b.bid_id, actor_role: 'vendor', vendor_name: b.vendor_name })),
       ...proofs.map(p => ({ type: 'proof_submitted', at: p.submitted_at, proof_id: p.proof_id, bid_id: p.bid_id, milestone_index: p.milestone_index })),
       ...paymentsActivity
     ].filter(Boolean).sort((a,b) => new Date(a.at).getTime() - new Date(b.at).getTime());
@@ -8911,7 +8916,7 @@ if (bidIds.length) {
     total: (bidRows || []).length,
     approved: (bidRows || []).filter(b => String(b.status).toLowerCase() === 'approved').length,
     // IMPORTANT: include ALL attachments
-    items: (bidRows || []).map(r => ({
+    items: bidsOut || []).map(r => ({
       ...r,                         // keep snake_case fields as-is
       doc: r.doc || null,           // single legacy doc (or null)
       files: Array.isArray(r.files) // multi-file array (or empty)
