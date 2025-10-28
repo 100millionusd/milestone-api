@@ -560,7 +560,8 @@ async function attachPaymentState(bids) {
     `);
     await pool.query(`
       ALTER TABLE bids
-        ADD COLUMN IF NOT EXISTS updated_at    timestamptz NOT NULL DEFAULT now();
+        ADD COLUMN IF NOT EXISTS updated_at    timestamptz NOT NULL DEFAULT now(),
+        ADD COLUMN IF NOT EXISTS files         jsonb;
     `);
     console.log('[db] proofs/bids columns ready');
   } catch (e) {
@@ -2246,6 +2247,16 @@ const proposalUpdateSchema = Joi.object({
   ownerPhone: Joi.string().allow(""),
 }).min(1);
 
+// Reusable file item schema (accept both mimetype and contentType)
+const fileItemSchema = Joi.object({
+  cid: Joi.string().optional(),
+  url: Joi.string().uri().required(),
+  name: Joi.string().required(),
+  size: Joi.number().optional(),
+  mimetype: Joi.string().optional(),
+  contentType: Joi.string().optional(),
+});
+
 const bidSchema = Joi.object({
   proposalId: Joi.number().integer().required(),
   vendorName: Joi.string().required(),
@@ -2259,13 +2270,12 @@ const bidSchema = Joi.object({
     amount: Joi.number().required(),
     dueDate: Joi.date().iso().required(),
   })).min(1).required(),
-  doc: Joi.object({
-    cid: Joi.string().optional(),
-    url: Joi.string().uri().required(),
-    name: Joi.string().required(),
-    size: Joi.number().optional(),
-    mimetype: Joi.string().optional(),
-  }).optional().allow(null),
+
+  // Back-compat single file (still supported)
+  doc: fileItemSchema.optional().allow(null),
+
+  // NEW: multi-file payload
+  files: Joi.array().items(fileItemSchema).max(20).default([]),
 });
 
 // ==============================
@@ -3364,12 +3374,32 @@ app.get("/bids/:id", async (req, res) => {
 app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
   try {
     const { error, value } = bidSchema.validate(req.body);
+        // Pick a doc for back-compat/Agent2 (prefer a PDF from files, else first file, else provided doc)
+    const docCompat =
+      value.doc
+      || (Array.isArray(value.files) && (value.files.find(f => /\.pdf($|\?)/i.test((f.name || ""))) || value.files[0]))
+      || null;
+
     if (error) return res.status(400).json({ error: error.message });
 
-    const insertQ = `
-      INSERT INTO bids (proposal_id,vendor_name,price_usd,days,notes,wallet_address,preferred_stablecoin,milestones,doc,status,created_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending', NOW())
+        const insertQ = `
+      INSERT INTO bids (
+        proposal_id,
+        vendor_name,
+        price_usd,
+        days,
+        notes,
+        wallet_address,
+        preferred_stablecoin,
+        milestones,
+        doc,
+        files,
+        status,
+        created_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending', NOW())
       RETURNING *`;
+
     const insertVals = [
       value.proposalId,
       value.vendorName,
@@ -3379,10 +3409,9 @@ app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
       value.walletAddress,
       value.preferredStablecoin,
       JSON.stringify(value.milestones || []),
-      value.doc ? JSON.stringify(value.doc) : null,
+      docCompat ? JSON.stringify(docCompat) : null,   // ← back-compat single doc
+      JSON.stringify(value.files || []),              // ← NEW multi-file column
     ];
-    const { rows } = await pool.query(insertQ, insertVals);
-    const inserted = rows[0];
 
     // Fetch proposal
     const { rows: pr } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ inserted.proposal_id ]);
