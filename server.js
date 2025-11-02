@@ -652,6 +652,44 @@ async function attachPaymentState(bids) {
 })();
 
 // ==============================
+// DB bootstrap — templates marketplace
+// ==============================
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS templates (
+        template_id       bigserial PRIMARY KEY,
+        slug              text UNIQUE NOT NULL,
+        title             text NOT NULL,
+        locale            text DEFAULT 'en',
+        category          text,
+        summary           text,
+        default_currency  text DEFAULT 'USD',
+        created_at        timestamptz NOT NULL DEFAULT now(),
+        updated_at        timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS template_milestones (
+        id           bigserial PRIMARY KEY,
+        template_id  bigint NOT NULL REFERENCES templates(template_id) ON DELETE CASCADE,
+        idx          integer NOT NULL,
+        name         text NOT NULL,
+        amount       numeric NOT NULL DEFAULT 0,
+        days_offset  integer NOT NULL DEFAULT 30,
+        acceptance   jsonb DEFAULT '[]'::jsonb
+      );
+    `);
+
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_template_ms ON template_milestones(template_id, idx);`);
+    console.log('[db] templates ready');
+  } catch (e) {
+    console.error('templates init failed:', e?.message || e);
+  }
+})();
+
+// ==============================
 // Utilities
 // ==============================
 function toCamel(row) {
@@ -4034,6 +4072,47 @@ app.get('/admin/alerts', adminGuard, async (_req, res) => {
     })));
   } catch (e) {
     res.status(500).json({ error: 'Failed to load alerts' });
+  }
+});
+
+// GET /templates — list summaries
+app.get('/templates', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT t.template_id AS id, t.slug, t.title, t.locale, t.category, t.summary, t.default_currency,
+              COUNT(m.*)::int AS milestones
+         FROM templates t
+         LEFT JOIN template_milestones m ON m.template_id = t.template_id
+        GROUP BY t.template_id
+        ORDER BY t.updated_at DESC, t.template_id DESC`
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: 'failed_list_templates' });
+  }
+});
+
+// GET /templates/:idOrSlug — detail with milestones
+app.get('/templates/:idOrSlug', async (req, res) => {
+  const raw = String(req.params.idOrSlug || '').trim();
+  const isId = /^\d+$/.test(raw);
+  try {
+    const { rows: head } = await pool.query(
+      `SELECT * FROM templates WHERE ${isId ? 'template_id' : 'slug'}=$1 LIMIT 1`,
+      [isId ? Number(raw) : raw]
+    );
+    if (!head[0]) return res.status(404).json({ error: 'not_found' });
+
+    const { rows: ms } = await pool.query(
+      `SELECT idx, name, amount, days_offset, acceptance
+         FROM template_milestones
+        WHERE template_id=$1
+        ORDER BY idx ASC`,
+      [head[0].template_id]
+    );
+    res.json({ ...toCamel(head[0]), milestones: ms.map(toCamel) });
+  } catch (e) {
+    res.status(500).json({ error: 'failed_get_template' });
   }
 });
 
@@ -8974,6 +9053,147 @@ app.post("/ipfs/upload-json", async (req, res) => {
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /templates  (admin upsert)
+// Body: { slug, title, locale?, category?, summary?, default_currency?, milestones:[{idx,name,amount,days_offset,acceptance[]}] }
+app.post('/templates', adminGuard, async (req, res) => {
+  const c = req.body || {};
+  if (!c.slug || !c.title) return res.status(400).json({ error: 'slug_and_title_required' });
+
+  try {
+    await pool.query('BEGIN');
+
+    const { rows: t } = await pool.query(
+      `INSERT INTO templates (slug, title, locale, category, summary, default_currency, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6, now())
+       ON CONFLICT (slug) DO UPDATE SET
+         title=EXCLUDED.title, locale=EXCLUDED.locale, category=EXCLUDED.category,
+         summary=EXCLUDED.summary, default_currency=EXCLUDED.default_currency, updated_at=now()
+       RETURNING template_id`,
+      [c.slug, c.title, c.locale || 'en', c.category || null, c.summary || null, c.default_currency || 'USD']
+    );
+
+    const tid = t[0].template_id;
+    await pool.query(`DELETE FROM template_milestones WHERE template_id=$1`, [tid]);
+
+    const ms = Array.isArray(c.milestones) ? c.milestones : [];
+    for (const m of ms) {
+      await pool.query(
+        `INSERT INTO template_milestones (template_id, idx, name, amount, days_offset, acceptance)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [tid, m.idx, m.name, Number(m.amount)||0, Number(m.days_offset)||0, JSON.stringify(m.acceptance||[])]
+      );
+    }
+
+    await pool.query('COMMIT');
+    res.json({ ok: true, templateId: tid });
+  } catch (e) {
+    await pool.query('ROLLBACK');
+    res.status(500).json({ error: 'create_or_update_template_failed' });
+  }
+});
+
+// POST /bids/from-template  (vendor/admin)
+// Body: { slug? | templateId?, proposalId, vendorName, walletAddress, preferredStablecoin? }
+// Notes: priceUSD = sum(template.amount); days = max(days_offset); milestones have dueDate = now + offset
+app.post('/bids/from-template', requireApprovedVendorOrAdmin, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const selector = b.templateId ?? b.slug;
+    if (!selector) return res.status(400).json({ error: 'template_required' });
+    if (!b.proposalId) return res.status(400).json({ error: 'proposalId_required' });
+    if (!b.vendorName) return res.status(400).json({ error: 'vendorName_required' });
+    if (!/^0x[a-fA-F0-9]{40}$/.test(String(b.walletAddress || '')))
+      return res.status(400).json({ error: 'wallet_invalid' });
+
+    const isId = Number.isFinite(+selector);
+    const { rows: t } = await pool.query(
+      `SELECT template_id, title FROM templates WHERE ${isId ? 'template_id' : 'slug'}=$1 LIMIT 1`,
+      [isId ? Number(selector) : String(selector)]
+    );
+    if (!t[0]) return res.status(404).json({ error: 'template_not_found' });
+
+    const tid = t[0].template_id;
+    const { rows: msRows } = await pool.query(
+      `SELECT idx, name, amount, days_offset, acceptance
+         FROM template_milestones
+        WHERE template_id=$1 ORDER BY idx ASC`,
+      [tid]
+    );
+
+    const now = Date.now();
+    const ms = msRows.map(r => ({
+      name: r.name,
+      amount: Number(r.amount) || 0,
+      dueDate: new Date(now + (Number(r.days_offset) || 0) * 86400 * 1000).toISOString(),
+      acceptance: r.acceptance || [],
+      archived: false,
+    }));
+
+    const priceUSD = ms.reduce((a, m) => a + (Number(m.amount) || 0), 0);
+    const days = Math.max(0, ...msRows.map(r => Number(r.days_offset) || 0));
+    const notes = `Created from template "${t[0].title}"`;
+    const preferred = String(b.preferredStablecoin || 'USDT').toUpperCase() === 'USDC' ? 'USDC' : 'USDT';
+
+    // --- insert same shape as /bids route ---
+    const insertQ = `
+      INSERT INTO bids (
+        proposal_id,
+        vendor_name,
+        price_usd,
+        days,
+        notes,
+        wallet_address,
+        preferred_stablecoin,
+        milestones,
+        doc,
+        files,
+        status,
+        created_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending', NOW())
+      RETURNING *`;
+
+    const insertVals = [
+      Number(b.proposalId),
+      String(b.vendorName),
+      priceUSD,
+      days,
+      notes,
+      String(b.walletAddress),
+      preferred,
+      JSON.stringify(ms),
+      null,                // doc (back-compat single doc)
+      JSON.stringify([]),  // files array
+    ];
+
+    const { rows } = await pool.query(insertQ, insertVals);
+    const inserted = rows[0];
+
+    // inline Agent2 analysis (same as /bids)
+    const { rows: pr } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ inserted.proposal_id ]);
+    const prop = pr[0] || null;
+
+    const INLINE_ANALYSIS_DEADLINE_MS = Number(process.env.AGENT2_INLINE_TIMEOUT_MS || 12000);
+    const analysis = await withTimeout(
+      prop ? runAgent2OnBid(inserted, prop) : Promise.resolve({
+        status: "error", summary: "Proposal not found for analysis.", risks: [],
+        fit: "low", milestoneNotes: [], confidence: 0, pdfUsed: false
+      }),
+      INLINE_ANALYSIS_DEADLINE_MS,
+      { status: "timeout", summary: "Analysis timed out.", risks: [], fit: "low", milestoneNotes: [], confidence: 0, pdfUsed: false }
+    );
+
+    await pool.query(
+      `UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2`,
+      [ JSON.stringify(analysis), inserted.bid_id ]
+    );
+
+    res.json({ ok: true, bidId: inserted.bid_id });
+  } catch (e) {
+    res.status(500).json({ error: 'failed_create_bid_from_template' });
   }
 });
 
