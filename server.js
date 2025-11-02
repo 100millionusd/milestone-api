@@ -9136,6 +9136,7 @@ app.post('/bids/from-template', requireApprovedVendorOrAdmin, async (req, res) =
     const days = Math.max(0, ...msRows.map(r => Number(r.days_offset) || 0));
     const notes = `Created from template "${t[0].title}"`;
     const preferred = String(b.preferredStablecoin || 'USDT').toUpperCase() === 'USDC' ? 'USDC' : 'USDT';
+    const files = Array.isArray(b.files) ? b.files.filter(u => typeof u === 'string' && u) : [];
 
     // --- insert same shape as /bids route ---
     const insertQ = `
@@ -9156,18 +9157,18 @@ app.post('/bids/from-template', requireApprovedVendorOrAdmin, async (req, res) =
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending', NOW())
       RETURNING *`;
 
-    const insertVals = [
-      Number(b.proposalId),
-      String(b.vendorName),
-      priceUSD,
-      days,
-      notes,
-      String(b.walletAddress),
-      preferred,
-      JSON.stringify(ms),
-      null,                // doc (back-compat single doc)
-      JSON.stringify([]),  // files array
-    ];
+  const insertVals = [
+  Number(b.proposalId),
+  String(b.vendorName),
+  priceUSD,
+  days,
+  notes,
+  String(b.walletAddress),
+  preferred,
+  JSON.stringify(ms),
+  null,
+  JSON.stringify(files),
+];
 
     const { rows } = await pool.query(insertQ, insertVals);
     const inserted = rows[0];
