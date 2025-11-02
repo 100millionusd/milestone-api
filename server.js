@@ -9033,6 +9033,17 @@ app.post("/payments/release", adminGuard, async (req, res) => {
   }
 });
 
+// Normalize client-provided milestones into the DB shape
+function normalizeMilestone(x) {
+  return {
+    name: String(x?.name || 'Milestone'),
+    amount: Number(x?.amount) || 0,
+    dueDate: new Date(x?.dueDate || Date.now()).toISOString(),
+    acceptance: Array.isArray(x?.acceptance) ? x.acceptance : [],
+    archived: !!x?.archived,
+  };
+}
+
 // ==============================
 // Routes — IPFS via Pinata
 // ==============================
@@ -9096,8 +9107,8 @@ app.post('/templates', adminGuard, async (req, res) => {
 });
 
 // POST /bids/from-template  (vendor/admin)
-// Body: { slug? | templateId?, proposalId, vendorName, walletAddress, preferredStablecoin? }
-// Notes: priceUSD = sum(template.amount); days = max(days_offset); milestones have dueDate = now + offset
+// Body: { slug? | templateId?, proposalId, vendorName, walletAddress, preferredStablecoin?, files?: string[], milestones?: [...] }
+// Notes: If milestones are provided, they override the template; otherwise build from template days_offset.
 app.post('/bids/from-template', requireApprovedVendorOrAdmin, async (req, res) => {
   try {
     const b = req.body || {};
@@ -9108,7 +9119,7 @@ app.post('/bids/from-template', requireApprovedVendorOrAdmin, async (req, res) =
     if (!/^0x[a-fA-F0-9]{40}$/.test(String(b.walletAddress || '')))
       return res.status(400).json({ error: 'wallet_invalid' });
 
-    const isId = Number.isFinite(+selector);
+    const isId = /^\d+$/.test(String(selector));
     const { rows: t } = await pool.query(
       `SELECT template_id, title FROM templates WHERE ${isId ? 'template_id' : 'slug'}=$1 LIMIT 1`,
       [isId ? Number(selector) : String(selector)]
@@ -9119,21 +9130,34 @@ app.post('/bids/from-template', requireApprovedVendorOrAdmin, async (req, res) =
     const { rows: msRows } = await pool.query(
       `SELECT idx, name, amount, days_offset, acceptance
          FROM template_milestones
-        WHERE template_id=$1 ORDER BY idx ASC`,
+        WHERE template_id=$1
+        ORDER BY idx ASC`,
       [tid]
     );
 
     const now = Date.now();
-    const ms = msRows.map(r => ({
-      name: r.name,
-      amount: Number(r.amount) || 0,
-      dueDate: new Date(now + (Number(r.days_offset) || 0) * 86400 * 1000).toISOString(),
-      acceptance: r.acceptance || [],
-      archived: false,
-    }));
 
+    // Prefer client-provided milestones; fallback to template-based
+    const ms = Array.isArray(b.milestones) && b.milestones.length
+      ? b.milestones.map(x => normalizeMilestone(x))
+      : msRows.map(r => ({
+          name: r.name,
+          amount: Number(r.amount) || 0,
+          dueDate: new Date(now + (Number(r.days_offset) || 0) * 86400 * 1000).toISOString(),
+          acceptance: r.acceptance || [],
+          archived: false,
+        }));
+
+    // Totals/duration
     const priceUSD = ms.reduce((a, m) => a + (Number(m.amount) || 0), 0);
-    const days = Math.max(0, ...msRows.map(r => Number(r.days_offset) || 0));
+    const days = Math.max(
+      0,
+      ...ms.map(m => {
+        const ts = Date.parse(m.dueDate);
+        return Number.isFinite(ts) ? Math.ceil((ts - now) / (86400 * 1000)) : 0;
+      })
+    );
+
     const notes = `Created from template "${t[0].title}"`;
     const preferred = String(b.preferredStablecoin || 'USDT').toUpperCase() === 'USDC' ? 'USDC' : 'USDT';
     const files = Array.isArray(b.files) ? b.files.filter(u => typeof u === 'string' && u) : [];
@@ -9157,40 +9181,55 @@ app.post('/bids/from-template', requireApprovedVendorOrAdmin, async (req, res) =
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending', NOW())
       RETURNING *`;
 
-  const insertVals = [
-  Number(b.proposalId),
-  String(b.vendorName),
-  priceUSD,
-  days,
-  notes,
-  String(b.walletAddress),
-  preferred,
-  JSON.stringify(ms),
-  null,
-  JSON.stringify(files),
-];
+    const insertVals = [
+      Number(b.proposalId),
+      String(b.vendorName),
+      priceUSD,
+      days,
+      notes,
+      String(b.walletAddress),
+      preferred,
+      JSON.stringify(ms),
+      null,                // doc (legacy single-doc field)
+      JSON.stringify(files),
+    ];
 
     const { rows } = await pool.query(insertQ, insertVals);
     const inserted = rows[0];
 
-    // inline Agent2 analysis (same as /bids)
-    const { rows: pr } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ inserted.proposal_id ]);
+    // Inline Agent2 analysis (same behavior as /bids)
+    const { rows: pr } = await pool.query(`SELECT * FROM proposals WHERE proposal_id=$1`, [inserted.proposal_id]);
     const prop = pr[0] || null;
 
     const INLINE_ANALYSIS_DEADLINE_MS = Number(process.env.AGENT2_INLINE_TIMEOUT_MS || 12000);
     const analysis = await withTimeout(
-      prop ? runAgent2OnBid(inserted, prop) : Promise.resolve({
-        status: "error", summary: "Proposal not found for analysis.", risks: [],
-        fit: "low", milestoneNotes: [], confidence: 0, pdfUsed: false
-      }),
+      prop
+        ? runAgent2OnBid(inserted, prop)
+        : Promise.resolve({
+            status: 'error',
+            summary: 'Proposal not found for analysis.',
+            risks: [],
+            fit: 'low',
+            milestoneNotes: [],
+            confidence: 0,
+            pdfUsed: false,
+          }),
       INLINE_ANALYSIS_DEADLINE_MS,
-      { status: "timeout", summary: "Analysis timed out.", risks: [], fit: "low", milestoneNotes: [], confidence: 0, pdfUsed: false }
+      {
+        status: 'timeout',
+        summary: 'Analysis timed out.',
+        risks: [],
+        fit: 'low',
+        milestoneNotes: [],
+        confidence: 0,
+        pdfUsed: false,
+      }
     );
 
-    await pool.query(
-      `UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2`,
-      [ JSON.stringify(analysis), inserted.bid_id ]
-    );
+    await pool.query(`UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2`, [
+      JSON.stringify(analysis),
+      inserted.bid_id,
+    ]);
 
     res.json({ ok: true, bidId: inserted.bid_id });
   } catch (e) {
