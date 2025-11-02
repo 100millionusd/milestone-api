@@ -9160,7 +9160,21 @@ app.post('/bids/from-template', requireApprovedVendorOrAdmin, async (req, res) =
 
     const notes = `Created from template "${t[0].title}"`;
     const preferred = String(b.preferredStablecoin || 'USDT').toUpperCase() === 'USDC' ? 'USDC' : 'USDT';
-    const files = Array.isArray(b.files) ? b.files.filter(u => typeof u === 'string' && u) : [];
+const files = Array.isArray(b.files)
+  ? b.files
+      .map(x =>
+        typeof x === 'string'
+          ? { url: x }
+          : {
+              url: String(x?.url || ''),
+              name: x?.name || (String(x?.url || '').split('/').pop() || 'file'),
+              cid: x?.cid ?? null,
+              mimetype: x?.mimetype || x?.contentType || null,
+            }
+      )
+      .filter(f => f.url)
+  : [];
+
 
     // --- insert same shape as /bids route ---
     const insertQ = `
