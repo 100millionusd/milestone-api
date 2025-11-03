@@ -9158,7 +9158,7 @@ app.post('/bids/from-template', requireApprovedVendorOrAdmin, async (req, res) =
       })
     );
 
-    const notes = `Created from template "${t[0].title}"`;
+    const notes = b.notes || `Created from template "${t[0].title}"`;
     const preferred = String(b.preferredStablecoin || 'USDT').toUpperCase() === 'USDC' ? 'USDC' : 'USDT';
 const files = Array.isArray(b.files)
   ? b.files
