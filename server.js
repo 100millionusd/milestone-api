@@ -9175,6 +9175,7 @@ const files = Array.isArray(b.files)
       .filter(f => f.url)
   : [];
 
+  const doc = files.length > 0 ? files[0] : null;
 
     // --- insert same shape as /bids route ---
     const insertQ = `
@@ -9196,17 +9197,17 @@ const files = Array.isArray(b.files)
       RETURNING *`;
 
     const insertVals = [
-      Number(b.proposalId),
-      String(b.vendorName),
-      priceUSD,
-      days,
-      notes,
-      String(b.walletAddress),
-      preferred,
-      JSON.stringify(ms),
-      null,                // doc (legacy single-doc field)
-      JSON.stringify(files),
-    ];
+  Number(b.proposalId),
+  String(b.vendorName),
+  priceUSD,
+  days,
+  notes,
+  String(b.walletAddress),
+  preferred,
+  JSON.stringify(ms),
+  JSON.stringify(doc),        
+  JSON.stringify(files),
+];
 
     const { rows } = await pool.query(insertQ, insertVals);
     const inserted = rows[0];
