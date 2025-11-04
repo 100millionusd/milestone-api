@@ -3775,6 +3775,24 @@ enrichAuditRow(pool, ins.rows[0].audit_id).catch(/* ... */);
   }
 });
 
+// ADD RIGHT HERE
+app.patch('/bids/:id/notes', requireApprovedVendorOrAdmin, async (req, res) => {
+  try {
+    const bidId = Number(req.params.id);
+    const { notes } = req.body;
+    
+    await pool.query(
+      `UPDATE bids SET notes = $1 WHERE bid_id = $2`,
+      [notes, bidId]
+    );
+    
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('Error updating bid notes:', e);
+    res.status(500).json({ error: 'failed_update_notes' });
+  }
+});
+
 // Admin: replace milestones array on a bid
 app.patch("/bids/:id/milestones", adminGuard, async (req, res) => {
   const bidId = Number(req.params.id);
