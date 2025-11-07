@@ -5989,42 +5989,48 @@ try {
   }
 }
 
-   // ---------- MANUAL/EOA PATH (EOA via ethers; uses existing ERC20_ABI) ----------
+// ---------- MANUAL/EOA PATH (EOA via ethers; uses existing ERC20_ABI, pinned chainId, strict hex addrs) ----------
 let txHash = null;
 
 try {
-  // Build signer from env (PAYOUT_* preferred, fallback to ANCHOR_*)
-  const rpcUrl = process.env.PAYOUT_RPC_URL || process.env.ANCHOR_RPC_URL;
-  const pk     = process.env.PAYOUT_PRIVATE_KEY || process.env.ANCHOR_PRIVATE_KEY;
+  // Build signer from env (PAYOUT_* preferred, fallback to ANCHOR_*). Pin chainId to avoid "unknown"/ENS.
+  const rpcUrl  = process.env.PAYOUT_RPC_URL  || process.env.ANCHOR_RPC_URL;
+  const chainId = Number(process.env.PAYOUT_CHAIN_ID || process.env.ANCHOR_CHAIN_ID) || undefined;
+  const pk      = process.env.PAYOUT_PRIVATE_KEY || process.env.ANCHOR_PRIVATE_KEY;
   if (!rpcUrl || !pk) throw new Error('Missing PAYOUT_RPC_URL/PRIVATE_KEY (or ANCHOR_*)');
 
-  const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+  const provider = new ethers.providers.JsonRpcProvider(rpcUrl, chainId);
   const signer   = new ethers.Wallet(pk, provider);
 
-  // ERC20 transfer with correct decimals (uses your ERC20_ABI)
-  const erc20r  = new ethers.Contract(token, ERC20_ABI, provider);
-  const dec     = await erc20r.decimals().catch(() => 18);
-  const erc20   = erc20r.connect(signer);
-  const amount  = ethers.utils.parseUnits(String(msAmountUSD), dec);
+  // Strict hex-address validation to prevent ENS lookups
+  const toRaw    = String(bid.wallet_address || '').trim();
+  const tokenRaw = String(token || '').trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(toRaw))    throw new Error(`invalid recipient address: ${toRaw}`);
+  if (!/^0x[0-9a-fA-F]{40}$/.test(tokenRaw)) throw new Error(`invalid token address: ${tokenRaw}`);
 
-  const tx = await erc20.transfer(bid.wallet_address, amount);
+  const toAddr    = ethers.utils.getAddress(toRaw);
+  const tokenAddr = ethers.utils.getAddress(tokenRaw);
+
+  // ERC20 transfer with correct decimals (uses your ERC20_ABI)
+  const erc20r = new ethers.Contract(tokenAddr, ERC20_ABI, provider);
+  const dec    = await erc20r.decimals().catch(() => 18);
+  const erc20  = erc20r.connect(signer);
+  const amount = ethers.utils.parseUnits(String(msAmountUSD), dec);
+
+  const tx = await erc20.transfer(toAddr, amount);
   txHash   = tx?.hash || tx?.transactionHash || null;
   console.log('[EOA] sent tx:', txHash);
 
-} catch (e) {
-  console.error('[EOA] send failed:', e?.message || e);
-}
-
-// If we got a hash, try a non-blocking confirm (and keep the hash if provider echoes it)
-try {
-  if (txHash) {
-    const rcpt = await (new ethers.providers.JsonRpcProvider(
-      process.env.PAYOUT_RPC_URL || process.env.ANCHOR_RPC_URL
-    )).waitForTransaction(txHash, 1);
-    if (!txHash && rcpt?.transactionHash) txHash = rcpt.transactionHash;
+  // Optional: 1-conf wait using the SAME provider (non-blocking for HTTP since this is in setImmediate)
+  try {
+    if (txHash) {
+      await provider.waitForTransaction(txHash, 1);
+    }
+  } catch (e) {
+    console.warn('[EOA] waitForTransaction failed (left pending):', e?.message || e);
   }
 } catch (e) {
-  console.warn('[EOA] waitForTransaction failed (left pending):', e?.message || e);
+  console.error('[EOA] send failed:', e?.message || e);
 }
 
 // Persist tx hash immediately (create pending row if needed)
@@ -6041,6 +6047,14 @@ if (txHash) {
       [bidId, milestoneIndex, txHash]
     );
   }
+} else {
+  // Ensure at least a pending row exists if no hash yet (do NOT mark released without a hash)
+  await pool.query(
+    `INSERT INTO milestone_payments (bid_id, milestone_index, status, created_at)
+     SELECT $1, $2, 'pending', NOW()
+     WHERE NOT EXISTS (SELECT 1 FROM milestone_payments WHERE bid_id=$1 AND milestone_index=$2)`,
+    [bidId, milestoneIndex]
+  );
 }
 
 // Mirror into milestone JSON for FE
@@ -6051,7 +6065,7 @@ ms.status         = txHash ? 'paid' : (ms.status || 'pending');
 milestones[milestoneIndex] = ms;
 await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2', [JSON.stringify(milestones), bidId]);
 
-// Only mark DB row as released when we have a tx hash
+// Only mark DB row as released when we have a tx hash (prevents released-without-hash)
 if (txHash) {
   await pool.query(
     `UPDATE milestone_payments
@@ -6063,46 +6077,40 @@ if (txHash) {
     [bidId, milestoneIndex, txHash, msAmountUSD]
   );
 } else {
-  // ensure a pending row exists if no hash yet
-  await pool.query(
-    `INSERT INTO milestone_payments (bid_id, milestone_index, status, created_at)
-     SELECT $1, $2, 'pending', NOW()
-     WHERE NOT EXISTS (SELECT 1 FROM milestone_payments WHERE bid_id=$1 AND milestone_index=$2)`,
-    [bidId, milestoneIndex]
-  );
+  // keep pending; a later reconcile/backfill can attach the hash and flip to released
 }
 
-    // 5) Notify best-effort
-    try {
-      const { rows: [proposal] } = await pool.query(
-        "SELECT * FROM proposals WHERE proposal_id=$1",
-        [bid.proposal_id]
-      );
-      if (proposal && typeof notifyPaymentReleased === "function") {
-        await notifyPaymentReleased({
-          bid, proposal,
-          msIndex: milestoneIndex + 1,
-          amount: msAmountUSD,
-          txHash: txHash || null
-        });
-      }
-    } catch (e) {
-      console.warn("notifyPaymentReleased failed", e?.message || e);
-    }
-
-    // Optional: audit
-    try {
-      await writeAudit(bidId, req, {
-        payment_released: {
-          milestone_index: milestoneIndex,
-          amount_usd: msAmountUSD,
-          tx: txHash || null
-        }
-      });
-    } catch {}
-  } catch (e) {
-    console.error("Background pay-milestone failed (left pending)", e);
+// 5) Notify best-effort
+try {
+  const { rows: [proposal] } = await pool.query(
+    "SELECT * FROM proposals WHERE proposal_id=$1",
+    [bid.proposal_id]
+  );
+  if (proposal && typeof notifyPaymentReleased === "function") {
+    await notifyPaymentReleased({
+      bid, proposal,
+      msIndex: milestoneIndex + 1,
+      amount: msAmountUSD,
+      txHash: txHash || null
+    });
   }
+} catch (e) {
+  console.warn("notifyPaymentReleased failed", e?.message || e);
+}
+
+// Optional: audit
+try {
+  await writeAudit(bidId, req, {
+    payment_released: {
+      milestone_index: milestoneIndex,
+      amount_usd: msAmountUSD,
+      tx: txHash || null
+    }
+  });
+} catch {}
+} catch (e) {
+  console.error("Background pay-milestone failed (left pending)", e);
+}
 });
 
 // 5) Return immediately to avoid proxy 502s on slow confirmations
@@ -6114,9 +6122,9 @@ return res.status(202).json({
 });
 
 } catch (err) {
-  console.error("pay-milestone error", err);
-  const msg = err?.shortMessage || err?.reason || err?.message || "Internal error paying milestone";
-  return res.status(500).json({ ok: false, error: msg });
+console.error("pay-milestone error", err);
+const msg = err?.shortMessage || err?.reason || err?.message || "Internal error paying milestone";
+return res.status(500).json({ ok: false, error: msg });
 }
 });
 
