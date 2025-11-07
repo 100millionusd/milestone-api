@@ -50,19 +50,6 @@ const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
 const { enrichAuditRow } = require('./services/auditPinata');
 
-// --- debug helper for logging wrapper responses safely ---
-function safeStringify(x) {
-  const seen = new WeakSet();
-  return JSON.stringify(x, (k, v) => {
-    if (v && v._isBigNumber && typeof v.toString === 'function') return v.toString();
-    if (typeof v === 'bigint') return v.toString();
-    if (typeof v === 'object' && v !== null) {
-      if (seen.has(v)) return '[Circular]';
-      seen.add(v);
-    }
-    return v;
-  }, 2);
-}
 
 // --- robust tx-hash extractor (handles strings, fields, functions, nested, promises) ---
 async function extractTxHash(sendRes) {
