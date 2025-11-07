@@ -6008,7 +6008,7 @@ try {
   }
 }
 
-/// ---------- MANUAL/EOA PATH ----------
+// ---------- MANUAL/EOA PATH ----------
 let txHash = null;
 let sendRes = null;
 
@@ -6129,6 +6129,7 @@ if (txHash) {
      WHERE bid_id=$1 AND milestone_index=$2 AND (tx_hash IS NULL OR tx_hash='')`,
     [bidId, milestoneIndex]
   );
+}
 
 // 5) Notify best-effort
 try {
