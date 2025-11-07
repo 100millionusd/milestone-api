@@ -58,6 +58,28 @@ function periodIdForDate(date = new Date()) {
   return `${y}-${m}-${d}T${h}`;
 }
 
+/* --------------------------
+   Idempotency helpers
+---------------------------*/
+const ZERO32 = '0x0000000000000000000000000000000000000000000000000000000000000000';
+
+function isAlreadyAnchoredError(err) {
+  const msg =
+    `${err?.reason || err?.error?.message || err?.message || ''}`.toLowerCase();
+  if (msg.includes('already anchored')) return true;
+
+  const data = err?.error?.data || err?.data;
+  if (typeof data === 'string' && data.startsWith('0x08c379a0')) {
+    try {
+      // decode Error(string)
+      const reasonHex = '0x' + data.slice(138);
+      const reason = ethers.utils.toUtf8String(reasonHex).toLowerCase();
+      if (reason.includes('already anchored')) return true;
+    } catch {}
+  }
+  return false;
+}
+
 /* -----------------------------------
    Anchor current period on-chain & DB
 ------------------------------------*/
@@ -84,41 +106,105 @@ async function anchorPeriod(pool, periodId) {
   const leaves = rows.map((r) => r.leaf_hash);
   const { root, layers } = buildTree(leaves);
 
-  // 2) Send anchor tx
-  const provider = new ethers.providers.JsonRpcProvider(
-    process.env.ANCHOR_RPC_URL,
-    Number(process.env.ANCHOR_CHAIN_ID)
-  );
-  const wallet = new ethers.Wallet(process.env.ANCHOR_PRIVATE_KEY, provider);
+  // Env
+  const rpcUrl = process.env.ANCHOR_RPC_URL;
+  const chainId = Number(process.env.ANCHOR_CHAIN_ID);
+  const pk = process.env.ANCHOR_PRIVATE_KEY;
+  const contractAddr = process.env.ANCHOR_CONTRACT;
+
+  if (!rpcUrl) throw new Error('ANCHOR_RPC_URL not set');
+  if (!chainId) throw new Error('ANCHOR_CHAIN_ID not set');
+  if (!pk) throw new Error('ANCHOR_PRIVATE_KEY not set');
+  if (!contractAddr) throw new Error('ANCHOR_CONTRACT not set');
+
+  const provider = new ethers.providers.JsonRpcProvider(rpcUrl, chainId);
+  const wallet = new ethers.Wallet(pk, provider);
   const abi = [
     'function roots(bytes32) view returns (bytes32)',
     'function anchor(bytes32 periodId, bytes32 root) external',
   ];
-  const c = new ethers.Contract(process.env.ANCHOR_CONTRACT, abi, wallet);
+  const c = new ethers.Contract(contractAddr, abi, wallet);
 
+  // Inputs
   const periodBytes32 = ethers.utils.keccak256(Buffer.from(periodId, 'utf8'));
   const rootHex = '0x' + root.toString('hex');
 
-  const tx = await c.anchor(periodBytes32, rootHex);
-  const receipt = await tx.wait();
+  // 2) On-chain check first (IDEMPOTENT)
+  const current = await c.roots(periodBytes32);
+  if (current && current.toLowerCase() !== ZERO32) {
+    if (current.toLowerCase() === rootHex.toLowerCase()) {
+      // Already anchored with same root → just link locally
+      const linked = await finalizeExistingAnchor(pool, periodId, /* txHash */ null);
+      return { ok: true, status: 'already_anchored_linked', ...linked };
+    }
+    // Different root anchored for this period → do not proceed
+    return {
+      ok: false,
+      status: 'onchain_root_mismatch',
+      periodId,
+      onchainRoot: current,
+      localRoot: rootHex,
+      message: 'On-chain root for period differs from local Merkle root.',
+    };
+  }
 
-  // 3) Persist batch row
+  // 3) Preflight + robust gas estimate (handle duplicate safely)
+  try {
+    // Static call should pass if not anchored; revert reasons bubble here
+    await c.callStatic.anchor(periodBytes32, rootHex, { from: wallet.address });
+  } catch (e) {
+    if (isAlreadyAnchoredError(e)) {
+      const linked = await finalizeExistingAnchor(pool, periodId, null);
+      return { ok: true, status: 'already_anchored_linked', ...linked };
+    }
+    throw e;
+  }
+
+  let gas;
+  try {
+    gas = await c.estimateGas.anchor(periodBytes32, rootHex, { from: wallet.address });
+  } catch (e) {
+    if (isAlreadyAnchoredError(e)) {
+      const linked = await finalizeExistingAnchor(pool, periodId, null);
+      return { ok: true, status: 'already_anchored_linked', ...linked };
+    }
+    throw e;
+  }
+
+  // pad gas a bit to avoid underestimation on busy L2s
+  const pad = Number(process.env.ANCHOR_GAS_PAD || '1.2');
+  const gasLimit = ethers.BigNumber.from(gas)
+    .mul(Math.floor(pad * 100))
+    .div(100);
+
+  const fee = await provider.getFeeData();
+
+  // 4) Send anchor tx
+  const tx = await c.anchor(periodBytes32, rootHex, {
+    gasLimit,
+    maxFeePerGas: fee.maxFeePerGas ?? undefined,
+    maxPriorityFeePerGas: fee.maxPriorityFeePerGas ?? undefined,
+  });
+  const receipt = await tx.wait(1);
+
+  // 5) Persist batch row
   const batch = (
     await pool.query(
       `INSERT INTO audit_batches (period_id, merkle_root, chain_id, contract_addr, tx_hash)
        VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (period_id) DO UPDATE SET merkle_root=EXCLUDED.merkle_root
        RETURNING id`,
       [
         periodId,
         root, // bytea
-        Number(process.env.ANCHOR_CHAIN_ID),
-        process.env.ANCHOR_CONTRACT,
+        chainId,
+        contractAddr,
         receipt.transactionHash,
       ]
     )
   ).rows[0];
 
-  // 4) Attach proofs/index to each audit row
+  // 6) Attach proofs/index to each audit row
   for (let i = 0; i < rows.length; i++) {
     const proof = proofForIndex(layers, i);
     await pool.query(
@@ -133,6 +219,7 @@ async function anchorPeriod(pool, periodId) {
 
   return {
     ok: true,
+    status: 'anchored',
     periodId,
     batchId: batch.id,
     root: rootHex,
