@@ -6021,15 +6021,49 @@ try {
       }
     }
 
-    // Optional confirm (non-blocking)
-    try {
-      if (blockchainService?.waitForConfirm && txHash && !String(txHash).startsWith("dev_")) {
-        await blockchainService.waitForConfirm(txHash, 1);
-      }
-    } catch (e) {
-      console.warn("waitForConfirm failed (left as pending)", e?.message || e);
-      // continue
+ // Optional confirm (1 conf). MUST NOT block the HTTP response.
+// Also salvage tx hash from receipt if initial send didn't return it.
+try {
+  let rcpt = null;
+  if (blockchainService?.waitForConfirm) {
+    // if txHash is falsy, many helpers still accept undefined/handle internally
+    rcpt = await blockchainService.waitForConfirm(txHash || undefined, 1);
+  }
+  const got =
+    rcpt?.transactionHash ||
+    rcpt?.hash ||
+    (rcpt && typeof rcpt === 'string' ? rcpt : null);
+
+  if (!txHash && got) {
+    txHash = got;
+
+    // Persist late-found tx hash to DB
+    const up2 = await pool.query(
+      `UPDATE milestone_payments SET tx_hash=$3
+       WHERE bid_id=$1 AND milestone_index=$2`,
+      [bidId, milestoneIndex, txHash]
+    );
+    if (!up2.rowCount) {
+      await pool.query(
+        `INSERT INTO milestone_payments (bid_id, milestone_index, status, tx_hash, created_at)
+         VALUES ($1,$2,'pending',$3,NOW())
+         ON CONFLICT (bid_id, milestone_index) DO UPDATE SET tx_hash = EXCLUDED.tx_hash`,
+        [bidId, milestoneIndex, txHash]
+      );
     }
+
+    // Mirror into milestone JSON so FE can show it immediately
+    ms.paymentTxHash = txHash;
+    milestones[milestoneIndex] = ms;
+    await pool.query(
+      "UPDATE bids SET milestones=$1 WHERE bid_id=$2",
+      [JSON.stringify(milestones), bidId]
+    );
+  }
+} catch (e) {
+  console.warn("waitForConfirm failed (left as pending)", e?.message || e);
+  // continue; we'll still mark released below
+}
 
     // 4) Mark released + mirror into milestone JSON for FE
     ms.paymentTxHash = txHash || ms.paymentTxHash || null;
@@ -6039,15 +6073,15 @@ try {
     milestones[milestoneIndex] = ms;
 
     await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
-    await pool.query(
-      `UPDATE milestone_payments
-         SET status='released',
-             tx_hash=COALESCE(tx_hash,$3),
-             released_at=NOW(),
-             amount_usd=COALESCE(amount_usd,$4)
-       WHERE bid_id=$1 AND milestone_index=$2`,
-      [bidId, milestoneIndex, txHash || null, msAmountUSD]
-    );
+ await pool.query(
+  `UPDATE milestone_payments
+     SET status='released',
+         tx_hash = COALESCE(tx_hash, $3, $5),
+         released_at = NOW(),
+         amount_usd = COALESCE(amount_usd, $4)
+   WHERE bid_id=$1 AND milestone_index=$2`,
+  [bidId, milestoneIndex, txHash || null, msAmountUSD, ms?.paymentTxHash || null]
+);
 
     // 5) Notify best-effort
     try {
