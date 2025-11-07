@@ -49,6 +49,25 @@ const crypto = require("crypto");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
 const { enrichAuditRow } = require('./services/auditPinata');
+
+// --- debug helper for logging wrapper responses safely ---
+function safeStringify(x) {
+  const seen = new WeakSet();
+  return JSON.stringify(
+    x,
+    (k, v) => {
+      if (v && v._isBigNumber && typeof v.toString === 'function') return v.toString();
+      if (typeof v === 'bigint') return v.toString();
+      if (typeof v === 'object' && v !== null) {
+        if (seen.has(v)) return '[Circular]';
+        seen.add(v);
+      }
+      return v;
+    },
+    2
+  );
+}
+
 // ==== SAFE CONFIG (define once, near the top) ====
 const SAFE_ADDRESS       = (process.env.SAFE_ADDRESS || process.env.SAFE_WALLET || '0xedd1F37FD3eaACb596CDF00102187DA0cc884D93').trim();
 const SAFE_TXSERVICE_URL = (process.env.SAFE_TXSERVICE_URL || 'https://api.safe.global/tx-service/sep').trim().replace(/\/+$/, '');
@@ -6001,6 +6020,15 @@ try {
   } else {
     txHash = "dev_" + crypto.randomBytes(8).toString("hex");
   }
+
+  // DEBUG: see exactly what your wrapper returned
+console.log('[EOA] sendRes keys:', sendRes && Object.keys(sendRes));
+try {
+  console.log('[EOA] sendRes sample:', safeStringify(sendRes).slice(0, 2000));
+} catch (e) {
+  console.log('[EOA] sendRes (string):', String(sendRes));
+}
+
 
   // Capture tx hash from as many common shapes as possible (no token/address validation; keep wrapper behavior)
   if (!txHash) {
