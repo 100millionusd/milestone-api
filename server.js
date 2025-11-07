@@ -5989,100 +5989,107 @@ try {
   }
 }
 
- // ---------- MANUAL/EOA PATH ----------
-let txHash = null;
-try {
-  if (blockchainService?.transferSubmit) {
-    const r = await blockchainService.transferSubmit(token, bid.wallet_address, msAmountUSD);
-    txHash = r?.hash || r?.transactionHash || r?.txHash || (typeof r === 'string' ? r : null);
-  } else if (blockchainService?.sendToken) {
-    const r = await blockchainService.sendToken(token, bid.wallet_address, msAmountUSD);
-    txHash = r?.hash || r?.transactionHash || r?.txHash || (typeof r === 'string' ? r : null);
-  } else {
-    txHash = "dev_" + crypto.randomBytes(8).toString("hex");
-  }
-} catch (e) {
-  console.error("EOA send failed", e?.message || e);
-}
-
-// persist tx hash immediately (create row if absent)
-if (txHash) {
-  const up = await pool.query(
-    `UPDATE milestone_payments SET tx_hash=$3 WHERE bid_id=$1 AND milestone_index=$2`,
-    [bidId, milestoneIndex, txHash]
-  );
-  if (!up.rowCount) {
-    await pool.query(
-      `INSERT INTO milestone_payments (bid_id, milestone_index, status, tx_hash, created_at)
-       VALUES ($1,$2,'pending',$3,NOW())
-       ON CONFLICT (bid_id, milestone_index) DO UPDATE SET tx_hash = EXCLUDED.tx_hash`,
-      [bidId, milestoneIndex, txHash]
-    );
-  }
-}
-
-// Optional confirm (1 conf). MUST NOT block the HTTP response.
-try {
-  if (blockchainService?.waitForConfirm && txHash && !String(txHash).startsWith("dev_")) {
-    await blockchainService.waitForConfirm(txHash, 1);
-  }
-} catch (e) {
-  console.warn("waitForConfirm failed (left as pending)", e?.message || e);
-  // DO NOT return; keep going to mark released + mirror JSON
-}
-
-// 4) Mark released + legacy JSON fields
-ms.paymentTxHash = txHash || ms.paymentTxHash || null;
-ms.paymentDate = new Date().toISOString();
-ms.paymentPending = false;
-ms.status = "paid";
-milestones[milestoneIndex] = ms;
-
-await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
-await pool.query(
-  `UPDATE milestone_payments
-     SET status='released', tx_hash=COALESCE(tx_hash,$3), released_at=NOW(), amount_usd=COALESCE(amount_usd,$4)
-   WHERE bid_id=$1 AND milestone_index=$2`,
-  [bidId, milestoneIndex, txHash || null, msAmountUSD]
-);
-
-// 5) Notify best-effort
-try {
-  const { rows: [proposal] } = await pool.query(
-    "SELECT * FROM proposals WHERE proposal_id=$1",
-    [bid.proposal_id]
-  );
-  if (proposal && typeof notifyPaymentReleased === "function") {
-    await notifyPaymentReleased({
-      bid, proposal,
-      msIndex: milestoneIndex + 1,
-      amount: msAmountUSD,
-      txHash: txHash || null
-    });
-  }
-} catch (e) {
-  console.warn("notifyPaymentReleased failed", e?.message || e);
-}
-
-// Optional: audit
-try {
-  await writeAudit(bidId, req, {
-    payment_released: {
-      milestone_index: milestoneIndex,
-      amount_usd: msAmountUSD,
-      tx: txHash || null
+setImmediate(async () => {
+  try {
+    // ---------- MANUAL/EOA PATH ----------
+    let txHash = null;
+    try {
+      if (blockchainService?.transferSubmit) {
+        const r = await blockchainService.transferSubmit(token, bid.wallet_address, msAmountUSD);
+        txHash = r?.hash || r?.transactionHash || r?.txHash || (typeof r === 'string' ? r : null);
+      } else if (blockchainService?.sendToken) {
+        const r = await blockchainService.sendToken(token, bid.wallet_address, msAmountUSD);
+        txHash = r?.hash || r?.transactionHash || r?.txHash || (typeof r === 'string' ? r : null);
+      } else {
+        txHash = "dev_" + crypto.randomBytes(8).toString("hex");
+      }
+    } catch (e) {
+      console.error("EOA send failed", e?.message || e);
     }
-  });
-} catch {}
 
-  // 5) Return immediately to avoid proxy 502s on slow confirmations
+    // persist tx hash immediately (create row if absent)
+    if (txHash) {
+      const up = await pool.query(
+        `UPDATE milestone_payments SET tx_hash=$3 WHERE bid_id=$1 AND milestone_index=$2`,
+        [bidId, milestoneIndex, txHash]
+      );
+      if (!up.rowCount) {
+        await pool.query(
+          `INSERT INTO milestone_payments (bid_id, milestone_index, status, tx_hash, created_at)
+           VALUES ($1,$2,'pending',$3,NOW())
+           ON CONFLICT (bid_id, milestone_index) DO UPDATE SET tx_hash = EXCLUDED.tx_hash`,
+          [bidId, milestoneIndex, txHash]
+        );
+      }
+    }
+
+    // Optional confirm (non-blocking)
+    try {
+      if (blockchainService?.waitForConfirm && txHash && !String(txHash).startsWith("dev_")) {
+        await blockchainService.waitForConfirm(txHash, 1);
+      }
+    } catch (e) {
+      console.warn("waitForConfirm failed (left as pending)", e?.message || e);
+      // continue
+    }
+
+    // 4) Mark released + mirror into milestone JSON for FE
+    ms.paymentTxHash = txHash || ms.paymentTxHash || null;
+    ms.paymentDate = new Date().toISOString();
+    ms.paymentPending = false;
+    ms.status = "paid";
+    milestones[milestoneIndex] = ms;
+
+    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
+    await pool.query(
+      `UPDATE milestone_payments
+         SET status='released',
+             tx_hash=COALESCE(tx_hash,$3),
+             released_at=NOW(),
+             amount_usd=COALESCE(amount_usd,$4)
+       WHERE bid_id=$1 AND milestone_index=$2`,
+      [bidId, milestoneIndex, txHash || null, msAmountUSD]
+    );
+
+    // 5) Notify best-effort
+    try {
+      const { rows: [proposal] } = await pool.query(
+        "SELECT * FROM proposals WHERE proposal_id=$1",
+        [bid.proposal_id]
+      );
+      if (proposal && typeof notifyPaymentReleased === "function") {
+        await notifyPaymentReleased({
+          bid, proposal,
+          msIndex: milestoneIndex + 1,
+          amount: msAmountUSD,
+          txHash: txHash || null
+        });
+      }
+    } catch (e) {
+      console.warn("notifyPaymentReleased failed", e?.message || e);
+    }
+
+    // Optional: audit
+    try {
+      await writeAudit(bidId, req, {
+        payment_released: {
+          milestone_index: milestoneIndex,
+          amount_usd: msAmountUSD,
+          tx: txHash || null
+        }
+      });
+    } catch {}
+  } catch (e) {
+    console.error("Background pay-milestone failed (left pending)", e);
+  }
+});
+
+// 5) Return immediately to avoid proxy 502s on slow confirmations
 return res.status(202).json({
   ok: true,
   status: "pending",
   bidId,
   milestoneIndex,
-  // NOTE: txHash is written to milestone_payments.tx_hash by the background section above.
-  // FE should poll /bids/:bidId (or /proofs) to surface the Tx once available.
 });
 
 } catch (err) {
