@@ -6064,40 +6064,89 @@ try {
     txHash = "dev_" + crypto.randomBytes(8).toString("hex");
   }
 
-  // DEBUG: see exactly what your wrapper returned
-  console.log('[EOA] sendRes keys:', sendRes && Object.keys(sendRes));
+  // --- DEBUG: surface shape & value types (do not remove until you see hashes in DB) ---
   try {
-    console.log('[EOA] sendRes sample:', safeStringify(sendRes).slice(0, 2000));
+    console.log('[EOA] sendRes keys:', sendRes && Object.keys(sendRes));
     console.log('[EOA] typeof sendRes.hash:', typeof (sendRes && sendRes.hash));
-  } catch (e) {
-    console.log('[EOA] sendRes (string):', String(sendRes));
+  } catch {}
+
+  // Helper to accept only proper 0x... hashes (>= 66 chars)
+  const takeHash = (v) => (typeof v === 'string' && /^0x[0-9a-fA-F]{64,}$/.test(v)) ? v : null;
+
+  // 1) Direct fields
+  if (!txHash && sendRes) {
+    txHash =
+      takeHash(sendRes.hash) ||
+      takeHash(sendRes.transactionHash) ||
+      takeHash(sendRes.txHash) ||
+      takeHash(sendRes.txid) ||
+      takeHash(sendRes.id) ||
+      takeHash(sendRes.tx) ||
+      (sendRes.receipt && (takeHash(sendRes.receipt.transactionHash) || takeHash(sendRes.receipt.hash))) ||
+      (sendRes.data && (takeHash(sendRes.data.hash) || takeHash(sendRes.data.txHash))) ||
+      (sendRes.result && (takeHash(sendRes.result.hash) || takeHash(sendRes.result.txHash))) ||
+      (typeof sendRes === "string" ? takeHash(sendRes) : null);
   }
 
-  // Capture tx hash (covers string, fields, functions, nested, promises)
-  if (!txHash) {
-    txHash = await extractTxHash(sendRes);
+  // 2) If hash is exposed via function/getter/promise, resolve it
+  if (!txHash && sendRes && ('hash' in sendRes)) {
+    try {
+      let raw = null;
+      const descOwn   = Object.getOwnPropertyDescriptor(Object(sendRes), 'hash');
+      const descProto = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(sendRes) || {}, 'hash');
+      const desc = descOwn || descProto;
+
+      if (desc && typeof desc.get === 'function') {
+        raw = desc.get.call(sendRes);
+      } else if (typeof sendRes.hash === 'function') {
+        raw = sendRes.hash();
+      } else {
+        raw = sendRes.hash;
+      }
+      if (raw && typeof raw.then === 'function') raw = await raw;
+      txHash = takeHash(raw) || txHash;
+    } catch (e) {
+      console.warn('[EOA] getter/hash() extraction failed:', e?.message || e);
+    }
   }
 
-  // Optional external confirm; try to salvage hash from its receipt if still missing
+  // 3) ethers-style: wait(1) → receipt.transactionHash
+  if (!txHash && sendRes && typeof sendRes.wait === 'function') {
+    try {
+      const rcpt = await sendRes.wait(1);
+      txHash = takeHash(rcpt?.transactionHash) || takeHash(rcpt?.hash) || txHash;
+    } catch (e) {
+      console.warn('[EOA] sendRes.wait(1) failed:', e?.message || e);
+    }
+  }
+
+  // 4) Wrapper confirm helper (if present) — also salvage from its receipt/string
   try {
     if (blockchainService?.waitForConfirm && (txHash || sendRes)) {
-      const hint = txHash || sendRes?.hash || sendRes?.transactionHash || sendRes?.txHash || sendRes;
+      const hint =
+        txHash ||
+        takeHash(sendRes?.hash) ||
+        takeHash(sendRes?.transactionHash) ||
+        takeHash(sendRes?.txHash) ||
+        sendRes; // some wrappers accept the original object
       const rcpt2 = await blockchainService.waitForConfirm(hint, 1);
       if (!txHash) {
         txHash =
-          (typeof rcpt2 === 'string' ? rcpt2 : null) ||
-          (rcpt2 && (rcpt2.transactionHash || rcpt2.hash || rcpt2.txHash)) ||
-          null;
+          (typeof rcpt2 === 'string' ? takeHash(rcpt2) : null) ||
+          takeHash(rcpt2?.transactionHash) ||
+          takeHash(rcpt2?.hash) ||
+          takeHash(rcpt2?.txHash) ||
+          txHash;
       }
     }
   } catch (e) {
-    console.warn("waitForConfirm failed (left pending)", e?.message || e);
+    console.warn('[EOA] waitForConfirm failed (left pending):', e?.message || e);
   }
 } catch (e) {
-  console.error("EOA send failed", e?.message || e);
+  console.error('EOA send failed', e?.message || e);
 }
 
-// Persist tx hash immediately (create row if absent)
+// ---- Persist tx hash immediately (or ensure a pending row exists) ----
 if (txHash) {
   const up = await pool.query(
     `UPDATE milestone_payments SET tx_hash=$3 WHERE bid_id=$1 AND milestone_index=$2`,
@@ -6112,7 +6161,6 @@ if (txHash) {
     );
   }
 } else {
-  // Ensure a pending row exists; DO NOT mark released without a real hash
   await pool.query(
     `INSERT INTO milestone_payments (bid_id, milestone_index, status, created_at)
      VALUES ($1,$2,'pending',NOW())
@@ -6122,15 +6170,14 @@ if (txHash) {
 }
 
 // ---- Mirror into milestone JSON for FE ----
-ms.paymentTxHash   = txHash || ms.paymentTxHash || null;
+ms.paymentTxHash   = txHash || ms.paymentTxHash || null;   // UI reads this
 ms.paymentDate     = new Date().toISOString();
 ms.paymentPending  = !txHash;
 ms.status          = txHash ? "paid" : "pending";
 milestones[milestoneIndex] = ms;
-
 await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
 
-// ---- ONLY mark DB row as released when a tx hash exists ----
+// ---- ONLY mark DB row as released when a real hash exists ----
 if (txHash) {
   await pool.query(
     `UPDATE milestone_payments
