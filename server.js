@@ -204,6 +204,61 @@ const TOKENS = {
   USDT: { address: USDT_ADDRESS, decimals: 6 },
 };
 
+// --- ERC20 Transfer log salvage (find tx hash if wrapper didn't return one) ---
+const TRANSFER_TOPIC = ethers.utils.id("Transfer(address,address,uint256)");
+
+async function salvageTxHashViaLogs(rpcUrl, tokenOrSymbol, toAddress, amountRaw) {
+  try {
+    if (!rpcUrl) return null;
+    if (!toAddress) return null;
+
+    // resolve token address from symbol or accept direct address
+    let tokenAddr = tokenOrSymbol;
+    if (typeof tokenOrSymbol === 'string' && !/^0x[0-9a-fA-F]{40}$/.test(tokenOrSymbol)) {
+      tokenAddr = (TOKENS[tokenOrSymbol] && TOKENS[tokenOrSymbol].address) || null;
+    }
+    if (!tokenAddr || !/^0x[0-9a-fA-F]{40}$/.test(tokenAddr)) return null;
+
+    const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+
+    // decimals
+    let dec = (TOKENS[tokenOrSymbol]?.decimals ?? TOKENS[tokenAddr]?.decimals);
+    if (!Number.isFinite(dec)) {
+      try {
+        const decCtr = new ethers.Contract(tokenAddr, ERC20_ABI, provider);
+        dec = await decCtr.decimals();
+      } catch { dec = 6; }
+    }
+
+    const amountUnits = ethers.utils.parseUnits(String(amountRaw), dec);
+
+    const head = await provider.getBlockNumber();
+    const win  = Math.max(1, Number(process.env.SALVAGE_BLOCK_WINDOW || 6000)); // ~20–30min window
+    const fromBlock = Math.max(0, head - win);
+
+    const topicTo = ethers.utils.hexZeroPad(ethers.utils.getAddress(toAddress), 32);
+    const logs = await provider.getLogs({
+      address: ethers.utils.getAddress(tokenAddr),
+      fromBlock,
+      toBlock: 'latest',
+      topics: [TRANSFER_TOPIC, null, topicTo],
+    });
+
+    // newest first; match exact amount
+    for (let i = logs.length - 1; i >= 0; i--) {
+      const log = logs[i];
+      const val = ethers.BigNumber.from(log.data); // amount
+      if (val.eq(amountUnits)) {
+        return log.transactionHash;
+      }
+    }
+    return null;
+  } catch (e) {
+    console.warn('[SALVAGE] failed:', e?.message || e);
+    return null;
+  }
+}
+
 // ==============================
 // Database
 // ==============================
