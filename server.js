@@ -4556,17 +4556,7 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
         console.warn('[reconcile-safe] notify failed', e?.message || e);
       }
 
-      updated++;
-    }
-
-    return res.json({ ok: true, updated });
-  } catch (e) {
-    console.error('[reconcile-safe] fatal', e);
-    return res.status(500).json({ error: e?.message || String(e) });
-  }
-});
-
-// write an audit row so it appears under ACTIVITY
+      // write an audit row so it appears under ACTIVITY
 try {
   await writeAudit(row.bid_id, req, {
     payment_released: {
@@ -4580,6 +4570,16 @@ try {
 } catch (e) {
   console.warn('[reconcile-safe] audit failed', e?.message || e);
 }
+
+      updated++;
+    }
+
+    return res.json({ ok: true, updated });
+  } catch (e) {
+    console.error('[reconcile-safe] fatal', e);
+    return res.status(500).json({ error: e?.message || String(e) });
+  }
+});
 
 // POST /admin/oversight/finalize-chain-tx  { bidId, milestoneIndex, txHash }
 app.post('/admin/oversight/finalize-chain-tx', adminGuard, async (req, res) => {
@@ -4674,7 +4674,6 @@ app.post('/admin/oversight/finalize-chain-tx', adminGuard, async (req, res) => {
     } catch (e) {
       console.warn('[finalize-chain-tx] audit failed', e?.message || e);
     }
-    // >>> END INSERT <<<
 
     return res.json({ ok: true, bidId, milestoneIndex, txHash });
   } catch (e) {
