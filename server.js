@@ -4566,7 +4566,21 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
   }
 });
 
-// Force-finalize a milestone as PAID using an executed on-chain tx hash
+// write an audit row so it appears under ACTIVITY
+try {
+  await writeAudit(row.bid_id, req, {
+    payment_released: {
+      milestone_index: idx,
+      amount_usd: row.amount_usd,
+      tx: txResp.transactionHash,
+      via: 'safe',
+      safe_tx_hash: row.safe_tx_hash
+    }
+  });
+} catch (e) {
+  console.warn('[reconcile-safe] audit failed', e?.message || e);
+}
+
 // POST /admin/oversight/finalize-chain-tx  { bidId, milestoneIndex, txHash }
 app.post('/admin/oversight/finalize-chain-tx', adminGuard, async (req, res) => {
   try {
@@ -4629,7 +4643,7 @@ app.post('/admin/oversight/finalize-chain-tx', adminGuard, async (req, res) => {
       );
     }
 
-    // 5) Optional: notify
+       // 5) Optional: notify
     try {
       const { rows: [proposal] } = await pool.query(
         'SELECT * FROM proposals WHERE proposal_id=$1',
@@ -4647,13 +4661,27 @@ app.post('/admin/oversight/finalize-chain-tx', adminGuard, async (req, res) => {
       console.warn('notifyPaymentReleased failed', e?.message || e);
     }
 
+    // >>> ADD THIS BLOCK (so Safe/Manual finalizations appear under ACTIVITY) <<<
+    try {
+      await writeAudit(bidId, req, {
+        payment_released: {
+          milestone_index: milestoneIndex,
+          amount_usd: ms.amount || null,
+          tx: txHash,
+          via: 'manual_finalize'
+        }
+      });
+    } catch (e) {
+      console.warn('[finalize-chain-tx] audit failed', e?.message || e);
+    }
+    // >>> END INSERT <<<
+
     return res.json({ ok: true, bidId, milestoneIndex, txHash });
   } catch (e) {
     console.error('finalize-chain-tx failed', e);
     return res.status(500).json({ error: e?.message || String(e) });
   }
 });
-
 
 // Quick status check for a Safe tx
 app.get('/safe/tx/:hash', adminGuard, async (req, res) => {
