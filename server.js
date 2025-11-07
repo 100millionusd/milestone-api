@@ -6008,7 +6008,7 @@ try {
   }
 }
 
-// ---------- MANUAL/EOA PATH ----------
+/// ---------- MANUAL/EOA PATH ----------
 let txHash = null;
 let sendRes = null;
 
@@ -6022,13 +6022,12 @@ try {
   }
 
   // DEBUG: see exactly what your wrapper returned
-console.log('[EOA] sendRes keys:', sendRes && Object.keys(sendRes));
-try {
-  console.log('[EOA] sendRes sample:', safeStringify(sendRes).slice(0, 2000));
-} catch (e) {
-  console.log('[EOA] sendRes (string):', String(sendRes));
-}
-
+  console.log('[EOA] sendRes keys:', sendRes && Object.keys(sendRes));
+  try {
+    console.log('[EOA] sendRes sample:', safeStringify(sendRes).slice(0, 2000));
+  } catch (e) {
+    console.log('[EOA] sendRes (string):', String(sendRes));
+  }
 
   // Capture tx hash from as many common shapes as possible (no token/address validation; keep wrapper behavior)
   if (!txHash) {
@@ -6092,22 +6091,44 @@ if (txHash) {
       [bidId, milestoneIndex, txHash]
     );
   }
+} else {
+  // Ensure there's at least a pending row; DO NOT mark released without a hash
+  await pool.query(
+    `INSERT INTO milestone_payments (bid_id, milestone_index, status, created_at)
+     VALUES ($1,$2,'pending',NOW())
+     ON CONFLICT (bid_id, milestone_index) DO NOTHING`,
+    [bidId, milestoneIndex]
+  );
 }
 
-// 4) Mark released + legacy JSON fields (unchanged behavior)
-ms.paymentTxHash = txHash || ms.paymentTxHash || null;
-ms.paymentDate = new Date().toISOString();
-ms.paymentPending = false;
-ms.status = "paid";
+// ---- Mirror into milestone JSON for FE ----
+ms.paymentTxHash   = txHash || ms.paymentTxHash || null;
+ms.paymentDate     = new Date().toISOString();
+ms.paymentPending  = !txHash;              // true if we still don't have a hash
+ms.status          = txHash ? "paid" : (ms.status || "pending");
 milestones[milestoneIndex] = ms;
 
 await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
-await pool.query(
-  `UPDATE milestone_payments
-     SET status='released', tx_hash=COALESCE(tx_hash,$3), released_at=NOW(), amount_usd=COALESCE(amount_usd,$4)
-   WHERE bid_id=$1 AND milestone_index=$2`,
-  [bidId, milestoneIndex, txHash || null, msAmountUSD]
-);
+
+// ---- ONLY mark DB row as released when a tx hash exists ----
+if (txHash) {
+  await pool.query(
+    `UPDATE milestone_payments
+       SET status='released',
+           tx_hash     = COALESCE(tx_hash,$3),
+           released_at = NOW(),
+           amount_usd  = COALESCE(amount_usd,$4)
+     WHERE bid_id=$1 AND milestone_index=$2`,
+    [bidId, milestoneIndex, txHash, msAmountUSD]
+  );
+} else {
+  // keep pending state; a later reconcile/backfill can attach the hash and flip to released
+  await pool.query(
+    `UPDATE milestone_payments
+       SET status='pending', released_at=NULL
+     WHERE bid_id=$1 AND milestone_index=$2 AND (tx_hash IS NULL OR tx_hash='')`,
+    [bidId, milestoneIndex]
+  );
 
 // 5) Notify best-effort
 try {
