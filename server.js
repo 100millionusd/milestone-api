@@ -4389,16 +4389,47 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
       out.payouts.recent  = rec  || [];
     }
 
-    // recent audits
-    {
-      const { rows } = await pool.query(`
-        SELECT created_at, actor_role, actor_wallet, changes, bid_id
-          FROM bid_audits
-         ORDER BY created_at DESC
-         LIMIT 50
-      `).catch(() => ({ rows: [] }));
-      out.recent = rows;
-    }
+ // recent activity = audits UNION released Safe payouts (so Safe shows up in Activity)
+{
+  const { rows } = await pool.query(`
+    SELECT *
+    FROM (
+      -- A) existing audit entries
+      SELECT
+        created_at,
+        actor_role,
+        actor_wallet,
+        changes,
+        bid_id
+      FROM bid_audits
+
+      UNION ALL
+
+      -- B) synthesized "payment_released" events for Safe payouts
+      SELECT
+        COALESCE(released_at, created_at) AS created_at,
+        'system'::text                    AS actor_role,
+        NULL::text                        AS actor_wallet,
+        jsonb_build_object(
+          'payment_released', jsonb_build_object(
+            'milestone_index', milestone_index,
+            'amount_usd',      amount_usd,
+            'tx',              NULLIF(tx_hash, ''),
+            'txHash',          NULLIF(tx_hash, ''),
+            'via',             'safe',
+            'safe_tx_hash',    NULLIF(safe_tx_hash, ''),
+            'safeTxHash',      NULLIF(safe_tx_hash, '')
+          )
+        )                                  AS changes,
+        bid_id
+      FROM milestone_payments
+      WHERE status = 'released' AND safe_tx_hash IS NOT NULL
+    ) x
+    ORDER BY created_at DESC
+    LIMIT 200
+  `).catch(() => ({ rows: [] }));
+  out.recent = rows;
+}
 
     res.set('Cache-Control','no-store');
     res.json(out);
