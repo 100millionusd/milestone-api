@@ -5989,8 +5989,6 @@ try {
   }
 }
 
-setImmediate(async () => {
-  try {
     // ---------- MANUAL/EOA PATH ----------
     let txHash = null;
     try {
