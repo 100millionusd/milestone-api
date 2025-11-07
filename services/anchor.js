@@ -1,6 +1,6 @@
 // services/anchor.js
 // Build & anchor Merkle roots for bid_audits, and link already-anchored periods.
-// CommonJS, no TS build required. Idempotent + order auto-detect on finalize.
+// CommonJS, no TS build required. Idempotent + order auto-detect on finalize + per-period advisory lock.
 
 const { ethers } = require('ethers');
 const { keccak256 } = require('ethers/lib/utils');
@@ -79,6 +79,25 @@ function isAlreadyAnchoredError(err) {
 }
 
 /* --------------------------
+   Per-period advisory lock
+---------------------------*/
+async function withPeriodLock(pool, periodId, fn) {
+  // Derive a signed 63-bit key from periodId
+  const hex = ethers.utils.keccak256(Buffer.from(periodId, 'utf8')).slice(2);
+  const asBig = BigInt('0x' + hex) % (2n ** 63n - 1n); // fit signed bigint
+  const key = asBig.toString(); // pass as string -> numeric in pg
+
+  const got = await pool.query('SELECT pg_try_advisory_lock($1)::boolean AS ok', [key]);
+  if (!got.rows?.[0]?.ok) throw new Error('anchor_locked');
+
+  try {
+    return await fn();
+  } finally {
+    await pool.query('SELECT pg_advisory_unlock($1)', [key]);
+  }
+}
+
+/* --------------------------
    Canonical leaf ordering
 ---------------------------*/
 // Returns both "db-order" and "sorted lexicographic" variants so we can
@@ -123,136 +142,138 @@ function buildBothVariants(rows) {
 async function anchorPeriod(pool, periodId) {
   if (!periodId) periodId = periodIdForDate();
 
-  // 1) Collect unbatched leaves for this period (UTC hour)
-  const rows = (
-    await pool.query(
-      `SELECT audit_id, leaf_hash
-         FROM bid_audits
-        WHERE batch_id IS NULL
-          AND leaf_hash IS NOT NULL
-          AND to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') = $1
-        ORDER BY audit_id ASC`,
-      [periodId]
-    )
-  ).rows;
+  return withPeriodLock(pool, periodId, async () => {
+    // 1) Collect unbatched leaves for this period (UTC hour)
+    const rows = (
+      await pool.query(
+        `SELECT audit_id, leaf_hash
+           FROM bid_audits
+          WHERE batch_id IS NULL
+            AND leaf_hash IS NOT NULL
+            AND to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') = $1
+          ORDER BY audit_id ASC`,
+        [periodId]
+      )
+    ).rows;
 
-  if (!rows.length) {
-    return { ok: true, message: 'nothing to anchor for this period', periodId, count: 0 };
-  }
-
-  // Env
-  const rpcUrl = process.env.ANCHOR_RPC_URL;
-  const chainId = Number(process.env.ANCHOR_CHAIN_ID);
-  const pk = process.env.ANCHOR_PRIVATE_KEY;
-  const contractAddr = process.env.ANCHOR_CONTRACT;
-
-  if (!rpcUrl) throw new Error('ANCHOR_RPC_URL not set');
-  if (!chainId) throw new Error('ANCHOR_CHAIN_ID not set');
-  if (!pk) throw new Error('ANCHOR_PRIVATE_KEY not set');
-  if (!contractAddr) throw new Error('ANCHOR_CONTRACT not set');
-
-  const provider = new ethers.providers.JsonRpcProvider(rpcUrl, chainId);
-  const wallet = new ethers.Wallet(pk, provider);
-  const abi = [
-    'function roots(bytes32) view returns (bytes32)',
-    'function anchor(bytes32 periodId, bytes32 root) external',
-  ];
-  const c = new ethers.Contract(contractAddr, abi, wallet);
-
-  const periodBytes32 = ethers.utils.keccak256(Buffer.from(periodId, 'utf8'));
-
-  // 2) Compute both DB-order and Sorted-order roots (for compatibility)
-  const variants = buildBothVariants(rows);
-
-  // 3) On-chain check first (IDEMPOTENT)
-  const current = await c.roots(periodBytes32);
-  if (current && current.toLowerCase() !== ZERO32) {
-    // Already anchored on-chain → choose the local variant that matches and link
-    if (current.toLowerCase() === variants.db.rootHex.toLowerCase()) {
-      return await _linkWithVariant(pool, periodId, chainId, contractAddr, /*tx*/ null, rows, variants.db);
+    if (!rows.length) {
+      return { ok: true, message: 'nothing to anchor for this period', periodId, count: 0 };
     }
-    if (current.toLowerCase() === variants.sorted.rootHex.toLowerCase()) {
-      return await _linkWithVariant(pool, periodId, chainId, contractAddr, /*tx*/ null, rows, variants.sorted);
-    }
-    // Neither variant matches → different snapshot/order/timestamp
-    return {
-      ok: false,
-      status: 'onchain_root_mismatch',
-      periodId,
-      onchainRoot: current,
-      localRootDb: variants.db.rootHex,
-      localRootSorted: variants.sorted.rootHex,
-      message: 'On-chain root differs from both DB-order and lexicographic-sorted roots.',
-    };
-  }
 
-  // 4) Not anchored yet: choose canonical order (default: SORTED for cross-system determinism)
-  const CANON = (process.env.MERKLE_CANON_ORDER || 'sorted').toLowerCase() === 'db'
-    ? variants.db : variants.sorted;
+    // Env
+    const rpcUrl = process.env.ANCHOR_RPC_URL;
+    const chainId = Number(process.env.ANCHOR_CHAIN_ID);
+    const pk = process.env.ANCHOR_PRIVATE_KEY;
+    const contractAddr = process.env.ANCHOR_CONTRACT;
 
-  // Preflight static call (idempotent race-safe)
-  const rootHex = CANON.rootHex;
-  try {
-    await c.callStatic.anchor(periodBytes32, rootHex, { from: wallet.address });
-  } catch (e) {
-    if (isAlreadyAnchoredError(e)) {
-      // Someone anchored in the meantime — re-check and link via finalize path:
-      const cur2 = await c.roots(periodBytes32);
-      if (cur2 && cur2.toLowerCase() === variants.db.rootHex.toLowerCase()) {
-        return await _linkWithVariant(pool, periodId, chainId, contractAddr, null, rows, variants.db);
+    if (!rpcUrl) throw new Error('ANCHOR_RPC_URL not set');
+    if (!chainId) throw new Error('ANCHOR_CHAIN_ID not set');
+    if (!pk) throw new Error('ANCHOR_PRIVATE_KEY not set');
+    if (!contractAddr) throw new Error('ANCHOR_CONTRACT not set');
+
+    const provider = new ethers.providers.JsonRpcProvider(rpcUrl, chainId);
+    const wallet = new ethers.Wallet(pk, provider);
+    const abi = [
+      'function roots(bytes32) view returns (bytes32)',
+      'function anchor(bytes32 periodId, bytes32 root) external',
+    ];
+    const c = new ethers.Contract(contractAddr, abi, wallet);
+
+    const periodBytes32 = ethers.utils.keccak256(Buffer.from(periodId, 'utf8'));
+
+    // 2) Compute both DB-order and Sorted-order roots (for compatibility)
+    const variants = buildBothVariants(rows);
+
+    // 3) On-chain check first (IDEMPOTENT)
+    const current = await c.roots(periodBytes32);
+    if (current && current.toLowerCase() !== ZERO32) {
+      // Already anchored on-chain → choose the local variant that matches and link
+      if (current.toLowerCase() === variants.db.rootHex.toLowerCase()) {
+        return await _linkWithVariant(pool, periodId, chainId, contractAddr, /*tx*/ null, rows, variants.db);
       }
-      if (cur2 && cur2.toLowerCase() === variants.sorted.rootHex.toLowerCase()) {
-        return await _linkWithVariant(pool, periodId, chainId, contractAddr, null, rows, variants.sorted);
+      if (current.toLowerCase() === variants.sorted.rootHex.toLowerCase()) {
+        return await _linkWithVariant(pool, periodId, chainId, contractAddr, /*tx*/ null, rows, variants.sorted);
       }
+      // Neither variant matches → different snapshot/order/timestamp
       return {
         ok: false,
-        status: 'onchain_root_mismatch_after_race',
+        status: 'onchain_root_mismatch',
         periodId,
-        onchainRoot: cur2,
+        onchainRoot: current,
         localRootDb: variants.db.rootHex,
         localRootSorted: variants.sorted.rootHex,
+        message: 'On-chain root differs from both DB-order and lexicographic-sorted roots.',
       };
     }
-    throw e;
-  }
 
-  // Estimate & send
-  let gas;
-  try {
-    gas = await c.estimateGas.anchor(periodBytes32, rootHex, { from: wallet.address });
-  } catch (e) {
-    if (isAlreadyAnchoredError(e)) {
-      const cur2 = await c.roots(periodBytes32);
-      if (cur2 && cur2.toLowerCase() === variants.db.rootHex.toLowerCase()) {
-        return await _linkWithVariant(pool, periodId, chainId, contractAddr, null, rows, variants.db);
+    // 4) Not anchored yet: choose canonical order (default: SORTED for cross-system determinism)
+    const CANON = (process.env.MERKLE_CANON_ORDER || 'sorted').toLowerCase() === 'db'
+      ? variants.db : variants.sorted;
+
+    // Preflight static call (idempotent race-safe)
+    const rootHex = CANON.rootHex;
+    try {
+      await c.callStatic.anchor(periodBytes32, rootHex, { from: wallet.address });
+    } catch (e) {
+      if (isAlreadyAnchoredError(e)) {
+        // Someone anchored in the meantime — re-check and link via finalize path:
+        const cur2 = await c.roots(periodBytes32);
+        if (cur2 && cur2.toLowerCase() === variants.db.rootHex.toLowerCase()) {
+          return await _linkWithVariant(pool, periodId, chainId, contractAddr, null, rows, variants.db);
+        }
+        if (cur2 && cur2.toLowerCase() === variants.sorted.rootHex.toLowerCase()) {
+          return await _linkWithVariant(pool, periodId, chainId, contractAddr, null, rows, variants.sorted);
+        }
+        return {
+          ok: false,
+          status: 'onchain_root_mismatch_after_race',
+          periodId,
+          onchainRoot: cur2,
+          localRootDb: variants.db.rootHex,
+          localRootSorted: variants.sorted.rootHex,
+        };
       }
-      if (cur2 && cur2.toLowerCase() === variants.sorted.rootHex.toLowerCase()) {
-        return await _linkWithVariant(pool, periodId, chainId, contractAddr, null, rows, variants.sorted);
-      }
-      return {
-        ok: false,
-        status: 'onchain_root_mismatch_after_estimate',
-        periodId,
-        onchainRoot: cur2,
-        localRootDb: variants.db.rootHex,
-        localRootSorted: variants.sorted.rootHex,
-      };
+      throw e;
     }
-    throw e;
-  }
 
-  const pad = Number(process.env.ANCHOR_GAS_PAD || '1.2');
-  const gasLimit = ethers.BigNumber.from(gas).mul(Math.floor(pad * 100)).div(100);
-  const fee = await provider.getFeeData();
+    // Estimate & send
+    let gas;
+    try {
+      gas = await c.estimateGas.anchor(periodBytes32, rootHex, { from: wallet.address });
+    } catch (e) {
+      if (isAlreadyAnchoredError(e)) {
+        const cur2 = await c.roots(periodBytes32);
+        if (cur2 && cur2.toLowerCase() === variants.db.rootHex.toLowerCase()) {
+          return await _linkWithVariant(pool, periodId, chainId, contractAddr, null, rows, variants.db);
+        }
+        if (cur2 && cur2.toLowerCase() === variants.sorted.rootHex.toLowerCase()) {
+          return await _linkWithVariant(pool, periodId, chainId, contractAddr, null, rows, variants.sorted);
+        }
+        return {
+          ok: false,
+          status: 'onchain_root_mismatch_after_estimate',
+          periodId,
+          onchainRoot: cur2,
+          localRootDb: variants.db.rootHex,
+          localRootSorted: variants.sorted.rootHex,
+        };
+      }
+      throw e;
+    }
 
-  const tx = await c.anchor(periodBytes32, rootHex, {
-    gasLimit,
-    maxFeePerGas: fee.maxFeePerGas ?? undefined,
-    maxPriorityFeePerGas: fee.maxPriorityFeePerGas ?? undefined,
+    const pad = Number(process.env.ANCHOR_GAS_PAD || '1.2');
+    const gasLimit = ethers.BigNumber.from(gas).mul(Math.floor(pad * 100)).div(100);
+    const fee = await provider.getFeeData();
+
+    const tx = await c.anchor(periodBytes32, rootHex, {
+      gasLimit,
+      maxFeePerGas: fee.maxFeePerGas ?? undefined,
+      maxPriorityFeePerGas: fee.maxPriorityFeePerGas ?? undefined,
+    });
+    const receipt = await tx.wait(1);
+
+    return await _linkWithVariant(pool, periodId, chainId, contractAddr, receipt.transactionHash, rows, CANON);
   });
-  const receipt = await tx.wait(1);
-
-  return await _linkWithVariant(pool, periodId, chainId, contractAddr, receipt.transactionHash, rows, CANON);
 }
 
 /* ------------------------------------------------------------
