@@ -9278,3 +9278,20 @@ app.listen(PORT, () => {
   console.log(`[api] Admin enforcement: ${ENFORCE_JWT_ADMIN ? "ON" : "OFF"}`);
   console.log(`[api] Vendor scoping:    ${SCOPE_BIDS_FOR_VENDOR ? "ON" : "OFF"}`);
 });
+
+// ==============================
+// Start blockchain event sync (viem)
+// ==============================
+(async () => {
+  try {
+    if (process.env.ENABLE_EVENT_SYNC !== 'false') {
+      const { startEventSync } = await import('./services/eventSync.mjs');
+      await startEventSync();
+      console.log('[eventSync] started');
+    } else {
+      console.log('[eventSync] disabled via ENABLE_EVENT_SYNC=false');
+    }
+  } catch (err) {
+    console.error('[eventSync] failed to start:', err?.message || err);
+  }
+})();
