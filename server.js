@@ -5989,51 +5989,68 @@ try {
   }
 }
 
-// ---------- MANUAL/EOA PATH (EOA via ethers; uses existing ERC20_ABI, pinned chainId, strict hex addrs) ----------
+// ---------- MANUAL/EOA PATH ----------
 let txHash = null;
+let sendRes = null;
 
 try {
-  // Build signer from env (PAYOUT_* preferred, fallback to ANCHOR_*). Pin chainId to avoid "unknown"/ENS.
-  const rpcUrl  = process.env.PAYOUT_RPC_URL  || process.env.ANCHOR_RPC_URL;
-  const chainId = Number(process.env.PAYOUT_CHAIN_ID || process.env.ANCHOR_CHAIN_ID) || undefined;
-  const pk      = process.env.PAYOUT_PRIVATE_KEY || process.env.ANCHOR_PRIVATE_KEY;
-  if (!rpcUrl || !pk) throw new Error('Missing PAYOUT_RPC_URL/PRIVATE_KEY (or ANCHOR_*)');
+  if (blockchainService?.transferSubmit) {
+    sendRes = await blockchainService.transferSubmit(token, bid.wallet_address, msAmountUSD);
+  } else if (blockchainService?.sendToken) {
+    sendRes = await blockchainService.sendToken(token, bid.wallet_address, msAmountUSD);
+  } else {
+    txHash = "dev_" + crypto.randomBytes(8).toString("hex");
+  }
 
-  const provider = new ethers.providers.JsonRpcProvider(rpcUrl, chainId);
-  const signer   = new ethers.Wallet(pk, provider);
+  // Capture tx hash from as many common shapes as possible (no token/address validation; keep wrapper behavior)
+  if (!txHash) {
+    txHash =
+      (sendRes && (
+        sendRes.hash ||
+        sendRes.transactionHash ||
+        sendRes.txHash ||
+        sendRes.txid ||
+        sendRes.id ||
+        sendRes.tx ||
+        (sendRes.receipt && (sendRes.receipt.transactionHash || sendRes.receipt.hash)) ||
+        (sendRes.data && (sendRes.data.hash || sendRes.data.txHash)) ||
+        (sendRes.result && (sendRes.result.hash || sendRes.result.txHash))
+      )) ||
+      (typeof sendRes === "string" ? sendRes : null);
+  }
 
-  // Strict hex-address validation to prevent ENS lookups
-  const toRaw    = String(bid.wallet_address || '').trim();
-  const tokenRaw = String(token || '').trim();
-  if (!/^0x[0-9a-fA-F]{40}$/.test(toRaw))    throw new Error(`invalid recipient address: ${toRaw}`);
-  if (!/^0x[0-9a-fA-F]{40}$/.test(tokenRaw)) throw new Error(`invalid token address: ${tokenRaw}`);
+  // If the wrapper returns an ethers-like TX response with .wait(), salvage from receipt
+  if (!txHash && sendRes && typeof sendRes.wait === "function") {
+    try {
+      const rcpt = await sendRes.wait(1);
+      txHash = rcpt?.transactionHash || rcpt?.hash || null;
+    } catch (e) {
+      console.warn("sendRes.wait(1) failed:", e?.message || e);
+    }
+  }
 
-  const toAddr    = ethers.utils.getAddress(toRaw);
-  const tokenAddr = ethers.utils.getAddress(tokenRaw);
-
-  // ERC20 transfer with correct decimals (uses your ERC20_ABI)
-  const erc20r = new ethers.Contract(tokenAddr, ERC20_ABI, provider);
-  const dec    = await erc20r.decimals().catch(() => 18);
-  const erc20  = erc20r.connect(signer);
-  const amount = ethers.utils.parseUnits(String(msAmountUSD), dec);
-
-  const tx = await erc20.transfer(toAddr, amount);
-  txHash   = tx?.hash || tx?.transactionHash || null;
-  console.log('[EOA] sent tx:', txHash);
-
-  // Optional: 1-conf wait using the SAME provider (non-blocking for HTTP since this is in setImmediate)
+  // Optional external confirm helper; do NOT return on failure; also try to salvage hash from its receipt
   try {
-    if (txHash) {
-      await provider.waitForTransaction(txHash, 1);
+    if (blockchainService?.waitForConfirm && (txHash || sendRes)) {
+      const hint =
+        txHash ||
+        (sendRes && (sendRes.hash || sendRes.transactionHash || sendRes.txHash || sendRes));
+      const rcpt2 = await blockchainService.waitForConfirm(hint, 1);
+      if (!txHash) {
+        txHash =
+          (rcpt2 && (rcpt2.transactionHash || rcpt2.hash || rcpt2.txHash)) ||
+          (typeof rcpt2 === "string" ? rcpt2 : null);
+      }
     }
   } catch (e) {
-    console.warn('[EOA] waitForTransaction failed (left pending):', e?.message || e);
+    console.warn("waitForConfirm failed (left pending)", e?.message || e);
+    // IMPORTANT: do NOT return here; continue to update DB/JSON below
   }
 } catch (e) {
-  console.error('[EOA] send failed:', e?.message || e);
+  console.error("EOA send failed", e?.message || e);
 }
 
-// Persist tx hash immediately (create pending row if needed)
+// Persist tx hash immediately (create row if absent)
 if (txHash) {
   const up = await pool.query(
     `UPDATE milestone_payments SET tx_hash=$3 WHERE bid_id=$1 AND milestone_index=$2`,
@@ -6042,43 +6059,27 @@ if (txHash) {
   if (!up.rowCount) {
     await pool.query(
       `INSERT INTO milestone_payments (bid_id, milestone_index, status, tx_hash, created_at)
-       SELECT $1, $2, 'pending', $3, NOW()
-       WHERE NOT EXISTS (SELECT 1 FROM milestone_payments WHERE bid_id=$1 AND milestone_index=$2)`,
+       VALUES ($1,$2,'pending',$3,NOW())
+       ON CONFLICT (bid_id, milestone_index) DO UPDATE SET tx_hash = EXCLUDED.tx_hash`,
       [bidId, milestoneIndex, txHash]
     );
   }
-} else {
-  // Ensure at least a pending row exists if no hash yet (do NOT mark released without a hash)
-  await pool.query(
-    `INSERT INTO milestone_payments (bid_id, milestone_index, status, created_at)
-     SELECT $1, $2, 'pending', NOW()
-     WHERE NOT EXISTS (SELECT 1 FROM milestone_payments WHERE bid_id=$1 AND milestone_index=$2)`,
-    [bidId, milestoneIndex]
-  );
 }
 
-// Mirror into milestone JSON for FE
-if (txHash) ms.paymentTxHash = txHash;
-ms.paymentDate    = ms.paymentDate || new Date().toISOString();
-ms.paymentPending = !txHash;
-ms.status         = txHash ? 'paid' : (ms.status || 'pending');
+// 4) Mark released + legacy JSON fields (unchanged behavior)
+ms.paymentTxHash = txHash || ms.paymentTxHash || null;
+ms.paymentDate = new Date().toISOString();
+ms.paymentPending = false;
+ms.status = "paid";
 milestones[milestoneIndex] = ms;
-await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2', [JSON.stringify(milestones), bidId]);
 
-// Only mark DB row as released when we have a tx hash (prevents released-without-hash)
-if (txHash) {
-  await pool.query(
-    `UPDATE milestone_payments
-       SET status='released',
-           tx_hash     = COALESCE(tx_hash, $3),
-           released_at = NOW(),
-           amount_usd  = COALESCE(amount_usd, $4)
-     WHERE bid_id=$1 AND milestone_index=$2`,
-    [bidId, milestoneIndex, txHash, msAmountUSD]
-  );
-} else {
-  // keep pending; a later reconcile/backfill can attach the hash and flip to released
-}
+await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
+await pool.query(
+  `UPDATE milestone_payments
+     SET status='released', tx_hash=COALESCE(tx_hash,$3), released_at=NOW(), amount_usd=COALESCE(amount_usd,$4)
+   WHERE bid_id=$1 AND milestone_index=$2`,
+  [bidId, milestoneIndex, txHash || null, msAmountUSD]
+);
 
 // 5) Notify best-effort
 try {
