@@ -53,19 +53,62 @@ const { enrichAuditRow } = require('./services/auditPinata');
 // --- debug helper for logging wrapper responses safely ---
 function safeStringify(x) {
   const seen = new WeakSet();
-  return JSON.stringify(
-    x,
-    (k, v) => {
-      if (v && v._isBigNumber && typeof v.toString === 'function') return v.toString();
-      if (typeof v === 'bigint') return v.toString();
-      if (typeof v === 'object' && v !== null) {
-        if (seen.has(v)) return '[Circular]';
-        seen.add(v);
-      }
-      return v;
-    },
-    2
-  );
+  return JSON.stringify(x, (k, v) => {
+    if (v && v._isBigNumber && typeof v.toString === 'function') return v.toString();
+    if (typeof v === 'bigint') return v.toString();
+    if (typeof v === 'object' && v !== null) {
+      if (seen.has(v)) return '[Circular]';
+      seen.add(v);
+    }
+    return v;
+  }, 2);
+}
+
+// --- robust tx-hash extractor (handles strings, fields, functions, nested, promises) ---
+async function extractTxHash(sendRes) {
+  if (!sendRes) return null;
+
+  const take = (v) =>
+    (typeof v === 'string' && v.startsWith('0x') && v.length >= 66) ? v : null;
+
+  // direct string
+  let v = take(sendRes);
+  if (v) return v;
+
+  // common direct fields
+  for (const k of ['hash', 'transactionHash', 'txHash', 'txid', 'id', 'tx']) {
+    v = take(sendRes[k]);
+    if (v) return v;
+  }
+
+  // functional getters
+  if (typeof sendRes.hash === 'function') {
+    try { v = take(await sendRes.hash()); if (v) return v; } catch {}
+  }
+  if (typeof sendRes.getHash === 'function') {
+    try { v = take(await sendRes.getHash()); if (v) return v; } catch {}
+  }
+
+  // nested common containers
+  for (const n of ['receipt', 'data', 'result']) {
+    const obj = sendRes[n];
+    if (!obj) continue;
+    for (const k of ['transactionHash', 'hash', 'txHash', 'txid', 'id', 'tx']) {
+      v = take(obj[k]);
+      if (v) return v;
+    }
+  }
+
+  // ethers-style wait()
+  if (typeof sendRes.wait === 'function') {
+    try {
+      const rcpt = await sendRes.wait(1);
+      v = take(rcpt?.transactionHash) || take(rcpt?.hash);
+      if (v) return v;
+    } catch {}
+  }
+
+  return null;
 }
 
 // ==== SAFE CONFIG (define once, near the top) ====
@@ -6025,53 +6068,30 @@ try {
   console.log('[EOA] sendRes keys:', sendRes && Object.keys(sendRes));
   try {
     console.log('[EOA] sendRes sample:', safeStringify(sendRes).slice(0, 2000));
+    console.log('[EOA] typeof sendRes.hash:', typeof (sendRes && sendRes.hash));
   } catch (e) {
     console.log('[EOA] sendRes (string):', String(sendRes));
   }
 
-  // Capture tx hash from as many common shapes as possible (no token/address validation; keep wrapper behavior)
+  // Capture tx hash (covers string, fields, functions, nested, promises)
   if (!txHash) {
-    txHash =
-      (sendRes && (
-        sendRes.hash ||
-        sendRes.transactionHash ||
-        sendRes.txHash ||
-        sendRes.txid ||
-        sendRes.id ||
-        sendRes.tx ||
-        (sendRes.receipt && (sendRes.receipt.transactionHash || sendRes.receipt.hash)) ||
-        (sendRes.data && (sendRes.data.hash || sendRes.data.txHash)) ||
-        (sendRes.result && (sendRes.result.hash || sendRes.result.txHash))
-      )) ||
-      (typeof sendRes === "string" ? sendRes : null);
+    txHash = await extractTxHash(sendRes);
   }
 
-  // If the wrapper returns an ethers-like TX response with .wait(), salvage from receipt
-  if (!txHash && sendRes && typeof sendRes.wait === "function") {
-    try {
-      const rcpt = await sendRes.wait(1);
-      txHash = rcpt?.transactionHash || rcpt?.hash || null;
-    } catch (e) {
-      console.warn("sendRes.wait(1) failed:", e?.message || e);
-    }
-  }
-
-  // Optional external confirm helper; do NOT return on failure; also try to salvage hash from its receipt
+  // Optional external confirm; try to salvage hash from its receipt if still missing
   try {
     if (blockchainService?.waitForConfirm && (txHash || sendRes)) {
-      const hint =
-        txHash ||
-        (sendRes && (sendRes.hash || sendRes.transactionHash || sendRes.txHash || sendRes));
+      const hint = txHash || sendRes?.hash || sendRes?.transactionHash || sendRes?.txHash || sendRes;
       const rcpt2 = await blockchainService.waitForConfirm(hint, 1);
       if (!txHash) {
         txHash =
+          (typeof rcpt2 === 'string' ? rcpt2 : null) ||
           (rcpt2 && (rcpt2.transactionHash || rcpt2.hash || rcpt2.txHash)) ||
-          (typeof rcpt2 === "string" ? rcpt2 : null);
+          null;
       }
     }
   } catch (e) {
     console.warn("waitForConfirm failed (left pending)", e?.message || e);
-    // IMPORTANT: do NOT return here; continue to update DB/JSON below
   }
 } catch (e) {
   console.error("EOA send failed", e?.message || e);
@@ -6092,7 +6112,7 @@ if (txHash) {
     );
   }
 } else {
-  // Ensure there's at least a pending row; DO NOT mark released without a hash
+  // Ensure a pending row exists; DO NOT mark released without a real hash
   await pool.query(
     `INSERT INTO milestone_payments (bid_id, milestone_index, status, created_at)
      VALUES ($1,$2,'pending',NOW())
@@ -6104,8 +6124,8 @@ if (txHash) {
 // ---- Mirror into milestone JSON for FE ----
 ms.paymentTxHash   = txHash || ms.paymentTxHash || null;
 ms.paymentDate     = new Date().toISOString();
-ms.paymentPending  = !txHash;              // true if we still don't have a hash
-ms.status          = txHash ? "paid" : (ms.status || "pending");
+ms.paymentPending  = !txHash;
+ms.status          = txHash ? "paid" : "pending";
 milestones[milestoneIndex] = ms;
 
 await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
@@ -6122,7 +6142,6 @@ if (txHash) {
     [bidId, milestoneIndex, txHash, msAmountUSD]
   );
 } else {
-  // keep pending state; a later reconcile/backfill can attach the hash and flip to released
   await pool.query(
     `UPDATE milestone_payments
        SET status='pending', released_at=NULL
