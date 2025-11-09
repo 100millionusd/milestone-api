@@ -8510,26 +8510,26 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
 
     UNION ALL
 
-    -- profiles that have no bids yet
-    SELECT
-      COALESCE(vp.vendor_name,'')                 AS vendor_name,
-      LOWER(vp.wallet_address)                    AS wallet_address,
-      0                                           AS bids_count,
-      NULL::timestamptz                           AS last_bid_at,
-      0::numeric                                  AS total_awarded_usd,
-      vp.vendor_name                              AS profile_vendor_name,
-      vp.email                                    AS email,
-      vp.phone                                    AS phone,
-      vp.website                                  AS website,
-      vp.address                                  AS address_raw,
-      vp.telegram_chat_id                         AS telegram_chat_id,
-      vp.telegram_username                        AS telegram_username,
-      vp.whatsapp                                 AS whatsapp,
-      vp.archived                                 AS archived
-    FROM vendor_profiles vp
-    WHERE NOT EXISTS (
-      SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
-    )
+  -- profiles that have no bids yet
+  SELECT
+    COALESCE(vp.vendor_name,'')                 AS vendor_name,
+    LOWER(vp.wallet_address)                    AS wallet_address,
+    0                                           AS bids_count,
+    NULL::timestamptz                           AS last_bid_at,
+    0::numeric                                  AS total_awarded_usd,
+    vp.vendor_name                              AS profile_vendor_name,
+    vp.email                                    AS email,
+    vp.phone                                    AS phone,
+    vp.website                                  AS website,
+    vp.address                                  AS address_raw,
+    vp.telegram_username                        AS telegram_username,  -- ← username first
+    vp.telegram_chat_id                         AS telegram_chat_id,   -- ← then chat id
+    vp.whatsapp                                 AS whatsapp,
+    vp.archived                                 AS archived
+  FROM vendor_profiles vp
+  WHERE NOT EXISTS (
+    SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
+  )
   `;
 
   let sql = `SELECT * FROM (${sqlBase}) s`;
