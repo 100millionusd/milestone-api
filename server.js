@@ -2954,7 +2954,7 @@ try {
 // always finish response
 nonces.delete(address);
 return res.json({ token, role });
-});
+}
 
 // nonce compat for frontend
 app.get("/auth/nonce", (req, res) => {
@@ -3023,7 +3023,7 @@ try {
 // always finish response
 nonces.delete(address);
 return res.json({ token, role });
-});
+}
 
 app.get("/auth/role", async (req, res) => {
   try {
