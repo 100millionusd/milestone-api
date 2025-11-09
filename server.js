@@ -7917,8 +7917,9 @@ app.post('/tg/webhook', async (req, res) => {
   try {
     const update = req.body || {};
 
-    // Extract chat id + message text
+    // Extract chat id + username + message text
     const chatId = update?.message?.chat?.id || update?.chat?.id || update?.message?.from?.id;
+    const username = update?.message?.from?.username || update?.message?.chat?.username || null; // may be null
     const textRaw = update?.message?.text || update?.message?.data || update?.message?.caption || "";
     const text = String(textRaw).trim();
 
@@ -7944,24 +7945,32 @@ app.post('/tg/webhook', async (req, res) => {
       return res.json({ ok: true });
     }
 
-    // Store chat id on the vendor profile
+    const chatIdStr = String(chatId);
+    const walletLower = wallet.toLowerCase();
+
+    // Store chat id + username on the vendor profile
     await pool.query(
       `UPDATE vendor_profiles
-         SET telegram_chat_id = $1, updated_at = now()
-       WHERE lower(wallet_address) = lower($2)`,
-      [ String(chatId), wallet.toLowerCase() ]
+         SET telegram_chat_id = $1,
+             telegram_username = $2,
+             updated_at = now()
+       WHERE lower(wallet_address) = lower($3)`,
+      [ chatIdStr, username, walletLower ]
     );
 
-    // ALSO store on proposals for proposers/entities
+    // ALSO store chat id on proposals for proposers/entities (username optional if you add that column later)
     await pool.query(
       `UPDATE proposals
          SET owner_telegram_chat_id = $1, updated_at = now()
        WHERE lower(owner_wallet) = lower($2)`,
-      [ String(chatId), wallet.toLowerCase() ]
+      [ chatIdStr, walletLower ]
     );
 
     // Confirm to the user
-    await sendTelegram([String(chatId)], `✅ Telegram linked to ${wallet}`);
+    await sendTelegram(
+      [chatIdStr],
+      `✅ Telegram linked to ${wallet}${username ? ` as @${username}` : ''}`
+    );
     return res.json({ ok: true });
   } catch (_e) {
     // Always 200 so Telegram doesn't retry forever
