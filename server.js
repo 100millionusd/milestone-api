@@ -8417,7 +8417,7 @@ app.delete('/admin/vendors/:wallet', adminGuard, async (req, res) => {
 app.get('/admin/vendors', adminGuard, async (req, res) => {
   const includeArchived = ['true','1','yes'].includes(String(req.query.includeArchived || '').toLowerCase());
 
-  const sqlBase = `
+ const sqlBase = `
     WITH agg AS (
       SELECT
         LOWER(b.wallet_address)                                        AS wallet_address,
@@ -8441,6 +8441,8 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       vp.phone                                    AS phone,
       vp.website                                  AS website,
       vp.address                                  AS address_raw,
+      vp.telegram_chat_id                         AS telegram_chat_id,
+      vp.whatsapp                                 AS whatsapp,
       vp.archived                                 AS archived
     FROM agg a
     LEFT JOIN vendor_profiles vp
@@ -8460,6 +8462,8 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       vp.phone                                    AS phone,
       vp.website                                  AS website,
       vp.address                                  AS address_raw,
+      vp.telegram_chat_id                         AS telegram_chat_id,
+      vp.whatsapp                                 AS whatsapp,
       vp.archived                                 AS archived
     FROM vendor_profiles vp
     WHERE NOT EXISTS (
@@ -8503,23 +8507,27 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       const flat = [parts.line1, parts.city, parts.postalCode, parts.country]
         .filter(Boolean).join(', ') || null;
 
-      const email   = norm(r.email);
-      const phone   = norm(r.phone);
-      const website = norm(r.website);
+const email    = norm(r.email);
+const phone    = norm(r.phone);
+const website  = norm(r.website);
+const telegram = norm(r.telegram_chat_id);
+const whatsapp = norm(r.whatsapp);
 
-      return {
-        // core
-        vendorName: r.profile_vendor_name || r.vendor_name || '',
-        walletAddress: r.wallet_address || '',
-        bidsCount: Number(r.bids_count) || 0,
-        lastBidAt: r.last_bid_at,
-        totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+return {
+  // core
+  vendorName: r.profile_vendor_name || r.vendor_name || '',
+  walletAddress: r.wallet_address || '',
+  bidsCount: Number(r.bids_count) || 0,
+  lastBidAt: r.last_bid_at,
+  totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // contact
-        email,
-        contactEmail: email,
-        phone,
-        website,
+  // contact
+  email,
+  contactEmail: email,
+  phone,
+  website,
+  telegramChatId: telegram,   
+  whatsapp,                   
 
         // address (full + parts + explicit street)
         address: flat,
@@ -8539,6 +8547,8 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
           contactEmail: email,
           phone,
           website,
+          telegram_chat_id: telegram,
+          whatsapp,  
           address: flat,
           addressText: flat,
           street: parts.line1 || null,
@@ -8554,6 +8564,8 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
         contact: {
           email,
           phone,
+          telegram,
+          whatsapp,
           street: parts.line1 || null,
           address: flat,
           addressText: flat,
