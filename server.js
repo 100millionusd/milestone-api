@@ -7918,9 +7918,9 @@ app.post('/tg/webhook', async (req, res) => {
     const update = req.body || {};
 
     // Extract chat id + username + message text (handle normal/callback cases)
-    const from     = update?.message?.from || update?.callback_query?.from || {};
-    const chatObj  = update?.message?.chat || update?.callback_query?.message?.chat || {};
-    const chatId   = chatObj?.id ?? from?.id;
+    const from    = update?.message?.from || update?.callback_query?.from || {};
+    const chatObj = update?.message?.chat || update?.callback_query?.message?.chat || {};
+    const chatId  = chatObj?.id ?? from?.id;
     const username = from?.username || chatObj?.username || null; // may be null
 
     const textRaw =
@@ -7930,7 +7930,37 @@ app.post('/tg/webhook', async (req, res) => {
       '';
     const text = String(textRaw).trim();
 
-    if (!chatId || !text) return res.json({ ok: true });
+    if (!chatId) return res.json({ ok: true }); // we need chatId at minimum
+
+    const chatIdStr = String(chatId);
+
+    // ------------------------------------------------------------------
+    // AUTO-REFRESH USERNAME ON ANY INBOUND MESSAGE FROM THIS CHAT
+    // (runs BEFORE wallet parsing; so if user changes Telegram @username,
+    //  the next message updates DB and the admin list shows the new one)
+    // ------------------------------------------------------------------
+    if (username) {
+      // vendor profile
+      await pool.query(
+        `UPDATE vendor_profiles
+           SET telegram_username = $1,
+               updated_at = NOW()
+         WHERE telegram_chat_id = $2`,
+        [username, chatIdStr]
+      );
+
+      // proposals (if you have owner_telegram_username column)
+      await pool.query(
+        `UPDATE proposals
+           SET owner_telegram_username = $1,
+               updated_at = NOW()
+         WHERE owner_telegram_chat_id = $2`,
+        [username, chatIdStr]
+      ).catch(() => null); // ignore if column not present
+    }
+
+    // If there's no text, we're done after the username refresh
+    if (!text) return res.json({ ok: true });
 
     // Parse wallet from either:
     // 1) "/link 0xABC..."     (manual)
@@ -7948,14 +7978,13 @@ app.post('/tg/webhook', async (req, res) => {
 
     // Validate wallet
     if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
-      await sendTelegram([String(chatId)], 'Send: /link 0xYourWalletAddress');
+      await sendTelegram([chatIdStr], 'Send: /link 0xYourWalletAddress');
       return res.json({ ok: true });
     }
 
-    const chatIdStr   = String(chatId);
     const walletLower = wallet.toLowerCase();
 
-    // --- ensure a Telegram chat is NOT linked to multiple vendors ---
+    // Ensure a Telegram chat is NOT linked to multiple vendors
     await pool.query(
       `UPDATE vendor_profiles
           SET telegram_chat_id = NULL,
@@ -7976,15 +8005,15 @@ app.post('/tg/webhook', async (req, res) => {
       [chatIdStr, username, walletLower]
     );
 
-   // ALSO store chat id + username on proposals for proposers/entities
-await pool.query(
-  `UPDATE proposals
-     SET owner_telegram_chat_id = $1,
-         owner_telegram_username = $2,
-         updated_at = NOW()
-   WHERE LOWER(owner_wallet) = LOWER($3)`,
-  [ chatIdStr, username, walletLower ]
-);
+    // ALSO store chat id + username on proposals for proposers/entities
+    await pool.query(
+      `UPDATE proposals
+         SET owner_telegram_chat_id = $1,
+             owner_telegram_username = $2,
+             updated_at = NOW()
+       WHERE LOWER(owner_wallet) = LOWER($3)`,
+      [chatIdStr, username, walletLower]
+    ).catch(() => null); // ignore if username column not present
 
     // Confirm to the user
     await sendTelegram(
