@@ -2935,7 +2935,6 @@ try {
     );
 
 // Only on first insert (new vendor) → notify admins + vendor (EN+ES)
-try {
   if (rows.length) {
     notifyVendorSignup({
       wallet: rows[0].wallet_address,
@@ -3005,7 +3004,6 @@ try {
     );
 
 // Only on first insert (new vendor) → notify admins + vendor (EN+ES)
-try {
   if (rows.length) {
     notifyVendorSignup({
       wallet: rows[0].wallet_address,
