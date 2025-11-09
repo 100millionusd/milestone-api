@@ -945,37 +945,89 @@ async function sendWhatsAppTemplate(to, contentSid, vars) {
   );
 }
 
-// Notify admins when a *new* vendor signs in for the first time
-async function notifyVendorSignup({ wallet, vendorName, email, phone }) {
+// Notify admins + vendor (EN + ES) when a *new* vendor signs up
+// NOTE: add optional vendorTelegramChatId / vendorWhatsapp if you have them; phone is used for WA fallback.
+async function notifyVendorSignup({
+  wallet,
+  vendorName,
+  email,
+  phone,
+  vendorTelegramChatId = null,   // <-- pass if you have it
+  vendorWhatsapp = null          // <-- pass if you have it; else phone is used
+}) {
   if (!NOTIFY_ENABLED) return;
 
+  // ---------- ADMIN (EN/ES) ----------
+  const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/vendors` : null;
+
   const enLines = [
-  '🆕 Vendor signup — approval needed',
-  `Wallet: ${wallet}`,
-  vendorName ? `Name: ${vendorName}` : null,
-  email ? `Email: ${email}` : null,
-  phone ? `Phone: ${phone}` : null,
-  adminLink ? `Admin: ${adminLink}` : null,
-].filter(Boolean);
+    '🆕 Vendor signup — approval needed',
+    `Wallet: ${wallet}`,
+    vendorName ? `Name: ${vendorName}` : null,
+    email ? `Email: ${email}` : null,
+    phone ? `Phone: ${phone}` : null,
+    adminLink ? `Admin: ${adminLink}` : null,
+  ].filter(Boolean);
 
-const esLines = [
-  '🆕 Registro de proveedor — se requiere aprobación',
-  `Billetera: ${wallet}`,
-  vendorName ? `Nombre: ${vendorName}` : null,
-  email ? `Correo electrónico: ${email}` : null,
-  phone ? `Teléfono: ${phone}` : null,
-  adminLink ? `Panel de administración: ${adminLink}` : null,
-].filter(Boolean);
+  const esLines = [
+    '🆕 Registro de proveedor — se requiere aprobación',
+    `Billetera: ${wallet}`,
+    vendorName ? `Nombre: ${vendorName}` : null,
+    email ? `Correo electrónico: ${email}` : null,
+    phone ? `Teléfono: ${phone}` : null,
+    adminLink ? `Panel de administración: ${adminLink}` : null,
+  ].filter(Boolean);
 
-  // bilingual wrapper (you already have bi())
-  const en = lines.join('\n');
-  const es = lines.join('\n');
-  const { text, html } = bi(en, es);
+  const en = enLines.join('\n');
+  const es = esLines.join('\n');
+  const { text: adminText, html: adminHtml } = bi(en, es);
 
   await Promise.allSettled([
-    TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
-    MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, 'Vendor signup — approval needed', html) : null,
-    ...(ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, text)),
+    TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, adminText) : null,
+    MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, 'Vendor signup — approval needed', adminHtml) : null,
+    ...(ADMIN_WHATSAPP || []).map(n =>
+      TWILIO_WA_CONTENT_SID
+        ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": vendorName || "", "2": "vendor signup" })
+        : sendWhatsApp(n, adminText)
+    ),
+  ].filter(Boolean));
+
+  // ---------- VENDOR (EN/ES) ----------
+  const vEn = [
+    'Thanks for signing up as a vendor.',
+    'Your account is pending admin approval.',
+    'You will receive a notification once it is approved.',
+  ].join('\n');
+
+  const vEs = [
+    'Gracias por registrarte como proveedor.',
+    'Tu cuenta está pendiente de aprobación por parte del administrador.',
+    'Recibirás una notificación cuando sea aprobada.',
+  ].join('\n');
+
+  const { text: vendorText, html: vendorHtml } = bi(vEn, vEs);
+
+  // Resolve WhatsApp: prefer vendorWhatsapp, else phone
+  const waRaw = vendorWhatsapp || phone || null;
+  const waE164 = waRaw ? toE164(waRaw) : null;
+
+  await Promise.allSettled([
+    // Email to vendor
+    email ? sendEmail([email],
+      'Vendor signup received — pending approval / Registro recibido — pendiente de aprobación',
+      vendorHtml
+    ) : null,
+
+    // Telegram to vendor (only if you have their chat id)
+    vendorTelegramChatId ? sendTelegram([vendorTelegramChatId], vendorText) : null,
+
+    // WhatsApp to vendor (uses template if available, else plain text)
+    waE164
+      ? (TWILIO_WA_CONTENT_SID
+          ? sendWhatsAppTemplate(waE164, TWILIO_WA_CONTENT_SID, { "1": vendorName || "", "2": "signup pending" })
+          : sendWhatsApp(waE164, vendorText)
+        )
+      : null,
   ].filter(Boolean));
 }
 
@@ -2883,21 +2935,22 @@ try {
     );
 
     // Only on first insert (new vendor) → notify admins
-    if (rows.length) {
-      notifyVendorSignup({
-        wallet: rows[0].wallet_address,
-        vendorName: rows[0].vendor_name || '',
-        email: rows[0].email || '',
-        phone: rows[0].phone || '',
-      }).catch(() => null);
-    }
-  }
+ if (rows.length) {
+  notifyVendorSignup({
+    wallet: rows[0].wallet_address,
+    vendorName: rows[0].vendor_name || '',
+    email: rows[0].email || '',
+    phone: rows[0].phone || '',
+    vendorTelegramChatId: rows[0].telegram_chat_id || null,
+    vendorWhatsapp: rows[0].whatsapp || null
+  }).catch(() => null);
+}
 } catch (e) {
   console.warn('profile auto-seed failed (non-fatal):', String(e).slice(0,200));
 }
 
-  nonces.delete(address);
-  res.json({ address, role });
+nonces.delete(address);
+res.json({ token, role });
 });
 
 // nonce compat for frontend
@@ -2947,22 +3000,23 @@ try {
       [w]
     );
 
-    // Only on first insert (new vendor) → notify admins
-    if (rows.length) {
-      notifyVendorSignup({
-        wallet: rows[0].wallet_address,
-        vendorName: rows[0].vendor_name || '',
-        email: rows[0].email || '',
-        phone: rows[0].phone || '',
-      }).catch(() => null);
-    }
-  }
+   // Only on first insert (new vendor) → notify admins + vendor (EN+ES)
+if (rows.length) {
+  notifyVendorSignup({
+    wallet: rows[0].wallet_address,
+    vendorName: rows[0].vendor_name || '',
+    email: rows[0].email || '',
+    phone: rows[0].phone || '',
+    vendorTelegramChatId: rows[0].telegram_chat_id || null,
+    vendorWhatsapp: rows[0].whatsapp || null
+  }).catch(() => null);
+}
 } catch (e) {
   console.warn('profile auto-seed failed (non-fatal):', String(e).slice(0,200));
 }
 
-  nonces.delete(address);
-  res.json({ token, role });
+nonces.delete(address);
+res.json({ token, role });
 });
 
 app.get("/auth/role", async (req, res) => {
