@@ -2934,17 +2934,19 @@ try {
       [w]
     );
 
-    // Only on first insert (new vendor) → notify admins
- if (rows.length) {
-  notifyVendorSignup({
-    wallet: rows[0].wallet_address,
-    vendorName: rows[0].vendor_name || '',
-    email: rows[0].email || '',
-    phone: rows[0].phone || '',
-    vendorTelegramChatId: rows[0].telegram_chat_id || null,
-    vendorWhatsapp: rows[0].whatsapp || null
-  }).catch(() => null);
-}
+try {
+  // Only on first insert (new vendor) → notify admins + vendor (EN+ES)
+  if (rows.length) {
+    notifyVendorSignup({
+      wallet: rows[0].wallet_address,
+      vendorName: rows[0].vendor_name || '',
+      email: rows[0].email || '',
+      phone: rows[0].phone || '',
+      // pass if you store these; otherwise null is fine
+      vendorTelegramChatId: rows[0].telegram_chat_id || null,
+      vendorWhatsapp: rows[0].whatsapp || null
+    }).catch(() => null);
+  }
 } catch (e) {
   console.warn('profile auto-seed failed (non-fatal):', String(e).slice(0,200));
 }
