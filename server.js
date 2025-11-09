@@ -2935,25 +2935,29 @@ try {
     );
 
 // Only on first insert (new vendor) → notify admins + vendor (EN+ES)
-  if (rows.length) {
-    notifyVendorSignup({
-      wallet: rows[0].wallet_address,
-      vendorName: rows[0].vendor_name || '',
-      email: rows[0].email || '',
-      phone: rows[0].phone || '',
-      // pass if you store these; otherwise null is fine (WA falls back to phone)
-      vendorTelegramChatId: rows[0].telegram_chat_id || null,
-      vendorWhatsapp: rows[0].whatsapp || null
-    }).catch(() => null);
+if (rows.length) {
+  notifyVendorSignup({
+    wallet: rows[0].wallet_address,
+    vendorName: rows[0].vendor_name || '',
+    email: rows[0].email || '',
+    phone: rows[0].phone || '',
+  }).catch(() => null);
+
+  notifyVendorSignupVendor({
+    vendorName: rows[0].vendor_name || '',
+    email: rows[0].email || '',
+    phone: rows[0].phone || '',
+    telegramChatId: rows[0].telegram_chat_id || null,
+    whatsapp: rows[0].whatsapp || null
+  }).catch(() => null);
+}
   }
 } catch (e) {
   console.warn('profile auto-seed failed (non-fatal):', String(e).slice(0,200));
 }
 
-// always finish response
-nonces.delete(address);
-return res.json({ token, role });
-}
+  nonces.delete(address);
+  res.json({ token, role });
 });
 
 // nonce compat for frontend
@@ -3004,25 +3008,29 @@ try {
     );
 
 // Only on first insert (new vendor) → notify admins + vendor (EN+ES)
-  if (rows.length) {
-    notifyVendorSignup({
-      wallet: rows[0].wallet_address,
-      vendorName: rows[0].vendor_name || '',
-      email: rows[0].email || '',
-      phone: rows[0].phone || '',
-      // pass if you store these; otherwise null is fine (WA falls back to phone)
-      vendorTelegramChatId: rows[0].telegram_chat_id || null,
-      vendorWhatsapp: rows[0].whatsapp || null
-    }).catch(() => null);
+if (rows.length) {
+  notifyVendorSignup({
+    wallet: rows[0].wallet_address,
+    vendorName: rows[0].vendor_name || '',
+    email: rows[0].email || '',
+    phone: rows[0].phone || '',
+  }).catch(() => null);
+
+  notifyVendorSignupVendor({
+    vendorName: rows[0].vendor_name || '',
+    email: rows[0].email || '',
+    phone: rows[0].phone || '',
+    telegramChatId: rows[0].telegram_chat_id || null,
+    whatsapp: rows[0].whatsapp || null
+  }).catch(() => null);
+}
   }
 } catch (e) {
   console.warn('profile auto-seed failed (non-fatal):', String(e).slice(0,200));
 }
 
-// always finish response
-nonces.delete(address);
-return res.json({ token, role });
-}
+  nonces.delete(address);
+  res.json({ token, role });
 });
 
 app.get("/auth/role", async (req, res) => {
