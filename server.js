@@ -8441,6 +8441,7 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       vp.phone                                    AS phone,
       vp.website                                  AS website,
       vp.address                                  AS address_raw,
+      vp.telegram_username                        AS telegram_username,
       vp.telegram_chat_id                         AS telegram_chat_id,
       vp.whatsapp                                 AS whatsapp,
       vp.archived                                 AS archived
@@ -8463,6 +8464,7 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       vp.website                                  AS website,
       vp.address                                  AS address_raw,
       vp.telegram_chat_id                         AS telegram_chat_id,
+      vp.telegram_username                        AS telegram_username,
       vp.whatsapp                                 AS whatsapp,
       vp.archived                                 AS archived
     FROM vendor_profiles vp
@@ -8511,6 +8513,7 @@ const email    = norm(r.email);
 const phone    = norm(r.phone);
 const website  = norm(r.website);
 const telegram = norm(r.telegram_chat_id);
+const telegramUsername = norm(r.telegram_username);
 const whatsapp = norm(r.whatsapp);
 
 return {
@@ -8526,7 +8529,8 @@ return {
   contactEmail: email,
   phone,
   website,
-  telegramChatId: telegram,   
+  telegramChatId: telegram, 
+  telegramUsername,  
   whatsapp,                   
 
         // address (full + parts + explicit street)
@@ -8548,6 +8552,7 @@ return {
           phone,
           website,
           telegram_chat_id: telegram,
+          telegram_username: telegramUsername,
           whatsapp,  
           address: flat,
           addressText: flat,
