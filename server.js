@@ -7917,10 +7917,17 @@ app.post('/tg/webhook', async (req, res) => {
   try {
     const update = req.body || {};
 
-    // Extract chat id + username + message text
-    const chatId = update?.message?.chat?.id || update?.chat?.id || update?.message?.from?.id;
-    const username = update?.message?.from?.username || update?.message?.chat?.username || null; // may be null
-    const textRaw = update?.message?.text || update?.message?.data || update?.message?.caption || "";
+    // Extract chat id + username + message text (handle normal/callback cases)
+    const from     = update?.message?.from || update?.callback_query?.from || {};
+    const chatObj  = update?.message?.chat || update?.callback_query?.message?.chat || {};
+    const chatId   = chatObj?.id ?? from?.id;
+    const username = from?.username || chatObj?.username || null; // may be null
+
+    const textRaw =
+      update?.message?.text ??
+      update?.callback_query?.data ??
+      update?.message?.caption ??
+      '';
     const text = String(textRaw).trim();
 
     if (!chatId || !text) return res.json({ ok: true });
@@ -7928,7 +7935,7 @@ app.post('/tg/webhook', async (req, res) => {
     // Parse wallet from either:
     // 1) "/link 0xABC..."     (manual)
     // 2) "/start link_0xABC"  (deep link)
-    let wallet = "";
+    let wallet = '';
     if (/^\/link\s+/i.test(text)) {
       wallet = text.slice(6).trim();
     } else {
@@ -7941,36 +7948,50 @@ app.post('/tg/webhook', async (req, res) => {
 
     // Validate wallet
     if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
-      await sendTelegram([String(chatId)], "Send: /link 0xYourWalletAddress");
+      await sendTelegram([String(chatId)], 'Send: /link 0xYourWalletAddress');
       return res.json({ ok: true });
     }
 
-    const chatIdStr = String(chatId);
+    const chatIdStr   = String(chatId);
     const walletLower = wallet.toLowerCase();
+
+    // --- ensure a Telegram chat is NOT linked to multiple vendors ---
+    await pool.query(
+      `UPDATE vendor_profiles
+          SET telegram_chat_id = NULL,
+              telegram_username = NULL,
+              updated_at = NOW()
+        WHERE telegram_chat_id = $1
+          AND LOWER(wallet_address) <> LOWER($2)`,
+      [chatIdStr, walletLower]
+    );
 
     // Store chat id + username on the vendor profile
     await pool.query(
       `UPDATE vendor_profiles
-         SET telegram_chat_id = $1,
-             telegram_username = $2,
-             updated_at = now()
-       WHERE lower(wallet_address) = lower($3)`,
-      [ chatIdStr, username, walletLower ]
+          SET telegram_chat_id = $1,
+              telegram_username = $2,
+              updated_at = NOW()
+        WHERE LOWER(wallet_address) = LOWER($3)`,
+      [chatIdStr, username, walletLower]
     );
 
-    // ALSO store chat id on proposals for proposers/entities (username optional if you add that column later)
-    await pool.query(
-      `UPDATE proposals
-         SET owner_telegram_chat_id = $1, updated_at = now()
-       WHERE lower(owner_wallet) = lower($2)`,
-      [ chatIdStr, walletLower ]
-    );
+   // ALSO store chat id + username on proposals for proposers/entities
+await pool.query(
+  `UPDATE proposals
+     SET owner_telegram_chat_id = $1,
+         owner_telegram_username = $2,
+         updated_at = NOW()
+   WHERE LOWER(owner_wallet) = LOWER($3)`,
+  [ chatIdStr, username, walletLower ]
+);
 
     // Confirm to the user
     await sendTelegram(
       [chatIdStr],
       `✅ Telegram linked to ${wallet}${username ? ` as @${username}` : ''}`
     );
+
     return res.json({ ok: true });
   } catch (_e) {
     // Always 200 so Telegram doesn't retry forever
