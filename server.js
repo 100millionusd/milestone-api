@@ -8811,12 +8811,13 @@ FROM vendor_profiles vp
 WHERE NOT EXISTS (
   SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
 )
+;
 
-  let sql = `SELECT * FROM (${sqlBase}) s`;
-  if (!includeArchived) {
-    sql += ` WHERE COALESCE(s.archived, false) = false`;
-  }
-  sql += ` ORDER BY s.last_bid_at DESC NULLS LAST, s.vendor_name ASC`;
+let sql = `SELECT * FROM (${sqlBase}) s`;
+    if (!includeArchived) {
+      sql += ` WHERE COALESCE(s.archived,false) = false`;
+    }
+    sql += ` ORDER BY s.last_bid_at DESC NULLS LAST, s.vendor_name ASC`;
 
   try {
     const { rows } = await pool.query(sql);
