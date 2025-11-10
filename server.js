@@ -862,6 +862,27 @@ function toE164(raw) {
   return `${WA_DEFAULT_COUNTRY}${s}`;
 }
 
+// --- Entity selector helpers (accept both new & legacy keys)
+function normalizeEntitySelector(body) {
+  const entity = (body?.entity ?? body?.orgName ?? '').trim();
+  const contactEmail = (body?.contactEmail ?? body?.ownerEmail ?? body?.contact ?? '').trim();
+  const wallet = (body?.wallet ?? body?.ownerWallet ?? '').trim();
+  return {
+    entity: entity || null,
+    contactEmail: contactEmail || null,
+    wallet: wallet || null,
+  };
+}
+
+function buildEntityWhere(sel) {
+  const clauses = [];
+  const params = [];
+  if (sel.wallet)       { params.push(sel.wallet);       clauses.push(`LOWER(owner_wallet) = LOWER($${params.length})`); }
+  if (sel.contactEmail) { params.push(sel.contactEmail); clauses.push(`LOWER(contact)      = LOWER($${params.length})`); }
+  if (sel.entity)       { params.push(sel.entity);       clauses.push(`LOWER(org_name)     = LOWER($${params.length})`); }
+  return { whereSql: clauses.length ? `(${clauses.join(' OR ')})` : '', params };
+}
+
 // Determine role from address: admin > vendor (has vendor_profile) > entity (has proposals) > user
 async function roleForAddress(address) {
   if (isAdminAddress(address)) return 'admin';
@@ -3214,22 +3235,19 @@ app.get("/proposals", async (req, res) => {
 // Admin — “Entities” (operate over proposals by org/email/wallet)
 // ==============================
 
-// Archive all proposals for a given org/email/wallet
 app.post('/admin/entities/archive', adminGuard, async (req, res) => {
   try {
-    const key = deriveEntityKey(req.body);
-    if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
+    const sel = normalizeEntitySelector(req.body);
+    const { whereSql, params } = buildEntityWhere(sel);
+    if (!whereSql) return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
 
-const { rowCount } = await pool.query(`
-  UPDATE proposals
-     SET status = 'archived', updated_at = NOW()
-   WHERE (
-          LOWER(owner_wallet) = LOWER($1)
-       OR LOWER(contact)      = LOWER($1)
-       OR LOWER(org_name)     = LOWER($1)
-   )
-     AND status <> 'archived'
-`, [key]);
+    const { rowCount } = await pool.query(
+      `UPDATE proposals
+         SET status='archived', updated_at=NOW()
+       WHERE ${whereSql}
+         AND status <> 'archived'`,
+      params
+    );
 
     return res.json({ ok: true, affected: rowCount });
   } catch (e) {
@@ -3238,27 +3256,25 @@ const { rowCount } = await pool.query(`
   }
 });
 
-// Unarchive (set back to a status, default 'pending')
 app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
   try {
-    const key = deriveEntityKey(req.body);
-    if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
+    const sel = normalizeEntitySelector(req.body);
+    const { whereSql, params } = buildEntityWhere(sel);
+    if (!whereSql) return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
 
     const toStatus = String(req.body?.toStatus || 'pending').toLowerCase();
     if (!['pending','approved','rejected'].includes(toStatus)) {
       return res.status(400).json({ error: 'Invalid toStatus' });
     }
+    params.push(toStatus);
 
- const { rowCount } = await pool.query(`
-  UPDATE proposals
-     SET status = $2, updated_at = NOW()
-   WHERE (
-          LOWER(owner_wallet) = LOWER($1)
-       OR LOWER(contact)      = LOWER($1)
-       OR LOWER(org_name)     = LOWER($1)
-   )
-     AND status = 'archived'
-`, [key, toStatus]);
+    const { rowCount } = await pool.query(
+      `UPDATE proposals
+         SET status=$${params.length}, updated_at=NOW()
+       WHERE ${whereSql}
+         AND status='archived'`,
+      params
+    );
 
     return res.json({ ok: true, affected: rowCount, toStatus });
   } catch (e) {
@@ -3267,35 +3283,29 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
   }
 });
 
-// Delete proposals for that entity (mode=soft/hard via ?mode=soft|hard)
 app.delete('/admin/entities', adminGuard, async (req, res) => {
   try {
-    const key = deriveEntityKey(req.body);
-    if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
+    const sel = normalizeEntitySelector(req.body);
+    const { whereSql, params } = buildEntityWhere(sel);
+    if (!whereSql) return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
 
-    const mode = String(req.query.mode || 'soft').toLowerCase(); // soft | hard
+    const mode = String(req.query.mode || 'soft').toLowerCase();
+
     if (mode === 'hard') {
- const { rowCount } = await pool.query(`
-  DELETE FROM proposals
-   WHERE (
-          LOWER(owner_wallet) = LOWER($1)
-       OR LOWER(contact)      = LOWER($1)
-       OR LOWER(org_name)     = LOWER($1)
-   )
-`, [key]);
+      const { rowCount } = await pool.query(
+        `DELETE FROM proposals WHERE ${whereSql}`,
+        params
+      );
       return res.json({ success: true, deleted: rowCount, mode: 'hard' });
     }
 
- const { rowCount } = await pool.query(`
-  UPDATE proposals
-     SET status = 'archived', updated_at = NOW()
-   WHERE (
-          LOWER(owner_wallet) = LOWER($1)
-       OR LOWER(contact)      = LOWER($1)
-       OR LOWER(org_name)     = LOWER($1)
-   )
-     AND status <> 'archived'
-`, [key]);
+    const { rowCount } = await pool.query(
+      `UPDATE proposals
+         SET status='archived', updated_at=NOW()
+       WHERE ${whereSql}
+         AND status <> 'archived'`,
+      params
+    );
 
     return res.json({ success: true, archived: rowCount, mode: 'soft' });
   } catch (e) {
