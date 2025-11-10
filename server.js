@@ -8302,7 +8302,7 @@ app.get('/admin/proofs-bids', adminGuard, async (req, res) => {
   }
 });
 
-// ADMIN: list proposers/entities that submitted proposals
+// ADMIN: list proposers/entities that submitted proposals (now includes phone + telegram)
 app.get('/admin/proposers', adminGuard, async (req, res) => {
   try {
     const includeArchived = ['true','1','yes'].includes(String(req.query.includeArchived || '').toLowerCase());
@@ -8334,6 +8334,9 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
           LOWER(contact)  AS contact_email,
           owner_wallet,
           owner_email,
+          owner_phone,
+          owner_telegram_chat_id,
+          owner_telegram_username,
           amount_usd,
           status,
           created_at,
@@ -8353,6 +8356,9 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
           MAX(owner_wallet) FILTER (WHERE owner_wallet IS NOT NULL AND owner_wallet <> '') AS wallet_address,
           MAX(contact) FILTER (WHERE contact IS NOT NULL AND contact <> '') AS contact_email,
           MAX(owner_email) FILTER (WHERE owner_email IS NOT NULL AND owner_email <> '') AS owner_email,
+          MAX(owner_phone) FILTER (WHERE owner_phone IS NOT NULL AND owner_phone <> '') AS owner_phone,
+          MAX(owner_telegram_chat_id) FILTER (WHERE owner_telegram_chat_id IS NOT NULL AND owner_telegram_chat_id <> '') AS owner_telegram_chat_id,
+          MAX(owner_telegram_username) FILTER (WHERE owner_telegram_username IS NOT NULL AND owner_telegram_username <> '') AS owner_telegram_username,
           COUNT(*) AS proposals_count,
           MAX(created_at) AS last_proposal_at,
           COALESCE(SUM(amount_usd),0)::numeric AS total_budget_usd,
@@ -8400,6 +8406,12 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
       walletAddress: r.wallet_address || null,
       contactEmail: r.contact_email || null,
       ownerEmail: r.owner_email || null,
+
+      // NEW: contact channels
+      ownerPhone: r.owner_phone || null,
+      ownerTelegramChatId: r.owner_telegram_chat_id || null,
+      ownerTelegramUsername: r.owner_telegram_username || null,
+
       proposalsCount: Number(r.proposals_count) || 0,
       totalBudgetUSD: Number(r.total_budget_usd) || 0,
       lastProposalAt: r.last_proposal_at ? new Date(r.last_proposal_at).toISOString() : null,
