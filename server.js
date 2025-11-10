@@ -3173,12 +3173,14 @@ app.get("/health", async (_req, res) => {
 app.get("/test", (_req, res) => res.json({ ok: true }));
 
 // --- Helper for /admin/entities routes (match org/email/wallet) ---
-function deriveEntityKey(body = {}) {
-  const id     = String(body.id || '').trim().toLowerCase();             // optional internal id
-  const wallet = String(body.ownerWallet || body.wallet || '').trim().toLowerCase();
-  const email  = String(body.contactEmail || body.email || '').trim().toLowerCase();
-  const org    = String(body.orgName || body.organization || '').trim().toLowerCase();
-  return id || wallet || email || org || null;
+function deriveEntityKey(body) {
+  const take = (v) => (v ? String(v).trim().toLowerCase() : '');
+  const id     = take(body?.id || body?.entityKey);
+  if (id) return id;
+  const wallet = take(body?.wallet || body?.ownerWallet);
+  const email  = take(body?.contactEmail || body?.ownerEmail || body?.contact);
+  const org    = take(body?.entity || body?.orgName);
+  return wallet || email || org || null;
 }
 
 // ==============================
