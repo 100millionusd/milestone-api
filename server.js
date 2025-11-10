@@ -3292,87 +3292,102 @@ app.get("/proposals", async (req, res) => {
 // ==============================
 // Admin — “Entities” (operate over proposals by org/email/wallet)
 // ==============================
-// ---- Helpers for /admin/entities/* (place above the routes) -----------------
-function __normStr(x) {
-  return (typeof x === 'string' && x.trim() !== '') ? x.trim() : null;
-}
+// ===== Entities helpers (place ABOVE the /admin/entities/* routes) =====
+function _s(x) { return typeof x === 'string' ? x.trim() : ''; }
 
-function normalizeEntitySelector(input) {
-  const v = __normStr;
+/** Accepts many aliases from the client; returns { entity, contactEmail, wallet } */
+function normalizeEntitySelector(body = {}) {
   const entity =
-    v(input?.entity) ||
-    v(input?.entityName) ||
-    v(input?.org) ||
-    v(input?.orgName) ||
+    _s(body.entity) ||
+    _s(body.entityName) ||
+    _s(body.org) ||
+    _s(body.orgName) ||
+    _s(body.company) ||
     null;
 
-  const contactEmail = (v(input?.contactEmail) || v(input?.ownerEmail) || v(input?.email) || null);
-  const wallet = (v(input?.wallet) || v(input?.ownerWallet) || null);
+  const contactEmail =
+    _s(body.contactEmail) ||
+    _s(body.email) ||
+    _s(body.owner_email) ||
+    _s(body.ownerEmail) ||
+    null;
+
+  const walletRaw =
+    _s(body.wallet) ||
+    _s(body.walletAddress) ||
+    _s(body.owner_wallet) ||
+    _s(body.ownerWallet) ||
+    null;
+
+  const wallet = walletRaw ? walletRaw.toLowerCase() : null;
+  return { entity, contactEmail, wallet };
+}
+
+/** Detect column names in proposals table so we can update the right fields */
+async function detectProposalCols(pool) {
+  const { rows } = await pool.query(
+    `SELECT column_name FROM information_schema.columns WHERE table_name='proposals'`
+  );
+  const has = (name) => rows.some(r => r.column_name === name);
+  const pick = (...cands) => cands.find(has) || null;
 
   return {
-    entity,
-    contactEmail: contactEmail ? contactEmail.toLowerCase() : null,
-    wallet: wallet ? wallet.toLowerCase() : null,
+    nameCol:    pick('org_name','entity_name','owner_name'),
+    emailCol:   pick('owner_email','contact_email','email'),
+    walletCol:  pick('owner_wallet','wallet_address','wallet'),
+    statusCol:  pick('status','proposal_status'),
+    archivedCol: pick('archived'),
+    updatedCol: pick('updated_at','updatedat','updated'),
   };
 }
 
-async function __detectProposalCols(pool) {
-  const sql = `
-    SELECT LOWER(column_name) AS c
-    FROM information_schema.columns
-    WHERE LOWER(table_name) = 'proposals'
-  `;
-  const cols = { statusCol: null, updatedCol: null };
-  try {
-    const { rows } = await pool.query(sql);
-    const set = new Set(rows.map(r => r.c));
-    cols.statusCol  = set.has('status')      ? 'status'      : null;
-    cols.updatedCol = set.has('updated_at')  ? 'updated_at'
-                     : set.has('updatedat')  ? 'updatedat'
-                     : null;
-  } catch (_) { /* ignore */ }
-  return cols;
-}
-
+/** Build WHERE ... and params based on provided selector + detected columns */
 async function buildEntityWhereAsync(pool, sel) {
-  const cols = await __detectProposalCols(pool);
-  const params = [];
+  const cols = await detectProposalCols(pool);
   const parts = [];
+  const params = [];
 
-  if (sel?.wallet) {
-    params.push(sel.wallet);
-    parts.push(`LOWER(owner_wallet) = LOWER($${params.length})`);
-  } else if (sel?.contactEmail) {
+  if (sel.entity && cols.nameCol) {
+    params.push(`%${sel.entity}%`);
+    parts.push(`${cols.nameCol} ILIKE $${params.length}`);
+  }
+  if (sel.contactEmail && cols.emailCol) {
     params.push(sel.contactEmail);
-    parts.push(`LOWER(owner_email) = LOWER($${params.length})`);
-  } else if (sel?.entity) {
-    params.push(sel.entity.toLowerCase());
-    parts.push(`LOWER(org_name) = LOWER($${params.length})`);
+    parts.push(`LOWER(${cols.emailCol}) = LOWER($${params.length})`);
+  }
+  if (sel.wallet && cols.walletCol) {
+    params.push(sel.wallet);
+    parts.push(`LOWER(${cols.walletCol}) = LOWER($${params.length})`);
   }
 
-  return {
-    whereSql: parts.join(' AND '),
-    params,
-    cols,
-  };
+  const whereSql = parts.join(' OR ');
+  return { whereSql, params, cols };
 }
-// ----------------------------------------------------------------------------- 
+
+// ==============================
+// Admin — “Entities” (operate over proposals by org/email/wallet)
+// ==============================
 
 app.post('/admin/entities/archive', adminGuard, async (req, res) => {
   try {
+    // Debug once if needed:
+    // console.log('entities.archive body ->', req.body);
+
     const sel = normalizeEntitySelector(req.body);
     const { whereSql, params, cols } = await buildEntityWhereAsync(pool, sel);
-    if (!whereSql) return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
+    if (!whereSql) return res.status(400).json({ error: 'Provide entity/contactEmail/wallet' });
     if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
 
-    const setSql = cols.updatedCol
-      ? `${cols.statusCol}='archived', ${cols.updatedCol}=NOW()`
-      : `${cols.statusCol}='archived'`;
+    // Set status='archived'; also set archived=true if that boolean column exists
+    const sets = [];
+    sets.push(`${cols.statusCol}='archived'`);
+    if (cols.archivedCol) sets.push(`${cols.archivedCol}=true`);
+    if (cols.updatedCol)  sets.push(`${cols.updatedCol}=NOW()`);
 
     const { rowCount } = await pool.query(
       `UPDATE proposals
-         SET ${setSql}
-       WHERE ${whereSql}
+         SET ${sets.join(', ')}
+       WHERE (${whereSql})
          AND ${cols.statusCol} <> 'archived'`,
       params
     );
@@ -3388,7 +3403,7 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
   try {
     const sel = normalizeEntitySelector(req.body);
     const { whereSql, params, cols } = await buildEntityWhereAsync(pool, sel);
-    if (!whereSql) return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
+    if (!whereSql) return res.status(400).json({ error: 'Provide entity/contactEmail/wallet' });
     if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
 
     const toStatus = String(req.body?.toStatus || 'pending').toLowerCase();
@@ -3396,15 +3411,17 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
       return res.status(400).json({ error: 'Invalid toStatus' });
     }
 
-    const setSql = cols.updatedCol
-      ? `${cols.statusCol}=$${params.length + 1}, ${cols.updatedCol}=NOW()`
-      : `${cols.statusCol}=$${params.length + 1}`;
+    const sets = [];
+    // first param placeholders already used by where; push new one for status
     params.push(toStatus);
+    sets.push(`${cols.statusCol}=$${params.length}`);
+    if (cols.archivedCol) sets.push(`${cols.archivedCol}=false`);
+    if (cols.updatedCol)  sets.push(`${cols.updatedCol}=NOW()`);
 
     const { rowCount } = await pool.query(
       `UPDATE proposals
-         SET ${setSql}
-       WHERE ${whereSql}
+         SET ${sets.join(', ')}
+       WHERE (${whereSql})
          AND ${cols.statusCol}='archived'`,
       params
     );
@@ -3420,25 +3437,30 @@ app.delete('/admin/entities', adminGuard, async (req, res) => {
   try {
     const sel = normalizeEntitySelector(req.body);
     const { whereSql, params, cols } = await buildEntityWhereAsync(pool, sel);
-    if (!whereSql) return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
+    if (!whereSql) return res.status(400).json({ error: 'Provide entity/contactEmail/wallet' });
 
     const mode = String(req.query.mode || 'soft').toLowerCase();
 
     if (mode === 'hard') {
-      const { rowCount } = await pool.query(`DELETE FROM proposals WHERE ${whereSql}`, params);
+      const { rowCount } = await pool.query(
+        `DELETE FROM proposals WHERE (${whereSql})`,
+        params
+      );
       return res.json({ success: true, deleted: rowCount, mode: 'hard' });
     }
 
     if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
 
-    const setSql = cols.updatedCol
-      ? `${cols.statusCol}='archived', ${cols.updatedCol}=NOW()`
-      : `${cols.statusCol}='archived'`;
+    // Soft delete = status='archived' (+ archived=true if exists)
+    const sets = [];
+    sets.push(`${cols.statusCol}='archived'`);
+    if (cols.archivedCol) sets.push(`${cols.archivedCol}=true`);
+    if (cols.updatedCol)  sets.push(`${cols.updatedCol}=NOW()`);
 
     const { rowCount } = await pool.query(
       `UPDATE proposals
-         SET ${setSql}
-       WHERE ${whereSql}
+         SET ${sets.join(', ')}
+       WHERE (${whereSql})
          AND ${cols.statusCol} <> 'archived'`,
       params
     );
