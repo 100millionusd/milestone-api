@@ -3349,6 +3349,30 @@ app.post("/proposals", async (req, res) => {
     const ownerWallet = (req.user?.sub || null);
     const ownerEmail  = (value.ownerEmail || null);
     const ownerPhone  = toE164(value.ownerPhone || ""); // normalize for WhatsApp (optional helper)
+    // Require a completed profile before proposal creation
+if (!ownerWallet) {
+  return res.status(401).json({ error: "Login required" });
+}
+{
+  const { rows: ok } = await pool.query(
+    `SELECT 1
+       FROM vendor_profiles
+      WHERE lower(wallet_address)=lower($1)
+        AND (
+          COALESCE(email,'') <> '' OR
+          COALESCE(phone,'') <> '' OR
+          COALESCE(telegram_chat_id,'') <> '' OR
+          COALESCE(telegram_username,'') <> ''
+        )
+      LIMIT 1`,
+    [ownerWallet]
+  );
+  if (!ok[0]) {
+    return res.status(400).json({
+      error: "Please complete your profile (add email, phone/WhatsApp, or Telegram) before submitting a proposal."
+    });
+  }
+}
 
     const q = `
       INSERT INTO proposals (
