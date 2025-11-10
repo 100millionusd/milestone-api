@@ -3323,7 +3323,6 @@ function normalizeEntitySelector(body) {
 }
 
 async function buildEntityWhereAsync(client, sel) {
-  // Minimal resolver over proposals table
   // Priority: wallet > email > entity(org_name)
   const params = [];
   const cols = { statusCol: 'status', updatedCol: 'updated_at' };
@@ -3468,7 +3467,7 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           COALESCE(MAX(p.country), '') AS country,
 
           -- archived based on proposals.status
-          COALESCE(BOOL_OR(p.status = 'archived'), false) AS archived
+          COALESCE(bool_or(p.status = 'archived'), false) AS archived
         FROM proposals p
         GROUP BY LOWER(p.owner_wallet)
       )
