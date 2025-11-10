@@ -3296,31 +3296,31 @@ app.get("/proposals", async (req, res) => {
 function _s(x) { return typeof x === 'string' ? x.trim() : ''; }
 
 /** Accepts many aliases from the client; returns { entity, contactEmail, wallet } */
-function normalizeEntitySelector(body = {}) {
+function normalizeEntitySelector(body) {
+  const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
+
   const entity =
-    _s(body.entity) ||
-    _s(body.entityName) ||
-    _s(body.org) ||
-    _s(body.orgName) ||
-    _s(body.company) ||
-    null;
+    norm(body?.entity) ||
+    norm(body?.entityName) ||
+    norm(body?.orgName) ||
+    norm(body?.organization) ||
+    norm(body?.name);
 
   const contactEmail =
-    _s(body.contactEmail) ||
-    _s(body.email) ||
-    _s(body.owner_email) ||
-    _s(body.ownerEmail) ||
-    null;
+    norm(body?.contactEmail) ||
+    norm(body?.ownerEmail) ||
+    norm(body?.email);
 
-  const walletRaw =
-    _s(body.wallet) ||
-    _s(body.walletAddress) ||
-    _s(body.owner_wallet) ||
-    _s(body.ownerWallet) ||
-    null;
+  const wallet =
+    (norm(body?.wallet) ||
+     norm(body?.ownerWallet) ||
+     null);
 
-  const wallet = walletRaw ? walletRaw.toLowerCase() : null;
-  return { entity, contactEmail, wallet };
+  return {
+    entity,
+    contactEmail,
+    wallet: wallet ? wallet.toLowerCase() : null,
+  };
 }
 
 /** Detect column names in proposals table so we can update the right fields */
@@ -3785,31 +3785,35 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
       const flat    = [line1, city, country].filter(Boolean).join(', ') || null;
 
       return {
-        // core
-        entityName: r.entity_name || '',
-        walletAddress: r.owner_wallet || '',
-        proposalsCount: Number(r.proposals_count) || 0,
-        lastProposalAt: r.last_proposal_at,
-        totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+  // core
+  entityName: r.entity_name || '',
+  entity: r.entity_name || '',              // alias for older UI
+  orgName: r.entity_name || '',             // alias
+  organization: r.entity_name || '',        // alias
 
-        // contact (frontend builds deep links)
-        email,
-        phone,
-        whatsapp: phone,
-        telegramChatId,
-        telegramUsername,
+  walletAddress: r.owner_wallet || '',
+  ownerWallet: r.owner_wallet || '',        // alias
 
-        // address
-        address: flat,
-        addressText: flat,
-        address1: line1,
+  proposalsCount: Number(r.proposals_count) || 0,
+  lastProposalAt: r.last_proposal_at,
+  totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // server-truth
-        archived: !!r.archived,
-        archivedCount: Number(r.archived_count || 0),
-        activeCount: Number(r.active_count || 0),
-      };
-    });
+  // contact (frontend turns into deep links)
+  email,                                    // original
+  contactEmail: email,                      // alias for UI
+  ownerEmail: email,                        // alias
+  phone,
+  whatsapp: phone,
+  telegramChatId,
+  telegramUsername,
+
+  // address
+  address: flat,
+  addressText: flat,
+  address1: line1,
+
+  archived: !!r.archived,
+};
 
     res.json({ items, page: 1, pageSize: items.length, total: items.length });
   } catch (e) {
