@@ -862,6 +862,27 @@ function toE164(raw) {
   return `${WA_DEFAULT_COUNTRY}${s}`;
 }
 
+// Determine role from address: admin > vendor (has vendor_profile) > entity (has proposals) > user
+async function roleForAddress(address) {
+  if (isAdminAddress(address)) return 'admin';
+
+  // vendor if has a vendor profile
+  const { rows: vp } = await pool.query(
+    `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+    [address]
+  );
+  if (vp[0]) return 'vendor';
+
+  // entity if has at least one proposal they own
+  const { rows: ep } = await pool.query(
+    `SELECT 1 FROM proposals WHERE lower(owner_wallet)=lower($1) LIMIT 1`,
+    [address]
+  );
+  if (ep[0]) return 'entity';
+
+  return 'user';
+}
+
 // Telegram
 async function sendTelegram(chatIds, text) {
   if (!TELEGRAM_BOT_TOKEN || !chatIds?.length) return;
@@ -3109,7 +3130,7 @@ app.get("/auth/role", async (req, res) => {
       const qAddress = norm(req.query.address);
       if (!qAddress) return res.json({ role: "guest" });
 
-      const role = isAdminAddress(qAddress) ? "admin" : "vendor";
+      const role = await roleForAddress(address);
       let vendorStatus = 'pending';
 
       if (role === 'vendor') {
