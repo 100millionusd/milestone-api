@@ -3290,104 +3290,77 @@ app.get("/proposals", async (req, res) => {
 
 
 // ==============================
-// Admin — “Entities” (operate over proposals by org/email/wallet)
+// Admin — Entities (REPLACE ENTIRE SECTION)
+// Operates over proposals by org/email/wallet; server-truth only
 // ==============================
-// ===== Entities helpers (place ABOVE the /admin/entities/* routes) =====
-function _s(x) { return typeof x === 'string' ? x.trim() : ''; }
 
-/** Accepts many aliases from the client; returns { entity, contactEmail, wallet } */
+// ---- helpers (keep above the /admin/entities/* routes) ----
+function normStr(s) {
+  return (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
+}
+
 function normalizeEntitySelector(body) {
-  const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
-
+  // Accept multiple alias keys so old/new clients both work
   const entity =
-    norm(body?.entity) ||
-    norm(body?.entityName) ||
-    norm(body?.orgName) ||
-    norm(body?.organization) ||
-    norm(body?.name);
+    normStr(body?.entity) ||
+    normStr(body?.entityName) ||
+    normStr(body?.orgName) ||
+    normStr(body?.organization) ||
+    normStr(body?.name);
 
   const contactEmail =
-    norm(body?.contactEmail) ||
-    norm(body?.ownerEmail) ||
-    norm(body?.email);
+    normStr(body?.contactEmail) ||
+    normStr(body?.ownerEmail) ||
+    normStr(body?.email);
 
-  const wallet =
-    (norm(body?.wallet) ||
-     norm(body?.ownerWallet) ||
-     null);
+  let wallet =
+    normStr(body?.wallet) ||
+    normStr(body?.ownerWallet) ||
+    null;
+  if (wallet) wallet = wallet.toLowerCase();
 
-  return {
-    entity,
-    contactEmail,
-    wallet: wallet ? wallet.toLowerCase() : null,
-  };
+  return { entity, contactEmail, wallet };
 }
 
-/** Detect column names in proposals table so we can update the right fields */
-async function detectProposalCols(pool) {
-  const { rows } = await pool.query(
-    `SELECT column_name FROM information_schema.columns WHERE table_name='proposals'`
-  );
-  const has = (name) => rows.some(r => r.column_name === name);
-  const pick = (...cands) => cands.find(has) || null;
-
-  return {
-    nameCol:    pick('org_name','entity_name','owner_name'),
-    emailCol:   pick('owner_email','contact_email','email'),
-    walletCol:  pick('owner_wallet','wallet_address','wallet'),
-    statusCol:  pick('status','proposal_status'),
-    archivedCol: pick('archived'),
-    updatedCol: pick('updated_at','updatedat','updated'),
-  };
-}
-
-/** Build WHERE ... and params based on provided selector + detected columns */
-async function buildEntityWhereAsync(pool, sel) {
-  const cols = await detectProposalCols(pool);
-  const parts = [];
+async function buildEntityWhereAsync(client, sel) {
+  // Minimal resolver over proposals table
+  // Priority: wallet > email > entity(org_name)
   const params = [];
+  const cols = { statusCol: 'status', updatedCol: 'updated_at' };
+  let whereSql = '';
 
-  if (sel.entity && cols.nameCol) {
-    params.push(`%${sel.entity}%`);
-    parts.push(`${cols.nameCol} ILIKE $${params.length}`);
-  }
-  if (sel.contactEmail && cols.emailCol) {
-    params.push(sel.contactEmail);
-    parts.push(`LOWER(${cols.emailCol}) = LOWER($${params.length})`);
-  }
-  if (sel.wallet && cols.walletCol) {
+  if (sel.wallet) {
     params.push(sel.wallet);
-    parts.push(`LOWER(${cols.walletCol}) = LOWER($${params.length})`);
+    whereSql = `LOWER(owner_wallet) = LOWER($${params.length})`;
+  } else if (sel.contactEmail) {
+    params.push(sel.contactEmail);
+    whereSql = `LOWER(owner_email) = LOWER($${params.length})`;
+  } else if (sel.entity) {
+    params.push(sel.entity);
+    whereSql = `LOWER(org_name) = LOWER($${params.length})`;
   }
 
-  const whereSql = parts.join(' OR ');
   return { whereSql, params, cols };
 }
 
 // ==============================
-// Admin — “Entities” (operate over proposals by org/email/wallet)
+// Actions
 // ==============================
 
 app.post('/admin/entities/archive', adminGuard, async (req, res) => {
   try {
-    // Debug once if needed:
-    // console.log('entities.archive body ->', req.body);
-
     const sel = normalizeEntitySelector(req.body);
     const { whereSql, params, cols } = await buildEntityWhereAsync(pool, sel);
-    if (!whereSql) return res.status(400).json({ error: 'Provide entity/contactEmail/wallet' });
-    if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
+    if (!whereSql) return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
 
-    // Set status='archived'; also set archived=true if that boolean column exists
-    const sets = [];
-    sets.push(`${cols.statusCol}='archived'`);
-    if (cols.archivedCol) sets.push(`${cols.archivedCol}=true`);
-    if (cols.updatedCol)  sets.push(`${cols.updatedCol}=NOW()`);
+    const setSql = cols.updatedCol
+      ? `${cols.statusCol}='archived', ${cols.updatedCol}=NOW()`
+      : `${cols.statusCol}='archived'`;
 
     const { rowCount } = await pool.query(
       `UPDATE proposals
-         SET ${sets.join(', ')}
-       WHERE (${whereSql})
+         SET ${setSql}
+       WHERE ${whereSql}
          AND ${cols.statusCol} <> 'archived'`,
       params
     );
@@ -3403,25 +3376,22 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
   try {
     const sel = normalizeEntitySelector(req.body);
     const { whereSql, params, cols } = await buildEntityWhereAsync(pool, sel);
-    if (!whereSql) return res.status(400).json({ error: 'Provide entity/contactEmail/wallet' });
-    if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
+    if (!whereSql) return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
 
     const toStatus = String(req.body?.toStatus || 'pending').toLowerCase();
-    if (!['pending','approved','rejected'].includes(toStatus)) {
+    if (!['pending','approved','rejected','funded','completed','submitted'].includes(toStatus)) {
       return res.status(400).json({ error: 'Invalid toStatus' });
     }
 
-    const sets = [];
-    // first param placeholders already used by where; push new one for status
+    const setSql = cols.updatedCol
+      ? `${cols.statusCol}=$${params.length + 1}, ${cols.updatedCol}=NOW()`
+      : `${cols.statusCol}=$${params.length + 1}`;
     params.push(toStatus);
-    sets.push(`${cols.statusCol}=$${params.length}`);
-    if (cols.archivedCol) sets.push(`${cols.archivedCol}=false`);
-    if (cols.updatedCol)  sets.push(`${cols.updatedCol}=NOW()`);
 
     const { rowCount } = await pool.query(
       `UPDATE proposals
-         SET ${sets.join(', ')}
-       WHERE (${whereSql})
+         SET ${setSql}
+       WHERE ${whereSql}
          AND ${cols.statusCol}='archived'`,
       params
     );
@@ -3437,30 +3407,23 @@ app.delete('/admin/entities', adminGuard, async (req, res) => {
   try {
     const sel = normalizeEntitySelector(req.body);
     const { whereSql, params, cols } = await buildEntityWhereAsync(pool, sel);
-    if (!whereSql) return res.status(400).json({ error: 'Provide entity/contactEmail/wallet' });
+    if (!whereSql) return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
 
     const mode = String(req.query.mode || 'soft').toLowerCase();
 
     if (mode === 'hard') {
-      const { rowCount } = await pool.query(
-        `DELETE FROM proposals WHERE (${whereSql})`,
-        params
-      );
+      const { rowCount } = await pool.query(`DELETE FROM proposals WHERE ${whereSql}`, params);
       return res.json({ success: true, deleted: rowCount, mode: 'hard' });
     }
 
-    if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
-
-    // Soft delete = status='archived' (+ archived=true if exists)
-    const sets = [];
-    sets.push(`${cols.statusCol}='archived'`);
-    if (cols.archivedCol) sets.push(`${cols.archivedCol}=true`);
-    if (cols.updatedCol)  sets.push(`${cols.updatedCol}=NOW()`);
+    const setSql = cols.updatedCol
+      ? `${cols.statusCol}='archived', ${cols.updatedCol}=NOW()`
+      : `${cols.statusCol}='archived'`;
 
     const { rowCount } = await pool.query(
       `UPDATE proposals
-         SET ${sets.join(', ')}
-       WHERE (${whereSql})
+         SET ${setSql}
+       WHERE ${whereSql}
          AND ${cols.statusCol} <> 'archived'`,
       params
     );
@@ -3469,6 +3432,100 @@ app.delete('/admin/entities', adminGuard, async (req, res) => {
   } catch (e) {
     console.error('delete entity error', e);
     return res.status(500).json({ error: 'Failed to delete entity' });
+  }
+});
+
+// ==============================
+// List
+// ==============================
+
+/** ADMIN: list entities (proposers) with deep-linkable contact fields */
+app.get('/admin/entities', adminGuard, async (req, res) => {
+  try {
+    const includeArchived = ['true','1','yes'].includes(
+      String(req.query.includeArchived || '').toLowerCase()
+    );
+
+    const sql = `
+      WITH agg AS (
+        SELECT
+          LOWER(p.owner_wallet) AS owner_wallet,
+          COALESCE(MAX(p.org_name), '') AS entity_name,
+          COUNT(*)::int AS proposals_count,
+          MAX(p.created_at) AS last_proposal_at,
+          COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
+                            THEN p.amount_usd ELSE 0 END),0)::numeric AS total_awarded_usd,
+
+          -- contact (latest non-null via MAX)
+          COALESCE(MAX(p.owner_email), '') AS email,
+          COALESCE(MAX(p.owner_phone), '') AS phone,
+          COALESCE(MAX(p.owner_telegram_chat_id), '') AS telegram_chat_id,
+          COALESCE(MAX(p.owner_telegram_username), '') AS telegram_username,
+
+          -- address-ish (latest non-null)
+          COALESCE(MAX(p.address), '') AS address_raw,
+          COALESCE(MAX(p.city), '') AS city,
+          COALESCE(MAX(p.country), '') AS country,
+
+          -- archived based on proposals.status
+          COALESCE(BOOL_OR(p.status = 'archived'), false) AS archived
+        FROM proposals p
+        GROUP BY LOWER(p.owner_wallet)
+      )
+      SELECT *
+      FROM agg
+      ${includeArchived ? '' : 'WHERE COALESCE(archived, false) = false'}
+      ORDER BY last_proposal_at DESC NULLS LAST, entity_name ASC
+    `;
+
+    const { rows } = await pool.query(sql);
+    const items = rows.map((r) => {
+      const email            = normStr(r.email);
+      const phone            = normStr(r.phone);
+      const telegramChatId   = normStr(r.telegram_chat_id);
+      const telegramUsername = normStr(r.telegram_username);
+
+      const line1   = normStr(r.address_raw);
+      const city    = normStr(r.city);
+      const country = normStr(r.country);
+      const flat    = [line1, city, country].filter(Boolean).join(', ') || null;
+
+      return {
+        // core + aliases (so any UI key works)
+        entityName: r.entity_name || '',
+        entity: r.entity_name || '',
+        orgName: r.entity_name || '',
+        organization: r.entity_name || '',
+
+        walletAddress: r.owner_wallet || '',
+        ownerWallet: r.owner_wallet || '',
+
+        proposalsCount: Number(r.proposals_count) || 0,
+        lastProposalAt: r.last_proposal_at,
+        totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+
+        // contact + aliases
+        email,
+        contactEmail: email,
+        ownerEmail: email,
+        phone,
+        whatsapp: phone,
+        telegramChatId,
+        telegramUsername,
+
+        // address
+        address: flat,
+        addressText: flat,
+        address1: line1,
+
+        archived: !!r.archived,
+      };
+    });
+
+    res.json({ items, page: 1, pageSize: items.length, total: items.length });
+  } catch (e) {
+    console.error('GET /admin/entities error', e);
+    res.status(500).json({ error: 'Failed to list entities' });
   }
 });
 
