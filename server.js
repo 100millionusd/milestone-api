@@ -8751,82 +8751,83 @@ app.delete('/admin/vendors/:wallet', adminGuard, async (req, res) => {
 
 /** ADMIN: list vendors (with or without bids), normalized email + rich address (street + house no + city + postal + country) */
 app.get('/admin/vendors', adminGuard, async (req, res) => {
-  const includeArchived = ['true','1','yes'].includes(String(req.query.includeArchived || '').toLowerCase());
+  try {
+    const includeArchived = ['true','1','yes'].includes(String(req.query.includeArchived || '').toLowerCase());
 
- const sqlBase = `
-    WITH agg AS (
+    const sqlBase = `
+      WITH agg AS (
+        SELECT
+          LOWER(b.wallet_address)                                        AS wallet_address,
+          COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
+          COUNT(*)::int                                                  AS bids_count,
+          MAX(b.created_at)                                              AS last_bid_at,
+          COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
+                            THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd
+        FROM bids b
+        GROUP BY LOWER(b.wallet_address)
+      )
+      -- vendors who have bids
       SELECT
-        LOWER(b.wallet_address)                                        AS wallet_address,
-        COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
-        COUNT(*)::int                                                  AS bids_count,
-        MAX(b.created_at)                                              AS last_bid_at,
-        COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
-                          THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd
-      FROM bids b
-      GROUP BY LOWER(b.wallet_address)
-    )
-    -- vendors who have bids
-SELECT
-  a.vendor_name                               AS vendor_name,
-  a.wallet_address                            AS wallet_address,
-  a.bids_count                                AS bids_count,
-  a.last_bid_at                               AS last_bid_at,
-  a.total_awarded_usd                         AS total_awarded_usd,
-  vp.vendor_name                              AS profile_vendor_name,
-  vp.email                                    AS email,
-  vp.phone                                    AS phone,
-  vp.website                                  AS website,
-  vp.address                                  AS address_raw,
-  vp.telegram_username                        AS telegram_username,
-  vp.telegram_chat_id                         AS telegram_chat_id,
-  vp.whatsapp                                 AS whatsapp,
-  vp.archived                                 AS archived,
-  vp.status                                   AS status,
-  vp.kyc_status                               AS kyc_status
-FROM agg a
-LEFT JOIN vendor_profiles vp
-  ON LOWER(vp.wallet_address) = a.wallet_address
+        a.vendor_name                               AS vendor_name,
+        a.wallet_address                            AS wallet_address,
+        a.bids_count                                AS bids_count,
+        a.last_bid_at                               AS last_bid_at,
+        a.total_awarded_usd                         AS total_awarded_usd,
+        vp.vendor_name                              AS profile_vendor_name,
+        vp.email                                    AS email,
+        vp.phone                                    AS phone,
+        vp.website                                  AS website,
+        vp.address                                  AS address_raw,
+        vp.telegram_username                        AS telegram_username,
+        vp.telegram_chat_id                         AS telegram_chat_id,
+        vp.whatsapp                                 AS whatsapp,
+        COALESCE(vp.archived,false)                 AS archived,
+        COALESCE(vp.status,'pending')               AS status,
+        COALESCE(vp.kyc_status,'none')              AS kyc_status
+      FROM agg a
+      LEFT JOIN vendor_profiles vp
+        ON LOWER(vp.wallet_address) = a.wallet_address
 
-UNION ALL
+      UNION ALL
 
--- profiles that have no bids yet
-SELECT
-  COALESCE(vp.vendor_name,'')                 AS vendor_name,
-  LOWER(vp.wallet_address)                    AS wallet_address,
-  0                                           AS bids_count,
-  NULL::timestamptz                           AS last_bid_at,
-  0::numeric                                  AS total_awarded_usd,
-  vp.vendor_name                              AS profile_vendor_name,
-  vp.email                                    AS email,
-  vp.phone                                    AS phone,
-  vp.website                                  AS website,
-  vp.address                                  AS address_raw,
-  vp.telegram_username                        AS telegram_username,
-  vp.telegram_chat_id                         AS telegram_chat_id,
-  vp.whatsapp                                 AS whatsapp,
-  vp.archived                                 AS archived,
-  vp.status                                   AS status,
-  vp.kyc_status                               AS kyc_status
-FROM vendor_profiles vp
-WHERE NOT EXISTS (
-  SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
-)
-;
+      -- profiles that have no bids yet
+      SELECT
+        COALESCE(vp.vendor_name,'')                 AS vendor_name,
+        LOWER(vp.wallet_address)                    AS wallet_address,
+        0                                           AS bids_count,
+        NULL::timestamptz                           AS last_bid_at,
+        0::numeric                                  AS total_awarded_usd,
+        vp.vendor_name                              AS profile_vendor_name,
+        vp.email                                    AS email,
+        vp.phone                                    AS phone,
+        vp.website                                  AS website,
+        vp.address                                  AS address_raw,
+        vp.telegram_username                        AS telegram_username,
+        vp.telegram_chat_id                         AS telegram_chat_id,
+        vp.whatsapp                                 AS whatsapp,
+        COALESCE(vp.archived,false)                 AS archived,
+        COALESCE(vp.status,'pending')               AS status,
+        COALESCE(vp.kyc_status,'none')              AS kyc_status
+      FROM vendor_profiles vp
+      WHERE NOT EXISTS (
+        SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
+      )
+    `; // ← CLOSE THE TEMPLATE STRING
 
-let sql = `SELECT * FROM (${sqlBase}) s`;
+    let sql = `SELECT * FROM (${sqlBase}) s`;
     if (!includeArchived) {
       sql += ` WHERE COALESCE(s.archived,false) = false`;
     }
     sql += ` ORDER BY s.last_bid_at DESC NULLS LAST, s.vendor_name ASC`;
 
-  try {
     const { rows } = await pool.query(sql);
+
     const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
     const out = rows.map((r) => {
       // address_raw can be JSON or plain text — normalize to parts
       let addrObj = null;
-      if (r.address_raw && r.address_raw.trim().startsWith('{')) {
+      if (r.address_raw && typeof r.address_raw === 'string' && r.address_raw.trim().startsWith('{')) {
         try { addrObj = JSON.parse(r.address_raw); } catch { addrObj = null; }
       }
 
@@ -8849,81 +8850,82 @@ let sql = `SELECT * FROM (${sqlBase}) s`;
       const flat = [parts.line1, parts.city, parts.postalCode, parts.country]
         .filter(Boolean).join(', ') || null;
 
-const email    = norm(r.email);
-const phone    = norm(r.phone);
-const website  = norm(r.website);
-const telegram = norm(r.telegram_chat_id);
-const telegramUsername = norm(r.telegram_username);
-const whatsapp = norm(r.whatsapp);
+      const email    = norm(r.email);
+      const phone    = norm(r.phone);
+      const website  = norm(r.website);
+      const telegram = norm(r.telegram_chat_id);
+      const telegramUsername = norm(r.telegram_username);
+      const whatsapp = norm(r.whatsapp);
 
-return {
-  // core
-  vendorName: r.profile_vendor_name || r.vendor_name || '',
-  walletAddress: r.wallet_address || '',
-  bidsCount: Number(r.bids_count) || 0,
-  lastBidAt: r.last_bid_at,
-  totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+      return {
+        // core
+        vendorName: r.profile_vendor_name || r.vendor_name || '',
+        walletAddress: r.wallet_address || '',
+        bidsCount: Number(r.bids_count) || 0,
+        lastBidAt: r.last_bid_at,
+        totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-  // ✅ server-truth flags used by the UI across devices
-  status: (r.status || 'pending'),
-  kycStatus: (r.kyc_status || 'none'),
+        // ✅ server-truth flags used by the UI across devices
+        status: r.status || 'pending',
+        kycStatus: r.kyc_status || 'none',
 
-  // contact
-  email,
-  contactEmail: email,
-  phone,
-  website,
-  telegramChatId: telegram,
-  telegramUsername,
-  whatsapp,
+        // contact
+        email,
+        contactEmail: email,
+        phone,
+        website,
+        telegramChatId: telegram,
+        telegramUsername,
+        whatsapp,
 
-  // address (full + parts + explicit street)
-  address: flat,
-  street: parts.line1 || null,
-  address1: parts.line1 || flat,
-  addressLine1: parts.line1 || flat,
-  city: parts.city,
-  state: parts.state,
-  postalCode: parts.postalCode,
-  country: parts.country,
+        // address (full + parts + explicit street)
+        address: flat,
+        street: parts.line1 || null,
+        address1: parts.line1 || flat,
+        addressLine1: parts.line1 || flat,
+        city: parts.city,
+        state: parts.state,
+        postalCode: parts.postalCode,
+        country: parts.country,
 
-  // nested copies (optional)
-  profile: {
-    companyName: r.profile_vendor_name ?? (r.vendor_name || null),
-    contactName: null,
-    email,
-    contactEmail: email,
-    phone,
-    website,
-    telegram_chat_id: telegram,
-    telegram_username: telegramUsername,
-    whatsapp,
-    address: flat,
-    addressText: flat,
-    street: parts.line1 || null,
-    address1: parts.line1 || flat,
-    address2: null,
-    city: parts.city,
-    state: parts.state,
-    postalCode: parts.postalCode,
-    country: parts.country,
-    notes: null,
-  },
+        // nested copies (optional)
+        profile: {
+          companyName: r.profile_vendor_name ?? (r.vendor_name || null),
+          contactName: null,
+          email,
+          contactEmail: email,
+          phone,
+          website,
+          telegram_chat_id: telegram,
+          telegram_username: telegramUsername,
+          whatsapp,
+          address: flat,
+          addressText: flat,
+          street: parts.line1 || null,
+          address1: parts.line1 || flat,
+          address2: null,
+          city: parts.city,
+          state: parts.state,
+          postalCode: parts.postalCode,
+          country: parts.country,
+          notes: null,
+        },
 
-  contact: {
-    email,
-    phone,
-    telegram,
-    whatsapp,
-    street: parts.line1 || null,
-    address: flat,
-    addressText: flat,
-  },
+        contact: {
+          email,
+          phone,
+          telegram,
+          whatsapp,
+          street: parts.line1 || null,
+          address: flat,
+          addressText: flat,
+        },
 
-  archived: !!r.archived,
-};
+        archived: !!r.archived,
+      };
     });
 
+    // Return array (frontend handles both array or { items })
     res.json(out);
   } catch (e) {
     console.error('GET /admin/vendors error', e);
