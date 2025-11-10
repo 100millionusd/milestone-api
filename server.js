@@ -3277,65 +3277,44 @@ app.get("/proposals", async (req, res) => {
 });
 
 // ==============================
-// Admin — Entities (REPLACE ENTIRE SECTION)
-// Operates over proposals by org/email/wallet; server-truth only
+// Admin — “Entities” (operate over proposals by org/email/wallet)
 // ==============================
 
-// ---- helpers (keep above the /admin/entities/* routes) ----
-function normStr(s) {
-  return (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
-}
-
+// Helpers
 function normalizeEntitySelector(body) {
-  // Accept multiple alias keys so old/new clients both work
-  const entity =
-    normStr(body?.entity) ||
-    normStr(body?.entityName) ||
-    normStr(body?.orgName) ||
-    normStr(body?.organization) ||
-    normStr(body?.name);
-
-  const contactEmail =
-    normStr(body?.contactEmail) ||
-    normStr(body?.ownerEmail) ||
-    normStr(body?.email);
-
-  let wallet =
-    normStr(body?.wallet) ||
-    normStr(body?.ownerWallet) ||
-    null;
-  if (wallet) wallet = wallet.toLowerCase();
-
-  return { entity, contactEmail, wallet };
+  const take = (v) => (v ? String(v).trim().toLowerCase() : '');
+  const entity       = take(body?.entity || body?.orgName || body?.name);
+  const contactEmail = take(body?.contactEmail || body?.ownerEmail || body?.email || body?.contact);
+  const wallet       = take(body?.wallet || body?.ownerWallet || body?.address);
+  return {
+    entity: entity || null,
+    contactEmail: contactEmail || null,
+    wallet: wallet || null,
+  };
 }
 
-async function buildEntityWhereAsync(client, sel) {
-  // Priority: wallet > email > entity(org_name)
+async function buildEntityWhereAsync(pool, sel) {
+  const parts = [];
   const params = [];
+  const norm = (s) => (s ? String(s).trim().toLowerCase() : null);
+
+  const w = norm(sel.wallet);
+  const e = norm(sel.contactEmail);
+  const o = norm(sel.entity);
+
+  if (w) { params.push(w); parts.push(`LOWER(owner_wallet) = $${params.length}`); }
+  if (e) { params.push(e); parts.push(`LOWER(owner_email)  = $${params.length}`); }
+  if (o) { params.push(o); parts.push(`LOWER(org_name)     = $${params.length}`); }
+
+  const whereSql = parts.join(' OR ');
   const cols = { statusCol: 'status', updatedCol: 'updated_at' };
-  let whereSql = '';
-
-  if (sel.wallet) {
-    params.push(sel.wallet);
-    whereSql = `LOWER(owner_wallet) = LOWER($${params.length})`;
-  } else if (sel.contactEmail) {
-    params.push(sel.contactEmail);
-    whereSql = `LOWER(owner_email) = LOWER($${params.length})`;
-  } else if (sel.entity) {
-    params.push(sel.entity);
-    whereSql = `LOWER(org_name) = LOWER($${params.length})`;
-  }
-
   return { whereSql, params, cols };
 }
 
-// ==============================
-// Actions
-// ==============================
-
+// Archive an entity (soft) — sets proposals.status='archived'
 app.post('/admin/entities/archive', adminGuard, async (req, res) => {
   try {
-    const sel = normalizeEntitySelector(req.body);
+    const sel = normalizeEntitySelector(req.body || {});
     const { whereSql, params, cols } = await buildEntityWhereAsync(pool, sel);
     if (!whereSql) return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
 
@@ -3358,14 +3337,15 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
   }
 });
 
+// Unarchive an entity — sets proposals.status back to provided toStatus
 app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
   try {
-    const sel = normalizeEntitySelector(req.body);
+    const sel = normalizeEntitySelector(req.body || {});
     const { whereSql, params, cols } = await buildEntityWhereAsync(pool, sel);
     if (!whereSql) return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
 
     const toStatus = String(req.body?.toStatus || 'pending').toLowerCase();
-    if (!['pending','approved','rejected','funded','completed','submitted'].includes(toStatus)) {
+    if (!['pending','approved','rejected'].includes(toStatus)) {
       return res.status(400).json({ error: 'Invalid toStatus' });
     }
 
@@ -3389,9 +3369,10 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
   }
 });
 
+// Delete an entity — soft (archive) or hard (DELETE)
 app.delete('/admin/entities', adminGuard, async (req, res) => {
   try {
-    const sel = normalizeEntitySelector(req.body);
+    const sel = normalizeEntitySelector(req.body || {});
     const { whereSql, params, cols } = await buildEntityWhereAsync(pool, sel);
     if (!whereSql) return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
 
@@ -3421,11 +3402,7 @@ app.delete('/admin/entities', adminGuard, async (req, res) => {
   }
 });
 
-// ==============================
-// List
-// ==============================
-
-/** ADMIN: list entities (proposers) with deep-linkable contact fields */
+// List entities (proposers) with contact fields
 app.get('/admin/entities', adminGuard, async (req, res) => {
   try {
     const includeArchived = ['true','1','yes'].includes(
@@ -3441,20 +3418,14 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           MAX(p.created_at) AS last_proposal_at,
           COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
                             THEN p.amount_usd ELSE 0 END),0)::numeric AS total_awarded_usd,
-
-          -- contact (latest non-null via MAX)
           COALESCE(MAX(p.owner_email), '') AS email,
           COALESCE(MAX(p.owner_phone), '') AS phone,
           COALESCE(MAX(p.owner_telegram_chat_id), '') AS telegram_chat_id,
           COALESCE(MAX(p.owner_telegram_username), '') AS telegram_username,
-
-          -- address-ish (latest non-null)
           COALESCE(MAX(p.address), '') AS address_raw,
           COALESCE(MAX(p.city), '') AS city,
           COALESCE(MAX(p.country), '') AS country,
-
-          -- archived based on proposals.status
-          COALESCE(bool_or(p.status = 'archived'), false) AS archived
+          COALESCE(MAX(p.archived), false) AS archived
         FROM proposals p
         GROUP BY LOWER(p.owner_wallet)
       )
@@ -3465,35 +3436,28 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
     `;
 
     const { rows } = await pool.query(sql);
-    const items = rows.map((r) => {
-      const email            = normStr(r.email);
-      const phone            = normStr(r.phone);
-      const telegramChatId   = normStr(r.telegram_chat_id);
-      const telegramUsername = normStr(r.telegram_username);
+    const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
-      const line1   = normStr(r.address_raw);
-      const city    = normStr(r.city);
-      const country = normStr(r.country);
+    const items = rows.map((r) => {
+      const email            = norm(r.email);
+      const phone            = norm(r.phone);
+      const telegramChatId   = norm(r.telegram_chat_id);
+      const telegramUsername = norm(r.telegram_username);
+
+      const line1   = norm(r.address_raw);
+      const city    = norm(r.city);
+      const country = norm(r.country);
       const flat    = [line1, city, country].filter(Boolean).join(', ') || null;
 
       return {
-        // core + aliases (so any UI key works)
         entityName: r.entity_name || '',
-        entity: r.entity_name || '',
-        orgName: r.entity_name || '',
-        organization: r.entity_name || '',
-
         walletAddress: r.owner_wallet || '',
-        ownerWallet: r.owner_wallet || '',
-
         proposalsCount: Number(r.proposals_count) || 0,
         lastProposalAt: r.last_proposal_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // contact + aliases
+        // contact
         email,
-        contactEmail: email,
-        ownerEmail: email,
         phone,
         whatsapp: phone,
         telegramChatId,
@@ -3514,6 +3478,11 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
     res.status(500).json({ error: 'Failed to list entities' });
   }
 });
+
+// ==============================
+// End Entities
+// ==============================
+
 
 // List proposals owned by the current user
 app.get("/proposals/mine", authRequired, async (req, res) => {
