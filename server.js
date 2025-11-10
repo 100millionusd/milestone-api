@@ -3464,6 +3464,89 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
   }
 });
 
+/** ADMIN: list entities (proposers) with deep-linkable contact fields */
+app.get('/admin/entities', adminGuard, async (req, res) => {
+  try {
+    const includeArchived = ['true','1','yes'].includes(
+      String(req.query.includeArchived || '').toLowerCase()
+    );
+
+    const sql = `
+      WITH agg AS (
+        SELECT
+          LOWER(p.owner_wallet)                                   AS owner_wallet,
+          COALESCE(MAX(p.org_name), '')                           AS entity_name,
+          COUNT(*)::int                                           AS proposals_count,
+          MAX(p.created_at)                                       AS last_proposal_at,
+          COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
+                            THEN p.amount_usd ELSE 0 END),0)::numeric  AS total_awarded_usd,
+
+          -- contact (latest non-null via MAX)
+          COALESCE(MAX(p.owner_email), '')                        AS email,
+          COALESCE(MAX(p.owner_phone), '')                        AS phone,
+          COALESCE(MAX(p.owner_telegram_chat_id), '')             AS telegram_chat_id,
+          COALESCE(MAX(p.owner_telegram_username), '')            AS telegram_username,
+
+          -- address-ish (latest non-null)
+          COALESCE(MAX(p.address), '')                            AS address_raw,
+          COALESCE(MAX(p.city), '')                               AS city,
+          COALESCE(MAX(p.country), '')                            AS country,
+
+          COALESCE(MAX(p.archived), false)                        AS archived
+        FROM proposals p
+        GROUP BY LOWER(p.owner_wallet)
+      )
+      SELECT *
+      FROM agg
+      ${includeArchived ? '' : 'WHERE COALESCE(archived, false) = false'}
+      ORDER BY last_proposal_at DESC NULLS LAST, entity_name ASC
+    `;
+
+    const { rows } = await pool.query(sql);
+    const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
+
+    const items = rows.map((r) => {
+      const email            = norm(r.email);
+      const phone            = norm(r.phone);
+      const telegramChatId   = norm(r.telegram_chat_id);
+      const telegramUsername = norm(r.telegram_username);
+
+      const line1   = norm(r.address_raw);
+      const city    = norm(r.city);
+      const country = norm(r.country);
+      const flat    = [line1, city, country].filter(Boolean).join(', ') || null;
+
+      return {
+        // core
+        entityName: r.entity_name || '',
+        walletAddress: r.owner_wallet || '',
+        proposalsCount: Number(r.proposals_count) || 0,
+        lastProposalAt: r.last_proposal_at,
+        totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+
+        // contact (frontend will turn into deep links)
+        email,
+        phone,                 // use as WhatsApp too
+        whatsapp: phone,       // same number reused
+        telegramChatId,
+        telegramUsername,
+
+        // address
+        address: flat,
+        addressText: flat,
+        address1: line1,
+
+        archived: !!r.archived,
+      };
+    });
+
+    res.json({ items, page: 1, pageSize: items.length, total: items.length });
+  } catch (e) {
+    console.error('GET /admin/entities error', e);
+    res.status(500).json({ error: 'Failed to list entities' });
+  }
+});
+
 // ==============================
 // Routes — Bids
 // ==============================
