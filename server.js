@@ -862,25 +862,45 @@ function toE164(raw) {
   return `${WA_DEFAULT_COUNTRY}${s}`;
 }
 
-// --- Entity selector helpers (accept both new & legacy keys)
-function normalizeEntitySelector(body) {
-  const entity = (body?.entity ?? body?.orgName ?? '').trim();
-  const contactEmail = (body?.contactEmail ?? body?.ownerEmail ?? body?.contact ?? '').trim();
-  const wallet = (body?.wallet ?? body?.ownerWallet ?? '').trim();
-  return {
-    entity: entity || null,
-    contactEmail: contactEmail || null,
-    wallet: wallet || null,
-  };
+// --- Entity selector helpers (accept camelCase + snake_case)
+function normalizeEntitySelector(body = {}) {
+  const entityRaw =
+    body.entity ?? body.orgName ?? body.org_name ?? null;
+
+  const contactEmailRaw =
+    body.contactEmail ?? body.ownerEmail ?? body.owner_email ?? body.contact ?? null;
+
+  const walletRaw =
+    body.wallet ?? body.ownerWallet ?? body.owner_wallet ?? null;
+
+  const entity = entityRaw ? String(entityRaw).trim() : null;
+  const contactEmail = contactEmailRaw ? String(contactEmailRaw).trim() : null;
+  const wallet = walletRaw ? String(walletRaw).trim() : null;
+
+  return { entity, contactEmail, wallet };
 }
 
 function buildEntityWhere(sel) {
   const clauses = [];
   const params = [];
-  if (sel.wallet)       { params.push(sel.wallet);       clauses.push(`LOWER(owner_wallet) = LOWER($${params.length})`); }
-  if (sel.contactEmail) { params.push(sel.contactEmail); clauses.push(`LOWER(contact)      = LOWER($${params.length})`); }
-  if (sel.entity)       { params.push(sel.entity);       clauses.push(`LOWER(org_name)     = LOWER($${params.length})`); }
-  return { whereSql: clauses.length ? `(${clauses.join(' OR ')})` : '', params };
+  let i = 1;
+
+  if (sel.entity) {
+    clauses.push(`LOWER(TRIM(org_name)) = LOWER(TRIM($${i++}))`);
+    params.push(String(sel.entity));
+  }
+  if (sel.contactEmail) {
+    clauses.push(`LOWER(TRIM(contact)) = LOWER(TRIM($${i++}))`);
+    params.push(String(sel.contactEmail));
+  }
+  if (sel.wallet) {
+    // wallet addresses are case-sensitive in DB? If not, normalize to lowercase on both sides:
+    clauses.push(`LOWER(TRIM(owner_wallet)) = LOWER(TRIM($${i++}))`);
+    params.push(String(sel.wallet));
+  }
+
+  const whereSql = clauses.length ? `(${clauses.join(' OR ')})` : '';
+  return { whereSql, params };
 }
 
 // Determine role from address: admin > vendor (has vendor_profile) > entity (has proposals) > user
