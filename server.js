@@ -848,6 +848,12 @@ const NOTIFY_ENABLED = String(process.env.NOTIFY_ENABLED || "true").toLowerCase(
 const NOTIFY_CONF_THRESHOLD = Number(process.env.NOTIFY_CONF_THRESHOLD || 0.35);
 const WA_DEFAULT_COUNTRY = process.env.WA_DEFAULT_COUNTRY || "+1";
 
+// ---- Safe stub so accidental calls don't crash if the real function isn't defined
+const notifyVendorSignupVendor =
+  (typeof globalThis.notifyVendorSignupVendor === 'function')
+    ? globalThis.notifyVendorSignupVendor
+    : async function noopNotifyVendorSignupVendor() { /* no-op */ };
+
 // Small helpers
 function toE164(raw) {
   if (!raw) return null;
@@ -2911,7 +2917,20 @@ app.post("/auth/verify", async (req, res) => {
     return res.status(401).json({ error: "signature does not match address" });
   }
 
-  const role = isAdminAddress(address) ? "admin" : "vendor";
+  const isAdmin = isAdminAddress(address);
+let role = isAdmin ? "admin" : "user";
+if (!isAdmin) {
+  try {
+    const { rows: vp } = await pool.query(
+      `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+      [address]
+    );
+    if (vp && vp[0]) role = "vendor";
+  } catch {
+    // leave as "user" on error
+  }
+}
+
   const token = signJwt({ sub: address, role });
 
   res.cookie("auth_token", token, {
@@ -2984,7 +3003,20 @@ app.post("/auth/login", async (req, res) => {
 
   if (norm(recovered) !== address) return res.status(401).json({ error: "signature does not match address" });
 
-  const role = isAdminAddress(address) ? "admin" : "vendor";
+  const isAdmin = isAdminAddress(address);
+let role = isAdmin ? "admin" : "user";
+if (!isAdmin) {
+  try {
+    const { rows: vp } = await pool.query(
+      `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+      [address]
+    );
+    if (vp && vp[0]) role = "vendor";
+  } catch {
+    // leave as "user" on error
+  }
+}
+
   const token = signJwt({ sub: address, role });
 
   res.cookie("auth_token", token, {
@@ -3165,12 +3197,16 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
     const key = deriveEntityKey(req.body);
     if (!key) return res.status(400).json({ error: 'Provide orgName OR contactEmail OR ownerWallet (or id)' });
 
-    const { rowCount } = await pool.query(`
-      UPDATE proposals
-         SET status = 'archived', updated_at = NOW()
-       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
-         AND status <> 'archived'
-    `, [key]);
+const { rowCount } = await pool.query(`
+  UPDATE proposals
+     SET status = 'archived', updated_at = NOW()
+   WHERE (
+          LOWER(owner_wallet) = LOWER($1)
+       OR LOWER(contact)      = LOWER($1)
+       OR LOWER(org_name)     = LOWER($1)
+   )
+     AND status <> 'archived'
+`, [key]);
 
     return res.json({ ok: true, affected: rowCount });
   } catch (e) {
@@ -3190,12 +3226,16 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
       return res.status(400).json({ error: 'Invalid toStatus' });
     }
 
-    const { rowCount } = await pool.query(`
-      UPDATE proposals
-         SET status = $2, updated_at = NOW()
-       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
-         AND status = 'archived'
-    `, [key, toStatus]);
+ const { rowCount } = await pool.query(`
+  UPDATE proposals
+     SET status = $2, updated_at = NOW()
+   WHERE (
+          LOWER(owner_wallet) = LOWER($1)
+       OR LOWER(contact)      = LOWER($1)
+       OR LOWER(org_name)     = LOWER($1)
+   )
+     AND status = 'archived'
+`, [key, toStatus]);
 
     return res.json({ ok: true, affected: rowCount, toStatus });
   } catch (e) {
@@ -3212,19 +3252,27 @@ app.delete('/admin/entities', adminGuard, async (req, res) => {
 
     const mode = String(req.query.mode || 'soft').toLowerCase(); // soft | hard
     if (mode === 'hard') {
-      const { rowCount } = await pool.query(`
-        DELETE FROM proposals
-         WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
-      `, [key]);
+ const { rowCount } = await pool.query(`
+  DELETE FROM proposals
+   WHERE (
+          LOWER(owner_wallet) = LOWER($1)
+       OR LOWER(contact)      = LOWER($1)
+       OR LOWER(org_name)     = LOWER($1)
+   )
+`, [key]);
       return res.json({ success: true, deleted: rowCount, mode: 'hard' });
     }
 
-    const { rowCount } = await pool.query(`
-      UPDATE proposals
-         SET status = 'archived', updated_at = NOW()
-       WHERE COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) = $1
-         AND status <> 'archived'
-    `, [key]);
+ const { rowCount } = await pool.query(`
+  UPDATE proposals
+     SET status = 'archived', updated_at = NOW()
+   WHERE (
+          LOWER(owner_wallet) = LOWER($1)
+       OR LOWER(contact)      = LOWER($1)
+       OR LOWER(org_name)     = LOWER($1)
+   )
+     AND status <> 'archived'
+`, [key]);
 
     return res.json({ success: true, archived: rowCount, mode: 'soft' });
   } catch (e) {
