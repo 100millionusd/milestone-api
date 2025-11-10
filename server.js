@@ -3249,17 +3249,6 @@ app.get("/health", async (_req, res) => {
 });
 app.get("/test", (_req, res) => res.json({ ok: true }));
 
-// --- Helper for /admin/entities routes (match org/email/wallet) ---
-function deriveEntityKey(body) {
-  const take = (v) => (v ? String(v).trim().toLowerCase() : '');
-  const id     = take(body?.id || body?.entityKey);
-  if (id) return id;
-  const wallet = take(body?.wallet || body?.ownerWallet);
-  const email  = take(body?.contactEmail || body?.ownerEmail || body?.contact);
-  const org    = take(body?.entity || body?.orgName);
-  return wallet || email || org || null;
-}
-
 // ==============================
 // Routes — Proposals
 // ==============================
@@ -3286,8 +3275,6 @@ app.get("/proposals", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-
 
 // ==============================
 // Admin — Entities (REPLACE ENTIRE SECTION)
