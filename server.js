@@ -2761,25 +2761,22 @@ app.use(cookieParser()); // 🔐 parse JWT cookie
 // Ensure JSON parsing is registered before admin routes
 app.use(express.json({ limit: '2mb' }));
 
-// --- Accept both camelCase + snake_case from clients
+// --- Accept both camelCase + snake_case + id/entityKey from clients
 function normalizeEntitySelector(body = {}) {
-  const entityRaw =
-    body.entity ?? body.orgName ?? body.org_name ?? null;
+  const norm = (v) => (v == null ? null : String(v).trim());
 
-  const contactEmailRaw =
-    body.contactEmail ?? body.ownerEmail ?? body.owner_email ?? body.contact ?? body.contact_email ?? null;
+  return {
+    // explicit triple
+    entity:       norm(body.entity ?? body.orgName ?? body.org_name),
+    contactEmail: norm(body.contactEmail ?? body.ownerEmail ?? body.owner_email ?? body.contact ?? body.contact_email),
+    wallet:       norm(body.wallet ?? body.ownerWallet ?? body.owner_wallet ?? body.wallet_address),
 
-  const walletRaw =
-    body.wallet ?? body.ownerWallet ?? body.owner_wallet ?? body.wallet_address ?? null;
-
-  const entity       = entityRaw ? String(entityRaw).trim() : null;
-  const contactEmail = contactEmailRaw ? String(contactEmailRaw).trim() : null;
-  const wallet       = walletRaw ? String(walletRaw).trim() : null;
-
-  return { entity, contactEmail, wallet };
+    // fallback key used by /admin/proposers -> AdminEntitiesTable
+    entityKey:    norm(body.id ?? body.entityKey ?? body.entity_key),
+  };
 }
 
-// --- Detect real column names from the DB and cache
+// --- Detect real column names from the DB and cache (now returns arrays)
 let _proposalColsCache = null;
 async function detectProposalCols(pool) {
   if (_proposalColsCache) return _proposalColsCache;
@@ -2789,42 +2786,52 @@ async function detectProposalCols(pool) {
     FROM information_schema.columns
     WHERE table_name = 'proposals' AND table_schema = current_schema()
   `);
+
   const have = new Set(rows.map(r => r.name));
+  const first   = (cands) => cands.find(c => have.has(c)) || null;
+  const present = (cands) => cands.filter(c => have.has(c));
 
-  const first = (cands) => cands.find(c => have.has(c)) || null;
-
-  const orgCol     = first(['org_name','org','organization','entity','orgname']);
-  const emailCol   = first(['contact','contact_email','owner_email','email','primary_email']);
-  const walletCol  = first(['owner_wallet','wallet','wallet_address','owner_wallet_address']);
+  const orgCols    = present(['org_name','org','organization','entity','orgname']);
+  const emailCols  = present(['contact','contact_email','owner_email','email','primary_email']);
+  const walletCols = present(['owner_wallet','wallet','wallet_address','owner_wallet_address']);
   const statusCol  = first(['status','proposal_status']);
   const updatedCol = first(['updated_at','updatedat','modified_at','modifiedat']);
 
-  _proposalColsCache = { orgCol, emailCol, walletCol, statusCol, updatedCol };
+  _proposalColsCache = { orgCols, emailCols, walletCols, statusCol, updatedCol };
   return _proposalColsCache;
 }
 
-// --- Build WHERE using actually-present columns (case/whitespace safe)
+// --- Build WHERE using all present cols; also handle entityKey fallback
 async function buildEntityWhereAsync(pool, sel) {
   const cols = await detectProposalCols(pool);
   const clauses = [];
   const params = [];
-  let i = 1;
 
-  if (sel.entity && cols.orgCol) {
-    clauses.push(`LOWER(TRIM(${cols.orgCol})) = LOWER(TRIM($${i++}))`);
-    params.push(sel.entity);
-  }
-  if (sel.contactEmail && cols.emailCol) {
-    clauses.push(`LOWER(TRIM(${cols.emailCol})) = LOWER(TRIM($${i++}))`);
-    params.push(sel.contactEmail);
-  }
-  if (sel.wallet && cols.walletCol) {
-    // wallets often stored as lowercase; compare lower to be safe
-    clauses.push(`LOWER(TRIM(${cols.walletCol})) = LOWER(TRIM($${i++}))`);
-    params.push(sel.wallet);
+  const eqGroup = (colsArr, idx) =>
+    colsArr.map(c => `LOWER(TRIM(${c})) = LOWER(TRIM($${idx}))`).join(' OR ');
+
+  const addEq = (value, colsArr) => {
+    if (value && colsArr.length) {
+      params.push(value);
+      clauses.push(`(${eqGroup(colsArr, params.length)})`);
+    }
+  };
+
+  // 1) explicit fields (any that are present)
+  addEq(sel.wallet,       cols.walletCols);
+  addEq(sel.contactEmail, cols.emailCols);
+  addEq(sel.entity,       cols.orgCols);
+
+  // 2) fallback: id/entityKey from /admin/proposers (match across any col)
+  if (!clauses.length && sel.entityKey) {
+    const all = [...cols.walletCols, ...cols.emailCols, ...cols.orgCols];
+    if (all.length) {
+      params.push(sel.entityKey);
+      clauses.push(`(${eqGroup(all, params.length)})`);
+    }
   }
 
-  const whereSql = clauses.length ? `(${clauses.join(' OR ')})` : '';
+  const whereSql = clauses.length ? clauses.join(' OR ') : '';
   return { whereSql, params, cols };
 }
 
