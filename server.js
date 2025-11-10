@@ -3292,6 +3292,71 @@ app.get("/proposals", async (req, res) => {
 // ==============================
 // Admin — “Entities” (operate over proposals by org/email/wallet)
 // ==============================
+// ---- Helpers for /admin/entities/* (place above the routes) -----------------
+function __normStr(x) {
+  return (typeof x === 'string' && x.trim() !== '') ? x.trim() : null;
+}
+
+function normalizeEntitySelector(input) {
+  const v = __normStr;
+  const entity =
+    v(input?.entity) ||
+    v(input?.entityName) ||
+    v(input?.org) ||
+    v(input?.orgName) ||
+    null;
+
+  const contactEmail = (v(input?.contactEmail) || v(input?.ownerEmail) || v(input?.email) || null);
+  const wallet = (v(input?.wallet) || v(input?.ownerWallet) || null);
+
+  return {
+    entity,
+    contactEmail: contactEmail ? contactEmail.toLowerCase() : null,
+    wallet: wallet ? wallet.toLowerCase() : null,
+  };
+}
+
+async function __detectProposalCols(pool) {
+  const sql = `
+    SELECT LOWER(column_name) AS c
+    FROM information_schema.columns
+    WHERE LOWER(table_name) = 'proposals'
+  `;
+  const cols = { statusCol: null, updatedCol: null };
+  try {
+    const { rows } = await pool.query(sql);
+    const set = new Set(rows.map(r => r.c));
+    cols.statusCol  = set.has('status')      ? 'status'      : null;
+    cols.updatedCol = set.has('updated_at')  ? 'updated_at'
+                     : set.has('updatedat')  ? 'updatedat'
+                     : null;
+  } catch (_) { /* ignore */ }
+  return cols;
+}
+
+async function buildEntityWhereAsync(pool, sel) {
+  const cols = await __detectProposalCols(pool);
+  const params = [];
+  const parts = [];
+
+  if (sel?.wallet) {
+    params.push(sel.wallet);
+    parts.push(`LOWER(owner_wallet) = LOWER($${params.length})`);
+  } else if (sel?.contactEmail) {
+    params.push(sel.contactEmail);
+    parts.push(`LOWER(owner_email) = LOWER($${params.length})`);
+  } else if (sel?.entity) {
+    params.push(sel.entity.toLowerCase());
+    parts.push(`LOWER(org_name) = LOWER($${params.length})`);
+  }
+
+  return {
+    whereSql: parts.join(' AND '),
+    params,
+    cols,
+  };
+}
+// ----------------------------------------------------------------------------- 
 
 app.post('/admin/entities/archive', adminGuard, async (req, res) => {
   try {
@@ -3648,33 +3713,38 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
     );
 
     const sql = `
-      WITH agg AS (
+      WITH g AS (
         SELECT
-          LOWER(p.owner_wallet)                                   AS owner_wallet,
-          COALESCE(MAX(p.org_name), '')                           AS entity_name,
-          COUNT(*)::int                                           AS proposals_count,
-          MAX(p.created_at)                                       AS last_proposal_at,
+          LOWER(COALESCE(p.owner_wallet,''))                         AS owner_wallet,
+          COALESCE(MAX(p.org_name), '')                              AS entity_name,
+          COUNT(*)::int                                              AS proposals_count,
+          MAX(p.created_at)                                          AS last_proposal_at,
           COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
-                            THEN p.amount_usd ELSE 0 END),0)::numeric  AS total_awarded_usd,
+                            THEN p.amount_usd ELSE 0 END),0)::numeric AS total_awarded_usd,
 
-          -- contact (latest non-null via MAX)
-          COALESCE(MAX(p.owner_email), '')                        AS email,
-          COALESCE(MAX(p.owner_phone), '')                        AS phone,
-          COALESCE(MAX(p.owner_telegram_chat_id), '')             AS telegram_chat_id,
-          COALESCE(MAX(p.owner_telegram_username), '')            AS telegram_username,
+          -- contact (pick latest non-null via MAX over text)
+          COALESCE(MAX(p.owner_email), '')                           AS email,
+          COALESCE(MAX(p.owner_phone), '')                           AS phone,
+          COALESCE(MAX(p.owner_telegram_chat_id), '')                AS telegram_chat_id,
+          COALESCE(MAX(p.owner_telegram_username), '')               AS telegram_username,
 
-          -- address-ish (latest non-null)
-          COALESCE(MAX(p.address), '')                            AS address_raw,
-          COALESCE(MAX(p.city), '')                               AS city,
-          COALESCE(MAX(p.country), '')                            AS country,
+          -- address-ish (pick latest non-null)
+          COALESCE(MAX(p.address), '')                               AS address_raw,
+          COALESCE(MAX(p.city), '')                                  AS city,
+          COALESCE(MAX(p.country), '')                               AS country,
 
-          COALESCE(MAX(p.archived), false)                        AS archived
+          -- status-based archive view
+          COUNT(*) FILTER (WHERE p.status = 'archived')::int         AS archived_count,
+          COUNT(*) FILTER (WHERE p.status <> 'archived')::int        AS active_count,
+          CASE WHEN COUNT(*) > 0
+                 AND COUNT(*) FILTER (WHERE p.status <> 'archived') = 0
+               THEN true ELSE false END                              AS archived
         FROM proposals p
-        GROUP BY LOWER(p.owner_wallet)
+        GROUP BY LOWER(COALESCE(p.owner_wallet,''))
       )
       SELECT *
-      FROM agg
-      ${includeArchived ? '' : 'WHERE COALESCE(archived, false) = false'}
+      FROM g
+      ${includeArchived ? '' : 'WHERE archived = false'}
       ORDER BY last_proposal_at DESC NULLS LAST, entity_name ASC
     `;
 
@@ -3700,10 +3770,10 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
         lastProposalAt: r.last_proposal_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // contact (frontend will turn into deep links)
+        // contact (frontend builds deep links)
         email,
-        phone,                 // use as WhatsApp too
-        whatsapp: phone,       // same number reused
+        phone,
+        whatsapp: phone,
         telegramChatId,
         telegramUsername,
 
@@ -3712,7 +3782,10 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
         addressText: flat,
         address1: line1,
 
+        // server-truth
         archived: !!r.archived,
+        archivedCount: Number(r.archived_count || 0),
+        activeCount: Number(r.active_count || 0),
       };
     });
 
