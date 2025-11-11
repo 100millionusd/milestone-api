@@ -9387,106 +9387,109 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
 
     const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
-    const out = rows.map((r) => {
-      // address_raw can be JSON or plain text — normalize to parts
-      let addrObj = null;
-      if (r.address_raw && typeof r.address_raw === 'string' && r.address_raw.trim().startsWith('{')) {
-        try { addrObj = JSON.parse(r.address_raw); } catch { addrObj = null; }
+ const out = rows.map((r) => {
+  // address_raw can be JSON or plain text — normalize to parts
+  let addrObj = null;
+  if (r.address_raw && typeof r.address_raw === 'string' && r.address_raw.trim().startsWith('{')) {
+    try { addrObj = JSON.parse(r.address_raw); } catch { addrObj = null; }
+  }
+
+  const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
+
+  const parts = addrObj && typeof addrObj === 'object'
+    ? {
+        line1: norm(addrObj.line1),
+        city: norm(addrObj.city),
+        state: norm(addrObj.state),
+        postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code),
+        country: norm(addrObj.country),
       }
-
-      const parts = addrObj && typeof addrObj === 'object'
-        ? {
-            line1: norm(addrObj.line1),
-            city: norm(addrObj.city),
-            state: norm(addrObj.state),
-            postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code),
-            country: norm(addrObj.country),
-          }
-        : {
-            line1: norm(r.address_raw),
-            city: null,
-            state: null,
-            postalCode: null,
-            country: null,
-          };
-
-      const flat = [parts.line1, parts.city, parts.postalCode, parts.country]
-        .filter(Boolean).join(', ') || null;
-
-      const email    = norm(r.email);
-      const phone    = norm(r.phone);
-      const website  = norm(r.website);
-      const telegram = norm(r.telegram_chat_id);
-      const telegramUsername = norm(r.telegram_username);
-      const whatsapp = norm(r.whatsapp);
-
-      return {
-        // core
-        vendorName: r.profile_vendor_name || r.vendor_name || '',
-        walletAddress: r.wallet_address || '',
-        bidsCount: Number(r.bids_count) || 0,
-        lastBidAt: r.last_bid_at,
-        totalAwardedUSD: Number(r.total_awarded_usd) || 0,
-
-        // ✅ server-truth flags used by the UI across devices
-        status: r.status || 'pending',
-        kycStatus: r.kyc_status || 'none',
-
-        // contact
-        email,
-        contactEmail: email,
-        phone,
-        website,
-        telegramChatId: telegram,
-        telegramUsername,
-        whatsapp,
-
-        // address (full + parts + explicit street)
-        address: flat,
-        street: parts.line1 || null,
-        address1: parts.line1 || flat,
-        addressLine1: parts.line1 || flat,
-        city: parts.city,
-        state: parts.state,
-        postalCode: parts.postalCode,
-        country: parts.country,
-
-        // nested copies (optional)
-        profile: {
-          companyName: r.profile_vendor_name ?? (r.vendor_name || null),
-          contactName: null,
-          email,
-          contactEmail: email,
-          phone,
-          website,
-          telegram_chat_id: telegram,
-          telegram_username: telegramUsername,
-          whatsapp,
-          address: flat,
-          addressText: flat,
-          street: parts.line1 || null,
-          address1: parts.line1 || flat,
-          address2: null,
-          city: parts.city,
-          state: parts.state,
-          postalCode: parts.postalCode,
-          country: parts.country,
-          notes: null,
-        },
-
-        contact: {
-          email,
-          phone,
-          telegram,
-          whatsapp,
-          street: parts.line1 || null,
-          address: flat,
-          addressText: flat,
-        },
-
-        archived: !!r.archived,
+    : {
+        line1: norm(r.address_raw),
+        city: null,
+        state: null,
+        postalCode: null,
+        country: null,
       };
-    });
+
+  const flat = [parts.line1, parts.city, parts.postalCode, parts.country].filter(Boolean).join(', ') || null;
+
+  const email    = norm(r.email);
+  const phone    = norm(r.phone);
+  const website  = norm(r.website);
+  const telegram = norm(r.telegram_chat_id);
+  const telegramUsername = norm(r.telegram_username);
+  const whatsapp = norm(r.whatsapp);
+
+  const addressObj = {
+    line1: parts.line1 || null,
+    city: parts.city || null,
+    state: parts.state || null,
+    postalCode: parts.postalCode || null,
+    country: parts.country || null,
+    addressText: flat,
+  };
+
+  const telegramConnected = !!(r.telegram_chat_id || r.telegram_username);
+
+  return {
+    // core
+    vendorName: r.profile_vendor_name || r.vendor_name || '',
+    walletAddress: r.wallet_address || '',
+    bidsCount: Number(r.bids_count) || 0,
+    lastBidAt: r.last_bid_at,
+    totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+
+    // server-truth flags
+    status: r.status || 'pending',
+    kycStatus: r.kyc_status || 'none',
+
+    // contact
+    email,
+    contactEmail: email,
+    phone,
+    website,
+    telegramChatId: telegram,
+    telegramUsername,
+    telegramConnected,
+    whatsapp,
+
+    // ✅ address as OBJECT (what UI expects)
+    address: addressObj,
+
+    // ✅ legacy top-level fields kept for compatibility
+    street: addressObj.line1,
+    address1: addressObj.line1 ?? flat,
+    addressLine1: addressObj.line1 ?? flat,
+    city: addressObj.city,
+    state: addressObj.state,
+    postalCode: addressObj.postalCode,
+    country: addressObj.country,
+
+    // ✅ nested copies (use vendorName and address object)
+    profile: {
+      vendorName: r.profile_vendor_name ?? (r.vendor_name || null),
+      email,
+      contactEmail: email,
+      phone,
+      website,
+      telegram_chat_id: telegram,
+      telegram_username: telegramUsername,
+      whatsapp,
+      address: addressObj,
+    },
+
+    contact: {
+      email,
+      phone,
+      telegram,
+      whatsapp,
+      address: addressObj,
+    },
+
+    archived: !!r.archived,
+  };
+});
 
     // Return array (frontend handles both array or { items })
     res.json(out);
