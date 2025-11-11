@@ -212,13 +212,11 @@ function _addrText(a, city, country) {
   return out || null;
 }
 
-// REPLACE existing function completely
 async function maybeSeedVendor(address) {
   const w = String(address || '').toLowerCase();
   if (!w) return;
 
-  // pull what the user saved on /profile
-  const { rows: upRows } = await pool.query(
+  const { rows } = await pool.query(
     `SELECT display_name, email, phone, website, address, city, country,
             telegram_chat_id, whatsapp
        FROM user_profiles
@@ -226,42 +224,36 @@ async function maybeSeedVendor(address) {
       LIMIT 1`,
     [w]
   );
-  const u = upRows[0] || {};
-  const vName = (u?.display_name || '').trim();
-  const addr  = _addrText(u?.address, u?.city, u?.country);
+  const u = rows[0] || {};
+  const vendorName = (u?.display_name || '').trim();
+  const addr = _addrText(u?.address, u?.city, u?.country);
 
-  // allow the guarded insert ONLY here
   __vendorSeedGuard++;
   try {
     await pool.query(
       `
       INSERT INTO vendor_profiles
-        (wallet_address, vendor_name, email, phone, website,
-         address, city, country, telegram_chat_id, whatsapp,
-         status, created_at, updated_at)
+        (wallet_address, vendor_name, email, phone, website, address,
+         status, telegram_chat_id, whatsapp, created_at, updated_at)
       VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending', NOW(), NOW())
+        ($1,$2,$3,$4,$5,$6,'pending',$7,$8,NOW(),NOW())
       ON CONFLICT (wallet_address) DO UPDATE SET
-        vendor_name       = COALESCE(NULLIF(EXCLUDED.vendor_name,''), vendor_profiles.vendor_name),
-        email             = COALESCE(EXCLUDED.email, vendor_profiles.email),
-        phone             = COALESCE(EXCLUDED.phone, vendor_profiles.phone),
-        website           = COALESCE(EXCLUDED.website, vendor_profiles.website),
-        address           = COALESCE(EXCLUDED.address, vendor_profiles.address),
-        city              = COALESCE(EXCLUDED.city, vendor_profiles.city),
-        country           = COALESCE(EXCLUDED.country, vendor_profiles.country),
-        telegram_chat_id  = COALESCE(EXCLUDED.telegram_chat_id, vendor_profiles.telegram_chat_id),
-        whatsapp          = COALESCE(EXCLUDED.whatsapp, vendor_profiles.whatsapp),
-        updated_at        = NOW()
+        vendor_name      = COALESCE(NULLIF(EXCLUDED.vendor_name,''), vendor_profiles.vendor_name),
+        email            = EXCLUDED.email,
+        phone            = EXCLUDED.phone,
+        website          = EXCLUDED.website,
+        address          = EXCLUDED.address,
+        telegram_chat_id = COALESCE(EXCLUDED.telegram_chat_id, vendor_profiles.telegram_chat_id),
+        whatsapp         = COALESCE(EXCLUDED.whatsapp, vendor_profiles.whatsapp),
+        updated_at       = NOW()
       `,
       [
         w,
-        vName,
+        vendorName || null,
         u?.email ?? null,
         u?.phone ?? null,
         u?.website ?? null,
         addr,
-        u?.city ?? null,
-        u?.country ?? null,
         u?.telegram_chat_id ?? null,
         u?.whatsapp ?? null,
       ]
@@ -8403,17 +8395,39 @@ const profileSchema = Joi.object({
   website: Joi.string().allow(''),
 });
 
-// --- Generic Profile (save before choosing role) ---
-app.post('/profile', authRequired, async (req, res) => {
+// helpers (add once near your other helpers if missing)
+function normWebsite(s) {
+  if (!s) return null;
+  s = String(s).trim();
+  if (!s) return null;
+  return /^https?:\/\//i.test(s) ? s : `https://${s}`;
+}
+function _addrText(a, city, country) {
+  if (!a) return null;
+  if (typeof a === 'string') {
+    const line = a.trim();
+    return [line, city || '', country || ''].filter(Boolean).join(', ') || line || null;
+  }
+  if (typeof a === 'object') {
+    const line = a.line1 || a.address1 || '';
+    const cty  = a.city || city || '';
+    const ctry = a.country || country || '';
+    return [line, cty, ctry].filter(Boolean).join(', ') || null;
+  }
+  return null;
+}
+
+// ---- Save generic profile (NO vendor insert here) ----
+app.post("/profile", authRequired, async (req, res) => {
   try {
-    const wallet = String(req.user?.sub || '').toLowerCase();
-    if (!wallet) return res.status(401).json({ error: 'unauthorized' });
+    const wallet = String(req.user?.sub || "").toLowerCase();
+    if (!wallet) return res.status(401).json({ error: "unauthorized" });
 
     const b = req.body || {};
-    // flatten/normalize address; keep simple string in DB
-    const addressStr = typeof b.address === 'object'
-      ? [b.address.line1, b.address.city, b.address.country].filter(Boolean).join(', ')
-      : (b.address || null);
+    const displayName =
+      (b.vendorName ?? b.orgName ?? b.displayName ?? b.display_name ?? "").trim();
+
+    const addrText = _addrText(b.address, b.city, b.country);
 
     await pool.query(
       `
@@ -8422,18 +8436,26 @@ app.post('/profile', authRequired, async (req, res) => {
       VALUES
         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
       ON CONFLICT (wallet_address) DO UPDATE SET
-        display_name=$2, email=$3, phone=$4, website=$5, address=$6, city=$7, country=$8,
-        telegram_chat_id=$9, whatsapp=$10, updated_at=NOW()
+        display_name      = COALESCE(NULLIF(EXCLUDED.display_name,''), user_profiles.display_name),
+        email             = EXCLUDED.email,
+        phone             = EXCLUDED.phone,
+        website           = EXCLUDED.website,
+        address           = EXCLUDED.address,
+        city              = EXCLUDED.city,
+        country           = EXCLUDED.country,
+        telegram_chat_id  = EXCLUDED.telegram_chat_id,
+        whatsapp          = EXCLUDED.whatsapp,
+        updated_at        = NOW()
       `,
       [
         wallet,
-        b.displayName ?? b.vendorName ?? null,
+        displayName || null,
         b.email ?? null,
         b.phone ?? null,
-        b.website ?? null,
-        addressStr,
-        b.city ?? b.address?.city ?? null,
-        b.country ?? b.address?.country ?? null,
+        normWebsite(b.website) ?? null,
+        addrText,
+        b.address?.city ?? b.city ?? null,
+        b.address?.country ?? b.country ?? null,
         b.telegramChatId ?? b.telegram_chat_id ?? null,
         b.whatsapp ?? null,
       ]
@@ -8441,115 +8463,65 @@ app.post('/profile', authRequired, async (req, res) => {
 
     return res.json({ ok: true });
   } catch (e) {
-    console.error('POST /profile error', e);
-    return res.status(500).json({ error: 'profile_save_failed' });
+    console.error("POST /profile error", e);
+    return res.status(500).json({ error: "profile_save_failed" });
   }
 });
 
-// REPLACE the whole route
 app.get('/vendor/profile', authRequired, async (req, res) => {
   try {
     const wallet = String(req.user?.sub || '').toLowerCase();
-    const { rows } = await pool.query(
-      `
-      SELECT
-        vp.wallet_address,
-        COALESCE(NULLIF(vp.vendor_name,''), up.display_name, '') AS vendor_name,
-        COALESCE(vp.email,   up.email)   AS email,
-        COALESCE(vp.phone,   up.phone)   AS phone,
-        COALESCE(vp.website, up.website) AS website,
-        COALESCE(vp.address, up.address) AS address,
-        COALESCE(vp.telegram_chat_id, up.telegram_chat_id) AS telegram_chat_id
-      FROM vendor_profiles vp
-      LEFT JOIN user_profiles up
-        ON lower(up.wallet_address)=lower(vp.wallet_address)
-      WHERE lower(vp.wallet_address)=lower($1)
-      LIMIT 1
-      `,
+
+    // 1) try vendor_profiles
+    const vq = await pool.query(
+      `SELECT wallet_address, vendor_name, email, phone, website, address, telegram_chat_id
+         FROM vendor_profiles
+        WHERE lower(wallet_address)=lower($1)`,
       [wallet]
     );
+    const v = vq.rows[0];
+    if (v) {
+      let parsed = null;
+      try { parsed = JSON.parse(v.address || ''); } catch {}
+      const address = parsed && typeof parsed === 'object'
+        ? _addrObj(parsed)
+        : _addrObj(v.address, null, null);
 
-    if (!rows[0]) return res.json(null);
-    const r = rows[0];
+      return res.json({
+        walletAddress: v.wallet_address,
+        vendorName: v.vendor_name || '',
+        email: v.email || '',
+        phone: v.phone || '',
+        website: v.website || '',
+        address,
+        telegram_chat_id: v.telegram_chat_id || null,
+        telegramChatId: v.telegram_chat_id || null,
+      });
+    }
 
-    // normalize address for UI
-    let aObj = null;
-    try { aObj = JSON.parse(r.address || ''); } catch {}
-    const address = aObj && typeof aObj === 'object'
-      ? {
-          line1: aObj.line1 || aObj.address1 || '',
-          city: aObj.city || '',
-          postalCode: aObj.postalCode || aObj.postal_code || '',
-          country: aObj.country || '',
-        }
-      : { line1: r.address || '', city: '', postalCode: '', country: '' };
+    // 2) fallback to user_profiles
+    const uq = await pool.query(
+      `SELECT wallet_address, display_name, email, phone, website, address, city, country, telegram_chat_id
+         FROM user_profiles
+        WHERE lower(wallet_address)=lower($1)`,
+      [wallet]
+    );
+    const u = uq.rows[0];
+    if (!u) return res.json(null);
 
-    res.json({
-      walletAddress: r.wallet_address,
-      vendorName: r.vendor_name || '',
-      email: r.email || '',
-      phone: r.phone || '',
-      website: r.website || '',
-      address,
-      telegram_chat_id: r.telegram_chat_id || null,
-      telegramChatId:  r.telegram_chat_id || null,
+    return res.json({
+      walletAddress: u.wallet_address,
+      vendorName: u.display_name || '',
+      email: u.email || '',
+      phone: u.phone || '',
+      website: u.website || '',
+      address: _addrObj(u.address, u.city, u.country),
+      telegram_chat_id: u.telegram_chat_id || null,
+      telegramChatId: u.telegram_chat_id || null,
     });
   } catch (e) {
     console.error('GET /vendor/profile error:', e);
     res.status(500).json({ error: 'Failed to load profile' });
-  }
-});
-
-// RENAME your POST /profile -> POST /vendor/profile (write to user_profiles only)
-app.post('/vendor/profile', authRequired, async (req, res) => {
-  try {
-    const wallet = String(req.user?.sub || "").toLowerCase();
-    if (!wallet) return res.status(401).json({ error: "unauthorized" });
-
-    const b = req.body || {};
-    const addressStr = (() => {
-      const a = b.address || {};
-      if (typeof a === 'string') return a;
-      const line = a.line1 || a.address1 || '';
-      const city = a.city || '';
-      const country = a.country || '';
-      return [line, city, country].filter(Boolean).join(', ') || null;
-    })();
-
-    await pool.query(
-      `INSERT INTO user_profiles
-         (wallet_address, display_name, email, phone, website, address, city, country, telegram_chat_id, whatsapp, updated_at)
-       VALUES
-         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
-       ON CONFLICT (wallet_address) DO UPDATE SET
-         display_name     = EXCLUDED.display_name,
-         email            = EXCLUDED.email,
-         phone            = EXCLUDED.phone,
-         website          = EXCLUDED.website,
-         address          = EXCLUDED.address,
-         city             = EXCLUDED.city,
-         country          = EXCLUDED.country,
-         telegram_chat_id = EXCLUDED.telegram_chat_id,
-         whatsapp         = EXCLUDED.whatsapp,
-         updated_at       = NOW()`,
-      [
-        wallet,
-        (b.vendorName || b.displayName || '').trim(),
-        (b.email || '').trim() || null,
-        (b.phone || '').trim() || null,
-        (b.website || '').trim() || null,
-        addressStr,
-        b?.address?.city || null,
-        b?.address?.country || null,
-        b.telegramChatId ?? b.telegram_chat_id ?? null,
-        b.whatsapp ?? null,
-      ]
-    );
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error('POST /vendor/profile error', e);
-    return res.status(500).json({ error: 'profile save failed' });
   }
 });
 
