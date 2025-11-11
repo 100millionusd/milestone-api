@@ -3691,16 +3691,49 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
                             THEN p.amount_usd ELSE 0 END),0)::numeric AS total_awarded_usd,
 
-          -- contact (pick latest non-null via MAX over text)
-          COALESCE(MAX(p.owner_email), '')                           AS email,
-          COALESCE(MAX(p.owner_phone), '')                           AS phone,
-          COALESCE(MAX(p.owner_telegram_chat_id), '')                AS telegram_chat_id,
-          COALESCE(MAX(p.owner_telegram_username), '')               AS telegram_username,
+           -- contact (prefer non-empty across multiple possible columns)
+          COALESCE(
+            MAX(NULLIF(p.owner_email,'')),
+            MAX(NULLIF(p.contact_email,'')),
+            MAX(NULLIF(p.email,'')),
+            MAX(NULLIF(p.primary_email,'')),
+            ''
+          )                                                          AS email,
+          COALESCE(
+            MAX(NULLIF(p.owner_phone,'')),
+            MAX(NULLIF(p.contact_phone,'')),
+            MAX(NULLIF(p.phone,'')),
+            MAX(NULLIF(p.whatsapp,'')),
+            ''
+          )                                                          AS phone,
+          COALESCE(
+            MAX(NULLIF(p.owner_telegram_chat_id::text,'')),
+            MAX(NULLIF(p.contact_telegram_chat_id::text,'')),
+            ''
+          )                                                          AS telegram_chat_id,
+          COALESCE(
+            MAX(NULLIF(p.owner_telegram_username,'')),
+            MAX(NULLIF(p.contact_telegram_username,'')),
+            ''
+          )                                                          AS telegram_username,
 
-          -- address-ish (pick latest non-null)
-          COALESCE(MAX(p.address), '')                               AS address_raw,
-          COALESCE(MAX(p.city), '')                                  AS city,
-          COALESCE(MAX(p.country), '')                               AS country,
+          -- address-ish (prefer non-empty across alternates)
+          COALESCE(
+            MAX(NULLIF(p.address,'')),
+            MAX(NULLIF(p.owner_address,'')),
+            MAX(NULLIF(p.address_text,'')),
+            ''
+          )                                                          AS address_raw,
+          COALESCE(
+            MAX(NULLIF(p.city,'')),
+            MAX(NULLIF(p.owner_city,'')),
+            ''
+          )                                                          AS city,
+          COALESCE(
+            MAX(NULLIF(p.country,'')),
+            MAX(NULLIF(p.owner_country,'')),
+            ''
+          )                                                          AS country,
 
           -- status-based archive view
           COUNT(*) FILTER (WHERE p.status = 'archived')::int         AS archived_count,
