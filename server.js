@@ -8345,6 +8345,49 @@ const profileSchema = Joi.object({
   website: Joi.string().allow(''),
 });
 
+// --- Generic Profile (save before choosing role) ---
+app.post('/profile', authRequired, async (req, res) => {
+  try {
+    const wallet = String(req.user?.sub || '').toLowerCase();
+    if (!wallet) return res.status(401).json({ error: 'unauthorized' });
+
+    const b = req.body || {};
+    // flatten/normalize address; keep simple string in DB
+    const addressStr = typeof b.address === 'object'
+      ? [b.address.line1, b.address.city, b.address.country].filter(Boolean).join(', ')
+      : (b.address || null);
+
+    await pool.query(
+      `
+      INSERT INTO user_profiles
+        (wallet_address, display_name, email, phone, website, address, city, country, telegram_chat_id, whatsapp, updated_at)
+      VALUES
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+      ON CONFLICT (wallet_address) DO UPDATE SET
+        display_name=$2, email=$3, phone=$4, website=$5, address=$6, city=$7, country=$8,
+        telegram_chat_id=$9, whatsapp=$10, updated_at=NOW()
+      `,
+      [
+        wallet,
+        b.displayName ?? b.vendorName ?? null,
+        b.email ?? null,
+        b.phone ?? null,
+        b.website ?? null,
+        addressStr,
+        b.city ?? b.address?.city ?? null,
+        b.country ?? b.address?.country ?? null,
+        b.telegramChatId ?? b.telegram_chat_id ?? null,
+        b.whatsapp ?? null,
+      ]
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('POST /profile error', e);
+    return res.status(500).json({ error: 'profile_save_failed' });
+  }
+});
+
 // REPLACE your GET /vendor/profile (read from user_profiles, not vendor_profiles)
 app.get('/vendor/profile', authRequired, async (req, res) => {
   try {
