@@ -3419,100 +3419,6 @@ app.delete('/admin/entities', adminGuard, async (req, res) => {
   }
 });
 
-// ==============================
-// List — entities (proposers)
-// ==============================
-app.get('/admin/entities', adminGuard, async (req, res) => {
-  try {
-    const includeArchived = ['true','1','yes'].includes(
-      String(req.query.includeArchived || '').toLowerCase()
-    );
-
-    const { rows } = await pool.query(`
-      WITH base AS (
-        SELECT
-          LOWER(p.owner_wallet)                      AS owner_wallet,
-          COALESCE(p.org_name, '')                  AS entity_name,
-          p.status,
-          p.amount_usd,
-          p.created_at,
-          p.updated_at,
-          p.owner_email,
-          p.owner_phone,
-          p.owner_telegram_chat_id,
-          p.owner_telegram_username,
-          p.address                                  AS address_raw,
-          p.city                                     AS city,
-          p.country                                  AS country,
-          COALESCE(p.archived,false)                 AS archived
-        FROM proposals p
-      )
-      SELECT
-        b.owner_wallet,
-        MAX(b.entity_name)                           AS entity_name,
-        COUNT(*)::int                                AS proposals_count,
-        MAX(b.created_at)                            AS last_proposal_at,
-        COALESCE(SUM(CASE WHEN b.status IN ('approved','funded','completed')
-                          THEN b.amount_usd ELSE 0 END),0)::numeric AS total_awarded_usd,
-        MAX(b.owner_email)                           AS email,
-        MAX(b.owner_phone)                           AS phone,
-        MAX(b.owner_telegram_chat_id)                AS telegram_chat_id,
-        MAX(b.owner_telegram_username)               AS telegram_username,
-        MAX(b.address_raw)                           AS address_raw,
-        MAX(b.city)                                  AS city,
-        MAX(b.country)                               AS country,
-        MAX(b.archived)                              AS archived
-      FROM base b
-      GROUP BY b.owner_wallet
-      ORDER BY last_proposal_at DESC NULLS LAST, entity_name ASC
-    `);
-
-    const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
-
-    const items = rows
-      .filter(r => includeArchived || !r.archived)
-      .map((r) => {
-        const email            = norm(r.email);
-        const phone            = norm(r.phone);
-        const telegramChatId   = norm(r.telegram_chat_id);
-        const telegramUsername = norm(r.telegram_username);
-
-        const line1   = norm(r.address_raw);
-        const city    = norm(r.city);
-        const country = norm(r.country);
-        const flat    = [line1, city, country].filter(Boolean).join(', ') || null;
-
-        return {
-          // core
-          entityName: r.entity_name || '',
-          walletAddress: r.owner_wallet || '',
-          proposalsCount: Number(r.proposals_count) || 0,
-          lastProposalAt: r.last_proposal_at,
-          totalAwardedUSD: Number(r.total_awarded_usd) || 0,
-
-          // contact
-          email,
-          phone,
-          whatsapp: phone,
-          telegramChatId,
-          telegramUsername,
-
-          // address
-          address: flat,
-          addressText: flat,
-          address1: line1,
-
-          archived: !!r.archived,
-        };
-      });
-
-    res.json({ items, page: 1, pageSize: items.length, total: items.length });
-  } catch (e) {
-    console.error('GET /admin/entities error', e);
-    res.status(500).json({ error: 'Failed to list entities' });
-  }
-});
-
 // List proposals owned by the current user
 app.get("/proposals/mine", authRequired, async (req, res) => {
   try {
@@ -3812,6 +3718,7 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
     `;
 
     const { rows } = await pool.query(sql);
+
     const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
     const items = rows.map((r) => {
@@ -3826,35 +3733,36 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
       const flat    = [line1, city, country].filter(Boolean).join(', ') || null;
 
       return {
-  // core
-  entityName: r.entity_name || '',
-  entity: r.entity_name || '',              // alias for older UI
-  orgName: r.entity_name || '',             // alias
-  organization: r.entity_name || '',        // alias
+        // core
+        entityName: r.entity_name || '',
+        entity: r.entity_name || '',              // alias for older UI
+        orgName: r.entity_name || '',             // alias
+        organization: r.entity_name || '',        // alias
 
-  walletAddress: r.owner_wallet || '',
-  ownerWallet: r.owner_wallet || '',        // alias
+        walletAddress: r.owner_wallet || '',
+        ownerWallet: r.owner_wallet || '',        // alias
 
-  proposalsCount: Number(r.proposals_count) || 0,
-  lastProposalAt: r.last_proposal_at,
-  totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+        proposalsCount: Number(r.proposals_count) || 0,
+        lastProposalAt: r.last_proposal_at,
+        totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-  // contact (frontend turns into deep links)
-  email,                                    // original
-  contactEmail: email,                      // alias for UI
-  ownerEmail: email,                        // alias
-  phone,
-  whatsapp: phone,
-  telegramChatId,
-  telegramUsername,
+        // contact (frontend turns into deep links)
+        email,                                    // original
+        contactEmail: email,                      // alias for UI
+        ownerEmail: email,                        // alias
+        phone,
+        whatsapp: phone,
+        telegramChatId,
+        telegramUsername,
 
-  // address
-  address: flat,
-  addressText: flat,
-  address1: line1,
+        // address
+        address: flat,
+        addressText: flat,
+        address1: line1,
 
-  archived: !!r.archived,
-};
+        archived: !!r.archived,
+      };
+    });
 
     res.json({ items, page: 1, pageSize: items.length, total: items.length });
   } catch (e) {
