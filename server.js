@@ -689,6 +689,10 @@ async function attachPaymentState(bids) {
   }
 })();
 
+
+(async function initDb() {
+  try {
+
 // Generic user profile (shared fields before picking a role)
 await pool.query(`
   CREATE TABLE IF NOT EXISTS user_profiles (
@@ -725,6 +729,10 @@ await pool.query(`
   );
 `);
 console.log('[db] proposer_profiles ready');
+  } catch (e) {
+    console.error('[initDb] error', e);
+  }
+})();
 
 // ==============================
 // DB bootstrap — proposals owner fields (create if missing)
