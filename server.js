@@ -9387,7 +9387,21 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
 
     const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
- // Build normalized address object + string
+ // Parse address_raw -> addrObj (supports jsonb object or stringified JSON)
+let addrObj = null;
+if (r.address_raw) {
+  if (typeof r.address_raw === 'object') {
+    // Postgres jsonb already parsed by pg
+    addrObj = r.address_raw;
+  } else if (typeof r.address_raw === 'string') {
+    const s = r.address_raw.trim();
+    if (s.startsWith('{')) {
+      try { addrObj = JSON.parse(s); } catch { /* ignore */ }
+    }
+  }
+}
+ 
+    // Build normalized address object + string
 const parts = addrObj && typeof addrObj === 'object'
   ? {
       line1: norm(addrObj.line1),
