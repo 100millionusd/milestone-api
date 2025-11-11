@@ -3192,44 +3192,6 @@ app.post("/auth/login", async (req, res) => {
   res.json({ token, role, roles });
 });
 
-  // ⬇️ Auto-seed vendor_profiles row with status='pending' and notify admins on FIRST signup
-try {
-  const w = (address || '').toLowerCase();
-  if (w) {
-    const { rows } = await pool.query(
-      `INSERT INTO vendor_profiles
-         (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at)
-       VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW())
-       ON CONFLICT (wallet_address) DO NOTHING
-       RETURNING wallet_address, vendor_name, email, phone`,
-      [w]
-    );
-
-// Only on first insert (new vendor) → notify admins + vendor (EN+ES)
-if (rows.length) {
-  notifyVendorSignup({
-    wallet: rows[0].wallet_address,
-    vendorName: rows[0].vendor_name || '',
-    email: rows[0].email || '',
-    phone: rows[0].phone || '',
-  }).catch(() => null);
-
-  notifyVendorSignupVendor({
-    vendorName: rows[0].vendor_name || '',
-    email: rows[0].email || '',
-    phone: rows[0].phone || '',
-    telegramChatId: rows[0].telegram_chat_id || null,
-    whatsapp: rows[0].whatsapp || null
-  }).catch(() => null);
-}
-  }
-} catch (e) {
-  console.warn('profile auto-seed failed (non-fatal):', String(e).slice(0,200));
-}
-
-  nonces.delete(address);
-  res.json({ token, role });
-
 app.get('/auth/role', async (req, res) => {
   try {
     // If middleware already decoded the token:
