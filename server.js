@@ -180,7 +180,7 @@ function authRequired(req, res, next) {
 }
 
 function requireRole(expected) {
-  return (req, res, next) => {
+  return async (req, res, next) => {
     if (!req.user) return res.status(401).json({ error: 'unauthenticated' });
     if (req.user.roles?.includes('admin')) return next(); // admins bypass
     if (req.user.role !== expected) {
@@ -3230,7 +3230,7 @@ if (rows.length) {
   nonces.delete(address);
   res.json({ token, role });
 
-app.get("/auth/role", async (req, res) => {
+app.get('/auth/role', async (req, res) => {
   try {
     // If middleware already decoded the token:
     if (req.user) {
