@@ -144,7 +144,6 @@ const jwt = require("jsonwebtoken");
 
 // --- role & auth helpers -----------------------------------------------------
 const VALID_ROLES = ['vendor', 'proposer', 'admin'];
-const JWT_SECRET = process.env.JWT_SECRET;
 
 function signJwt(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
