@@ -3674,42 +3674,47 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
   }
 });
 
-// ==============================
-// /admin/entities  — REPLACE ENTIRE ROUTE
-// ==============================
+// /admin/entities — REPLACE ENTIRE ROUTE
 app.get('/admin/entities', adminGuard, async (req, res) => {
   try {
-    const includeArchived = ['true','1','yes'].includes(String(req.query.includeArchived || '').toLowerCase());
+    const includeArchived = ['true','1','yes'].includes(
+      String(req.query.includeArchived || '').toLowerCase()
+    );
 
     const sql = `
       WITH g AS (
         SELECT
           LOWER(COALESCE(p.owner_wallet,'')) AS owner_wallet,
-          COALESCE(MAX(NULLIF(p.org_name,'')), '') AS entity_name,
-          COUNT(*)::int AS proposals_count,
-          MAX(p.created_at) AS last_proposal_at,
-          COALESCE(
-            SUM(CASE WHEN p.status IN ('approved','funded','completed')
-                     THEN p.amount_usd ELSE 0 END),0
-          )::numeric AS total_awarded_usd,
+          COALESCE(MAX(NULLIF(p.org_name,'')), '')                 AS entity_name,
+          COUNT(*)::int                                            AS proposals_count,
+          MAX(COALESCE(p.updated_at, p.created_at))               AS last_proposal_at,
+          COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
+                            THEN p.amount_usd ELSE 0 END),0)::numeric AS total_awarded_usd,
 
-          -- contact fields (ONLY from proposals; no vendor_profiles join)
-          COALESCE(MAX(NULLIF(p.owner_email,'')), '') AS email,
-          COALESCE(MAX(NULLIF(p.owner_phone,'')), '') AS phone,
-          COALESCE(MAX(NULLIF(p.owner_telegram_chat_id::text,'')), '') AS telegram_chat_id,
-          COALESCE(MAX(NULLIF(p.owner_telegram_username,'')), '') AS telegram_username,
+          -- EMAIL: prefer owner_email; else extract from 'contact' if it contains an email
+          MAX(
+            COALESCE(
+              NULLIF(p.owner_email,''),
+              NULLIF(
+                SUBSTRING(p.contact FROM '([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,})'),
+                ''
+              )
+            )
+          )                                                      AS email,
 
-          -- address (latest non-empty)
-          COALESCE(MAX(NULLIF(p.address,'')), '') AS address_raw,
-          COALESCE(MAX(NULLIF(p.city,'')), '') AS city,
-          COALESCE(MAX(NULLIF(p.country,'')), '') AS country,
+          MAX(NULLIF(p.owner_phone,''))                           AS phone,
+          MAX(NULLIF(p.owner_telegram_chat_id::text,''))          AS telegram_chat_id,
+          MAX(NULLIF(p.owner_telegram_username,''))               AS telegram_username,
 
-          -- archive state derived from status
-          COUNT(*) FILTER (WHERE p.status = 'archived')::int  AS archived_count,
-          COUNT(*) FILTER (WHERE p.status <> 'archived')::int AS active_count,
+          MAX(NULLIF(p.address,''))                               AS address_raw,
+          MAX(NULLIF(p.city,''))                                  AS city,
+          MAX(NULLIF(p.country,''))                               AS country,
+
+          COUNT(*) FILTER (WHERE p.status = 'archived')::int      AS archived_count,
+          COUNT(*) FILTER (WHERE p.status <> 'archived')::int     AS active_count,
           CASE WHEN COUNT(*) > 0
                  AND COUNT(*) FILTER (WHERE p.status <> 'archived') = 0
-               THEN true ELSE false END AS archived
+               THEN true ELSE false END                           AS archived
         FROM proposals p
         GROUP BY LOWER(COALESCE(p.owner_wallet,''))
       )
@@ -3734,7 +3739,6 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
       const flat    = [line1, city, country].filter(Boolean).join(', ') || null;
 
       return {
-        // core + aliases
         entityName: r.entity_name || '',
         entity: r.entity_name || '',
         orgName: r.entity_name || '',
@@ -3747,7 +3751,6 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
         lastProposalAt: r.last_proposal_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // contact
         email,
         contactEmail: email,
         ownerEmail: email,
@@ -3756,7 +3759,6 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
         telegramChatId,
         telegramUsername,
 
-        // address
         address: flat,
         addressText: flat,
         address1: line1,
