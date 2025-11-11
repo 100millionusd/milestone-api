@@ -3675,7 +3675,7 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
 });
 
 // ==============================
-// /admin/entities  (REPLACE the whole route with this; remove duplicates)
+// /admin/entities  (safe columns only)
 // ==============================
 app.get('/admin/entities', adminGuard, async (req, res) => {
   try {
@@ -3686,58 +3686,31 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
     const sql = `
       WITH g AS (
         SELECT
-          LOWER(COALESCE(p.owner_wallet,'')) AS owner_wallet,
-          COALESCE(MAX(NULLIF(p.org_name,'')),'Unknown') AS entity_name,
-          COUNT(*)::int AS proposals_count,
-          MAX(p.created_at) AS last_proposal_at,
-          COALESCE(
-            SUM(CASE WHEN p.status IN ('approved','funded','completed') THEN p.amount_usd ELSE 0 END),0
-          )::numeric AS total_awarded_usd,
+          LOWER(COALESCE(p.owner_wallet,''))                             AS owner_wallet,
+          COALESCE(MAX(NULLIF(p.org_name,'')),'Unknown')                 AS entity_name,
+          COUNT(*)::int                                                  AS proposals_count,
+          MAX(p.created_at)                                              AS last_proposal_at,
+          COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
+                            THEN p.amount_usd ELSE 0 END),0)::numeric    AS total_awarded_usd,
 
-          /* -------- EMAILS -------- */
-          MAX(NULLIF(p.owner_email,'')) AS owner_email,
-          COALESCE(
-            MAX(NULLIF(p.contact_email,'')),
-            MAX(NULLIF(p.email,'')),
-            MAX(NULLIF(p.primary_email,'')),
-            MAX(p.contact) FILTER (WHERE p.contact ~* '@')
-          ) AS contact_email,
-          COALESCE(
-            MAX(NULLIF(p.owner_email,'')),
-            MAX(NULLIF(p.contact_email,'')),
-            MAX(NULLIF(p.email,'')),
-            MAX(NULLIF(p.primary_email,'')),
-            MAX(p.contact) FILTER (WHERE p.contact ~* '@')
-          ) AS email,
+          -- contact sources that exist
+          MAX(NULLIF(p.owner_email,''))                                  AS owner_email,
+          MAX(NULLIF(p.contact,''))                                      AS contact_raw,
+          MAX(NULLIF(p.owner_phone,''))                                  AS phone,
+          MAX(NULLIF(p.owner_telegram_chat_id::text,''))                 AS telegram_chat_id,
+          MAX(NULLIF(p.owner_telegram_username,''))                      AS telegram_username,
 
-          /* -------- PHONE / TELEGRAM -------- */
-          COALESCE(
-            MAX(NULLIF(p.owner_phone,'')),
-            MAX(NULLIF(p.contact_phone,'')),
-            MAX(NULLIF(p.phone,'')),
-            MAX(NULLIF(p.whatsapp,''))
-          ) AS phone,
-          COALESCE(
-            MAX(NULLIF(p.owner_telegram_chat_id::text,'')),
-            MAX(NULLIF(p.contact_telegram_chat_id::text,''))
-          ) AS telegram_chat_id,
-          COALESCE(
-            MAX(NULLIF(p.owner_telegram_username,'')),
-            MAX(NULLIF(p.contact_telegram_username,''))
-          ) AS telegram_username,
+          -- address sources that exist
+          MAX(NULLIF(p.address,''))                                      AS address_raw,
+          MAX(NULLIF(p.city,''))                                         AS city,
+          MAX(NULLIF(p.country,''))                                      AS country,
 
-          /* -------- ADDRESS -------- */
-          COALESCE(MAX(NULLIF(p.address_text,'')), MAX(NULLIF(p.address,''))) AS address_text,
-          COALESCE(MAX(NULLIF(p.address1,'')), MAX(NULLIF(p.addr_line1,''))) AS address1,
-          COALESCE(MAX(NULLIF(p.city,''))) AS city,
-          COALESCE(MAX(NULLIF(p.country,''))) AS country,
-
-          /* -------- ARCHIVE (no p.archived col) -------- */
-          COUNT(*) FILTER (WHERE p.status = 'archived')::int AS archived_count,
-          COUNT(*) FILTER (WHERE p.status <> 'archived')::int AS active_count,
+          -- derive archived from statuses (no p.archived column)
+          COUNT(*) FILTER (WHERE p.status = 'archived')::int             AS archived_count,
+          COUNT(*) FILTER (WHERE p.status <> 'archived')::int            AS active_count,
           CASE WHEN COUNT(*) > 0
                  AND COUNT(*) FILTER (WHERE p.status <> 'archived') = 0
-               THEN true ELSE false END AS archived
+               THEN true ELSE false END                                  AS archived
         FROM proposals p
         GROUP BY LOWER(COALESCE(p.owner_wallet,''))
       )
@@ -3751,12 +3724,17 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
     const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
     const items = rows.map((r) => {
-      const line1   = norm(r.address1);
+      const contact = norm(r.contact_raw);
+      const owner   = norm(r.owner_email);
+      const email   = owner || (contact && /@/.test(contact) ? contact : null);
+
+      const line1   = norm(r.address_raw);
       const city    = norm(r.city);
       const country = norm(r.country);
-      const flat    = [line1, city, country].filter(Boolean).join(', ') || norm(r.address_text);
+      const flat    = [line1, city, country].filter(Boolean).join(', ') || null;
 
       return {
+        // core + aliases
         entityName: r.entity_name || '',
         entity: r.entity_name || '',
         orgName: r.entity_name || '',
@@ -3769,19 +3747,20 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
         lastProposalAt: r.last_proposal_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        email:        norm(r.email),
-        contactEmail: norm(r.contact_email),
-        ownerEmail:   norm(r.owner_email),
+        // contact (all three populated for the frontend)
+        email,
+        contactEmail: email,
+        ownerEmail: owner,
 
         phone: norm(r.phone),
         whatsapp: norm(r.phone),
-
-        telegramChatId:   norm(r.telegram_chat_id),
+        telegramChatId: norm(r.telegram_chat_id),
         telegramUsername: norm(r.telegram_username),
 
-        address:    flat || null,
-        addressText: norm(r.address_text),
-        address1:    line1,
+        // address
+        address: flat,
+        addressText: flat,
+        address1: line1,
 
         archived: !!r.archived,
       };
