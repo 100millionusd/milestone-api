@@ -2735,31 +2735,6 @@ function normalizeEntitySelector(body = {}) {
   };
 }
 
-// --- Detect real column names from the DB and cache (now returns arrays)
-let _proposalColsCache = null;
-async function detectProposalCols(pool) {
-  if (_proposalColsCache) return _proposalColsCache;
-
-  const { rows } = await pool.query(`
-    SELECT LOWER(column_name) AS name
-    FROM information_schema.columns
-    WHERE table_name = 'proposals' AND table_schema = current_schema()
-  `);
-
-  const have = new Set(rows.map(r => r.name));
-  const first   = (cands) => cands.find(c => have.has(c)) || null;
-  const present = (cands) => cands.filter(c => have.has(c));
-
-  const orgCols    = present(['org_name','org','organization','entity','orgname']);
-  const emailCols  = present(['contact','contact_email','owner_email','email','primary_email']);
-  const walletCols = present(['owner_wallet','wallet','wallet_address','owner_wallet_address']);
-  const statusCol  = first(['status','proposal_status']);
-  const updatedCol = first(['updated_at','updatedat','modified_at','modifiedat']);
-
-  _proposalColsCache = { orgCols, emailCols, walletCols, statusCol, updatedCol };
-  return _proposalColsCache;
-}
-
 // --- Build WHERE using all present cols; also handle entityKey fallback
 async function buildEntityWhereAsync(pool, sel) {
   const cols = await detectProposalCols(pool);
@@ -3283,24 +3258,13 @@ app.get("/proposals", async (req, res) => {
 // JSON body (must be before routes)
 app.use(express.json({ limit: '2mb' }));
 
-// ---- Accept camelCase / snake_case / legacy keys
-function normalizeEntitySelector(body = {}) {
-  const norm = (v) => (v == null ? null : String(v).trim());
-  return {
-    // explicit triple
-    entity:       norm(body.entity ?? body.orgName ?? body.org_name),
-    contactEmail: norm(body.contactEmail ?? body.ownerEmail ?? body.owner_email ?? body.contact ?? body.contact_email),
-    wallet:       norm(body.wallet ?? body.ownerWallet ?? body.owner_wallet ?? body.wallet_address),
-
-    // fallback key used by some older UIs
-    entityKey:    norm(body.id ?? body.entityKey ?? body.entity_key),
-  };
+// ==== proposals column detector (deduped, hot-reload safe)
+if (typeof globalThis.__lxProposalColsCache === 'undefined') {
+  globalThis.__lxProposalColsCache = null;
 }
 
-// ---- Detect proposals columns once and cache (arrays for OR-matching)
-let _proposalColsCache = null;
 async function detectProposalCols(pool) {
-  if (_proposalColsCache) return _proposalColsCache;
+  if (globalThis.__lxProposalColsCache) return globalThis.__lxProposalColsCache;
 
   const { rows } = await pool.query(`
     SELECT LOWER(column_name) AS name
@@ -3318,8 +3282,22 @@ async function detectProposalCols(pool) {
   const statusCol  = first(['status','proposal_status']);
   const updatedCol = first(['updated_at','updatedat','modified_at','modifiedat']);
 
-  _proposalColsCache = { orgCols, emailCols, walletCols, statusCol, updatedCol };
-  return _proposalColsCache;
+  globalThis.__lxProposalColsCache = { orgCols, emailCols, walletCols, statusCol, updatedCol };
+  return globalThis.__lxProposalColsCache;
+}
+
+// ---- Accept camelCase / snake_case / legacy keys
+function normalizeEntitySelector(body = {}) {
+  const norm = (v) => (v == null ? null : String(v).trim());
+  return {
+    // explicit triple
+    entity:       norm(body.entity ?? body.orgName ?? body.org_name),
+    contactEmail: norm(body.contactEmail ?? body.ownerEmail ?? body.owner_email ?? body.contact ?? body.contact_email),
+    wallet:       norm(body.wallet ?? body.ownerWallet ?? body.owner_wallet ?? body.wallet_address),
+
+    // fallback key used by some older UIs
+    entityKey:    norm(body.id ?? body.entityKey ?? body.entity_key),
+  };
 }
 
 // ---- Build WHERE using any present columns; also supports entityKey fallback
