@@ -3280,19 +3280,17 @@ app.get("/proposals", async (req, res) => {
 // Admin — “Entities” (proposers) helpers + routes
 // ==============================
 
-// DELETE any old deriveEntityKey() you still have.
-
-// Helper: normalize body into {wallet,email,entity}
-function normalizeEntitySelector(body) {
+// Helper: normalize body into { wallet, email, entity }
+function normalizeEntitySelector(body = {}) {
   const take = (v) => (v ? String(v).trim().toLowerCase() : '');
   return {
-    wallet: take(body?.wallet || body?.ownerWallet),
-    email:  take(body?.contactEmail || body?.ownerEmail || body?.email),
-    entity: take(body?.entity || body?.orgName || body?.name),
+    wallet: take(body.wallet ?? body.ownerWallet),
+    email:  take(body.contactEmail ?? body.ownerEmail ?? body.email),
+    entity: take(body.entity ?? body.orgName ?? body.name),
   };
 }
 
-// Helper: build WHERE clause + column names
+// Helper: build WHERE clause + column names (uses your proposals table)
 async function buildEntityWhereAsync(pool, sel) {
   const where = [];
   const params = [];
@@ -3312,7 +3310,7 @@ async function buildEntityWhereAsync(pool, sel) {
   return { whereSql, params, cols };
 }
 
-// ---- Archive entity
+// ---- Archive entity (set proposals.status='archived')
 app.post('/admin/entities/archive', adminGuard, async (req, res) => {
   try {
     const sel = normalizeEntitySelector(req.body || {});
@@ -3326,7 +3324,10 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
       : `${cols.statusCol}='archived'`;
 
     const { rowCount } = await pool.query(
-      `UPDATE proposals SET ${setSql} WHERE ${whereSql} AND ${cols.statusCol} <> 'archived'`,
+      `UPDATE proposals p
+         SET ${setSql}
+       WHERE ${whereSql}
+         AND ${cols.statusCol} <> 'archived'`,
       params
     );
 
@@ -3337,7 +3338,7 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
   }
 });
 
-// ---- Unarchive entity
+// ---- Unarchive entity (restore to pending/approved/rejected)
 app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
   try {
     const sel = normalizeEntitySelector(req.body || {});
@@ -3346,16 +3347,21 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
       return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
     }
 
-    const toStatusRaw = String(req.body?.toStatus || 'pending').toLowerCase();
-    const toStatus = ['pending', 'approved', 'rejected'].includes(toStatusRaw) ? toStatusRaw : 'pending';
+    const toStatus = String(req.body?.toStatus || 'pending').toLowerCase();
+    if (!['pending','approved','rejected'].includes(toStatus)) {
+      return res.status(400).json({ error: 'Invalid toStatus' });
+    }
 
-    params.push(toStatus);
     const setSql = cols.updatedCol
-      ? `${cols.statusCol}=$${params.length}, ${cols.updatedCol}=NOW()`
-      : `${cols.statusCol}=$${params.length}`;
+      ? `${cols.statusCol}=$${params.length + 1}, ${cols.updatedCol}=NOW()`
+      : `${cols.statusCol}=$${params.length + 1}`;
+    params.push(toStatus);
 
     const { rowCount } = await pool.query(
-      `UPDATE proposals SET ${setSql} WHERE ${whereSql} AND ${cols.statusCol}='archived'`,
+      `UPDATE proposals p
+         SET ${setSql}
+       WHERE ${whereSql}
+         AND ${cols.statusCol}='archived'`,
       params
     );
 
@@ -3366,11 +3372,11 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
   }
 });
 
-// ---- Delete entity (soft/hard)
+// ---- Delete entity’s proposals (soft=archive / hard=delete)
 app.delete('/admin/entities', adminGuard, async (req, res) => {
   try {
     const sel = normalizeEntitySelector(req.body || {});
-    const { whereSql, params } = await buildEntityWhereAsync(pool, sel);
+    const { whereSql, params, cols } = await buildEntityWhereAsync(pool, sel);
     if (!whereSql) {
       return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
     }
@@ -3379,16 +3385,22 @@ app.delete('/admin/entities', adminGuard, async (req, res) => {
 
     if (mode === 'hard') {
       const { rowCount } = await pool.query(
-        `DELETE FROM proposals WHERE ${whereSql}`,
+        `DELETE FROM proposals p WHERE ${whereSql}`,
         params
       );
       return res.json({ success: true, deleted: rowCount, mode: 'hard' });
     }
 
-    // soft = archive
+    // soft delete → archive
+    const setSql = cols.updatedCol
+      ? `${cols.statusCol}='archived', ${cols.updatedCol}=NOW()`
+      : `${cols.statusCol}='archived'`;
+
     const { rowCount } = await pool.query(
-      `UPDATE proposals SET status='archived', updated_at=NOW()
-       WHERE ${whereSql} AND status <> 'archived'`,
+      `UPDATE proposals p
+         SET ${setSql}
+       WHERE ${whereSql}
+         AND ${cols.statusCol} <> 'archived'`,
       params
     );
 
