@@ -212,6 +212,37 @@ function _addrText(a, city, country) {
   return out || null;
 }
 
+// ---- Canonical vendor seeder: copy from user_profiles to vendor_profiles
+async function seedVendorFromUserProfile(pool, wallet) {
+  const w = String(wallet || '').toLowerCase();
+  if (!w) return false;
+
+  const { rows } = await pool.query(
+    `INSERT INTO vendor_profiles
+       (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at, telegram_chat_id, whatsapp)
+     SELECT $1,
+            COALESCE(display_name,''),
+            email, phone, website, address,
+            'pending', NOW(), NOW(),
+            telegram_chat_id, whatsapp
+       FROM user_profiles
+      WHERE lower(wallet_address)=lower($1)
+     ON CONFLICT (wallet_address) DO UPDATE SET
+       vendor_name       = COALESCE(EXCLUDED.vendor_name,''),
+       email             = EXCLUDED.email,
+       phone             = EXCLUDED.phone,
+       website           = EXCLUDED.website,
+       address           = EXCLUDED.address,
+       telegram_chat_id  = EXCLUDED.telegram_chat_id,
+       whatsapp          = EXCLUDED.whatsapp,
+       updated_at        = NOW()
+     RETURNING wallet_address`,
+    [w]
+  );
+
+  return rows.length > 0;
+}
+
 async function maybeSeedVendor(address) {
   const w = String(address || '').toLowerCase();
   if (!w) return;
@@ -3182,7 +3213,7 @@ app.post("/auth/verify", async (req, res) => {
     return res.status(401).json({ error: "signature does not match address" });
   }
 
-  // Compute durable roles and decide effective role
+  // Determine durable roles and effective role (from intent)
   let roles = await durableRolesForAddress(address);
   let role = roleFromDurableOrIntent(roles, roleIntent);
   if (!role) {
@@ -3192,9 +3223,11 @@ app.post("/auth/verify", async (req, res) => {
     });
   }
 
-  // Only seed vendor row when vendor intent chosen and missing — and notify on FIRST insert
-  try {
-    if (role === "vendor" && !roles.includes("vendor")) {
+  // Seed vendor profile ONLY when intent=vendor and the wallet isn't a vendor yet.
+  if (role === "vendor" && !roles.includes("vendor")) {
+    try {
+      if (typeof __vendorSeedGuard === "number") __vendorSeedGuard++; // allow guarded insert here
+
       const w = (address || "").toLowerCase();
       const { rows } = await pool.query(
         `INSERT INTO vendor_profiles
@@ -3205,40 +3238,39 @@ app.post("/auth/verify", async (req, res) => {
         [w]
       );
 
-      // Only if this was the FIRST time (row actually inserted), send notifications
+      // On first-ever insert → send notifications (best-effort)
       if (rows.length) {
         try {
-          await notifyVendorSignup({
-            wallet: rows[0].wallet_address,
-            vendorName: rows[0].vendor_name || "",
-            email: rows[0].email || "",
-            phone: rows[0].phone || "",
-          });
-        } catch {}
-
-        try {
-          await notifyVendorSignupVendor({
-            vendorName: rows[0].vendor_name || "",
-            email: rows[0].email || "",
-            phone: rows[0].phone || "",
-            telegramChatId: rows[0].telegram_chat_id || null,
-            whatsapp: rows[0].whatsapp || null,
-          });
+          await Promise.allSettled([
+            notifyVendorSignup?.({
+              wallet: rows[0].wallet_address,
+              vendorName: rows[0].vendor_name || "",
+              email: rows[0].email || "",
+              phone: rows[0].phone || ""
+            }),
+            notifyVendorSignupVendor?.({
+              vendorName: rows[0].vendor_name || "",
+              email: rows[0].email || "",
+              phone: rows[0].phone || "",
+              telegramChatId: rows[0].telegram_chat_id || null,
+              whatsapp: rows[0].whatsapp || null
+            })
+          ]);
         } catch {}
       }
-
-      // refresh durable roles after insert
-      roles = await durableRolesForAddress(address);
+    } finally {
+      if (typeof __vendorSeedGuard === "number") __vendorSeedGuard--;
     }
-  } catch (e) {
-    console.warn("vendor seed/notify failed (non-fatal):", String(e).slice(0, 200));
+
+    // Refresh roles after possible insert
+    roles = await durableRolesForAddress(address);
   }
 
-  // ADMIN OVERRIDE: if wallet is admin, always act as admin in the UI
-if (isAdminAddress(address)) {
-  roles = Array.from(new Set([...(roles || []), 'admin']));
-  role = 'admin';
-}
+  // Admin override: admin wallets always act as admin
+  if (isAdminAddress(address)) {
+    roles = Array.from(new Set([...(roles || []), "admin"]));
+    role = "admin";
+  }
 
   const token = signJwt({ sub: address, role, roles });
 
@@ -3246,10 +3278,11 @@ if (isAdminAddress(address)) {
     httpOnly: true,
     secure: true,
     sameSite: "none",
-    maxAge: 7 * 24 * 3600 * 1000,
+    maxAge: 7 * 24 * 3600 * 1000
   });
 
-  try { nonces.delete(address); } catch {}
+  // one-time nonce, then done
+  nonces.delete(address);
 
   return res.json({ token, role, roles });
 });
