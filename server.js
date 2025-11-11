@@ -3130,6 +3130,12 @@ app.post("/auth/verify", async (req, res) => {
     console.warn("vendor seed/notify failed (non-fatal):", String(e).slice(0, 200));
   }
 
+  // ADMIN OVERRIDE: if wallet is admin, always act as admin in the UI
+if (isAdminAddress(address)) {
+  roles = Array.from(new Set([...(roles || []), 'admin']));
+  role = 'admin';
+}
+
   const token = signJwt({ sub: address, role, roles });
 
   res.cookie("auth_token", token, {
@@ -3183,6 +3189,12 @@ app.post("/auth/login", async (req, res) => {
     roles = await durableRolesForAddress(address);
   }
 
+  // ADMIN OVERRIDE: if wallet is admin, always act as admin in the UI
+if (isAdminAddress(address)) {
+  roles = Array.from(new Set([...(roles || []), 'admin']));
+  role = 'admin';
+}
+
   const token = signJwt({ sub: address, role, roles });
 
   res.cookie("auth_token", token, {
@@ -3196,65 +3208,63 @@ app.post("/auth/login", async (req, res) => {
   res.json({ token, role, roles });
 });
 
-app.get('/auth/role', async (req, res) => {
+app.get("/auth/role", async (req, res) => {
   try {
-    // If middleware already decoded the token:
-    if (req.user) {
-      const address = String(req.user.sub || '');
-      const role = req.user.role;
-      const roles = Array.isArray(req.user.roles) ? req.user.roles : await durableRolesForAddress(address);
-      let vendorStatus = 'pending';
+    // (1) Token-decoded user (middleware or cookie)
+    const tokenFromHeader = req.headers.authorization?.startsWith('Bearer ')
+      ? req.headers.authorization.slice(7)
+      : null;
+    const tokenFromCookie = req.cookies?.auth_token || null;
+    const token = tokenFromHeader || tokenFromCookie;
+    const decoded = token ? verifyJwt(token) : null;
 
-      if (role === 'vendor' && address) {
+    if (decoded?.sub) {
+      const address = String(decoded.sub).toLowerCase();
+      let roles = Array.isArray(decoded.roles) ? decoded.roles : await durableRolesForAddress(address);
+      let role = decoded.role;
+
+      // ADMIN OVERRIDE
+      if (isAdminAddress(address)) {
+        roles = Array.from(new Set([...(roles || []), 'admin']));
+        role = 'admin';
+      }
+
+      let vendorStatus = 'pending';
+      if (role === 'vendor') {
         const { rows } = await pool.query(
           `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
           [address]
         );
         vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
       }
+
       return res.json({ address, role, roles, vendorStatus });
     }
 
-    // Legacy cookie fallback
-    {
-      const legacyToken = req.cookies?.auth_token;
-      const legacyUser = legacyToken ? verifyJwt(legacyToken) : null;
-
-      if (legacyUser) {
-        const address = String(legacyUser.sub || '');
-        const role = legacyUser.role;
-        const roles = Array.isArray(legacyUser.roles) ? legacyUser.roles : await durableRolesForAddress(address);
-        let vendorStatus = 'pending';
-
-        if (role === 'vendor' && address) {
-          const { rows } = await pool.query(
-            `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-            [address]
-          );
-          vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
-        }
-        return res.json({ address, role, roles, vendorStatus });
+    // (2) Query fallback (?address=0x...)
+    const qAddress = norm(req.query.address);
+    if (qAddress) {
+      const addr = qAddress.toLowerCase();
+      let roles = await durableRolesForAddress(addr);
+      // ADMIN OVERRIDE
+      if (isAdminAddress(addr)) {
+        roles = Array.from(new Set([...(roles || []), 'admin']));
       }
-    }
+      const role = isAdminAddress(addr) ? 'admin' : (roles[0] || 'user');
 
-    // Query fallback (?address=0x...)
-    {
-      const qAddress = norm(req.query.address);
-      if (!qAddress) return res.json({ role: "guest" });
-
-      const roles = await durableRolesForAddress(qAddress);
-      const role = roles[0] || 'user'; // arbitrary default when unauthenticated
       let vendorStatus = 'pending';
-
       if (role === 'vendor') {
         const { rows } = await pool.query(
           `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-          [qAddress]
+          [addr]
         );
         vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
       }
-      return res.json({ address: qAddress, role, roles, vendorStatus });
+      return res.json({ address: addr, role, roles, vendorStatus });
     }
+
+    // (3) No identity
+    return res.json({ role: "guest" });
   } catch (e) {
     console.error('/auth/role error', e);
     return res.status(500).json({ error: 'role_failed' });
