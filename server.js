@@ -190,6 +190,14 @@ async function durableRolesForAddress(address) {
     if (p.rowCount > 0) roles.push('proposer');
   } catch {}
 
+  try {
+  const r = await pool.query(
+    `SELECT 1 FROM proposer_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+    [addr]
+  );
+  if (r.rowCount > 0) roles.push('proposer');
+} catch {}
+
   return roles;
 }
 
@@ -333,23 +341,6 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
-
-// --- Install vendor insert guard (MUST be after pool is created)
-if (!pool.query.__guardInstalled) {
-  const __origPoolQuery = pool.query.bind(pool);
-
-  pool.query = async function guardedQuery(...args) {
-    const sql = typeof args[0] === 'string' ? args[0] : String(args[0]?.text || '');
-    if (/^\s*insert\s+into\s+vendor_profiles\b/i.test(sql) && __vendorSeedGuard === 0) {
-      console.warn('[BLOCKED] vendor_profiles insert outside guarded login path');
-      // behave like a successful no-op
-      return { rows: [], rowCount: 0, command: 'INSERT' };
-    }
-    return __origPoolQuery(...args);
-  };
-  // mark so we don't double-wrap
-  pool.query.__guardInstalled = true;
-}
 
 // ---- Safe Tx overlay helpers (response-time hydration) ----
 const SAFE_CACHE_TTL_MS = Number(process.env.SAFE_CACHE_TTL_MS || 5000);
@@ -697,6 +688,43 @@ async function attachPaymentState(bids) {
     console.error('vendor_profiles init failed:', e);
   }
 })();
+
+// Generic user profile (shared fields before picking a role)
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS user_profiles (
+    wallet_address TEXT PRIMARY KEY,
+    display_name   TEXT,
+    email          TEXT,
+    phone          TEXT,
+    website        TEXT,
+    address        TEXT,
+    city           TEXT,
+    country        TEXT,
+    telegram_chat_id TEXT,
+    whatsapp       TEXT,
+    updated_at     TIMESTAMP DEFAULT NOW()
+  );
+`);
+console.log('[db] user_profiles ready');
+
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS proposer_profiles (
+    wallet_address   TEXT PRIMARY KEY,
+    org_name         TEXT,
+    contact_email    TEXT,
+    phone            TEXT,
+    website          TEXT,
+    address          TEXT,
+    city             TEXT,
+    country          TEXT,
+    telegram_chat_id TEXT,
+    whatsapp         TEXT,
+    status           TEXT DEFAULT 'active',  -- active|archived
+    created_at       TIMESTAMP DEFAULT NOW(),
+    updated_at       TIMESTAMP DEFAULT NOW()
+  );
+`);
+console.log('[db] proposer_profiles ready');
 
 // ==============================
 // DB bootstrap — proposals owner fields (create if missing)
@@ -3846,7 +3874,7 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
   }
 });
 
-// /admin/entities — REPLACE ENTIRE ROUTE
+// /admin/entities — REPLACE ENTIRE ROUTE (includes proposer_profiles even with 0 proposals)
 app.get('/admin/entities', adminGuard, async (req, res) => {
   try {
     const includeArchived = ['true','1','yes'].includes(
@@ -3854,14 +3882,14 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
     );
 
     const sql = `
-      WITH g AS (
+      WITH props AS (
         SELECT
-          LOWER(COALESCE(p.owner_wallet,'')) AS owner_wallet,
+          LOWER(COALESCE(p.owner_wallet,''))                       AS owner_wallet,
           COALESCE(MAX(NULLIF(p.org_name,'')), '')                 AS entity_name,
           COUNT(*)::int                                            AS proposals_count,
           MAX(COALESCE(p.updated_at, p.created_at))               AS last_proposal_at,
           COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
-                            THEN p.amount_usd ELSE 0 END),0)::numeric AS total_awarded_usd,
+                            THEN COALESCE(p.amount_usd,0) ELSE 0 END),0)::numeric AS total_awarded_usd,
 
           -- EMAIL: prefer owner_email; else extract from 'contact' if it contains an email
           MAX(
@@ -3872,7 +3900,7 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
                 ''
               )
             )
-          )                                                      AS email,
+          )                                                        AS email,
 
           MAX(NULLIF(p.owner_phone,''))                           AS phone,
           MAX(NULLIF(p.owner_telegram_chat_id::text,''))          AS telegram_chat_id,
@@ -3883,17 +3911,66 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           MAX(NULLIF(p.country,''))                               AS country,
 
           COUNT(*) FILTER (WHERE p.status = 'archived')::int      AS archived_count,
-          COUNT(*) FILTER (WHERE p.status <> 'archived')::int     AS active_count,
-          CASE WHEN COUNT(*) > 0
-                 AND COUNT(*) FILTER (WHERE p.status <> 'archived') = 0
-               THEN true ELSE false END                           AS archived
+          COUNT(*) FILTER (WHERE p.status <> 'archived')::int     AS active_count
         FROM proposals p
         GROUP BY LOWER(COALESCE(p.owner_wallet,''))
+      ),
+      ents AS (
+        SELECT
+          LOWER(pp.wallet_address)            AS wallet_address,
+          COALESCE(pp.org_name,'')            AS org_name,
+          NULLIF(pp.contact_email,'')         AS contact_email,
+          NULLIF(pp.phone,'')                 AS phone,
+          NULLIF(pp.website,'')               AS website,
+          NULLIF(pp.address,'')               AS address_raw,
+          NULLIF(pp.city,'')                  AS city,
+          NULLIF(pp.country,'')               AS country,
+          NULLIF(pp.telegram_chat_id::text,'')AS telegram_chat_id,
+          NULLIF(pp.whatsapp,'')              AS whatsapp,
+          COALESCE(pp.status,'active')        AS status,
+          pp.updated_at                       AS updated_at
+        FROM proposer_profiles pp
+      ),
+      combined AS (
+        SELECT
+          COALESCE(ents.wallet_address, props.owner_wallet)                AS owner_wallet,
+          COALESCE(NULLIF(ents.org_name,''), props.entity_name, '')       AS entity_name,
+          COALESCE(ents.contact_email, props.email)                       AS email,
+          COALESCE(ents.phone, props.phone)                               AS phone,
+          COALESCE(ents.address_raw, props.address_raw)                   AS address_raw,
+          COALESCE(ents.city, props.city)                                 AS city,
+          COALESCE(ents.country, props.country)                           AS country,
+          COALESCE(props.proposals_count, 0)::int                         AS proposals_count,
+          COALESCE(props.last_proposal_at, ents.updated_at)               AS last_activity_at,
+          COALESCE(props.total_awarded_usd, 0)::numeric                   AS total_awarded_usd,
+          COALESCE(props.archived_count, 0)::int                          AS archived_count,
+          COALESCE(props.active_count, 0)::int                            AS active_count,
+          COALESCE(ents.status,'active')                                  AS entity_status
+        FROM props
+        FULL OUTER JOIN ents
+          ON ents.wallet_address = props.owner_wallet
       )
-      SELECT *
-      FROM g
-      ${includeArchived ? '' : 'WHERE archived = false'}
-      ORDER BY last_proposal_at DESC NULLS LAST, entity_name ASC
+      SELECT
+        owner_wallet,
+        entity_name,
+        email,
+        phone,
+        address_raw,
+        city,
+        country,
+        proposals_count,
+        last_activity_at,
+        total_awarded_usd,
+        archived_count,
+        active_count,
+        CASE
+          WHEN entity_status = 'archived' THEN TRUE
+          WHEN proposals_count > 0 AND active_count = 0 THEN TRUE
+          ELSE FALSE
+        END AS archived
+      FROM combined
+      ${includeArchived ? '' : 'WHERE NOT (CASE WHEN entity_status = \'archived\' THEN TRUE WHEN proposals_count > 0 AND active_count = 0 THEN TRUE ELSE FALSE END)'}
+      ORDER BY last_activity_at DESC NULLS LAST, entity_name ASC
     `;
 
     const { rows } = await pool.query(sql);
@@ -3902,13 +3979,10 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
     const items = rows.map((r) => {
       const email            = norm(r.email);
       const phone            = norm(r.phone);
-      const telegramChatId   = norm(r.telegram_chat_id);
-      const telegramUsername = norm(r.telegram_username);
-
-      const line1   = norm(r.address_raw);
-      const city    = norm(r.city);
-      const country = norm(r.country);
-      const flat    = [line1, city, country].filter(Boolean).join(', ') || null;
+      const line1            = norm(r.address_raw);
+      const city             = norm(r.city);
+      const country          = norm(r.country);
+      const flat             = [line1, city, country].filter(Boolean).join(', ') || null;
 
       return {
         entityName: r.entity_name || '',
@@ -3920,16 +3994,14 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
         ownerWallet: r.owner_wallet || '',
 
         proposalsCount: Number(r.proposals_count) || 0,
-        lastProposalAt: r.last_proposal_at,
-        totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+        lastActivityAt: r.last_activity_at,
+        totalBudgetUSD: Number(r.total_awarded_usd) || 0,
 
         email,
         contactEmail: email,
         ownerEmail: email,
         phone,
         whatsapp: phone,
-        telegramChatId,
-        telegramUsername,
 
         address: flat,
         addressText: flat,
@@ -8310,6 +8382,136 @@ app.get('/vendor/profile', authRequired, async (req, res) => {
   } catch (e) {
     console.error('GET /vendor/profile error:', e);
     res.status(500).json({ error: 'Failed to load profile' });
+  }
+});
+
+// Save generic profile (no role required). Call this BEFORE choosing role.
+app.post("/profile", async (req, res) => {
+  try {
+    const wallet = String(req.user?.sub || "").toLowerCase();
+    if (!wallet) return res.status(401).json({ error: "unauthorized" });
+
+    const b = req.body || {};
+    const rowArgs = [
+      wallet,
+      b.displayName ?? b.display_name ?? null,
+      b.email ?? null,
+      b.phone ?? null,
+      b.website ?? null,
+      b.address ?? null,
+      b.city ?? null,
+      b.country ?? null,
+      b.telegramChatId ?? b.telegram_chat_id ?? null,
+      b.whatsapp ?? null,
+    ];
+
+    await pool.query(
+      `
+      INSERT INTO user_profiles
+        (wallet_address, display_name, email, phone, website, address, city, country, telegram_chat_id, whatsapp, updated_at)
+      VALUES
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NOW())
+      ON CONFLICT (wallet_address) DO UPDATE SET
+        display_name=$2, email=$3, phone=$4, website=$5, address=$6, city=$7, country=$8,
+        telegram_chat_id=$9, whatsapp=$10, updated_at=NOW()
+      `,
+      rowArgs
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /profile error", e);
+    return res.status(500).json({ error: "profile_save_failed" });
+  }
+});
+
+// Choose a role AFTER profile save
+app.post("/profile/choose-role", async (req, res) => {
+  try {
+    const wallet = String(req.user?.sub || "").toLowerCase();
+    if (!wallet) return res.status(401).json({ error: "unauthorized" });
+
+    const roleIntent = normalizeRoleIntent(req.body?.role || req.query?.role); // 'vendor' | 'proposer'
+    if (!roleIntent) return res.status(400).json({ error: "role_required" });
+
+    // Read generic profile to copy common fields on first-time seed
+    const { rows: base } = await pool.query(
+      `SELECT display_name, email, phone, website, address, city, country,
+              telegram_chat_id, whatsapp
+         FROM user_profiles WHERE lower(wallet_address)=lower($1)`,
+      [wallet]
+    );
+    const p = base[0] || {};
+    let roles = await durableRolesForAddress(wallet);
+
+    if (roleIntent === 'vendor' && !roles.includes('vendor')) {
+      // open the vendor insert window ONLY here
+      __vendorSeedGuard++;
+      try {
+        const { rows } = await pool.query(
+          `
+          INSERT INTO vendor_profiles
+            (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at, telegram_chat_id, whatsapp)
+          VALUES
+            ($1, COALESCE($2,''), $3, $4, $5, $6, 'pending', NOW(), NOW(), $7, $8)
+          ON CONFLICT (wallet_address) DO UPDATE SET
+            vendor_name=COALESCE($2,''), email=$3, phone=$4, website=$5, address=$6,
+            telegram_chat_id=$7, whatsapp=$8, updated_at=NOW()
+          RETURNING wallet_address`,
+          [
+            wallet,
+            p.display_name, p.email, p.phone, p.website, p.address,
+            p.telegram_chat_id, p.whatsapp
+          ]
+        );
+        if (rows && rows.length) {
+          try { await notifyVendorSignup({ wallet: rows[0].wallet_address }); } catch {}
+          try { await notifyVendorSignupVendor({ email: p.email || null }); } catch {}
+        }
+      } finally {
+        __vendorSeedGuard--;
+        if (__vendorSeedGuard < 0) __vendorSeedGuard = 0;
+      }
+    }
+
+    if (roleIntent === 'proposer' && !roles.includes('proposer')) {
+      await pool.query(
+        `
+        INSERT INTO proposer_profiles
+          (wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_chat_id, whatsapp, status, created_at, updated_at)
+        VALUES
+          ($1, COALESCE($2,''), $3, $4, $5, $6, $7, $8, $9, $10, 'active', NOW(), NOW())
+        ON CONFLICT (wallet_address) DO UPDATE SET
+          org_name=COALESCE($2,''), contact_email=$3, phone=$4, website=$5, address=$6, city=$7, country=$8,
+          telegram_chat_id=$9, whatsapp=$10, updated_at=NOW()
+        `,
+        [
+          wallet,
+          // org_name: prefer display_name as org by default (user can edit later)
+          p.display_name, p.email, p.phone, p.website, p.address, p.city, p.country, p.telegram_chat_id, p.whatsapp
+        ]
+      );
+    }
+
+    // recompute durable roles
+    roles = await durableRolesForAddress(wallet);
+    let role = roleFromDurableOrIntent(roles, roleIntent);
+
+    // Admin can still override to admin for UI if needed
+    if (isAdminAddress(wallet)) {
+      roles = Array.from(new Set([...(roles || []), 'admin']));
+      role = 'admin';
+    }
+
+    const token = signJwt({ sub: wallet, role, roles });
+    res.cookie("auth_token", token, {
+      httpOnly: true, secure: true, sameSite: "none", maxAge: 7 * 24 * 3600 * 1000,
+    });
+
+    return res.json({ ok: true, role, roles, token });
+  } catch (e) {
+    console.error("POST /profile/choose-role error", e);
+    return res.status(500).json({ error: "choose_role_failed" });
   }
 });
 
