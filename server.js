@@ -2779,6 +2779,19 @@ app.use(helmet());
 app.use(express.json({ limit: "20mb" }));
 app.use(cookieParser()); // 🔐 parse JWT cookie
 
+// --- auth decode (sets req.user if cookie/Bearer exists) --------------------
+app.use((req, _res, next) => {
+  try {
+    const token = req.headers.authorization?.startsWith('Bearer ')
+      ? req.headers.authorization.slice(7)
+      : req.cookies?.auth_token;
+    if (token) {
+      try { req.user = verifyJwt(token); } catch {}
+    }
+  } catch {}
+  next();
+});
+
 // Ensure JSON parsing is registered before admin routes
 app.use(express.json({ limit: '2mb' }));
 
