@@ -50,21 +50,6 @@ const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
 const { enrichAuditRow } = require('./services/auditPinata');
 
-
-// --- Global guard: block stray vendor inserts everywhere except inside /auth/login?role=vendor
-let __vendorSeedGuard = 0;
-const __origPoolQuery = pool.query.bind(pool);
-
-pool.query = async function guardedQuery(...args) {
-  const sql = typeof args[0] === 'string' ? args[0] : String(args[0]?.text || '');
-  if (/^\s*insert\s+into\s+vendor_profiles\b/i.test(sql) && __vendorSeedGuard === 0) {
-    console.warn('[BLOCKED] vendor_profiles insert outside guarded login path');
-    // behave like a successful no-op insert
-    return { rows: [], rowCount: 0, command: 'INSERT' };
-  }
-  return __origPoolQuery(...args);
-};
-
 // --- robust tx-hash extractor (handles strings, fields, functions, nested, promises) ---
 async function extractTxHash(sendRes) {
   if (!sendRes) return null;
@@ -155,6 +140,8 @@ async function safeFetchRL(url, opts = {}, attempt = 0) {
 // 🔐 auth utilities
 const cookieParser = require("cookie-parser");
 const jwt = require("jsonwebtoken");
+
+let __vendorSeedGuard = 0;
 
 // === ROLE HELPERS (paste once, under auth utilities; do NOT redeclare JWT_SECRET) =========
 const VALID_ROLES = ['vendor', 'proposer', 'admin'];
@@ -346,6 +333,23 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
+
+// --- Install vendor insert guard (MUST be after pool is created)
+if (!pool.query.__guardInstalled) {
+  const __origPoolQuery = pool.query.bind(pool);
+
+  pool.query = async function guardedQuery(...args) {
+    const sql = typeof args[0] === 'string' ? args[0] : String(args[0]?.text || '');
+    if (/^\s*insert\s+into\s+vendor_profiles\b/i.test(sql) && __vendorSeedGuard === 0) {
+      console.warn('[BLOCKED] vendor_profiles insert outside guarded login path');
+      // behave like a successful no-op
+      return { rows: [], rowCount: 0, command: 'INSERT' };
+    }
+    return __origPoolQuery(...args);
+  };
+  // mark so we don't double-wrap
+  pool.query.__guardInstalled = true;
+}
 
 // ---- Safe Tx overlay helpers (response-time hydration) ----
 const SAFE_CACHE_TTL_MS = Number(process.env.SAFE_CACHE_TTL_MS || 5000);
