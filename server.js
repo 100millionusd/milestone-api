@@ -8468,25 +8468,32 @@ app.post("/profile", authRequired, async (req, res) => {
   }
 });
 
-// --- hotfix: ensure _addrObj exists (alias or empty object) ---
-if (typeof _addrObj === 'undefined') {
-  const maybeAddr =
-    (typeof addrObj !== 'undefined' && addrObj) ||
-    (profile && (profile.address || profile.addressText)) ||
-    (vendor && (vendor.address || vendor.address1)) ||
-    null;
+// ---------- address helper (place this ABOVE the /vendor/profile route) ----------
+function _addrObj(addr, city = null, country = null) {
+  let o;
+  if (addr && typeof addr === 'object') {
+    o = { ...addr };
+  } else if (typeof addr === 'string') {
+    try {
+      const parsed = JSON.parse(addr);
+      o = parsed && typeof parsed === 'object' ? { ...parsed } : { line1: addr };
+    } catch {
+      o = { line1: addr };
+    }
+  } else {
+    o = {};
+  }
+  if (city && !o.city) o.city = city;
+  if (country && !o.country) o.country = country;
 
-  const normalized =
-    typeof maybeAddr === 'string'
-      ? { line1: maybeAddr }
-      : (maybeAddr && typeof maybeAddr === 'object' ? maybeAddr : {});
+  const addressText = [o.line1, o.line2, o.city, o.state, o.postalCode, o.country]
+    .filter(Boolean).join(', ');
 
-  // define the missing var so downstream code doesn't crash
-  var _addrObj = normalized;
+  return { ...o, addressText };
 }
-// --- end hotfix ---
+// ------------------------------------------------------------------------------
 
-
+// your existing route (UNCHANGED except it now finds _addrObj)
 app.get('/vendor/profile', authRequired, async (req, res) => {
   try {
     const wallet = String(req.user?.sub || '').toLowerCase();
@@ -8512,7 +8519,7 @@ app.get('/vendor/profile', authRequired, async (req, res) => {
         email: v.email || '',
         phone: v.phone || '',
         website: v.website || '',
-        address,
+        address, // same as before
         telegram_chat_id: v.telegram_chat_id || null,
         telegramChatId: v.telegram_chat_id || null,
       });
@@ -8534,7 +8541,7 @@ app.get('/vendor/profile', authRequired, async (req, res) => {
       email: u.email || '',
       phone: u.phone || '',
       website: u.website || '',
-      address: _addrObj(u.address, u.city, u.country),
+      address: _addrObj(u.address, u.city, u.country), // same as before
       telegram_chat_id: u.telegram_chat_id || null,
       telegramChatId: u.telegram_chat_id || null,
     });
