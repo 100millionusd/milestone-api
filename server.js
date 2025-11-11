@@ -142,83 +142,66 @@ async function safeFetchRL(url, opts = {}, attempt = 0) {
 const cookieParser = require("cookie-parser");
 const jwt = require("jsonwebtoken");
 
-// --- role & auth helpers -----------------------------------------------------
+// === ROLE HELPERS (paste once, under auth utilities; do NOT redeclare JWT_SECRET) =========
 const VALID_ROLES = ['vendor', 'proposer', 'admin'];
 
-function signJwt(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
+/** normalize role intent from query/body */
+function normalizeRoleIntent(v) {
+  return String(v || '').trim().toLowerCase();
 }
 
-function setAuthCookie(res, token) {
-  res.cookie('auth_token', token, {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: true,
-    maxAge: 30 * 24 * 60 * 60 * 1000,
-  });
+/** decide effective role given durable roles + optional explicit intent */
+function roleFromDurableOrIntent(roles, intent) {
+  if (!Array.isArray(roles)) roles = [];
+  // if they already only have one durable role and no intent, use it
+  if (roles.length === 1 && !intent) return roles[0];
+  // explicit intent wins (only allow vendor/proposer here)
+  if (intent === 'vendor' || intent === 'proposer') return intent;
+  // if there’s a single non-admin durable role, pick it
+  const nonAdmin = roles.filter(r => r !== 'admin');
+  if (nonAdmin.length === 1) return nonAdmin[0];
+  // otherwise force the client to choose
+  return null;
 }
 
-function readBearerOrCookie(req) {
-  const bearer = req.headers.authorization?.startsWith('Bearer ')
-    ? req.headers.authorization.slice(7)
-    : null;
-  return bearer || req.cookies?.auth_token || null;
-}
-
-function authOptional(req, _res, next) {
-  const token = readBearerOrCookie(req);
-  if (!token) return next();
-  try { req.user = jwt.verify(token, JWT_SECRET); } catch { /* ignore */ }
-  next();
-}
-
-function authRequired(req, res, next) {
-  authOptional(req, res, () => {
-    if (!req.user) return res.status(401).json({ error: 'unauthenticated' });
-    next();
-  });
-}
-
-function requireRole(expected) {
-  return async (req, res, next) => {
-    if (!req.user) return res.status(401).json({ error: 'unauthenticated' });
-    if (req.user.roles?.includes('admin')) return next(); // admins bypass
-    if (req.user.role !== expected) {
-      return res.status(403).json({
-        error: 'wrong_role',
-        message: `This endpoint requires "${expected}", current role is "${req.user.role}".`,
-      });
-    }
-    next();
-  };
-}
-
-// Discover durable roles the wallet already has (from DB + ADMIN list)
-async function discoverRoles(db, address) {
+/** durable roles = what the wallet actually has in DB (plus admin) */
+async function durableRolesForAddress(address) {
+  const addr = String(address || '').toLowerCase();
   const roles = [];
 
-  // vendor if a vendor profile exists
-  const v = await db.query(
-    'select 1 from vendor_profiles where wallet_address=$1 limit 1',
-    [address]
-  );
-  if (v.rowCount > 0) roles.push('vendor');
+  try {
+    if (isAdminAddress(addr)) roles.push('admin');
+  } catch {}
 
-  // proposer if they’ve authored proposals (owner_wallet)
-  const p = await db.query(
-    'select 1 from proposals where owner_wallet=$1 limit 1',
-    [address]
-  );
-  if (p.rowCount > 0) roles.push('proposer');
+  try {
+    const v = await pool.query(
+      `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+      [addr]
+    );
+    if (v.rowCount > 0) roles.push('vendor');
+  } catch {}
 
-  // admin via env
-  const admins = (process.env.ADMIN_ADDRESSES || '')
-    .split(',')
-    .map(s => s.trim().toLowerCase())
-    .filter(Boolean);
-  if (admins.includes(address.toLowerCase())) roles.push('admin');
+  try {
+    const p = await pool.query(
+      `SELECT 1 FROM proposals WHERE lower(owner_wallet)=lower($1) LIMIT 1`,
+      [addr]
+    );
+    if (p.rowCount > 0) roles.push('proposer');
+  } catch {}
 
   return roles;
+}
+
+/** create vendor profile only when user explicitly chooses vendor */
+async function maybeSeedVendor(address) {
+  const w = String(address || '').toLowerCase();
+  await pool.query(
+    `INSERT INTO vendor_profiles
+       (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at)
+     VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW())
+     ON CONFLICT (wallet_address) DO NOTHING`,
+    [w]
+  );
 }
 
 // ==============================
