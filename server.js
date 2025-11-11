@@ -3675,85 +3675,55 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
 });
 
 // ==============================
-// /admin/entities  (REPLACE the whole route with this; remove any duplicate route definitions)
+// /admin/entities  — REPLACE ENTIRE ROUTE
 // ==============================
 app.get('/admin/entities', adminGuard, async (req, res) => {
   try {
-    const includeArchived = ['true','1','yes'].includes(
-      String(req.query.includeArchived || '').toLowerCase()
-    );
+    const includeArchived = ['true','1','yes'].includes(String(req.query.includeArchived || '').toLowerCase());
 
     const sql = `
       WITH g AS (
         SELECT
-          LOWER(COALESCE(p.owner_wallet,''))                         AS owner_wallet,
-          COALESCE(MAX(p.org_name), '')                              AS entity_name,
-          COUNT(*)::int                                              AS proposals_count,
-          MAX(p.created_at)                                          AS last_proposal_at,
-          COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
-                            THEN p.amount_usd ELSE 0 END),0)::numeric AS total_awarded_usd,
-
-          -- Email from proposals first (owner_email), else contact if it looks like an email
+          LOWER(COALESCE(p.owner_wallet,'')) AS owner_wallet,
+          COALESCE(MAX(NULLIF(p.org_name,'')), '') AS entity_name,
+          COUNT(*)::int AS proposals_count,
+          MAX(p.created_at) AS last_proposal_at,
           COALESCE(
-            NULLIF(MAX(p.owner_email), ''),
-            NULLIF(MAX(CASE WHEN POSITION('@' IN COALESCE(p.contact,'')) > 0
-                            THEN p.contact ELSE '' END), '')
-          )                                                          AS email_from_proposals,
+            SUM(CASE WHEN p.status IN ('approved','funded','completed')
+                     THEN p.amount_usd ELSE 0 END),0
+          )::numeric AS total_awarded_usd,
 
-          -- other contact bits
-          COALESCE(MAX(NULLIF(p.owner_phone,'')), '')                AS phone,
+          -- contact fields (ONLY from proposals; no vendor_profiles join)
+          COALESCE(MAX(NULLIF(p.owner_email,'')), '') AS email,
+          COALESCE(MAX(NULLIF(p.owner_phone,'')), '') AS phone,
           COALESCE(MAX(NULLIF(p.owner_telegram_chat_id::text,'')), '') AS telegram_chat_id,
-          COALESCE(MAX(NULLIF(p.owner_telegram_username,'')), '')    AS telegram_username,
+          COALESCE(MAX(NULLIF(p.owner_telegram_username,'')), '') AS telegram_username,
 
           -- address (latest non-empty)
-          COALESCE(MAX(NULLIF(p.address,'')), '')                    AS address_raw,
-          COALESCE(MAX(NULLIF(p.city,'')), '')                       AS city,
-          COALESCE(MAX(NULLIF(p.country,'')), '')                    AS country,
+          COALESCE(MAX(NULLIF(p.address,'')), '') AS address_raw,
+          COALESCE(MAX(NULLIF(p.city,'')), '') AS city,
+          COALESCE(MAX(NULLIF(p.country,'')), '') AS country,
 
-          -- archived derived from statuses (NO p.archived / p.contact_email)
-          COUNT(*) FILTER (WHERE p.status = 'archived')::int         AS archived_count,
-          COUNT(*) FILTER (WHERE p.status <> 'archived')::int        AS active_count,
+          -- archive state derived from status
+          COUNT(*) FILTER (WHERE p.status = 'archived')::int  AS archived_count,
+          COUNT(*) FILTER (WHERE p.status <> 'archived')::int AS active_count,
           CASE WHEN COUNT(*) > 0
                  AND COUNT(*) FILTER (WHERE p.status <> 'archived') = 0
-               THEN true ELSE false END                              AS archived
+               THEN true ELSE false END AS archived
         FROM proposals p
         GROUP BY LOWER(COALESCE(p.owner_wallet,''))
       )
-      SELECT
-        g.owner_wallet,
-        g.entity_name,
-        g.proposals_count,
-        g.last_proposal_at,
-        g.total_awarded_usd,
-        g.phone,
-        g.telegram_chat_id,
-        g.telegram_username,
-        g.address_raw,
-        g.city,
-        g.country,
-        g.archived_count,
-        g.active_count,
-        g.archived,
-
-        -- Prefer vendor_profiles email; then proposals-derived
-        COALESCE(
-          NULLIF(vp.email, ''),
-          NULLIF(vp.contact_email, ''),
-          NULLIF(vp.owner_email, ''),
-          g.email_from_proposals
-        ) AS email_final
+      SELECT *
       FROM g
-      LEFT JOIN vendor_profiles vp
-        ON LOWER(COALESCE(vp.wallet_address,'')) = g.owner_wallet
-      ${includeArchived ? '' : 'WHERE g.archived = false'}
-      ORDER BY g.last_proposal_at DESC NULLS LAST, g.entity_name ASC
+      ${includeArchived ? '' : 'WHERE archived = false'}
+      ORDER BY last_proposal_at DESC NULLS LAST, entity_name ASC
     `;
 
     const { rows } = await pool.query(sql);
     const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
     const items = rows.map((r) => {
-      const email            = norm(r.email_final);
+      const email            = norm(r.email);
       const phone            = norm(r.phone);
       const telegramChatId   = norm(r.telegram_chat_id);
       const telegramUsername = norm(r.telegram_username);
@@ -3777,7 +3747,7 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
         lastProposalAt: r.last_proposal_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // contact (unified)
+        // contact
         email,
         contactEmail: email,
         ownerEmail: email,
