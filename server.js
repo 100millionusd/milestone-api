@@ -3675,7 +3675,7 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
 });
 
 // ==============================
-// List — entities (proposers)  (REPLACE the whole /admin/entities GET route)
+// List — entities (proposers)  (REPLACE WHOLE ROUTE)
 // ==============================
 app.get('/admin/entities', adminGuard, async (req, res) => {
   try {
@@ -3683,77 +3683,32 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
       String(req.query.includeArchived || '').toLowerCase()
     );
 
-    // use your existing helper (defined once, not duplicated)
-    const cols = await detectProposalCols(pool);
-
-    // dynamic pieces (only use columns that actually exist)
-    const walletCol = cols.walletCols[0] || null;
-    const statusCol = cols.statusCol || null;
-
-    const walletExpr = walletCol
-      ? `LOWER(COALESCE(NULLIF(p.${walletCol},''), ''))`
-      : `''`; // fallback
-
-    const entityExpr = cols.orgCols.length
-      ? `COALESCE(${cols.orgCols.map(c => `MAX(NULLIF(p.${c},''))`).join(', ')}, '')`
-      : `''`;
-
-    const emailExpr = cols.emailCols.length
-      ? `COALESCE(${cols.emailCols.map(c => `MAX(NULLIF(p.${c},''))`).join(', ')}, '')`
-      : `''`;
-
-    // keep the rest conservative to avoid unknown columns
-    const phoneExpr        = `COALESCE(MAX(NULLIF(p.owner_phone,'')), MAX(NULLIF(p.phone,'')), MAX(NULLIF(p.whatsapp,'')), '')`;
-    const telegramIdExpr   = `COALESCE(MAX(NULLIF(p.owner_telegram_chat_id::text,'')), '')`;
-    const telegramUserExpr = `COALESCE(MAX(NULLIF(p.owner_telegram_username,'')), '')`;
-    const addrExpr         = `COALESCE(MAX(NULLIF(p.address,'')), '')`;
-    const cityExpr         = `COALESCE(MAX(NULLIF(p.city,'')), '')`;
-    const countryExpr      = `COALESCE(MAX(NULLIF(p.country,'')), '')`;
-
-    const archivedCountExpr = statusCol ? `COUNT(*) FILTER (WHERE p.${statusCol} = 'archived')::int` : `0::int`;
-    const activeCountExpr   = statusCol ? `COUNT(*) FILTER (WHERE p.${statusCol} <> 'archived')::int` : `COUNT(*)::int`;
-    const archivedFlagExpr  = statusCol
-      ? `CASE WHEN COUNT(*) > 0 AND COUNT(*) FILTER (WHERE p.${statusCol} <> 'archived') = 0 THEN true ELSE false END`
-      : `false`;
-
-    const approvedCond = statusCol ? `b.status IN ('approved','funded','completed')` : `true`;
-
     const sql = `
-      WITH base AS (
+      WITH g AS (
         SELECT
-          ${walletExpr} AS owner_wallet,
-          ${entityExpr} AS entity_name,
-          p.amount_usd,
-          p.created_at,
-          ${emailExpr} AS email,
-          ${phoneExpr} AS phone,
-          ${telegramIdExpr} AS telegram_chat_id,
-          ${telegramUserExpr} AS telegram_username,
-          ${addrExpr} AS address_raw,
-          ${cityExpr} AS city,
-          ${countryExpr} AS country
-          ${statusCol ? `, p.${statusCol} AS status` : ``}
-        FROM proposals p
-      ),
-      g AS (
-        SELECT
-          b.owner_wallet,
-          MAX(b.entity_name) AS entity_name,
+          LOWER(COALESCE(p.owner_wallet,'')) AS owner_wallet,
+          COALESCE(MAX(NULLIF(p.org_name,'')), '') AS entity_name,
           COUNT(*)::int AS proposals_count,
-          MAX(b.created_at) AS last_proposal_at,
-          COALESCE(SUM(CASE WHEN ${approvedCond} THEN b.amount_usd ELSE 0 END),0)::numeric AS total_awarded_usd,
-          MAX(b.email) AS email,
-          MAX(b.phone) AS phone,
-          MAX(b.telegram_chat_id) AS telegram_chat_id,
-          MAX(b.telegram_username) AS telegram_username,
-          MAX(b.address_raw) AS address_raw,
-          MAX(b.city) AS city,
-          MAX(b.country) AS country,
-          ${archivedCountExpr} AS archived_count,
-          ${activeCountExpr} AS active_count,
-          ${archivedFlagExpr} AS archived
-        FROM base b
-        GROUP BY b.owner_wallet
+          MAX(p.created_at) AS last_proposal_at,
+          COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
+                            THEN p.amount_usd ELSE 0 END),0)::numeric AS total_awarded_usd,
+
+          MAX(NULLIF(p.owner_email,'')) AS email,
+          MAX(NULLIF(p.owner_phone,'')) AS phone,
+          MAX(NULLIF((p.owner_telegram_chat_id)::text,'')) AS telegram_chat_id,
+          MAX(NULLIF(p.owner_telegram_username,'')) AS telegram_username,
+
+          MAX(NULLIF(p.address,'')) AS address_raw,
+          MAX(NULLIF(p.city,'')) AS city,
+          MAX(NULLIF(p.country,'')) AS country,
+
+          COUNT(*) FILTER (WHERE p.status = 'archived')::int AS archived_count,
+          COUNT(*) FILTER (WHERE p.status <> 'archived')::int AS active_count,
+          CASE WHEN COUNT(*) > 0
+                 AND COUNT(*) FILTER (WHERE p.status <> 'archived') = 0
+               THEN true ELSE false END AS archived
+        FROM proposals p
+        GROUP BY LOWER(COALESCE(p.owner_wallet,''))
       )
       SELECT *
       FROM g
