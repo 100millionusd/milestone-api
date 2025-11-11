@@ -8468,6 +8468,25 @@ app.post("/profile", authRequired, async (req, res) => {
   }
 });
 
+// --- hotfix: ensure _addrObj exists (alias or empty object) ---
+if (typeof _addrObj === 'undefined') {
+  const maybeAddr =
+    (typeof addrObj !== 'undefined' && addrObj) ||
+    (profile && (profile.address || profile.addressText)) ||
+    (vendor && (vendor.address || vendor.address1)) ||
+    null;
+
+  const normalized =
+    typeof maybeAddr === 'string'
+      ? { line1: maybeAddr }
+      : (maybeAddr && typeof maybeAddr === 'object' ? maybeAddr : {});
+
+  // define the missing var so downstream code doesn't crash
+  var _addrObj = normalized;
+}
+// --- end hotfix ---
+
+
 app.get('/vendor/profile', authRequired, async (req, res) => {
   try {
     const wallet = String(req.user?.sub || '').toLowerCase();
