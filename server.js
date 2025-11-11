@@ -204,6 +204,23 @@ async function maybeSeedVendor(address) {
   );
 }
 
+function requireAdmin(req, res, next) {
+  try {
+    const token = req.headers.authorization?.startsWith('Bearer ')
+      ? req.headers.authorization.slice(7)
+      : req.cookies?.auth_token;
+    const user = token ? verifyJwt(token) : null;
+    if (!user?.sub) return res.status(401).json({ error: 'unauthenticated' });
+    if (!isAdminAddress(String(user.sub).toLowerCase())) {
+      return res.status(403).json({ error: 'forbidden', message: 'admin only' });
+    }
+    req.user = user;
+    return next();
+  } catch {
+    return res.status(401).json({ error: 'unauthenticated' });
+  }
+}
+
 // ==============================
 // Config
 // ==============================
@@ -2778,19 +2795,6 @@ app.use(
 app.use(helmet());
 app.use(express.json({ limit: "20mb" }));
 app.use(cookieParser()); // 🔐 parse JWT cookie
-
-// --- auth decode (sets req.user if cookie/Bearer exists) --------------------
-app.use((req, _res, next) => {
-  try {
-    const token = req.headers.authorization?.startsWith('Bearer ')
-      ? req.headers.authorization.slice(7)
-      : req.cookies?.auth_token;
-    if (token) {
-      try { req.user = verifyJwt(token); } catch {}
-    }
-  } catch {}
-  next();
-});
 
 // Ensure JSON parsing is registered before admin routes
 app.use(express.json({ limit: '2mb' }));
