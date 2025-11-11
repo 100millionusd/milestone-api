@@ -142,6 +142,86 @@ async function safeFetchRL(url, opts = {}, attempt = 0) {
 const cookieParser = require("cookie-parser");
 const jwt = require("jsonwebtoken");
 
+// --- role & auth helpers -----------------------------------------------------
+const VALID_ROLES = ['vendor', 'proposer', 'admin'];
+const JWT_SECRET = process.env.JWT_SECRET;
+
+function signJwt(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
+}
+
+function setAuthCookie(res, token) {
+  res.cookie('auth_token', token, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: true,
+    maxAge: 30 * 24 * 60 * 60 * 1000,
+  });
+}
+
+function readBearerOrCookie(req) {
+  const bearer = req.headers.authorization?.startsWith('Bearer ')
+    ? req.headers.authorization.slice(7)
+    : null;
+  return bearer || req.cookies?.auth_token || null;
+}
+
+function authOptional(req, _res, next) {
+  const token = readBearerOrCookie(req);
+  if (!token) return next();
+  try { req.user = jwt.verify(token, JWT_SECRET); } catch { /* ignore */ }
+  next();
+}
+
+function authRequired(req, res, next) {
+  authOptional(req, res, () => {
+    if (!req.user) return res.status(401).json({ error: 'unauthenticated' });
+    next();
+  });
+}
+
+function requireRole(expected) {
+  return (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: 'unauthenticated' });
+    if (req.user.roles?.includes('admin')) return next(); // admins bypass
+    if (req.user.role !== expected) {
+      return res.status(403).json({
+        error: 'wrong_role',
+        message: `This endpoint requires "${expected}", current role is "${req.user.role}".`,
+      });
+    }
+    next();
+  };
+}
+
+// Discover durable roles the wallet already has (from DB + ADMIN list)
+async function discoverRoles(db, address) {
+  const roles = [];
+
+  // vendor if a vendor profile exists
+  const v = await db.query(
+    'select 1 from vendor_profiles where wallet_address=$1 limit 1',
+    [address]
+  );
+  if (v.rowCount > 0) roles.push('vendor');
+
+  // proposer if they’ve authored proposals (owner_wallet)
+  const p = await db.query(
+    'select 1 from proposals where owner_wallet=$1 limit 1',
+    [address]
+  );
+  if (p.rowCount > 0) roles.push('proposer');
+
+  // admin via env
+  const admins = (process.env.ADMIN_ADDRESSES || '')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (admins.includes(address.toLowerCase())) roles.push('admin');
+
+  return roles;
+}
+
 // ==============================
 // Config
 // ==============================
@@ -2973,10 +3053,11 @@ app.post("/auth/nonce", (req, res) => {
   res.json({ nonce });
 });
 
-// cookie-mode verify (kept for compatibility)
 app.post("/auth/verify", async (req, res) => {
   const address = norm(req.body?.address);
   const signature = req.body?.signature;
+  const roleIntent = normalizeRoleIntent(req.body?.role || req.query?.role);
+
   if (!address || !signature) return res.status(400).json({ error: "address and signature required" });
 
   const nonce = getNonce(address);
@@ -2990,21 +3071,23 @@ app.post("/auth/verify", async (req, res) => {
     return res.status(401).json({ error: "signature does not match address" });
   }
 
-  const isAdmin = isAdminAddress(address);
-let role = isAdmin ? "admin" : "user";
-if (!isAdmin) {
-  try {
-    const { rows: vp } = await pool.query(
-      `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-      [address]
-    );
-    if (vp && vp[0]) role = "vendor";
-  } catch {
-    // leave as "user" on error
+  // Compute durable roles and decide effective role
+  let roles = await durableRolesForAddress(address);
+  let role = roleFromDurableOrIntent(roles, roleIntent);
+  if (!role) {
+    return res.status(400).json({
+      error: "role_required",
+      message: 'Choose "vendor" (Submit a Bid) or "proposer" (Submit Proposal).'
+    });
   }
-}
 
-  const token = signJwt({ sub: address, role });
+  // Only seed vendor row when vendor intent chosen and missing
+  if (role === 'vendor' && !roles.includes('vendor')) {
+    await maybeSeedVendor(address);
+    roles = await durableRolesForAddress(address);
+  }
+
+  const token = signJwt({ sub: address, role, roles });
 
   res.cookie("auth_token", token, {
     httpOnly: true,
@@ -3012,6 +3095,13 @@ if (!isAdmin) {
     sameSite: "none",
     maxAge: 7 * 24 * 3600 * 1000,
   });
+
+  // (Optional) notify on first vendor creation (only when we actually seeded)
+  // if (role === 'vendor') { try { /* call your notifyVendorSignup* here if needed */ } catch {} }
+
+  nonces.delete(address);
+  res.json({ token, role, roles });
+});
 
   // ⬇️ Auto-seed vendor_profiles row with status='pending' and notify admins on FIRST signup
 try {
@@ -3050,7 +3140,6 @@ if (rows.length) {
 
   nonces.delete(address);
   res.json({ token, role });
-});
 
 // nonce compat for frontend
 app.get("/auth/nonce", (req, res) => {
@@ -3061,10 +3150,11 @@ app.get("/auth/nonce", (req, res) => {
   res.json({ nonce });
 });
 
-// login compat for frontend
 app.post("/auth/login", async (req, res) => {
   const address = norm(req.body?.address);
   const signature = req.body?.signature;
+  const roleIntent = normalizeRoleIntent(req.body?.role || req.query?.role);
+
   if (!address || !signature) return res.status(400).json({ error: "address and signature required" });
 
   const nonce = getNonce(address);
@@ -3076,21 +3166,21 @@ app.post("/auth/login", async (req, res) => {
 
   if (norm(recovered) !== address) return res.status(401).json({ error: "signature does not match address" });
 
-  const isAdmin = isAdminAddress(address);
-let role = isAdmin ? "admin" : "user";
-if (!isAdmin) {
-  try {
-    const { rows: vp } = await pool.query(
-      `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-      [address]
-    );
-    if (vp && vp[0]) role = "vendor";
-  } catch {
-    // leave as "user" on error
+  let roles = await durableRolesForAddress(address);
+  let role = roleFromDurableOrIntent(roles, roleIntent);
+  if (!role) {
+    return res.status(400).json({
+      error: "role_required",
+      message: 'Choose "vendor" (Submit a Bid) or "proposer" (Submit Proposal).'
+    });
   }
-}
 
-  const token = signJwt({ sub: address, role });
+  if (role === 'vendor' && !roles.includes('vendor')) {
+    await maybeSeedVendor(address);
+    roles = await durableRolesForAddress(address);
+  }
+
+  const token = signJwt({ sub: address, role, roles });
 
   res.cookie("auth_token", token, {
     httpOnly: true,
@@ -3098,6 +3188,10 @@ if (!isAdmin) {
     sameSite: "none",
     maxAge: 7 * 24 * 3600 * 1000,
   });
+
+  nonces.delete(address);
+  res.json({ token, role, roles });
+});
 
   // ⬇️ Auto-seed vendor_profiles row with status='pending' and notify admins on FIRST signup
 try {
@@ -3136,14 +3230,14 @@ if (rows.length) {
 
   nonces.delete(address);
   res.json({ token, role });
-});
 
 app.get("/auth/role", async (req, res) => {
   try {
-    // 1) Primary: req.user set by cookie/Bearer
+    // If middleware already decoded the token:
     if (req.user) {
       const address = String(req.user.sub || '');
       const role = req.user.role;
+      const roles = Array.isArray(req.user.roles) ? req.user.roles : await durableRolesForAddress(address);
       let vendorStatus = 'pending';
 
       if (role === 'vendor' && address) {
@@ -3153,10 +3247,10 @@ app.get("/auth/role", async (req, res) => {
         );
         vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
       }
-      return res.json({ address, role, vendorStatus });
+      return res.json({ address, role, roles, vendorStatus });
     }
 
-    // 2) Legacy cookie fallback (use unique names to avoid redeclare)
+    // Legacy cookie fallback
     {
       const legacyToken = req.cookies?.auth_token;
       const legacyUser = legacyToken ? verifyJwt(legacyToken) : null;
@@ -3164,6 +3258,7 @@ app.get("/auth/role", async (req, res) => {
       if (legacyUser) {
         const address = String(legacyUser.sub || '');
         const role = legacyUser.role;
+        const roles = Array.isArray(legacyUser.roles) ? legacyUser.roles : await durableRolesForAddress(address);
         let vendorStatus = 'pending';
 
         if (role === 'vendor' && address) {
@@ -3173,16 +3268,17 @@ app.get("/auth/role", async (req, res) => {
           );
           vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
         }
-        return res.json({ address, role, vendorStatus });
+        return res.json({ address, role, roles, vendorStatus });
       }
     }
 
-    // 3) Query fallback (?address=0x...)
+    // Query fallback (?address=0x...)
     {
       const qAddress = norm(req.query.address);
       if (!qAddress) return res.json({ role: "guest" });
 
-      const role = await roleForAddress(address);
+      const roles = await durableRolesForAddress(qAddress);
+      const role = roles[0] || 'user'; // arbitrary default when unauthenticated
       let vendorStatus = 'pending';
 
       if (role === 'vendor') {
@@ -3192,11 +3288,74 @@ app.get("/auth/role", async (req, res) => {
         );
         vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
       }
-      return res.json({ address: qAddress, role, vendorStatus });
+      return res.json({ address: qAddress, role, roles, vendorStatus });
     }
   } catch (e) {
     console.error('/auth/role error', e);
     return res.status(500).json({ error: 'role_failed' });
+  }
+});
+
+// switch current role between "vendor" and "proposer"
+app.post("/auth/switch-role", async (req, res) => {
+  try {
+    const token = req.headers.authorization?.startsWith('Bearer ')
+      ? req.headers.authorization.slice(7)
+      : req.cookies?.auth_token;
+
+    if (!token) return res.status(401).json({ error: 'unauthenticated' });
+
+    const user = verifyJwt(token);
+    const address = norm(user?.sub || '');
+    if (!address) return res.status(401).json({ error: 'unauthenticated' });
+
+    const target = String(req.body?.role || '').toLowerCase();
+    if (target !== 'vendor' && target !== 'proposer') {
+      return res.status(400).json({ error: 'invalid_role' });
+    }
+
+    // if switching to vendor, ensure a vendor profile exists (explicit intent)
+    if (target === 'vendor') {
+      await pool.query(
+        `INSERT INTO vendor_profiles
+           (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at)
+         VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW())
+         ON CONFLICT (wallet_address) DO NOTHING`,
+        [address.toLowerCase()]
+      );
+      // optional: notify admins/vendor here if you want, gated to only first insert
+    }
+
+    // recompute durable roles (admin/vendor/proposer)
+    const roles = [];
+    if (isAdminAddress(address)) roles.push('admin');
+
+    const { rows: v } = await pool.query(
+      `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+      [address]
+    );
+    if (v && v[0]) roles.push('vendor');
+
+    const { rows: p } = await pool.query(
+      `SELECT 1 FROM proposals WHERE lower(owner_wallet)=lower($1) LIMIT 1`,
+      [address]
+    );
+    if (p && p[0]) roles.push('proposer');
+
+    // issue a new token with the chosen current role
+    const newToken = signJwt({ sub: address, role: target, roles });
+
+    res.cookie("auth_token", newToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "none",
+      maxAge: 7 * 24 * 3600 * 1000,
+    });
+
+    return res.json({ role: target, roles });
+  } catch (e) {
+    console.error('/auth/switch-role error', e);
+    return res.status(500).json({ error: 'server_error' });
   }
 });
 
