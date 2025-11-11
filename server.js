@@ -212,86 +212,43 @@ function _addrText(a, city, country) {
   return out || null;
 }
 
-// ---- Canonical vendor seeder: copy from user_profiles to vendor_profiles
+// Canonical vendor seeder: copy fields from user_profiles → vendor_profiles
 async function seedVendorFromUserProfile(pool, wallet) {
   const w = String(wallet || '').toLowerCase();
   if (!w) return false;
 
-  const { rows } = await pool.query(
-    `INSERT INTO vendor_profiles
-       (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at, telegram_chat_id, whatsapp)
-     SELECT $1,
-            COALESCE(display_name,''),
-            email, phone, website, address,
-            'pending', NOW(), NOW(),
-            telegram_chat_id, whatsapp
-       FROM user_profiles
-      WHERE lower(wallet_address)=lower($1)
-     ON CONFLICT (wallet_address) DO UPDATE SET
-       vendor_name       = COALESCE(EXCLUDED.vendor_name,''),
-       email             = EXCLUDED.email,
-       phone             = EXCLUDED.phone,
-       website           = EXCLUDED.website,
-       address           = EXCLUDED.address,
-       telegram_chat_id  = EXCLUDED.telegram_chat_id,
-       whatsapp          = EXCLUDED.whatsapp,
-       updated_at        = NOW()
-     RETURNING wallet_address`,
-    [w]
-  );
-
-  return rows.length > 0;
-}
-
-async function maybeSeedVendor(address) {
-  const w = String(address || '').toLowerCase();
-  if (!w) return;
-
-  const { rows } = await pool.query(
-    `SELECT display_name, email, phone, website, address, city, country,
-            telegram_chat_id, whatsapp
-       FROM user_profiles
-      WHERE lower(wallet_address)=lower($1)
-      LIMIT 1`,
-    [w]
-  );
-  const u = rows[0] || {};
-  const vendorName = (u?.display_name || '').trim();
-  const addr = _addrText(u?.address, u?.city, u?.country);
-
-  __vendorSeedGuard++;
+  __vendorSeedGuard++; // temporarily allow vendor insert past the global guard
   try {
-    await pool.query(
-      `
-      INSERT INTO vendor_profiles
-        (wallet_address, vendor_name, email, phone, website, address,
-         status, telegram_chat_id, whatsapp, created_at, updated_at)
-      VALUES
-        ($1,$2,$3,$4,$5,$6,'pending',$7,$8,NOW(),NOW())
-      ON CONFLICT (wallet_address) DO UPDATE SET
-        vendor_name      = COALESCE(NULLIF(EXCLUDED.vendor_name,''), vendor_profiles.vendor_name),
-        email            = EXCLUDED.email,
-        phone            = EXCLUDED.phone,
-        website          = EXCLUDED.website,
-        address          = EXCLUDED.address,
-        telegram_chat_id = COALESCE(EXCLUDED.telegram_chat_id, vendor_profiles.telegram_chat_id),
-        whatsapp         = COALESCE(EXCLUDED.whatsapp, vendor_profiles.whatsapp),
-        updated_at       = NOW()
-      `,
-      [
-        w,
-        vendorName || null,
-        u?.email ?? null,
-        u?.phone ?? null,
-        u?.website ?? null,
-        addr,
-        u?.telegram_chat_id ?? null,
-        u?.whatsapp ?? null,
-      ]
+    const { rowCount } = await pool.query(
+      `INSERT INTO vendor_profiles
+         (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at, telegram_chat_id, whatsapp)
+       SELECT $1,
+              COALESCE(display_name,''),
+              email, phone, website, address,
+              'pending', NOW(), NOW(),
+              telegram_chat_id, whatsapp
+         FROM user_profiles
+        WHERE lower(wallet_address)=lower($1)
+       ON CONFLICT (wallet_address) DO UPDATE SET
+         vendor_name       = COALESCE(NULLIF(EXCLUDED.vendor_name,''), vendor_profiles.vendor_name),
+         email             = EXCLUDED.email,
+         phone             = EXCLUDED.phone,
+         website           = EXCLUDED.website,
+         address           = EXCLUDED.address,
+         telegram_chat_id  = COALESCE(EXCLUDED.telegram_chat_id, vendor_profiles.telegram_chat_id),
+         whatsapp          = COALESCE(EXCLUDED.whatsapp, vendor_profiles.whatsapp),
+         updated_at        = NOW()`,
+      [w]
     );
+    return rowCount > 0;
   } finally {
     __vendorSeedGuard--;
   }
+}
+
+// Back-compat alias for old call sites
+async function maybeSeedVendor(address) {
+  return seedVendorFromUserProfile(pool, address);
 }
 
 function requireAdmin(req, res, next) {
@@ -3296,22 +3253,33 @@ app.get("/auth/nonce", (req, res) => {
   res.json({ nonce });
 });
 
+// === Auth: login (nonce + signature -> JWT, role by intent; vendor seeding guarded) ===
 app.post("/auth/login", async (req, res) => {
   const address = norm(req.body?.address);
   const signature = req.body?.signature;
   const roleIntent = normalizeRoleIntent(req.body?.role || req.query?.role);
 
-  if (!address || !signature) return res.status(400).json({ error: "address and signature required" });
+  if (!address || !signature) {
+    return res.status(400).json({ error: "address and signature required" });
+  }
 
   const nonce = getNonce(address);
-  if (!nonce) return res.status(400).json({ error: "nonce not found or expired" });
+  if (!nonce) {
+    return res.status(400).json({ error: "nonce not found or expired" });
+  }
 
   let recovered;
-  try { recovered = ethers.utils.verifyMessage(nonce, signature); }
-  catch { return res.status(400).json({ error: "invalid signature" }); }
+  try {
+    recovered = ethers.utils.verifyMessage(nonce, signature);
+  } catch {
+    return res.status(400).json({ error: "invalid signature" });
+  }
 
-  if (norm(recovered) !== address) return res.status(401).json({ error: "signature does not match address" });
+  if (norm(recovered) !== address) {
+    return res.status(401).json({ error: "signature does not match address" });
+  }
 
+  // Decide role from durable roles + button intent
   let roles = await durableRolesForAddress(address);
   let role = roleFromDurableOrIntent(roles, roleIntent);
   if (!role) {
@@ -3321,48 +3289,69 @@ app.post("/auth/login", async (req, res) => {
     });
   }
 
-  if (role === 'vendor' && !roles.includes('vendor')) {
-  __vendorSeedGuard++; // allow exactly this insert
-  try {
-    const w = address.toLowerCase();
-    const { rows } = await pool.query(
-      `INSERT INTO vendor_profiles
-         (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at)
-       VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW())
-       ON CONFLICT (wallet_address) DO NOTHING
-       RETURNING wallet_address, vendor_name, email, phone`,
-      [w]
-    );
+  // Seed vendor row ONLY when intent=vendor and user isn't a vendor yet
+  if (role === "vendor" && !roles.includes("vendor")) {
+    __vendorSeedGuard++; // temporarily lift the global insert guard
+    try {
+      const w = address.toLowerCase();
+      const { rows } = await pool.query(
+        `INSERT INTO vendor_profiles
+           (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at)
+         VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW())
+         ON CONFLICT (wallet_address) DO NOTHING
+         RETURNING wallet_address, vendor_name, email, phone, telegram_chat_id, whatsapp`,
+        [w]
+      );
 
-    if (rows && rows.length) {
-      try { await notifyVendorSignup({ wallet: rows[0].wallet_address }); } catch {}
-      try { await notifyVendorSignupVendor({ email: rows[0].email || null }); } catch {}
-      roles = Array.from(new Set([ ...(roles || []), 'vendor' ]));
+      if (rows && rows.length) {
+        // first-time notifications (best-effort)
+        try {
+          await notifyVendorSignup({
+            wallet: rows[0].wallet_address,
+            vendorName: rows[0].vendor_name || "",
+            email: rows[0].email || "",
+            phone: rows[0].phone || ""
+          });
+        } catch {}
+        try {
+          await notifyVendorSignupVendor({
+            vendorName: rows[0].vendor_name || "",
+            email: rows[0].email || "",
+            phone: rows[0].phone || "",
+            telegramChatId: rows[0].telegram_chat_id || null,
+            whatsapp: rows[0].whatsapp || null
+          });
+        } catch {}
+
+        // reflect vendor in role set
+        roles = Array.from(new Set([...(roles || []), "vendor"]));
+      }
+    } catch (e) {
+      console.warn("vendor seed failed (non-fatal):", String(e).slice(0, 200));
+    } finally {
+      __vendorSeedGuard--; // restore guard
     }
-  } catch (e) {
-    console.warn('vendor seed failed (non-fatal):', String(e).slice(0,200));
-  } finally {
-    __vendorSeedGuard--; // re-enable global block
   }
-}
 
-  // ADMIN OVERRIDE: if wallet is admin, always act as admin in the UI
-if (isAdminAddress(address)) {
-  roles = Array.from(new Set([...(roles || []), 'admin']));
-  role = 'admin';
-}
+  // Admin override: force admin role if wallet is admin
+  if (isAdminAddress(address)) {
+    roles = Array.from(new Set([...(roles || []), "admin"]));
+    role = "admin";
+  }
 
+  // Issue JWT + cookie
   const token = signJwt({ sub: address, role, roles });
-
   res.cookie("auth_token", token, {
     httpOnly: true,
     secure: true,
     sameSite: "none",
-    maxAge: 7 * 24 * 3600 * 1000,
+    maxAge: 7 * 24 * 3600 * 1000
   });
 
+  // Single-use nonce
   nonces.delete(address);
-  res.json({ token, role, roles });
+
+  return res.json({ token, role, roles });
 });
 
 app.get("/auth/role", async (req, res) => {
@@ -3428,7 +3417,6 @@ app.get("/auth/role", async (req, res) => {
   }
 });
 
-// switch current role between "vendor" and "proposer"
 app.post("/auth/switch-role", async (req, res) => {
   try {
     const token = req.headers.authorization?.startsWith('Bearer ')
@@ -3446,37 +3434,28 @@ app.post("/auth/switch-role", async (req, res) => {
       return res.status(400).json({ error: 'invalid_role' });
     }
 
-    // if switching to vendor, ensure a vendor profile exists (explicit intent)
+    // ✅ use the helper instead of a raw INSERT
     if (target === 'vendor') {
-      await pool.query(
-        `INSERT INTO vendor_profiles
-           (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at)
-         VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW())
-         ON CONFLICT (wallet_address) DO NOTHING`,
-        [address.toLowerCase()]
-      );
-      // optional: notify admins/vendor here if you want, gated to only first insert
+      await seedVendorFromUserProfile(pool, address);
     }
 
-    // recompute durable roles (admin/vendor/proposer)
+    // recompute durable roles
     const roles = [];
     if (isAdminAddress(address)) roles.push('admin');
 
-    const { rows: v } = await pool.query(
+    const v = await pool.query(
       `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
       [address]
     );
-    if (v && v[0]) roles.push('vendor');
+    if (v.rowCount > 0) roles.push('vendor');
 
-    const { rows: p } = await pool.query(
+    const p = await pool.query(
       `SELECT 1 FROM proposals WHERE lower(owner_wallet)=lower($1) LIMIT 1`,
       [address]
     );
-    if (p && p[0]) roles.push('proposer');
+    if (p.rowCount > 0) roles.push('proposer');
 
-    // issue a new token with the chosen current role
     const newToken = signJwt({ sub: address, role: target, roles });
-
     res.cookie("auth_token", newToken, {
       httpOnly: true,
       secure: true,
