@@ -3674,75 +3674,86 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
   }
 });
 
-/** ADMIN: list entities (proposers) with deep-linkable contact fields */
+// ==============================
+// List — entities (proposers)  (REPLACE the whole /admin/entities GET route)
+// ==============================
 app.get('/admin/entities', adminGuard, async (req, res) => {
   try {
     const includeArchived = ['true','1','yes'].includes(
       String(req.query.includeArchived || '').toLowerCase()
     );
 
+    // use your existing helper (defined once, not duplicated)
+    const cols = await detectProposalCols(pool);
+
+    // dynamic pieces (only use columns that actually exist)
+    const walletCol = cols.walletCols[0] || null;
+    const statusCol = cols.statusCol || null;
+
+    const walletExpr = walletCol
+      ? `LOWER(COALESCE(NULLIF(p.${walletCol},''), ''))`
+      : `''`; // fallback
+
+    const entityExpr = cols.orgCols.length
+      ? `COALESCE(${cols.orgCols.map(c => `MAX(NULLIF(p.${c},''))`).join(', ')}, '')`
+      : `''`;
+
+    const emailExpr = cols.emailCols.length
+      ? `COALESCE(${cols.emailCols.map(c => `MAX(NULLIF(p.${c},''))`).join(', ')}, '')`
+      : `''`;
+
+    // keep the rest conservative to avoid unknown columns
+    const phoneExpr        = `COALESCE(MAX(NULLIF(p.owner_phone,'')), MAX(NULLIF(p.phone,'')), MAX(NULLIF(p.whatsapp,'')), '')`;
+    const telegramIdExpr   = `COALESCE(MAX(NULLIF(p.owner_telegram_chat_id::text,'')), '')`;
+    const telegramUserExpr = `COALESCE(MAX(NULLIF(p.owner_telegram_username,'')), '')`;
+    const addrExpr         = `COALESCE(MAX(NULLIF(p.address,'')), '')`;
+    const cityExpr         = `COALESCE(MAX(NULLIF(p.city,'')), '')`;
+    const countryExpr      = `COALESCE(MAX(NULLIF(p.country,'')), '')`;
+
+    const archivedCountExpr = statusCol ? `COUNT(*) FILTER (WHERE p.${statusCol} = 'archived')::int` : `0::int`;
+    const activeCountExpr   = statusCol ? `COUNT(*) FILTER (WHERE p.${statusCol} <> 'archived')::int` : `COUNT(*)::int`;
+    const archivedFlagExpr  = statusCol
+      ? `CASE WHEN COUNT(*) > 0 AND COUNT(*) FILTER (WHERE p.${statusCol} <> 'archived') = 0 THEN true ELSE false END`
+      : `false`;
+
+    const approvedCond = statusCol ? `b.status IN ('approved','funded','completed')` : `true`;
+
     const sql = `
-      WITH g AS (
+      WITH base AS (
         SELECT
-          LOWER(COALESCE(p.owner_wallet,''))                         AS owner_wallet,
-          COALESCE(MAX(p.org_name), '')                              AS entity_name,
-          COUNT(*)::int                                              AS proposals_count,
-          MAX(p.created_at)                                          AS last_proposal_at,
-          COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
-                            THEN p.amount_usd ELSE 0 END),0)::numeric AS total_awarded_usd,
-
-           -- contact (prefer non-empty across multiple possible columns)
-          COALESCE(
-            MAX(NULLIF(p.owner_email,'')),
-            MAX(NULLIF(p.contact_email,'')),
-            MAX(NULLIF(p.email,'')),
-            MAX(NULLIF(p.primary_email,'')),
-            ''
-          )                                                          AS email,
-          COALESCE(
-            MAX(NULLIF(p.owner_phone,'')),
-            MAX(NULLIF(p.contact_phone,'')),
-            MAX(NULLIF(p.phone,'')),
-            MAX(NULLIF(p.whatsapp,'')),
-            ''
-          )                                                          AS phone,
-          COALESCE(
-            MAX(NULLIF(p.owner_telegram_chat_id::text,'')),
-            MAX(NULLIF(p.contact_telegram_chat_id::text,'')),
-            ''
-          )                                                          AS telegram_chat_id,
-          COALESCE(
-            MAX(NULLIF(p.owner_telegram_username,'')),
-            MAX(NULLIF(p.contact_telegram_username,'')),
-            ''
-          )                                                          AS telegram_username,
-
-          -- address-ish (prefer non-empty across alternates)
-          COALESCE(
-            MAX(NULLIF(p.address,'')),
-            MAX(NULLIF(p.owner_address,'')),
-            MAX(NULLIF(p.address_text,'')),
-            ''
-          )                                                          AS address_raw,
-          COALESCE(
-            MAX(NULLIF(p.city,'')),
-            MAX(NULLIF(p.owner_city,'')),
-            ''
-          )                                                          AS city,
-          COALESCE(
-            MAX(NULLIF(p.country,'')),
-            MAX(NULLIF(p.owner_country,'')),
-            ''
-          )                                                          AS country,
-
-          -- status-based archive view
-          COUNT(*) FILTER (WHERE p.status = 'archived')::int         AS archived_count,
-          COUNT(*) FILTER (WHERE p.status <> 'archived')::int        AS active_count,
-          CASE WHEN COUNT(*) > 0
-                 AND COUNT(*) FILTER (WHERE p.status <> 'archived') = 0
-               THEN true ELSE false END                              AS archived
+          ${walletExpr} AS owner_wallet,
+          ${entityExpr} AS entity_name,
+          p.amount_usd,
+          p.created_at,
+          ${emailExpr} AS email,
+          ${phoneExpr} AS phone,
+          ${telegramIdExpr} AS telegram_chat_id,
+          ${telegramUserExpr} AS telegram_username,
+          ${addrExpr} AS address_raw,
+          ${cityExpr} AS city,
+          ${countryExpr} AS country
+          ${statusCol ? `, p.${statusCol} AS status` : ``}
         FROM proposals p
-        GROUP BY LOWER(COALESCE(p.owner_wallet,''))
+      ),
+      g AS (
+        SELECT
+          b.owner_wallet,
+          MAX(b.entity_name) AS entity_name,
+          COUNT(*)::int AS proposals_count,
+          MAX(b.created_at) AS last_proposal_at,
+          COALESCE(SUM(CASE WHEN ${approvedCond} THEN b.amount_usd ELSE 0 END),0)::numeric AS total_awarded_usd,
+          MAX(b.email) AS email,
+          MAX(b.phone) AS phone,
+          MAX(b.telegram_chat_id) AS telegram_chat_id,
+          MAX(b.telegram_username) AS telegram_username,
+          MAX(b.address_raw) AS address_raw,
+          MAX(b.city) AS city,
+          MAX(b.country) AS country,
+          ${archivedCountExpr} AS archived_count,
+          ${activeCountExpr} AS active_count,
+          ${archivedFlagExpr} AS archived
+        FROM base b
+        GROUP BY b.owner_wallet
       )
       SELECT *
       FROM g
@@ -3751,7 +3762,6 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
     `;
 
     const { rows } = await pool.query(sql);
-
     const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
     const items = rows.map((r) => {
@@ -3759,36 +3769,25 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
       const phone            = norm(r.phone);
       const telegramChatId   = norm(r.telegram_chat_id);
       const telegramUsername = norm(r.telegram_username);
-
-      const line1   = norm(r.address_raw);
-      const city    = norm(r.city);
-      const country = norm(r.country);
-      const flat    = [line1, city, country].filter(Boolean).join(', ') || null;
+      const line1            = norm(r.address_raw);
+      const city             = norm(r.city);
+      const country          = norm(r.country);
+      const flat             = [line1, city, country].filter(Boolean).join(', ') || null;
 
       return {
-        // core
         entityName: r.entity_name || '',
-        entity: r.entity_name || '',              // alias for older UI
-        orgName: r.entity_name || '',             // alias
-        organization: r.entity_name || '',        // alias
-
         walletAddress: r.owner_wallet || '',
-        ownerWallet: r.owner_wallet || '',        // alias
-
         proposalsCount: Number(r.proposals_count) || 0,
         lastProposalAt: r.last_proposal_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // contact (frontend turns into deep links)
-        email,                                    // original
-        contactEmail: email,                      // alias for UI
-        ownerEmail: email,                        // alias
+        email,
+        contactEmail: email,
         phone,
         whatsapp: phone,
         telegramChatId,
         telegramUsername,
 
-        // address
         address: flat,
         addressText: flat,
         address1: line1,
