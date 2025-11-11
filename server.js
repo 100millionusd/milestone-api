@@ -3052,19 +3052,27 @@ app.post("/auth/nonce", (req, res) => {
   res.json({ nonce });
 });
 
+// REPLACE your existing /auth/verify with this:
 app.post("/auth/verify", async (req, res) => {
   const address = norm(req.body?.address);
   const signature = req.body?.signature;
   const roleIntent = normalizeRoleIntent(req.body?.role || req.query?.role);
 
-  if (!address || !signature) return res.status(400).json({ error: "address and signature required" });
+  if (!address || !signature) {
+    return res.status(400).json({ error: "address and signature required" });
+  }
 
   const nonce = getNonce(address);
-  if (!nonce) return res.status(400).json({ error: "nonce not found or expired" });
+  if (!nonce) {
+    return res.status(400).json({ error: "nonce not found or expired" });
+  }
 
   let recovered;
-  try { recovered = ethers.utils.verifyMessage(nonce, signature); }
-  catch { return res.status(400).json({ error: "invalid signature" }); }
+  try {
+    recovered = ethers.utils.verifyMessage(nonce, signature);
+  } catch {
+    return res.status(400).json({ error: "invalid signature" });
+  }
 
   if (norm(recovered) !== address) {
     return res.status(401).json({ error: "signature does not match address" });
@@ -3080,10 +3088,46 @@ app.post("/auth/verify", async (req, res) => {
     });
   }
 
-  // Only seed vendor row when vendor intent chosen and missing
-  if (role === 'vendor' && !roles.includes('vendor')) {
-    await maybeSeedVendor(address);
-    roles = await durableRolesForAddress(address);
+  // Only seed vendor row when vendor intent chosen and missing — and notify on FIRST insert
+  try {
+    if (role === "vendor" && !roles.includes("vendor")) {
+      const w = (address || "").toLowerCase();
+      const { rows } = await pool.query(
+        `INSERT INTO vendor_profiles
+           (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at)
+         VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW())
+         ON CONFLICT (wallet_address) DO NOTHING
+         RETURNING wallet_address, vendor_name, email, phone, telegram_chat_id, whatsapp`,
+        [w]
+      );
+
+      // Only if this was the FIRST time (row actually inserted), send notifications
+      if (rows.length) {
+        try {
+          await notifyVendorSignup({
+            wallet: rows[0].wallet_address,
+            vendorName: rows[0].vendor_name || "",
+            email: rows[0].email || "",
+            phone: rows[0].phone || "",
+          });
+        } catch {}
+
+        try {
+          await notifyVendorSignupVendor({
+            vendorName: rows[0].vendor_name || "",
+            email: rows[0].email || "",
+            phone: rows[0].phone || "",
+            telegramChatId: rows[0].telegram_chat_id || null,
+            whatsapp: rows[0].whatsapp || null,
+          });
+        } catch {}
+      }
+
+      // refresh durable roles after insert
+      roles = await durableRolesForAddress(address);
+    }
+  } catch (e) {
+    console.warn("vendor seed/notify failed (non-fatal):", String(e).slice(0, 200));
   }
 
   const token = signJwt({ sub: address, role, roles });
@@ -3095,50 +3139,10 @@ app.post("/auth/verify", async (req, res) => {
     maxAge: 7 * 24 * 3600 * 1000,
   });
 
-  // (Optional) notify on first vendor creation (only when we actually seeded)
-  // if (role === 'vendor') { try { /* call your notifyVendorSignup* here if needed */ } catch {} }
+  try { nonces.delete(address); } catch {}
 
-  nonces.delete(address);
-  res.json({ token, role, roles });
+  return res.json({ token, role, roles });
 });
-
-  // ⬇️ Auto-seed vendor_profiles row with status='pending' and notify admins on FIRST signup
-try {
-  const w = (address || '').toLowerCase();
-  if (w) {
-    const { rows } = await pool.query(
-      `INSERT INTO vendor_profiles
-         (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at)
-       VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW())
-       ON CONFLICT (wallet_address) DO NOTHING
-       RETURNING wallet_address, vendor_name, email, phone`,
-      [w]
-    );
-
-// Only on first insert (new vendor) → notify admins + vendor (EN+ES)
-if (rows.length) {
-  notifyVendorSignup({
-    wallet: rows[0].wallet_address,
-    vendorName: rows[0].vendor_name || '',
-    email: rows[0].email || '',
-    phone: rows[0].phone || '',
-  }).catch(() => null);
-
-  notifyVendorSignupVendor({
-    vendorName: rows[0].vendor_name || '',
-    email: rows[0].email || '',
-    phone: rows[0].phone || '',
-    telegramChatId: rows[0].telegram_chat_id || null,
-    whatsapp: rows[0].whatsapp || null
-  }).catch(() => null);
-}
-  }
-} catch (e) {
-  console.warn('profile auto-seed failed (non-fatal):', String(e).slice(0,200));
-}
-
-  nonces.delete(address);
-  res.json({ token, role });
 
 // nonce compat for frontend
 app.get("/auth/nonce", (req, res) => {
