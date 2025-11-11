@@ -51,6 +51,20 @@ const OpenAI = require("openai");
 const { enrichAuditRow } = require('./services/auditPinata');
 
 
+// --- Global guard: block stray vendor inserts everywhere except inside /auth/login?role=vendor
+let __vendorSeedGuard = 0;
+const __origPoolQuery = pool.query.bind(pool);
+
+pool.query = async function guardedQuery(...args) {
+  const sql = typeof args[0] === 'string' ? args[0] : String(args[0]?.text || '');
+  if (/^\s*insert\s+into\s+vendor_profiles\b/i.test(sql) && __vendorSeedGuard === 0) {
+    console.warn('[BLOCKED] vendor_profiles insert outside guarded login path');
+    // behave like a successful no-op insert
+    return { rows: [], rowCount: 0, command: 'INSERT' };
+  }
+  return __origPoolQuery(...args);
+};
+
 // --- robust tx-hash extractor (handles strings, fields, functions, nested, promises) ---
 async function extractTxHash(sendRes) {
   if (!sendRes) return null;
@@ -3185,9 +3199,29 @@ app.post("/auth/login", async (req, res) => {
   }
 
   if (role === 'vendor' && !roles.includes('vendor')) {
-    await maybeSeedVendor(address);
-    roles = await durableRolesForAddress(address);
+  __vendorSeedGuard++; // allow exactly this insert
+  try {
+    const w = address.toLowerCase();
+    const { rows } = await pool.query(
+      `INSERT INTO vendor_profiles
+         (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at)
+       VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW())
+       ON CONFLICT (wallet_address) DO NOTHING
+       RETURNING wallet_address, vendor_name, email, phone`,
+      [w]
+    );
+
+    if (rows && rows.length) {
+      try { await notifyVendorSignup({ wallet: rows[0].wallet_address }); } catch {}
+      try { await notifyVendorSignupVendor({ email: rows[0].email || null }); } catch {}
+      roles = Array.from(new Set([ ...(roles || []), 'vendor' ]));
+    }
+  } catch (e) {
+    console.warn('vendor seed failed (non-fatal):', String(e).slice(0,200));
+  } finally {
+    __vendorSeedGuard--; // re-enable global block
   }
+}
 
   // ADMIN OVERRIDE: if wallet is admin, always act as admin in the UI
 if (isAdminAddress(address)) {
