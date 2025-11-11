@@ -201,16 +201,74 @@ async function durableRolesForAddress(address) {
   return roles;
 }
 
-/** create vendor profile only when user explicitly chooses vendor */
+// Put near your other helpers
+function _addrText(a, city, country) {
+  if (!a) return null;
+  if (typeof a === 'string') return a;
+  const line = a.line1 || a.address1 || '';
+  const cty  = a.city ?? city ?? '';
+  const ctry = a.country ?? country ?? '';
+  const out = [line, cty, ctry].filter(Boolean).join(', ');
+  return out || null;
+}
+
+// REPLACE existing function completely
 async function maybeSeedVendor(address) {
   const w = String(address || '').toLowerCase();
-  await pool.query(
-    `INSERT INTO vendor_profiles
-       (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at)
-     VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW())
-     ON CONFLICT (wallet_address) DO NOTHING`,
+  if (!w) return;
+
+  // pull what the user saved on /profile
+  const { rows: upRows } = await pool.query(
+    `SELECT display_name, email, phone, website, address, city, country,
+            telegram_chat_id, whatsapp
+       FROM user_profiles
+      WHERE lower(wallet_address)=lower($1)
+      LIMIT 1`,
     [w]
   );
+  const u = upRows[0] || {};
+  const vName = (u?.display_name || '').trim();
+  const addr  = _addrText(u?.address, u?.city, u?.country);
+
+  // allow the guarded insert ONLY here
+  __vendorSeedGuard++;
+  try {
+    await pool.query(
+      `
+      INSERT INTO vendor_profiles
+        (wallet_address, vendor_name, email, phone, website,
+         address, city, country, telegram_chat_id, whatsapp,
+         status, created_at, updated_at)
+      VALUES
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending', NOW(), NOW())
+      ON CONFLICT (wallet_address) DO UPDATE SET
+        vendor_name       = COALESCE(NULLIF(EXCLUDED.vendor_name,''), vendor_profiles.vendor_name),
+        email             = COALESCE(EXCLUDED.email, vendor_profiles.email),
+        phone             = COALESCE(EXCLUDED.phone, vendor_profiles.phone),
+        website           = COALESCE(EXCLUDED.website, vendor_profiles.website),
+        address           = COALESCE(EXCLUDED.address, vendor_profiles.address),
+        city              = COALESCE(EXCLUDED.city, vendor_profiles.city),
+        country           = COALESCE(EXCLUDED.country, vendor_profiles.country),
+        telegram_chat_id  = COALESCE(EXCLUDED.telegram_chat_id, vendor_profiles.telegram_chat_id),
+        whatsapp          = COALESCE(EXCLUDED.whatsapp, vendor_profiles.whatsapp),
+        updated_at        = NOW()
+      `,
+      [
+        w,
+        vName,
+        u?.email ?? null,
+        u?.phone ?? null,
+        u?.website ?? null,
+        addr,
+        u?.city ?? null,
+        u?.country ?? null,
+        u?.telegram_chat_id ?? null,
+        u?.whatsapp ?? null,
+      ]
+    );
+  } finally {
+    __vendorSeedGuard--;
+  }
 }
 
 function requireAdmin(req, res, next) {
@@ -8388,54 +8446,57 @@ app.post('/profile', authRequired, async (req, res) => {
   }
 });
 
-// REPLACE your GET /vendor/profile (read from user_profiles, not vendor_profiles)
+// REPLACE the whole route
 app.get('/vendor/profile', authRequired, async (req, res) => {
   try {
     const wallet = String(req.user?.sub || '').toLowerCase();
-
     const { rows } = await pool.query(
-      `SELECT wallet_address, display_name, email, phone, website, address, city, country, telegram_chat_id
-       FROM user_profiles
-       WHERE lower(wallet_address)=lower($1)`,
+      `
+      SELECT
+        vp.wallet_address,
+        COALESCE(NULLIF(vp.vendor_name,''), up.display_name, '') AS vendor_name,
+        COALESCE(vp.email,   up.email)   AS email,
+        COALESCE(vp.phone,   up.phone)   AS phone,
+        COALESCE(vp.website, up.website) AS website,
+        COALESCE(vp.address, up.address) AS address,
+        COALESCE(vp.telegram_chat_id, up.telegram_chat_id) AS telegram_chat_id
+      FROM vendor_profiles vp
+      LEFT JOIN user_profiles up
+        ON lower(up.wallet_address)=lower(vp.wallet_address)
+      WHERE lower(vp.wallet_address)=lower($1)
+      LIMIT 1
+      `,
       [wallet]
     );
 
-    const r = rows[0] || {};
+    if (!rows[0]) return res.json(null);
+    const r = rows[0];
 
-    // address may be JSON or plain text -> normalize
-    const addrObj = (() => {
-      try {
-        const a = typeof r.address === 'string' ? JSON.parse(r.address) : r.address;
-        if (a && typeof a === 'object') {
-          return {
-            line1: a.line1 || '',
-            city: a.city || '',
-            postalCode: a.postalCode || a.postal_code || '',
-            country: a.country || '',
-          };
+    // normalize address for UI
+    let aObj = null;
+    try { aObj = JSON.parse(r.address || ''); } catch {}
+    const address = aObj && typeof aObj === 'object'
+      ? {
+          line1: aObj.line1 || aObj.address1 || '',
+          city: aObj.city || '',
+          postalCode: aObj.postalCode || aObj.postal_code || '',
+          country: aObj.country || '',
         }
-      } catch {}
-      return {
-        line1: r.address || '',
-        city: r.city || '',
-        postalCode: '',
-        country: r.country || '',
-      };
-    })();
+      : { line1: r.address || '', city: '', postalCode: '', country: '' };
 
-    return res.json({
-      walletAddress: r.wallet_address || wallet,
-      vendorName: r.display_name || '',
+    res.json({
+      walletAddress: r.wallet_address,
+      vendorName: r.vendor_name || '',
       email: r.email || '',
       phone: r.phone || '',
       website: r.website || '',
-      address: addrObj,
+      address,
       telegram_chat_id: r.telegram_chat_id || null,
       telegramChatId:  r.telegram_chat_id || null,
     });
   } catch (e) {
-    console.error('GET /vendor/profile error', e);
-    res.status(500).json({ error: 'profile load failed' });
+    console.error('GET /vendor/profile error:', e);
+    res.status(500).json({ error: 'Failed to load profile' });
   }
 });
 
