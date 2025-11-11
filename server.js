@@ -3675,7 +3675,7 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
 });
 
 // ==============================
-// List — entities (proposers)  (REPLACE your /admin/entities route with THIS, and keep ONLY ONE copy)
+// /admin/entities  (REPLACE the whole route with this; remove any duplicate route definitions)
 // ==============================
 app.get('/admin/entities', adminGuard, async (req, res) => {
   try {
@@ -3684,90 +3684,86 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
     );
 
     const sql = `
-      WITH base AS (
+      WITH g AS (
         SELECT
-          LOWER(p.owner_wallet)            AS owner_wallet,
-          COALESCE(p.org_name,'')          AS entity_name,
-          p.status,
-          p.amount_usd,
-          p.created_at,
-          p.owner_email,
-          p.owner_phone,
-          p.owner_telegram_chat_id,
-          p.owner_telegram_username,
-          p.address                        AS address_raw,
-          p.city                           AS city,
-          p.country                        AS country,
-          COALESCE(p.archived,false)       AS archived
+          LOWER(COALESCE(p.owner_wallet,''))                         AS owner_wallet,
+          COALESCE(MAX(p.org_name), '')                              AS entity_name,
+          COUNT(*)::int                                              AS proposals_count,
+          MAX(p.created_at)                                          AS last_proposal_at,
+          COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
+                            THEN p.amount_usd ELSE 0 END),0)::numeric AS total_awarded_usd,
+
+          -- contact (latest non-empty)
+          COALESCE(MAX(NULLIF(p.owner_email,'')), '')                AS email,
+          COALESCE(MAX(NULLIF(p.owner_phone,'')), '')                AS phone,
+          COALESCE(MAX(NULLIF(p.owner_telegram_chat_id::text,'')), '') AS telegram_chat_id,
+          COALESCE(MAX(NULLIF(p.owner_telegram_username,'')), '')    AS telegram_username,
+
+          -- address (latest non-empty)
+          COALESCE(MAX(NULLIF(p.address,'')), '')                    AS address_raw,
+          COALESCE(MAX(NULLIF(p.city,'')), '')                       AS city,
+          COALESCE(MAX(NULLIF(p.country,'')), '')                    AS country,
+
+          -- derive archive state from status (no p.archived column needed)
+          COUNT(*) FILTER (WHERE p.status = 'archived')::int         AS archived_count,
+          COUNT(*) FILTER (WHERE p.status <> 'archived')::int        AS active_count,
+          CASE WHEN COUNT(*) > 0
+                 AND COUNT(*) FILTER (WHERE p.status <> 'archived') = 0
+               THEN true ELSE false END                              AS archived
         FROM proposals p
+        GROUP BY LOWER(COALESCE(p.owner_wallet,''))
       )
-      SELECT
-        b.owner_wallet,
-        MAX(b.entity_name)                 AS entity_name,
-        COUNT(*)::int                      AS proposals_count,
-        MAX(b.created_at)                  AS last_proposal_at,
-        COALESCE(SUM(CASE WHEN b.status IN ('approved','funded','completed')
-                          THEN b.amount_usd ELSE 0 END),0)::numeric AS total_awarded_usd,
-        MAX(b.owner_email)                 AS email,
-        MAX(b.owner_phone)                 AS phone,
-        MAX(b.owner_telegram_chat_id)      AS telegram_chat_id,
-        MAX(b.owner_telegram_username)     AS telegram_username,
-        MAX(b.address_raw)                 AS address_raw,
-        MAX(b.city)                        AS city,
-        MAX(b.country)                     AS country,
-        MAX(b.archived)                    AS archived
-      FROM base b
-      GROUP BY b.owner_wallet
+      SELECT *
+      FROM g
+      ${includeArchived ? '' : 'WHERE archived = false'}
       ORDER BY last_proposal_at DESC NULLS LAST, entity_name ASC
     `;
 
     const { rows } = await pool.query(sql);
     const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
-    const items = rows
-      .filter(r => includeArchived || !r.archived)
-      .map((r) => {
-        const email            = norm(r.email);
-        const phone            = norm(r.phone);
-        const telegramChatId   = norm(r.telegram_chat_id);
-        const telegramUsername = norm(r.telegram_username);
+    const items = rows.map((r) => {
+      const email            = norm(r.email);
+      const phone            = norm(r.phone);
+      const telegramChatId   = norm(r.telegram_chat_id);
+      const telegramUsername = norm(r.telegram_username);
 
-        const line1   = norm(r.address_raw);
-        const city    = norm(r.city);
-        const country = norm(r.country);
-        const flat    = [line1, city, country].filter(Boolean).join(', ') || null;
+      const line1   = norm(r.address_raw);
+      const city    = norm(r.city);
+      const country = norm(r.country);
+      const flat    = [line1, city, country].filter(Boolean).join(', ') || null;
 
-        return {
-          // core + aliases (so UI can read any of these)
-          entityName: r.entity_name || '',
-          entity: r.entity_name || '',
-          orgName: r.entity_name || '',
-          organization: r.entity_name || '',
+      return {
+        // core + aliases
+        entityName: r.entity_name || '',
+        entity: r.entity_name || '',
+        orgName: r.entity_name || '',
+        organization: r.entity_name || '',
 
-          walletAddress: r.owner_wallet || '',
-          ownerWallet: r.owner_wallet || '',
+        walletAddress: r.owner_wallet || '',
+        ownerWallet: r.owner_wallet || '',
 
-          proposalsCount: Number(r.proposals_count) || 0,
-          lastProposalAt: r.last_proposal_at,
-          totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+        proposalsCount: Number(r.proposals_count) || 0,
+        lastProposalAt: r.last_proposal_at,
+        totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-          // contact (both primary + aliases)
-          email,
-          contactEmail: email,
-          ownerEmail: email,
-          phone,
-          whatsapp: phone,
-          telegramChatId,
-          telegramUsername,
+        // contact
+        email,
+        contactEmail: email,
+        ownerEmail: email,
+        phone,
+        whatsapp: phone,
+        telegramChatId,
+        telegramUsername,
 
-          // address
-          address: flat,
-          addressText: flat,
-          address1: line1,
+        // address
+        address: flat,
+        addressText: flat,
+        address1: line1,
 
-          archived: !!r.archived,
-        };
-      });
+        archived: !!r.archived,
+      };
+    });
 
     res.json({ items, page: 1, pageSize: items.length, total: items.length });
   } catch (e) {
