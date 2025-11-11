@@ -8345,91 +8345,107 @@ const profileSchema = Joi.object({
   website: Joi.string().allow(''),
 });
 
+// REPLACE your GET /vendor/profile (read from user_profiles, not vendor_profiles)
 app.get('/vendor/profile', authRequired, async (req, res) => {
   try {
     const wallet = String(req.user?.sub || '').toLowerCase();
+
     const { rows } = await pool.query(
-      `SELECT wallet_address, vendor_name, email, phone, address, website, telegram_chat_id
-       FROM vendor_profiles
+      `SELECT wallet_address, display_name, email, phone, website, address, city, country, telegram_chat_id
+       FROM user_profiles
        WHERE lower(wallet_address)=lower($1)`,
       [wallet]
     );
 
-    if (!rows[0]) return res.json(null);
+    const r = rows[0] || {};
 
-    const r = rows[0];
-
-    // address can be JSON or plain text -> normalize to the UI shape you expect
-    let parsed = null;
-    try { parsed = JSON.parse(r.address || ''); } catch {}
-    const address =
-      parsed && typeof parsed === 'object'
-        ? {
-            line1: parsed.line1 || '',
-            city: parsed.city || '',
-            postalCode: parsed.postalCode || parsed.postal_code || '',
-            country: parsed.country || '',
-          }
-        : {
-            line1: r.address || '',
-            city: '',
-            postalCode: '',
-            country: '',
+    // address may be JSON or plain text -> normalize
+    const addrObj = (() => {
+      try {
+        const a = typeof r.address === 'string' ? JSON.parse(r.address) : r.address;
+        if (a && typeof a === 'object') {
+          return {
+            line1: a.line1 || '',
+            city: a.city || '',
+            postalCode: a.postalCode || a.postal_code || '',
+            country: a.country || '',
           };
+        }
+      } catch {}
+      return {
+        line1: r.address || '',
+        city: r.city || '',
+        postalCode: '',
+        country: r.country || '',
+      };
+    })();
 
-    res.json({
-      walletAddress: r.wallet_address,
-      vendorName: r.vendor_name || '',
+    return res.json({
+      walletAddress: r.wallet_address || wallet,
+      vendorName: r.display_name || '',
       email: r.email || '',
       phone: r.phone || '',
       website: r.website || '',
-      address,
-      telegram_chat_id: r.telegram_chat_id || null, // snake_case (backend)
-      telegramChatId: r.telegram_chat_id || null,   // camelCase (frontend convenience)
+      address: addrObj,
+      telegram_chat_id: r.telegram_chat_id || null,
+      telegramChatId:  r.telegram_chat_id || null,
     });
   } catch (e) {
-    console.error('GET /vendor/profile error:', e);
-    res.status(500).json({ error: 'Failed to load profile' });
+    console.error('GET /vendor/profile error', e);
+    res.status(500).json({ error: 'profile load failed' });
   }
 });
 
-// Save generic profile (no role required). Call this BEFORE choosing role.
-app.post("/profile", async (req, res) => {
+// RENAME your POST /profile -> POST /vendor/profile (write to user_profiles only)
+app.post('/vendor/profile', authRequired, async (req, res) => {
   try {
     const wallet = String(req.user?.sub || "").toLowerCase();
     if (!wallet) return res.status(401).json({ error: "unauthorized" });
 
     const b = req.body || {};
-    const rowArgs = [
-      wallet,
-      b.displayName ?? b.display_name ?? null,
-      b.email ?? null,
-      b.phone ?? null,
-      b.website ?? null,
-      b.address ?? null,
-      b.city ?? null,
-      b.country ?? null,
-      b.telegramChatId ?? b.telegram_chat_id ?? null,
-      b.whatsapp ?? null,
-    ];
+    const addressStr = (() => {
+      const a = b.address || {};
+      if (typeof a === 'string') return a;
+      const line = a.line1 || a.address1 || '';
+      const city = a.city || '';
+      const country = a.country || '';
+      return [line, city, country].filter(Boolean).join(', ') || null;
+    })();
 
     await pool.query(
-      `
-      INSERT INTO user_profiles
-        (wallet_address, display_name, email, phone, website, address, city, country, telegram_chat_id, whatsapp, updated_at)
-      VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NOW())
-      ON CONFLICT (wallet_address) DO UPDATE SET
-        display_name=$2, email=$3, phone=$4, website=$5, address=$6, city=$7, country=$8,
-        telegram_chat_id=$9, whatsapp=$10, updated_at=NOW()
-      `,
-      rowArgs
+      `INSERT INTO user_profiles
+         (wallet_address, display_name, email, phone, website, address, city, country, telegram_chat_id, whatsapp, updated_at)
+       VALUES
+         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+       ON CONFLICT (wallet_address) DO UPDATE SET
+         display_name     = EXCLUDED.display_name,
+         email            = EXCLUDED.email,
+         phone            = EXCLUDED.phone,
+         website          = EXCLUDED.website,
+         address          = EXCLUDED.address,
+         city             = EXCLUDED.city,
+         country          = EXCLUDED.country,
+         telegram_chat_id = EXCLUDED.telegram_chat_id,
+         whatsapp         = EXCLUDED.whatsapp,
+         updated_at       = NOW()`,
+      [
+        wallet,
+        (b.vendorName || b.displayName || '').trim(),
+        (b.email || '').trim() || null,
+        (b.phone || '').trim() || null,
+        (b.website || '').trim() || null,
+        addressStr,
+        b?.address?.city || null,
+        b?.address?.country || null,
+        b.telegramChatId ?? b.telegram_chat_id ?? null,
+        b.whatsapp ?? null,
+      ]
     );
 
     return res.json({ ok: true });
   } catch (e) {
-    console.error("POST /profile error", e);
-    return res.status(500).json({ error: "profile_save_failed" });
+    console.error('POST /vendor/profile error', e);
+    return res.status(500).json({ error: 'profile save failed' });
   }
 });
 
