@@ -9312,6 +9312,7 @@ app.delete('/admin/vendors/:wallet', adminGuard, async (req, res) => {
   }
 });
 
+// /admin/vendors — normalized vendor list (profiles + bids)
 app.get('/admin/vendors', adminGuard, async (req, res) => {
   try {
     const includeArchived = ['true','1','yes'].includes(String(req.query.includeArchived || '').toLowerCase());
@@ -9343,7 +9344,10 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
                COALESCE(status,'pending')      AS status,
                COALESCE(kyc_status,'none')     AS kyc_status
         FROM vendor_profiles
-        ORDER BY LOWER(wallet_address), COALESCE(updated_at, created_at) DESC
+        ORDER BY
+          LOWER(wallet_address),
+          (NULLIF(vendor_name, '') IS NULL),                  -- prefer non-empty vendor_name
+          COALESCE(updated_at, created_at) DESC NULLS LAST    -- newest wins
       )
       SELECT
         COALESCE(NULLIF(vp.vendor_name,''), NULLIF(a.bid_vendor_name,''), '') AS vendor_name,
@@ -9377,52 +9381,51 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
     const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
     const out = rows.map((r) => {
-      // address_raw may be jsonb (object) or stringified JSON or plain text
+      // Parse address_raw -> addrObj (supports jsonb or stringified JSON)
       let addrObj = null;
-      if (r.address_raw) {
-        if (typeof r.address_raw === 'object') {
-          addrObj = r.address_raw;
-        } else if (typeof r.address_raw === 'string') {
-          const s = r.address_raw.trim();
-          if (s.startsWith('{')) { try { addrObj = JSON.parse(s); } catch {} }
-        }
+      const raw = r.address_raw;
+      if (raw && typeof raw === 'object') {
+        addrObj = raw;
+      } else if (typeof raw === 'string' && raw.trim().startsWith('{')) {
+        try { addrObj = JSON.parse(raw.trim()); } catch {}
       }
 
+      // Build normalized address object + string
       const parts = addrObj && typeof addrObj === 'object'
         ? {
-            line1:      norm(addrObj.line1),
-            city:       norm(addrObj.city),
-            state:      norm(addrObj.state),
+            line1: norm(addrObj.line1),
+            city: norm(addrObj.city),
+            state: norm(addrObj.state),
             postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code),
-            country:    norm(addrObj.country),
+            country: norm(addrObj.country),
           }
         : {
-            line1:      norm(r.address_raw),
-            city:       null,
-            state:      null,
+            line1: norm(raw),
+            city: null,
+            state: null,
             postalCode: null,
-            country:    null,
+            country: null,
           };
 
       const addressText = [parts.line1, parts.city, parts.postalCode, parts.country]
         .filter(Boolean).join(', ') || null;
 
-      const email   = norm(r.email);
-      const phone   = norm(r.phone);
-      const website = norm(r.website);
-      const tgId    = norm(r.telegram_chat_id);
-      const tgUser  = norm(r.telegram_username);
-      const whatsapp= norm(r.whatsapp);
+      const email    = norm(r.email);
+      const phone    = norm(r.phone);
+      const website  = norm(r.website);
+      const tgId     = norm(r.telegram_chat_id);
+      const tgUser   = norm(r.telegram_username);
+      const whatsapp = norm(r.whatsapp);
 
       return {
         // core
         vendorName: r.profile_vendor_name || r.vendor_name || '',
         walletAddress: r.wallet_address || '',
         bidsCount: Number(r.bids_count) || 0,
-        lastBidAt: r.last_bid_at,
+        lastBidAt: r.last_bid_at || null,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // flags
+        // server-truth flags used by the UI
         status: r.status || 'pending',
         kycStatus: r.kyc_status || 'none',
 
@@ -9431,15 +9434,16 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
         phone,
         website,
 
-        // telegram summary
+        // explicit boolean for existing UIs
         telegramConnected: !!(tgId || tgUser || whatsapp),
         telegramChatId: tgId,
         telegramUsername: tgUser,
         whatsapp,
 
-        // address (flat + structured + legacy aliases)
+        // back-compat: string address for existing tables/cells
         address: addressText,
         addressText,
+        // structured copy for new UI
         addressObj: {
           line1: parts.line1,
           city: parts.city,
@@ -9448,6 +9452,8 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
           country: parts.country,
           addressText,
         },
+
+        // legacy aliases some components might read
         street: parts.line1 || null,
         address1: parts.line1 || addressText,
         addressLine1: parts.line1 || addressText,
@@ -9456,7 +9462,7 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
         postalCode: parts.postalCode,
         country: parts.country,
 
-        // nested (some components read profile.*)
+        // nested copies for components that deref profile.*
         profile: {
           companyName: r.profile_vendor_name ?? (r.vendor_name || null),
           contactName: null,
