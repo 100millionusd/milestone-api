@@ -8686,44 +8686,71 @@ app.get('/proposer/profile', authGuard, async (req, res) => {
   }
 });
 
-// Save Entity/Proposer profile (separate from vendor!)
+// server.js — REPLACE your existing POST /proposer/profile with this whole block
 app.post('/proposer/profile', authGuard, async (req, res) => {
   try {
     const addr = String(req.user.address || '').toLowerCase();
-    const b = req.body || {};
+    if (!addr) return res.status(401).json({ error: 'unauthenticated' });
 
+    const b = req.body || {};
+    // address can be object or plain string
     const addressJson =
       b.address && typeof b.address === 'object'
         ? JSON.stringify(b.address)
         : (typeof b.address === 'string' ? b.address : null);
 
+    // 1) Keep legacy/validator-friendly copy in user_profiles
     await pool.query(`
-      INSERT INTO user_profiles
-        (wallet_address, vendor_name, email, phone, website, address, telegram_username, telegram_chat_id, whatsapp, updated_at)
-      VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9, NOW())
+      INSERT INTO user_profiles (wallet_address, vendor_name, email, phone, website, address, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6, NOW())
       ON CONFLICT (wallet_address) DO UPDATE SET
-        vendor_name       = EXCLUDED.vendor_name,
-        email             = EXCLUDED.email,
-        phone             = EXCLUDED.phone,
-        website           = EXCLUDED.website,
-        address           = EXCLUDED.address,
-        telegram_username = EXCLUDED.telegram_username,
-        telegram_chat_id  = EXCLUDED.telegram_chat_id,
-        whatsapp          = EXCLUDED.whatsapp,
-        updated_at        = NOW()
+        vendor_name = EXCLUDED.vendor_name,
+        email       = EXCLUDED.email,
+        phone       = EXCLUDED.phone,
+        website     = EXCLUDED.website,
+        address     = EXCLUDED.address,
+        updated_at  = NOW()
     `, [
       addr,
-      b.vendorName || '',
+      b.vendorName || '',                 // name/org
+      b.email || '',
+      b.phone || '',
+      b.website || '',
+      addressJson
+    ]);
+
+    // 2) Canonical entity record in proposer_profiles
+    await pool.query(`
+      INSERT INTO proposer_profiles (
+        wallet_address, org_name, contact_email, phone, website,
+        address, city, country, telegram_chat_id, whatsapp, updated_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NOW())
+      ON CONFLICT (wallet_address) DO UPDATE SET
+        org_name         = EXCLUDED.org_name,
+        contact_email    = EXCLUDED.contact_email,
+        phone            = EXCLUDED.phone,
+        website          = EXCLUDED.website,
+        address          = EXCLUDED.address,
+        city             = EXCLUDED.city,
+        country          = EXCLUDED.country,
+        telegram_chat_id = EXCLUDED.telegram_chat_id,
+        whatsapp         = EXCLUDED.whatsapp,
+        updated_at       = NOW()
+    `, [
+      addr,
+      b.vendorName || '',                 // use same field
       b.email || '',
       b.phone || '',
       b.website || '',
       addressJson,
-      b.telegramUsername ?? null,
-      (b.telegram_chat_id ?? b.telegramChatId) ?? null,
+      b.address?.city ?? null,
+      b.address?.country ?? null,
+      b.telegram_chat_id ?? b.telegramChatId ?? null,
       b.whatsapp ?? null,
     ]);
 
+    // IMPORTANT: do NOT seed vendor here
     return res.json({ ok: true });
   } catch (e) {
     console.error('POST /proposer/profile error', e);
