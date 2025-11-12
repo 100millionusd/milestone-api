@@ -9312,72 +9312,61 @@ app.delete('/admin/vendors/:wallet', adminGuard, async (req, res) => {
   }
 });
 
-// /admin/vendors — robust mapper, no nulling of legit values
 app.get('/admin/vendors', adminGuard, async (req, res) => {
   try {
     const includeArchived = ['true','1','yes'].includes(String(req.query.includeArchived || '').toLowerCase());
 
-    const sqlBase = `
-      WITH agg AS (
+    const sqlCore = `
+      WITH a AS (
         SELECT
-          LOWER(b.wallet_address)                                        AS wallet_address,
-          COALESCE(MAX(b.vendor_name),'')                                AS vendor_name,
-          COUNT(*)::int                                                  AS bids_count,
-          MAX(b.created_at)                                              AS last_bid_at,
+          LOWER(b.wallet_address)                                            AS wallet_address,
+          COUNT(*)::int                                                      AS bids_count,
+          MAX(b.created_at)                                                  AS last_bid_at,
           COALESCE(SUM(CASE WHEN b.status IN ('approved','completed')
-                            THEN b.price_usd ELSE 0 END),0)::numeric     AS total_awarded_usd
+                            THEN b.price_usd ELSE 0 END),0)::numeric         AS total_awarded_usd,
+          MAX(NULLIF(b.vendor_name, ''))                                     AS bid_vendor_name
         FROM bids b
         GROUP BY LOWER(b.wallet_address)
+      ),
+      vp AS (
+        SELECT DISTINCT ON (LOWER(wallet_address))
+               LOWER(wallet_address) AS wallet_address,
+               vendor_name,
+               email,
+               phone,
+               website,
+               address,
+               telegram_username,
+               telegram_chat_id,
+               whatsapp,
+               COALESCE(archived,false)        AS archived,
+               COALESCE(status,'pending')      AS status,
+               COALESCE(kyc_status,'none')     AS kyc_status
+        FROM vendor_profiles
+        ORDER BY LOWER(wallet_address), COALESCE(updated_at, created_at) DESC
       )
-      -- vendors who have bids
       SELECT
-        a.vendor_name                               AS vendor_name,
-        a.wallet_address                            AS wallet_address,
-        a.bids_count                                AS bids_count,
-        a.last_bid_at                               AS last_bid_at,
-        a.total_awarded_usd                         AS total_awarded_usd,
-        vp.vendor_name                              AS profile_vendor_name,
-        vp.email                                    AS email,
-        vp.phone                                    AS phone,
-        vp.website                                  AS website,
-        vp.address                                  AS address_raw,
-        vp.telegram_username                        AS telegram_username,
-        vp.telegram_chat_id                         AS telegram_chat_id,
-        vp.whatsapp                                 AS whatsapp,
-        COALESCE(vp.archived,false)                 AS archived,
-        COALESCE(vp.status,'pending')               AS status,
-        COALESCE(vp.kyc_status,'none')              AS kyc_status
-      FROM agg a
-      LEFT JOIN vendor_profiles vp
-        ON LOWER(vp.wallet_address) = a.wallet_address
-
-      UNION ALL
-
-      -- profiles that have no bids yet
-      SELECT
-        COALESCE(vp.vendor_name,'')                 AS vendor_name,
-        LOWER(vp.wallet_address)                    AS wallet_address,
-        0                                           AS bids_count,
-        NULL::timestamptz                           AS last_bid_at,
-        0::numeric                                  AS total_awarded_usd,
-        vp.vendor_name                              AS profile_vendor_name,
-        vp.email                                    AS email,
-        vp.phone                                    AS phone,
-        vp.website                                  AS website,
-        vp.address                                  AS address_raw,
-        vp.telegram_username                        AS telegram_username,
-        vp.telegram_chat_id                         AS telegram_chat_id,
-        vp.whatsapp                                 AS whatsapp,
-        COALESCE(vp.archived,false)                 AS archived,
-        COALESCE(vp.status,'pending')               AS status,
-        COALESCE(vp.kyc_status,'none')              AS kyc_status
-      FROM vendor_profiles vp
-      WHERE NOT EXISTS (
-        SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
-      )
+        COALESCE(NULLIF(vp.vendor_name,''), NULLIF(a.bid_vendor_name,''), '') AS vendor_name,
+        COALESCE(vp.wallet_address, a.wallet_address)                         AS wallet_address,
+        COALESCE(a.bids_count, 0)                                            AS bids_count,
+        a.last_bid_at,
+        COALESCE(a.total_awarded_usd, 0)                                     AS total_awarded_usd,
+        vp.vendor_name                                                        AS profile_vendor_name,
+        vp.email,
+        vp.phone,
+        vp.website,
+        vp.address                                                            AS address_raw,
+        vp.telegram_username,
+        vp.telegram_chat_id,
+        vp.whatsapp,
+        COALESCE(vp.archived,false)                                          AS archived,
+        COALESCE(vp.status,'pending')                                        AS status,
+        COALESCE(vp.kyc_status,'none')                                       AS kyc_status
+      FROM a
+      FULL OUTER JOIN vp ON vp.wallet_address = a.wallet_address
     `;
 
-    let sql = `SELECT * FROM (${sqlBase}) s`;
+    let sql = `SELECT * FROM (${sqlCore}) s`;
     if (!includeArchived) {
       sql += ` WHERE COALESCE(s.archived,false) = false`;
     }
@@ -9385,20 +9374,14 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
 
     const { rows } = await pool.query(sql);
 
-    // Safer normalizer: preserves numbers/booleans by casting to string
-    const norm = (v) => {
-      if (v === null || v === undefined) return null;
-      const s = (typeof v === 'string') ? v : String(v);
-      const t = s.trim();
-      return t.length ? t : null;
-    };
+    const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
     const out = rows.map((r) => {
-      // address_raw may be: jsonb, JSON string, or plain text
+      // address_raw may be jsonb (object) or stringified JSON or plain text
       let addrObj = null;
-      if (r.address_raw != null) {
+      if (r.address_raw) {
         if (typeof r.address_raw === 'object') {
-          addrObj = r.address_raw; // jsonb from pg
+          addrObj = r.address_raw;
         } else if (typeof r.address_raw === 'string') {
           const s = r.address_raw.trim();
           if (s.startsWith('{')) { try { addrObj = JSON.parse(s); } catch {} }
@@ -9407,40 +9390,39 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
 
       const parts = addrObj && typeof addrObj === 'object'
         ? {
-            line1: norm(addrObj.line1),
-            city: norm(addrObj.city),
-            state: norm(addrObj.state),
+            line1:      norm(addrObj.line1),
+            city:       norm(addrObj.city),
+            state:      norm(addrObj.state),
             postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code),
-            country: norm(addrObj.country),
+            country:    norm(addrObj.country),
           }
         : {
-            line1: norm(r.address_raw),
-            city: null,
-            state: null,
+            line1:      norm(r.address_raw),
+            city:       null,
+            state:      null,
             postalCode: null,
-            country: null,
+            country:    null,
           };
 
       const addressText = [parts.line1, parts.city, parts.postalCode, parts.country]
         .filter(Boolean).join(', ') || null;
 
-      const email    = norm(r.email);
-      const phone    = norm(r.phone);
-      const website  = norm(r.website);
-      // cast telegram_chat_id (often numeric) to string so it doesn’t get dropped
-      const tgId     = norm(r.telegram_chat_id == null ? null : String(r.telegram_chat_id));
-      const tgUser   = norm(r.telegram_username);
-      const whatsapp = norm(r.whatsapp);
+      const email   = norm(r.email);
+      const phone   = norm(r.phone);
+      const website = norm(r.website);
+      const tgId    = norm(r.telegram_chat_id);
+      const tgUser  = norm(r.telegram_username);
+      const whatsapp= norm(r.whatsapp);
 
       return {
         // core
-        vendorName: norm(r.profile_vendor_name) || norm(r.vendor_name) || '',
+        vendorName: r.profile_vendor_name || r.vendor_name || '',
         walletAddress: r.wallet_address || '',
         bidsCount: Number(r.bids_count) || 0,
         lastBidAt: r.last_bid_at,
         totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // status
+        // flags
         status: r.status || 'pending',
         kycStatus: r.kyc_status || 'none',
 
@@ -9449,13 +9431,13 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
         phone,
         website,
 
-        // messaging flags
+        // telegram summary
         telegramConnected: !!(tgId || tgUser || whatsapp),
         telegramChatId: tgId,
         telegramUsername: tgUser,
         whatsapp,
 
-        // address (string + structured + legacy aliases)
+        // address (flat + structured + legacy aliases)
         address: addressText,
         addressText,
         addressObj: {
@@ -9474,9 +9456,9 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
         postalCode: parts.postalCode,
         country: parts.country,
 
-        // nested mirrors for older UI that reads profile.*
+        // nested (some components read profile.*)
         profile: {
-          companyName: norm(r.profile_vendor_name) || norm(r.vendor_name) || null,
+          companyName: r.profile_vendor_name ?? (r.vendor_name || null),
           contactName: null,
           email,
           contactEmail: email,
