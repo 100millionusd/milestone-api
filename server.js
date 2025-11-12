@@ -8623,71 +8623,94 @@ app.get('/vendor/profile', authGuard, async (req, res) => {
   }
 });
 
-// GET proposer (entity) profile
+// Read Entity/Proposer profile (no vendor seeding, no joins)
+// RETURNS: { vendorName, email, phone, website, address, addressText, telegram_username, telegram_chat_id, whatsapp }
 app.get('/proposer/profile', authGuard, async (req, res) => {
   try {
     const addr = String(req.user.address || '').toLowerCase();
-    const { rows } = await pool.query(`
-      SELECT vendor_name, email, phone, website, address,
-             telegram_username, telegram_chat_id, whatsapp
-      FROM user_profiles
-      WHERE lower(wallet_address)=lower($1)
-      LIMIT 1
-    `, [addr]);
+    const { rows } = await pool.query(
+      `SELECT vendor_name, email, phone, website, address, telegram_username, telegram_chat_id, whatsapp
+         FROM user_profiles
+        WHERE lower(wallet_address)=lower($1)
+        LIMIT 1`,
+      [addr]
+    );
+    const r = rows[0] || null;
 
-    const r = rows[0] || {};
-    let address = r.address ?? null;
-    if (address && typeof address === 'string' && address.trim().startsWith('{')) {
-      try { address = JSON.parse(address); } catch { /* keep as string */ }
+    const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
+
+    // address may be JSON or plain text
+    let addressObj = null, addressText = null;
+    if (r?.address) {
+      if (typeof r.address === 'string' && r.address.trim().startsWith('{')) {
+        try { addressObj = JSON.parse(r.address); } catch {}
+      }
+      if (addressObj && typeof addressObj === 'object') {
+        const line1 = norm(addressObj.line1);
+        const city  = norm(addressObj.city);
+        const pc    = norm(addressObj.postalCode) || norm(addressObj.postal_code);
+        const ctry  = norm(addressObj.country);
+        addressText = [line1, city, pc, ctry].filter(Boolean).join(', ') || null;
+      } else {
+        addressText = norm(r.address);
+      }
     }
 
     return res.json({
-      walletAddress: addr,
-      vendorName: r.vendor_name || '',
-      email: r.email || '',
-      phone: r.phone || '',
-      website: r.website || '',
-      address,
-      telegram_username: r.telegram_username || null,
-      telegram_chat_id: r.telegram_chat_id || null,
-      whatsapp: r.whatsapp || null,
+      vendorName: r?.vendor_name || '',
+      email:      r?.email || '',
+      phone:      r?.phone || '',
+      website:    r?.website || '',
+      address:    addressObj || addressText || null,
+      addressText,
+      telegram_username: r?.telegram_username ?? null,
+      telegram_chat_id:  r?.telegram_chat_id ?? null,
+      whatsapp:          r?.whatsapp ?? null,
     });
   } catch (e) {
     console.error('GET /proposer/profile error', e);
-    return res.status(500).json({ error: 'load_failed' });
+    res.status(500).json({ error: 'load_failed' });
   }
 });
 
-// === PROPOSER PROFILE (Entity) ===
+// Save Entity/Proposer profile (separate from vendor!)
 app.post('/proposer/profile', authGuard, async (req, res) => {
   try {
     const addr = String(req.user.address || '').toLowerCase();
     const b = req.body || {};
+
     const addressJson =
       b.address && typeof b.address === 'object'
         ? JSON.stringify(b.address)
         : (typeof b.address === 'string' ? b.address : null);
 
     await pool.query(`
-      INSERT INTO user_profiles (wallet_address, vendor_name, email, phone, website, address, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6, NOW())
+      INSERT INTO user_profiles
+        (wallet_address, vendor_name, email, phone, website, address, telegram_username, telegram_chat_id, whatsapp, updated_at)
+      VALUES
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9, NOW())
       ON CONFLICT (wallet_address) DO UPDATE SET
-        vendor_name = EXCLUDED.vendor_name,
-        email       = EXCLUDED.email,
-        phone       = EXCLUDED.phone,
-        website     = EXCLUDED.website,
-        address     = EXCLUDED.address,
-        updated_at  = NOW()
+        vendor_name       = EXCLUDED.vendor_name,
+        email             = EXCLUDED.email,
+        phone             = EXCLUDED.phone,
+        website           = EXCLUDED.website,
+        address           = EXCLUDED.address,
+        telegram_username = EXCLUDED.telegram_username,
+        telegram_chat_id  = EXCLUDED.telegram_chat_id,
+        whatsapp          = EXCLUDED.whatsapp,
+        updated_at        = NOW()
     `, [
       addr,
       b.vendorName || '',
       b.email || '',
       b.phone || '',
       b.website || '',
-      addressJson
+      addressJson,
+      b.telegramUsername ?? null,
+      (b.telegram_chat_id ?? b.telegramChatId) ?? null,
+      b.whatsapp ?? null,
     ]);
 
-    // do NOT seed vendor here
     return res.json({ ok: true });
   } catch (e) {
     console.error('POST /proposer/profile error', e);
