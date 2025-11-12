@@ -2987,6 +2987,35 @@ function verifyJwt(token) {
   catch { return null; }
 }
 
+// ==== AUTH GUARD (drop-in) ===============================================
+// Place this block **right after** your verifyJwt() definition.
+
+const extractToken = (req) => {
+  const h = req.headers.authorization;
+  if (h && h.startsWith('Bearer ')) return h.slice(7);
+  return req.cookies?.auth_token || null;
+};
+
+function authGuard(req, res, next) {
+  try {
+    const token = extractToken(req);
+    if (!token) return res.status(401).json({ error: 'unauthenticated' });
+
+    const user = verifyJwt(token);
+    if (!user?.sub) return res.status(401).json({ error: 'unauthenticated' });
+
+    req.user = {
+      address: String(user.sub).toLowerCase(),
+      role: user.role || null,
+      roles: Array.isArray(user.roles) ? user.roles : [],
+    };
+    return next();
+  } catch {
+    return res.status(401).json({ error: 'unauthenticated' });
+  }
+}
+// ========================================================================
+
 // Attach req.user if cookie is present (optional)
 app.use((req, _res, next) => {
   const token = req.cookies?.auth_token;
