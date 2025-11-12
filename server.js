@@ -382,11 +382,43 @@ const pool = new Pool({
 
 (async () => {
   try {
-    await ensureUserProfilesSchema();
+    if (typeof ensureUserProfilesSchema === 'function') {
+      await ensureUserProfilesSchema();
+    } else {
+      console.warn('[startup] ensureUserProfilesSchema is not defined — skipping schema bootstrap');
+    }
   } catch (e) {
-    console.error('ensureUserProfilesSchema failed', e);
+    console.error('[startup] ensureUserProfilesSchema failed', e);
   }
 })();
+
+// Ensures the vendor/user profiles table and columns exist.
+// Safe to run at every boot.
+async function ensureUserProfilesSchema() {
+  const sql = `
+    CREATE TABLE IF NOT EXISTS vendor_profiles (
+      profile_id SERIAL PRIMARY KEY,
+      wallet_address TEXT UNIQUE NOT NULL,
+      vendor_name   TEXT,
+      email         TEXT,
+      phone         TEXT,
+      website       TEXT,
+      address       TEXT,
+      profile       JSONB DEFAULT '{}'::jsonb,
+      created_at    TIMESTAMPTZ DEFAULT now(),
+      updated_at    TIMESTAMPTZ DEFAULT now()
+    );
+
+    -- Redundant address key often used by the UI
+    ALTER TABLE vendor_profiles
+      ADD COLUMN IF NOT EXISTS address1 TEXT;
+
+    -- Keep both top-level and nested profile forms available to the UI
+    -- (No-op if rows already present; this just standardizes shape for new inserts)
+  `;
+  await pool.query(sql);
+  console.log('[startup] vendor_profiles schema ensured');
+}
 
 // ---- Safe Tx overlay helpers (response-time hydration) ----
 const SAFE_CACHE_TTL_MS = Number(process.env.SAFE_CACHE_TTL_MS || 5000);
