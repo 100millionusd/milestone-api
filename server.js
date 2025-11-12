@@ -8623,6 +8623,41 @@ app.get('/vendor/profile', authGuard, async (req, res) => {
   }
 });
 
+// GET proposer (entity) profile
+app.get('/proposer/profile', authGuard, async (req, res) => {
+  try {
+    const addr = String(req.user.address || '').toLowerCase();
+    const { rows } = await pool.query(`
+      SELECT vendor_name, email, phone, website, address,
+             telegram_username, telegram_chat_id, whatsapp
+      FROM user_profiles
+      WHERE lower(wallet_address)=lower($1)
+      LIMIT 1
+    `, [addr]);
+
+    const r = rows[0] || {};
+    let address = r.address ?? null;
+    if (address && typeof address === 'string' && address.trim().startsWith('{')) {
+      try { address = JSON.parse(address); } catch { /* keep as string */ }
+    }
+
+    return res.json({
+      walletAddress: addr,
+      vendorName: r.vendor_name || '',
+      email: r.email || '',
+      phone: r.phone || '',
+      website: r.website || '',
+      address,
+      telegram_username: r.telegram_username || null,
+      telegram_chat_id: r.telegram_chat_id || null,
+      whatsapp: r.whatsapp || null,
+    });
+  } catch (e) {
+    console.error('GET /proposer/profile error', e);
+    return res.status(500).json({ error: 'load_failed' });
+  }
+});
+
 // === PROPOSER PROFILE (Entity) ===
 app.post('/proposer/profile', authGuard, async (req, res) => {
   try {
