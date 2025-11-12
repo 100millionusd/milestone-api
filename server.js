@@ -3356,7 +3356,7 @@ app.post("/auth/login", async (req, res) => {
 
 app.get("/auth/role", async (req, res) => {
   try {
-    // (1) Token-decoded user (middleware or cookie)
+    // Extract JWT from Bearer or cookie
     const tokenFromHeader = req.headers.authorization?.startsWith('Bearer ')
       ? req.headers.authorization.slice(7)
       : null;
@@ -3364,49 +3364,51 @@ app.get("/auth/role", async (req, res) => {
     const token = tokenFromHeader || tokenFromCookie;
     const decoded = token ? verifyJwt(token) : null;
 
+    // Helper to compute roles strictly from DB + admin list
+    const computeRolesFor = async (address) => {
+      const lower = address.toLowerCase();
+      const roles = [];
+
+      if (isAdminAddress(address)) roles.push('admin');
+
+      const vp = await pool.query(
+        `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+        [lower]
+      );
+      if (vp.rowCount > 0) roles.push('vendor');
+
+      const pp = await pool.query(
+        `SELECT 1 FROM proposals WHERE lower(owner_wallet)=lower($1) LIMIT 1`,
+        [lower]
+      );
+      if (pp.rowCount > 0) roles.push('proposer');
+
+      const vendorStatus = vp.rowCount > 0
+        ? String(vp.rows[0].status || 'pending').toLowerCase()
+        : 'none';
+
+      return { roles, vendorStatus };
+    };
+
+    // (1) JWT identity path
     if (decoded?.sub) {
-      const address = String(decoded.sub).toLowerCase();
-      let roles = Array.isArray(decoded.roles) ? decoded.roles : await durableRolesForAddress(address);
-      let role = decoded.role;
+      const address = String(decoded.sub);
+      const { roles, vendorStatus } = await computeRolesFor(address);
 
-      // ADMIN OVERRIDE
-      if (isAdminAddress(address)) {
-        roles = Array.from(new Set([...(roles || []), 'admin']));
-        role = 'admin';
-      }
-
-      let vendorStatus = 'pending';
-      if (role === 'vendor') {
-        const { rows } = await pool.query(
-          `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-          [address]
-        );
-        vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
-      }
+      // Keep "preferred" role from token only if it's actually allowed
+      const preferred = String(decoded.role || '').toLowerCase();
+      const role = roles.includes(preferred) ? preferred : (roles[0] || 'guest');
 
       return res.json({ address, role, roles, vendorStatus });
     }
 
-    // (2) Query fallback (?address=0x...)
-    const qAddress = norm(req.query.address);
-    if (qAddress) {
-      const addr = qAddress.toLowerCase();
-      let roles = await durableRolesForAddress(addr);
-      // ADMIN OVERRIDE
-      if (isAdminAddress(addr)) {
-        roles = Array.from(new Set([...(roles || []), 'admin']));
-      }
-      const role = isAdminAddress(addr) ? 'admin' : (roles[0] || 'user');
-
-      let vendorStatus = 'pending';
-      if (role === 'vendor') {
-        const { rows } = await pool.query(
-          `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-          [addr]
-        );
-        vendorStatus = (rows[0]?.status || 'pending').toLowerCase();
-      }
-      return res.json({ address: addr, role, roles, vendorStatus });
+    // (2) Optional ?address= fallback
+    const qAddressRaw = req.query.address;
+    if (qAddressRaw && String(qAddressRaw).trim()) {
+      const address = String(qAddressRaw).trim();
+      const { roles, vendorStatus } = await computeRolesFor(address);
+      const role = roles[0] || (isAdminAddress(address) ? 'admin' : 'guest');
+      return res.json({ address, role, roles, vendorStatus });
     }
 
     // (3) No identity
@@ -3426,7 +3428,7 @@ app.post("/auth/switch-role", async (req, res) => {
     if (!token) return res.status(401).json({ error: 'unauthenticated' });
 
     const user = verifyJwt(token);
-    const address = norm(user?.sub || '');
+    const address = String(user?.sub || '').trim();
     if (!address) return res.status(401).json({ error: 'unauthenticated' });
 
     const target = String(req.body?.role || '').toLowerCase();
@@ -3434,27 +3436,29 @@ app.post("/auth/switch-role", async (req, res) => {
       return res.status(400).json({ error: 'invalid_role' });
     }
 
-    // ✅ use the helper instead of a raw INSERT
-    if (target === 'vendor') {
-      await seedVendorFromUserProfile(pool, address);
-    }
+    // ❌ DO NOT SEED ANYTHING HERE
+    // (remove: await seedVendorFromUserProfile(pool, address);)
 
-    // recompute durable roles
+    // Recompute roles from DB + admin list (no auto-vendor)
+    const lower = address.toLowerCase();
     const roles = [];
+
     if (isAdminAddress(address)) roles.push('admin');
 
     const v = await pool.query(
       `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-      [address]
+      [lower]
     );
     if (v.rowCount > 0) roles.push('vendor');
 
     const p = await pool.query(
       `SELECT 1 FROM proposals WHERE lower(owner_wallet)=lower($1) LIMIT 1`,
-      [address]
+      [lower]
     );
     if (p.rowCount > 0) roles.push('proposer');
 
+    // Issue a new token that stores only the *preferred* role (for navigation),
+    // but the authoritative roles array comes from DB.
     const newToken = signJwt({ sub: address, role: target, roles });
     res.cookie("auth_token", newToken, {
       httpOnly: true,
@@ -8503,63 +8507,55 @@ function _addrObj(addr, city = null, country = null) {
 
   return { ...o, addressText };
 }
-// ------------------------------------------------------------------------------
 
-// your existing route (UNCHANGED except it now finds _addrObj)
-app.get('/vendor/profile', authRequired, async (req, res) => {
+// === BEGIN PATCH: GET /vendor/profile (no auto-insert) ===
+app.get('/vendor/profile', authGuard, async (req, res) => {
   try {
-    const wallet = String(req.user?.sub || '').toLowerCase();
-
-    // 1) try vendor_profiles
-    const vq = await pool.query(
-      `SELECT wallet_address, vendor_name, email, phone, website, address, telegram_chat_id
+    const wallet = String(req.user.address || '').toLowerCase();
+    const { rows } = await pool.query(
+      `SELECT vendor_name, email, phone, website, address, telegram_username, telegram_chat_id, whatsapp
          FROM vendor_profiles
-        WHERE lower(wallet_address)=lower($1)`,
+        WHERE LOWER(wallet_address) = $1
+        LIMIT 1`,
       [wallet]
     );
-    const v = vq.rows[0];
-    if (v) {
-      let parsed = null;
-      try { parsed = JSON.parse(v.address || ''); } catch {}
-      const address = parsed && typeof parsed === 'object'
-        ? _addrObj(parsed)
-        : _addrObj(v.address, null, null);
 
+    if (rows.length === 0) {
+      // Return a read-only empty shape; DO NOT create a DB row here.
       return res.json({
-        walletAddress: v.wallet_address,
-        vendorName: v.vendor_name || '',
-        email: v.email || '',
-        phone: v.phone || '',
-        website: v.website || '',
-        address, // same as before
-        telegram_chat_id: v.telegram_chat_id || null,
-        telegramChatId: v.telegram_chat_id || null,
+        walletAddress: req.user.address,
+        vendorName: '',
+        email: '',
+        phone: '',
+        website: '',
+        address: { addressText: '' },
+        telegram_chat_id: null,
+        telegramChatId: null,
       });
     }
 
-    // 2) fallback to user_profiles
-    const uq = await pool.query(
-      `SELECT wallet_address, display_name, email, phone, website, address, city, country, telegram_chat_id
-         FROM user_profiles
-        WHERE lower(wallet_address)=lower($1)`,
-      [wallet]
-    );
-    const u = uq.rows[0];
-    if (!u) return res.json(null);
+    const r = rows[0];
+    let addrObj = null;
+    if (r.address && typeof r.address === 'object') addrObj = r.address;
+    else if (r.address && typeof r.address === 'string') {
+      const s = r.address.trim();
+      if (s.startsWith('{')) { try { addrObj = JSON.parse(s); } catch {}
+      } else { addrObj = { addressText: s }; }
+    }
 
-    return res.json({
-      walletAddress: u.wallet_address,
-      vendorName: u.display_name || '',
-      email: u.email || '',
-      phone: u.phone || '',
-      website: u.website || '',
-      address: _addrObj(u.address, u.city, u.country), // same as before
-      telegram_chat_id: u.telegram_chat_id || null,
-      telegramChatId: u.telegram_chat_id || null,
+    res.json({
+      walletAddress: req.user.address,
+      vendorName: r.vendor_name || '',
+      email: r.email || '',
+      phone: r.phone || '',
+      website: r.website || '',
+      address: addrObj || { addressText: '' },
+      telegram_chat_id: r.telegram_chat_id ?? null,
+      telegramChatId: r.telegram_chat_id ?? null,
     });
   } catch (e) {
-    console.error('GET /vendor/profile error:', e);
-    res.status(500).json({ error: 'Failed to load profile' });
+    console.error('GET /vendor/profile failed', e);
+    res.status(500).json({ error: 'Failed to fetch vendor profile' });
   }
 });
 
