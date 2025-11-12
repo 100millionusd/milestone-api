@@ -9312,7 +9312,7 @@ app.delete('/admin/vendors/:wallet', adminGuard, async (req, res) => {
   }
 });
 
-/** ADMIN: list vendors (with or without bids), normalized email + rich address (street + house no + city + postal + country) */
+// /admin/vendors — robust mapper, no nulling of legit values
 app.get('/admin/vendors', adminGuard, async (req, res) => {
   try {
     const includeArchived = ['true','1','yes'].includes(String(req.query.includeArchived || '').toLowerCase());
@@ -9375,7 +9375,7 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       WHERE NOT EXISTS (
         SELECT 1 FROM bids b WHERE LOWER(b.wallet_address) = LOWER(vp.wallet_address)
       )
-    `; // ← CLOSE THE TEMPLATE STRING
+    `;
 
     let sql = `SELECT * FROM (${sqlBase}) s`;
     if (!includeArchived) {
@@ -9383,139 +9383,133 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
     }
     sql += ` ORDER BY s.last_bid_at DESC NULLS LAST, s.vendor_name ASC`;
 
- const { rows } = await pool.query(sql);
+    const { rows } = await pool.query(sql);
 
-// helper kept once here
-const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
+    // Safer normalizer: preserves numbers/booleans by casting to string
+    const norm = (v) => {
+      if (v === null || v === undefined) return null;
+      const s = (typeof v === 'string') ? v : String(v);
+      const t = s.trim();
+      return t.length ? t : null;
+    };
 
-// ✨ IMPORTANT: everything lives INSIDE the map callback so `r` is in scope
-const out = rows.map((r) => {
-  // Parse address_raw -> addrObj (jsonb object or stringified JSON)
-  let addrObj = null;
-  if (r.address_raw) {
-    if (typeof r.address_raw === 'object') {
-      // pg may already parse jsonb
-      addrObj = r.address_raw;
-    } else if (typeof r.address_raw === 'string') {
-      const s = r.address_raw.trim();
-      if (s.startsWith('{')) {
-        try { addrObj = JSON.parse(s); } catch { /* ignore bad JSON */ }
+    const out = rows.map((r) => {
+      // address_raw may be: jsonb, JSON string, or plain text
+      let addrObj = null;
+      if (r.address_raw != null) {
+        if (typeof r.address_raw === 'object') {
+          addrObj = r.address_raw; // jsonb from pg
+        } else if (typeof r.address_raw === 'string') {
+          const s = r.address_raw.trim();
+          if (s.startsWith('{')) { try { addrObj = JSON.parse(s); } catch {} }
+        }
       }
-    }
-  }
 
-  // Build normalized address object + string
-  const parts = addrObj && typeof addrObj === 'object'
-    ? {
-        line1: norm(addrObj.line1),
-        city: norm(addrObj.city),
-        state: norm(addrObj.state),
-        postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code),
-        country: norm(addrObj.country),
-      }
-    : {
-        line1: norm(r.address_raw),
-        city: null,
-        state: null,
-        postalCode: null,
-        country: null,
-      };
+      const parts = addrObj && typeof addrObj === 'object'
+        ? {
+            line1: norm(addrObj.line1),
+            city: norm(addrObj.city),
+            state: norm(addrObj.state),
+            postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code),
+            country: norm(addrObj.country),
+          }
+        : {
+            line1: norm(r.address_raw),
+            city: null,
+            state: null,
+            postalCode: null,
+            country: null,
+          };
 
-  const addressText = [parts.line1, parts.city, parts.postalCode, parts.country]
-    .filter(Boolean)
-    .join(', ') || null;
+      const addressText = [parts.line1, parts.city, parts.postalCode, parts.country]
+        .filter(Boolean).join(', ') || null;
 
-  const email    = norm(r.email);
-  const phone    = norm(r.phone);
-  const website  = norm(r.website);
-  const tgId     = norm(r.telegram_chat_id);
-  const tgUser   = norm(r.telegram_username);
-  const whatsapp = norm(r.whatsapp);
+      const email    = norm(r.email);
+      const phone    = norm(r.phone);
+      const website  = norm(r.website);
+      // cast telegram_chat_id (often numeric) to string so it doesn’t get dropped
+      const tgId     = norm(r.telegram_chat_id == null ? null : String(r.telegram_chat_id));
+      const tgUser   = norm(r.telegram_username);
+      const whatsapp = norm(r.whatsapp);
 
-  return {
-    // core
-    vendorName: r.profile_vendor_name || r.vendor_name || '',
-    walletAddress: r.wallet_address || '',
-    bidsCount: Number(r.bids_count) || 0,
-    lastBidAt: r.last_bid_at,
-    totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+      return {
+        // core
+        vendorName: norm(r.profile_vendor_name) || norm(r.vendor_name) || '',
+        walletAddress: r.wallet_address || '',
+        bidsCount: Number(r.bids_count) || 0,
+        lastBidAt: r.last_bid_at,
+        totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-    // server-truth flags used by the UI
-    status: r.status || 'pending',
-    kycStatus: r.kyc_status || 'none',
+        // status
+        status: r.status || 'pending',
+        kycStatus: r.kyc_status || 'none',
 
-    // contact
-    email,
-    phone,
-    website,
+        // contact
+        email,
+        phone,
+        website,
 
-    // explicit boolean for existing UIs
-    telegramConnected: !!(tgId || tgUser || whatsapp),
-    telegramChatId: tgId,
-    telegramUsername: tgUser,
-    whatsapp,
+        // messaging flags
+        telegramConnected: !!(tgId || tgUser || whatsapp),
+        telegramChatId: tgId,
+        telegramUsername: tgUser,
+        whatsapp,
 
-    // BACK-COMPAT: string address for existing tables/cells
-    address: addressText,
-    addressText,
-
-    // structured for newer UI
-    addressObj: {
-      line1: parts.line1,
-      city: parts.city,
-      state: parts.state,
-      postalCode: parts.postalCode,
-      country: parts.country,
-      addressText,
-    },
-
-    // legacy aliases some components might read
-    street: parts.line1 || null,
-    address1: parts.line1 || addressText,
-    addressLine1: parts.line1 || addressText,
-    city: parts.city,
-    state: parts.state,
-    postalCode: parts.postalCode,
-    country: parts.country,
-
-    // nested copies (for components that deref profile.*)
-    profile: {
-      companyName: r.profile_vendor_name ?? (r.vendor_name || null),
-      contactName: null,
-      email,
-      contactEmail: email,
-      phone,
-      website,
-      telegram_chat_id: tgId,
-      telegram_username: tgUser,
-      whatsapp,
-      address: addressText,
-      addressText,
-      addressObj: {
-        line1: parts.line1,
+        // address (string + structured + legacy aliases)
+        address: addressText,
+        addressText,
+        addressObj: {
+          line1: parts.line1,
+          city: parts.city,
+          state: parts.state,
+          postalCode: parts.postalCode,
+          country: parts.country,
+          addressText,
+        },
+        street: parts.line1 || null,
+        address1: parts.line1 || addressText,
+        addressLine1: parts.line1 || addressText,
         city: parts.city,
         state: parts.state,
         postalCode: parts.postalCode,
         country: parts.country,
-        addressText,
-      },
-      street: parts.line1 || null,
-      address1: parts.line1 || addressText,
-      address2: null,
-      city: parts.city,
-      state: parts.state,
-      postalCode: parts.postalCode,
-      country: parts.country,
-      notes: null,
-    },
 
-    archived: !!r.archived,
-  };
-});
+        // nested mirrors for older UI that reads profile.*
+        profile: {
+          companyName: norm(r.profile_vendor_name) || norm(r.vendor_name) || null,
+          contactName: null,
+          email,
+          contactEmail: email,
+          phone,
+          website,
+          telegram_chat_id: tgId,
+          telegram_username: tgUser,
+          whatsapp,
+          address: addressText,
+          addressText,
+          addressObj: {
+            line1: parts.line1,
+            city: parts.city,
+            state: parts.state,
+            postalCode: parts.postalCode,
+            country: parts.country,
+            addressText,
+          },
+          street: parts.line1 || null,
+          address1: parts.line1 || addressText,
+          address2: null,
+          city: parts.city,
+          state: parts.state,
+          postalCode: parts.postalCode,
+          country: parts.country,
+          notes: null,
+        },
 
-// ✅ return the mapped array
-res.json(out);
+        archived: !!r.archived,
+      };
+    });
 
+    res.json(out);
   } catch (e) {
     console.error('GET /admin/vendors error', e);
     res.status(500).json({ error: 'Failed to list vendors' });
