@@ -8592,6 +8592,43 @@ app.get('/vendor/profile', authGuard, async (req, res) => {
   }
 });
 
+// === PROPOSER PROFILE (Entity) ===
+app.post('/proposer/profile', authGuard, async (req, res) => {
+  try {
+    const addr = String(req.user.address || '').toLowerCase();
+    const b = req.body || {};
+    const addressJson =
+      b.address && typeof b.address === 'object'
+        ? JSON.stringify(b.address)
+        : (typeof b.address === 'string' ? b.address : null);
+
+    await pool.query(`
+      INSERT INTO user_profiles (wallet_address, vendor_name, email, phone, website, address, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6, NOW())
+      ON CONFLICT (wallet_address) DO UPDATE SET
+        vendor_name = EXCLUDED.vendor_name,
+        email       = EXCLUDED.email,
+        phone       = EXCLUDED.phone,
+        website     = EXCLUDED.website,
+        address     = EXCLUDED.address,
+        updated_at  = NOW()
+    `, [
+      addr,
+      b.vendorName || '',
+      b.email || '',
+      b.phone || '',
+      b.website || '',
+      addressJson
+    ]);
+
+    // do NOT seed vendor here
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('POST /proposer/profile error', e);
+    return res.status(500).json({ error: 'save_failed' });
+  }
+});
+
 // Choose a role AFTER profile save
 app.post("/profile/choose-role", async (req, res) => {
   try {
