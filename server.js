@@ -3465,10 +3465,15 @@ app.post("/auth/switch-role", async (req, res) => {
       return res.status(400).json({ error: 'invalid_role' });
     }
 
-    // ❌ DO NOT SEED ANYTHING HERE
-    // (remove: await seedVendorFromUserProfile(pool, address);)
+    // 🚫 BLOCK: Admins cannot switch to vendor (unless explicitly allowed)
+    if (target === 'vendor' && isAdminAddress(address) && !req.body?.allowAdminVendor) {
+      return res.status(403).json({ error: 'admin_cannot_be_vendor' });
+    }
 
-    // Recompute roles from DB + admin list (no auto-vendor)
+    // ❌ DO NOT seed here — no auto-creation of vendor rows
+    // (remove any: await seedVendorFromUserProfile(pool, address);)
+
+    // Recompute roles from DB (authoritative) + admin list
     const lower = address.toLowerCase();
     const roles = [];
 
@@ -3486,8 +3491,7 @@ app.post("/auth/switch-role", async (req, res) => {
     );
     if (p.rowCount > 0) roles.push('proposer');
 
-    // Issue a new token that stores only the *preferred* role (for navigation),
-    // but the authoritative roles array comes from DB.
+    // Issue a new token with the preferred role + authoritative roles[]
     const newToken = signJwt({ sub: address, role: target, roles });
     res.cookie("auth_token", newToken, {
       httpOnly: true,
@@ -9518,11 +9522,17 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
           notes: null,
         },
 
-        archived: !!r.archived,
+    archived: !!r.archived,
       };
     });
 
-    res.json(out);
+    // Hide admin wallets from the list
+    const outFiltered = out.filter(v => {
+      const w = String(v.walletAddress || '').toLowerCase();
+      return w && !isAdminAddress(w);
+    });
+
+    res.json(outFiltered);
   } catch (e) {
     console.error('GET /admin/vendors error', e);
     res.status(500).json({ error: 'Failed to list vendors' });
