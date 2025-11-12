@@ -380,6 +380,37 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+// --- ensure user_profiles has the columns we write ---
+async function ensureUserProfilesSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_profiles (
+      wallet_address text PRIMARY KEY,
+      vendor_name text,
+      email text,
+      phone text,
+      website text,
+      address text,
+      created_at timestamptz DEFAULT now(),
+      updated_at timestamptz DEFAULT now()
+    );
+    ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS vendor_name text;
+    ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS email text;
+    ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS phone text;
+    ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS website text;
+    ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS address text;
+    ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();
+  `);
+  console.log('[db] user_profiles ready');
+}
+
+(async () => {
+  try {
+    await ensureUserProfilesSchema();
+  } catch (e) {
+    console.error('ensureUserProfilesSchema failed', e);
+  }
+})();
+
 // ---- Safe Tx overlay helpers (response-time hydration) ----
 const SAFE_CACHE_TTL_MS = Number(process.env.SAFE_CACHE_TTL_MS || 5000);
 
