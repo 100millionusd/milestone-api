@@ -143,6 +143,32 @@ const jwt = require("jsonwebtoken");
 
 let __vendorSeedGuard = 0;
 
+// ==== JWT helpers (put near top of server.js) ====
+const jwt = require('jsonwebtoken'); // if not already required
+const JWT_SECRET = process.env.JWT_SECRET || 'changeme';
+
+function readJwtFromReq(req) {
+  // 1) Authorization: Bearer <token>
+  const h = String(req.headers?.authorization || '');
+  if (h.startsWith('Bearer ')) return h.slice(7).trim();
+
+  // 2) Cookies: auth_token (backend) or lx_jwt (frontend sync)
+  const c = req.cookies || {};
+  if (c.auth_token && String(c.auth_token).trim()) return String(c.auth_token).trim();
+  if (c.lx_jwt && String(c.lx_jwt).trim()) return String(c.lx_jwt).trim();
+
+  return null;
+}
+
+function verifyJwt(t) {
+  try {
+    const p = jwt.verify(t, JWT_SECRET);
+    return p && typeof p === 'object' ? p : null;
+  } catch {
+    return null;
+  }
+}
+
 // === ROLE HELPERS (paste once, under auth utilities; do NOT redeclare JWT_SECRET) =========
 const VALID_ROLES = ['vendor', 'proposer', 'admin'];
 
@@ -3433,68 +3459,53 @@ app.post("/auth/login", async (req, res) => {
   return res.json({ token, role, roles });
 });
 
-app.get("/auth/role", async (req, res) => {
+// ==== AUTH ROLE (cookie OR Bearer) ====
+app.get('/auth/role', async (req, res) => {
   try {
-    // Extract JWT from Bearer or cookie
-    const tokenFromHeader = req.headers.authorization?.startsWith('Bearer ')
-      ? req.headers.authorization.slice(7)
-      : null;
-    const tokenFromCookie = req.cookies?.auth_token || null;
-    const token = tokenFromHeader || tokenFromCookie;
-    const decoded = token ? verifyJwt(token) : null;
+    const token = readJwtFromReq(req);
+    let payload = null, address = null;
 
-    // Helper to compute roles strictly from DB + admin list
-    const computeRolesFor = async (address) => {
-      const lower = address.toLowerCase();
-      const roles = [];
+    if (token) {
+      payload = verifyJwt(token);
+      address = String(payload?.sub || payload?.address || '').toLowerCase() || null;
+    }
 
-      if (isAdminAddress(address)) roles.push('admin');
+    // Compute durable roles even if only address is known
+    let roles = [];
+    if (address) {
+      roles = await durableRolesForAddress(address); // your existing function
+      // ensure unique
+      roles = Array.from(new Set(roles));
+    }
 
-      const vp = await pool.query(
+    // Pick a primary role (admin > vendor/proposer > guest)
+    let role = 'guest';
+    if (roles.includes('admin')) role = 'admin';
+    else if (roles.includes('vendor')) role = 'vendor';
+    else if (roles.includes('proposer')) role = 'proposer';
+
+    // vendorStatus for banner gating
+    let vendorStatus = 'none';
+    if (address) {
+      const r = await pool.query(
         `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-        [lower]
+        [address]
       );
-      if (vp.rowCount > 0) roles.push('vendor');
-
-      const pp = await pool.query(
-        `SELECT 1 FROM proposals WHERE lower(owner_wallet)=lower($1) LIMIT 1`,
-        [lower]
-      );
-      if (pp.rowCount > 0) roles.push('proposer');
-
-      const vendorStatus = vp.rowCount > 0
-        ? String(vp.rows[0].status || 'pending').toLowerCase()
-        : 'none';
-
-      return { roles, vendorStatus };
-    };
-
-    // (1) JWT identity path
-    if (decoded?.sub) {
-      const address = String(decoded.sub);
-      const { roles, vendorStatus } = await computeRolesFor(address);
-
-      // Keep "preferred" role from token only if it's actually allowed
-      const preferred = String(decoded.role || '').toLowerCase();
-      const role = roles.includes(preferred) ? preferred : (roles[0] || 'guest');
-
-      return res.json({ address, role, roles, vendorStatus });
+      if (r.rows.length) vendorStatus = String(r.rows[0].status || 'pending');
     }
 
-    // (2) Optional ?address= fallback
-    const qAddressRaw = req.query.address;
-    if (qAddressRaw && String(qAddressRaw).trim()) {
-      const address = String(qAddressRaw).trim();
-      const { roles, vendorStatus } = await computeRolesFor(address);
-      const role = roles[0] || (isAdminAddress(address) ? 'admin' : 'guest');
-      return res.json({ address, role, roles, vendorStatus });
+    // If payload had a role claim (from choose-role), prefer it when consistent
+    const claimed = String(payload?.role || '').toLowerCase();
+    if (claimed && (claimed === 'admin' || claimed === 'vendor' || claimed === 'proposer')) {
+      // Keep admin if durable says admin
+      if (claimed === 'admin' && roles.includes('admin')) role = 'admin';
+      else role = claimed; // otherwise trust the token's role
     }
 
-    // (3) No identity
-    return res.json({ role: "guest" });
+    return res.json({ address: address || null, role, roles, vendorStatus });
   } catch (e) {
-    console.error('/auth/role error', e);
-    return res.status(500).json({ error: 'role_failed' });
+    console.error('GET /auth/role error', e);
+    return res.json({ address: null, role: 'guest', roles: [], vendorStatus: 'none' });
   }
 });
 
