@@ -8636,56 +8636,6 @@ app.get('/vendor/profile', authGuard, async (req, res) => {
   }
 });
 
-// Read Entity/Proposer profile (no vendor seeding, no joins)
-// RETURNS: { vendorName, email, phone, website, address, addressText, telegram_username, telegram_chat_id, whatsapp }
-app.get('/proposer/profile', authGuard, async (req, res) => {
-  try {
-    const addr = String(req.user.address || '').toLowerCase();
-    const { rows } = await pool.query(
-      `SELECT vendor_name, email, phone, website, address, telegram_username, telegram_chat_id, whatsapp
-         FROM user_profiles
-        WHERE lower(wallet_address)=lower($1)
-        LIMIT 1`,
-      [addr]
-    );
-    const r = rows[0] || null;
-
-    const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
-
-    // address may be JSON or plain text
-    let addressObj = null, addressText = null;
-    if (r?.address) {
-      if (typeof r.address === 'string' && r.address.trim().startsWith('{')) {
-        try { addressObj = JSON.parse(r.address); } catch {}
-      }
-      if (addressObj && typeof addressObj === 'object') {
-        const line1 = norm(addressObj.line1);
-        const city  = norm(addressObj.city);
-        const pc    = norm(addressObj.postalCode) || norm(addressObj.postal_code);
-        const ctry  = norm(addressObj.country);
-        addressText = [line1, city, pc, ctry].filter(Boolean).join(', ') || null;
-      } else {
-        addressText = norm(r.address);
-      }
-    }
-
-    return res.json({
-      vendorName: r?.vendor_name || '',
-      email:      r?.email || '',
-      phone:      r?.phone || '',
-      website:    r?.website || '',
-      address:    addressObj || addressText || null,
-      addressText,
-      telegram_username: r?.telegram_username ?? null,
-      telegram_chat_id:  r?.telegram_chat_id ?? null,
-      whatsapp:          r?.whatsapp ?? null,
-    });
-  } catch (e) {
-    console.error('GET /proposer/profile error', e);
-    res.status(500).json({ error: 'load_failed' });
-  }
-});
-
 /// --- PROPOSER PROFILE -------------------------------------------------------
 app.post('/proposer/profile', requireAuth, async (req, res) => {
   try {
