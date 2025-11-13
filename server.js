@@ -8653,44 +8653,65 @@ app.get('/vendor/profile', authGuard, async (req, res) => {
   }
 });
 
-// --- PROPOSER / ENTITY PROFILE (UPSERT into proposer_profiles) ---
-app.post('/proposer/profile', requireAuth, async (req, res) => {
+// ── PROPOSER PROFILE (Entity) 
+app.post('/proposer/profile', authGuard /* or requireAuth */, async (req, res) => {
   try {
-    const addr = req.user.address; // already lowercased by guard
+    const wallet = String(req.user?.address || '').toLowerCase();
+    if (!wallet) return res.status(401).json({ error: 'unauthenticated' });
+
     const {
-      vendorName, email, phone, website,
-      address, city, country,
-      telegram_username, telegram_chat_id, whatsapp
+      vendorName,            // maps → org_name
+      email,                 // maps → contact_email
+      phone,
+      website,
+      address,               // object or string
+      city,
+      country,
+      whatsapp,
+      telegram_chat_id,
+      telegram_username,     // <- this was missing in your table
     } = req.body || {};
 
     const addressVal =
       typeof address === 'string' ? address :
       address ? JSON.stringify(address) : null;
 
-    const up = await pool.query(`
+    await pool.query(`
       INSERT INTO proposer_profiles
-        (wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_username, telegram_chat_id, whatsapp, updated_at)
+        (wallet_address, org_name, contact_email, phone, website, address, city, country,
+         whatsapp, telegram_chat_id, telegram_username, updated_at)
       VALUES
         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now())
       ON CONFLICT (wallet_address) DO UPDATE SET
-        org_name=EXCLUDED.org_name,
-        contact_email=EXCLUDED.contact_email,
-        phone=EXCLUDED.phone,
-        website=EXCLUDED.website,
-        address=EXCLUDED.address,
-        city=EXCLUDED.city,
-        country=EXCLUDED.country,
-        telegram_username=EXCLUDED.telegram_username,
-        telegram_chat_id=EXCLUDED.telegram_chat_id,
-        whatsapp=EXCLUDED.whatsapp,
-        updated_at=now()
-      RETURNING wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_username, telegram_chat_id, whatsapp, updated_at
-    `, [addr, vendorName, email, phone, website, addressVal, city, country, telegram_username ?? null, telegram_chat_id ?? null, whatsapp ?? null]);
+        org_name          = EXCLUDED.org_name,
+        contact_email     = EXCLUDED.contact_email,
+        phone             = EXCLUDED.phone,
+        website           = EXCLUDED.website,
+        address           = EXCLUDED.address,
+        city              = EXCLUDED.city,
+        country           = EXCLUDED.country,
+        whatsapp          = EXCLUDED.whatsapp,
+        telegram_chat_id  = EXCLUDED.telegram_chat_id,
+        telegram_username = EXCLUDED.telegram_username,
+        updated_at        = now()
+    `, [
+      wallet,
+      vendorName ?? null,
+      email ?? null,
+      phone ?? null,
+      website ?? null,
+      addressVal,
+      city ?? null,
+      country ?? null,
+      whatsapp ?? null,
+      telegram_chat_id ?? null,
+      telegram_username ?? null,
+    ]);
 
-    res.json({ ok: true, saved: up.rows[0] });
+    return res.json({ ok: true });
   } catch (e) {
     console.error('POST /proposer/profile error', e);
-    res.status(500).json({ error: 'Failed to save proposer profile' });
+    return res.status(500).json({ error: 'Failed to save proposer profile' });
   }
 });
 
