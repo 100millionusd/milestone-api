@@ -8686,7 +8686,7 @@ app.get('/proposer/profile', authGuard, async (req, res) => {
   }
 });
 
-// --- PROPOSER PROFILE -------------------------------------------------------
+/// --- PROPOSER PROFILE -------------------------------------------------------
 app.post('/proposer/profile', requireAuth, async (req, res) => {
   try {
     const addr = (req.user?.address || '').toLowerCase();
