@@ -9072,17 +9072,17 @@ app.post("/profile/choose-role", async (req, res) => {
           (wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_chat_id, whatsapp, status, created_at, updated_at)
         VALUES
           ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active',NOW(),NOW())
-        ON CONFLICT (wallet_address) DO UPDATE SET
-          org_name        = COALESCE(NULLIF(EXCLUDED.org_name,''),              proposer_profiles.org_name),
-          contact_email   = COALESCE(EXCLUDED.contact_email,                    proposer_profiles.contact_email),
-          phone           = COALESCE(EXCLUDED.phone,                            proposer_profiles.phone),
-          website         = COALESCE(EXCLUDED.website,                          proposer_profiles.website),
-          address         = COALESCE(EXCLUDED.address,                          proposer_profiles.address),
-          city            = COALESCE(EXCLUDED.city,                             proposer_profiles.city),
-          country         = COALESCE(EXCLUDED.country,                          proposer_profiles.country),
-          telegram_chat_id= COALESCE(EXCLUDED.telegram_chat_id,                 proposer_profiles.telegram_chat_id),
-          whatsapp        = COALESCE(EXCLUDED.whatsapp,                         proposer_profiles.whatsapp),
-          updated_at      = NOW()
+ ON CONFLICT (wallet_address) DO UPDATE SET
+  org_name         = COALESCE(NULLIF(EXCLUDED.org_name, ''),         proposer_profiles.org_name),
+  contact_email    = COALESCE(NULLIF(EXCLUDED.contact_email, ''),    proposer_profiles.contact_email),
+  phone            = COALESCE(NULLIF(EXCLUDED.phone, ''),            proposer_profiles.phone),
+  website          = COALESCE(NULLIF(EXCLUDED.website, ''),          proposer_profiles.website),
+  address          = COALESCE(NULLIF(EXCLUDED.address, ''),          proposer_profiles.address),
+  city             = COALESCE(NULLIF(EXCLUDED.city, ''),             proposer_profiles.city),
+  country          = COALESCE(NULLIF(EXCLUDED.country, ''),          proposer_profiles.country),
+  telegram_chat_id = COALESCE(NULLIF(EXCLUDED.telegram_chat_id, ''), proposer_profiles.telegram_chat_id),
+  whatsapp         = COALESCE(NULLIF(EXCLUDED.whatsapp, ''),         proposer_profiles.whatsapp),
+  updated_at       = NOW()
         `,
         [wallet, orgName, email, phone, website, addressVal, city, country, tgChatId, whatsapp]
       );
