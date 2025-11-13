@@ -8946,7 +8946,7 @@ app.post('/proposer/profile', authGuard /* or requireAuth */, async (req, res) =
 // Read Entity/Proposer profile **from proposer_profiles**
 app.get('/proposer/profile', requireAuth, async (req, res) => {
   try {
-    const addr = req.user.address;
+    const addr = String(req.user?.address || req.user?.sub || "").toLowerCase();
     const r = await pool.query(`
       SELECT org_name, contact_email, phone, website, address, city, country, telegram_username, telegram_chat_id, whatsapp
       FROM proposer_profiles
@@ -9042,7 +9042,7 @@ app.post("/profile/choose-role", async (req, res) => {
       }
     }
 
- if (roleIntent === 'proposer') {
+ if (roleIntent === 'proposer' && !roles.includes('proposer')) {
   const b = req.body || {};
 
   // Body-first values; fall back to user_profiles row `p`
