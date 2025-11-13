@@ -268,16 +268,6 @@ function requireAdmin(req, res, next) {
   }
 }
 
-// --- auth guard (simple) ---
-const authGuard = (req, res, next) => {
-  if (req?.user?.address) return next();
-  return res.status(401).json({ error: 'Unauthorized' });
-};
-
-// If some routes still use `requireAuth`, keep this alias:
-const requireAuth = authGuard;
-
-
 // ==============================
 // Config
 // ==============================
@@ -3069,8 +3059,15 @@ function authGuard(req, res, next) {
   }
 }
 
-// Back-compat alias (some routes use `requireAuth`)
+// --- auth guard (simple) ---
+const authGuard = (req, res, next) => {
+  if (req?.user?.address) return next();
+  return res.status(401).json({ error: 'Unauthorized' });
+};
+
+// If some routes still use `requireAuth`, keep this alias:
 const requireAuth = authGuard;
+
 
 // ========================================================================
 
