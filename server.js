@@ -144,7 +144,6 @@ const jwt = require("jsonwebtoken");
 let __vendorSeedGuard = 0;
 
 // ==== JWT helpers (put near top of server.js) ====
-const JWT_SECRET = process.env.JWT_SECRET || 'changeme';
 
 function readJwtFromReq(req) {
   // 1) Authorization: Bearer <token>
