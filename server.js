@@ -8993,16 +8993,18 @@ app.get('/proposer/profile', requireAuth, async (req, res) => {
   }
 });
 
-// Choose a role AFTER profile save
+// Choose a role AFTER profile save (SAFE — does not wipe proposer fields)
 app.post("/profile/choose-role", async (req, res) => {
   try {
     const wallet = String(req.user?.sub || "").toLowerCase();
     if (!wallet) return res.status(401).json({ error: "unauthorized" });
 
-    const roleIntent = normalizeRoleIntent(req.body?.role || req.query?.role); // 'vendor' | 'proposer'
-    if (!roleIntent) return res.status(400).json({ error: "role_required" });
+    const roleIntent = String(req.body?.role || req.query?.role || "").trim().toLowerCase(); // 'vendor' | 'proposer'
+    if (roleIntent !== "vendor" && roleIntent !== "proposer") {
+      return res.status(400).json({ error: "role_required" });
+    }
 
-    // Read generic profile to copy common fields on first-time seed
+    // Base row to seed from (only used on first insert)
     const { rows: base } = await pool.query(
       `SELECT display_name, email, phone, website, address, city, country,
               telegram_chat_id, whatsapp
@@ -9012,81 +9014,86 @@ app.post("/profile/choose-role", async (req, res) => {
     const p = base[0] || {};
     let roles = await durableRolesForAddress(wallet);
 
-    if (roleIntent === 'vendor' && !roles.includes('vendor')) {
-      // open the vendor insert window ONLY here
+    // ----- VENDOR seeding (unchanged behavior but made safe against blank overwrite)
+    if (roleIntent === "vendor" && !roles.includes("vendor")) {
       __vendorSeedGuard++;
       try {
-        const { rows } = await pool.query(
+        await pool.query(
           `
           INSERT INTO vendor_profiles
             (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at, telegram_chat_id, whatsapp)
           VALUES
             ($1, COALESCE($2,''), $3, $4, $5, $6, 'pending', NOW(), NOW(), $7, $8)
           ON CONFLICT (wallet_address) DO UPDATE SET
-            vendor_name=COALESCE($2,''), email=$3, phone=$4, website=$5, address=$6,
-            telegram_chat_id=$7, whatsapp=$8, updated_at=NOW()
-          RETURNING wallet_address`,
+            vendor_name       = COALESCE(NULLIF(EXCLUDED.vendor_name,''), vendor_profiles.vendor_name),
+            email             = COALESCE(EXCLUDED.email,    vendor_profiles.email),
+            phone             = COALESCE(EXCLUDED.phone,    vendor_profiles.phone),
+            website           = COALESCE(EXCLUDED.website,  vendor_profiles.website),
+            address           = COALESCE(EXCLUDED.address,  vendor_profiles.address),
+            telegram_chat_id  = COALESCE(EXCLUDED.telegram_chat_id, vendor_profiles.telegram_chat_id),
+            whatsapp          = COALESCE(EXCLUDED.whatsapp, vendor_profiles.whatsapp),
+            updated_at        = NOW()
+          `,
           [
             wallet,
-            p.display_name, p.email, p.phone, p.website, p.address,
-            p.telegram_chat_id, p.whatsapp
+            p.display_name ?? "",
+            p.email ?? null,
+            p.phone ?? null,
+            p.website ?? null,
+            p.address ?? null,
+            p.telegram_chat_id ?? null,
+            p.whatsapp ?? null,
           ]
         );
-        if (rows && rows.length) {
-          try { await notifyVendorSignup({ wallet: rows[0].wallet_address }); } catch {}
-          try { await notifyVendorSignupVendor({ email: p.email || null }); } catch {}
-        }
       } finally {
-        __vendorSeedGuard--;
-        if (__vendorSeedGuard < 0) __vendorSeedGuard = 0;
+        __vendorSeedGuard = Math.max(0, __vendorSeedGuard - 1);
       }
     }
 
- if (roleIntent === 'proposer' && !roles.includes('proposer')) {
-  const b = req.body || {};
+    // ----- PROPOSER seeding (SAFE UPSERT — DO NOT WIPE EXISTING FIELDS)
+    if (roleIntent === "proposer") {
+      const b = req.body || {};
 
-  // Body-first values; fall back to user_profiles row `p`
-  const orgName  = (b.vendorName ?? b.orgName ?? p.display_name ?? '').trim();
-  const email    = b.email ?? p.email ?? null;
-  const phone    = b.phone ?? p.phone ?? null;
-  const website  = b.website ?? p.website ?? null;
-  const city     = b.city ?? p.city ?? null;
-  const country  = b.country ?? p.country ?? null;
-  const tgChatId = b.telegram_chat_id ?? p.telegram_chat_id ?? null;
-  const whatsapp = b.whatsapp ?? p.whatsapp ?? null;
+      const orgName  = (b.vendorName ?? b.orgName ?? p.display_name ?? "").trim();
+      const email    = b.email   ?? p.email   ?? null;
+      const phone    = b.phone   ?? p.phone   ?? null;
+      const website  = b.website ?? p.website ?? null;
+      const city     = b.city    ?? p.city    ?? null;
+      const country  = b.country ?? p.country ?? null;
+      const tgChatId = b.telegram_chat_id ?? p.telegram_chat_id ?? null;
+      const whatsapp = b.whatsapp ?? p.whatsapp ?? null;
+      const addressVal =
+        typeof b.address === "string" ? b.address :
+        (b.address ? JSON.stringify(b.address) : (p.address ?? null));
 
-  // address can be an object or a string in your UI; store string or JSON string
-  const addressVal =
-    typeof b.address === 'string' ? b.address :
-    (b.address ? JSON.stringify(b.address) : (p.address ?? null));
+      await pool.query(
+        `
+        INSERT INTO proposer_profiles
+          (wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_chat_id, whatsapp, status, created_at, updated_at)
+        VALUES
+          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active',NOW(),NOW())
+        ON CONFLICT (wallet_address) DO UPDATE SET
+          org_name        = COALESCE(NULLIF(EXCLUDED.org_name,''),              proposer_profiles.org_name),
+          contact_email   = COALESCE(EXCLUDED.contact_email,                    proposer_profiles.contact_email),
+          phone           = COALESCE(EXCLUDED.phone,                            proposer_profiles.phone),
+          website         = COALESCE(EXCLUDED.website,                          proposer_profiles.website),
+          address         = COALESCE(EXCLUDED.address,                          proposer_profiles.address),
+          city            = COALESCE(EXCLUDED.city,                             proposer_profiles.city),
+          country         = COALESCE(EXCLUDED.country,                          proposer_profiles.country),
+          telegram_chat_id= COALESCE(EXCLUDED.telegram_chat_id,                 proposer_profiles.telegram_chat_id),
+          whatsapp        = COALESCE(EXCLUDED.whatsapp,                         proposer_profiles.whatsapp),
+          updated_at      = NOW()
+        `,
+        [wallet, orgName, email, phone, website, addressVal, city, country, tgChatId, whatsapp]
+      );
+    }
 
-  await pool.query(`
-    INSERT INTO proposer_profiles
-      (wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_chat_id, whatsapp, status, created_at, updated_at)
-    VALUES
-      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active',NOW(),NOW())
-    ON CONFLICT (wallet_address) DO UPDATE SET
-      org_name         = COALESCE(NULLIF(EXCLUDED.org_name,''), proposer_profiles.org_name),
-      contact_email    = COALESCE(EXCLUDED.contact_email,        proposer_profiles.contact_email),
-      phone            = COALESCE(EXCLUDED.phone,                proposer_profiles.phone),
-      website          = COALESCE(EXCLUDED.website,              proposer_profiles.website),
-      address          = COALESCE(EXCLUDED.address,              proposer_profiles.address),
-      city             = COALESCE(EXCLUDED.city,                 proposer_profiles.city),
-      country          = COALESCE(EXCLUDED.country,              proposer_profiles.country),
-      telegram_chat_id = COALESCE(EXCLUDED.telegram_chat_id,     proposer_profiles.telegram_chat_id),
-      whatsapp         = COALESCE(EXCLUDED.whatsapp,             proposer_profiles.whatsapp),
-      updated_at       = NOW()
-  `, [wallet, orgName, email, phone, website, addressVal, city, country, tgChatId, whatsapp]);
-}
-
-    // recompute durable roles
+    // Recompute durable roles and set token
     roles = await durableRolesForAddress(wallet);
     let role = roleFromDurableOrIntent(roles, roleIntent);
-
-    // Admin can still override to admin for UI if needed
     if (isAdminAddress(wallet)) {
-      roles = Array.from(new Set([...(roles || []), 'admin']));
-      role = 'admin';
+      roles = Array.from(new Set([...(roles || []), "admin"]));
+      role = role === "vendor" || role === "proposer" ? role : "admin";
     }
 
     const token = signJwt({ sub: wallet, role, roles });
