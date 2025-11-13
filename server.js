@@ -8882,9 +8882,8 @@ app.get('/vendor/profile', authGuard, async (req, res) => {
 });
 
 // ── PROPOSER PROFILE (Entity) 
-app.post('/proposer/profile', authGuard /* or requireAuth */, async (req, res) => {
-  try {
-    const wallet = String(req.user?.address || req.user?.sub || '').toLowerCase();
+app.post('/proposer/profile', requireAuth, async (req, res) => {
+  const wallet = String(req.user?.address || req.user?.sub || '').toLowerCase();
     if (!wallet) return res.status(401).json({ error: 'unauthenticated' });
 
     const {
@@ -8910,18 +8909,21 @@ app.post('/proposer/profile', authGuard /* or requireAuth */, async (req, res) =
          whatsapp, telegram_chat_id, telegram_username, updated_at)
       VALUES
         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now())
-      ON CONFLICT (wallet_address) DO UPDATE SET
-        org_name          = EXCLUDED.org_name,
-        contact_email     = EXCLUDED.contact_email,
-        phone             = EXCLUDED.phone,
-        website           = EXCLUDED.website,
-        address           = EXCLUDED.address,
-        city              = EXCLUDED.city,
-        country           = EXCLUDED.country,
-        whatsapp          = EXCLUDED.whatsapp,
-        telegram_chat_id  = EXCLUDED.telegram_chat_id,
-        telegram_username = EXCLUDED.telegram_username,
-        updated_at        = now()
+ ON CONFLICT (wallet_address) DO UPDATE SET
+  org_name          = COALESCE(NULLIF(EXCLUDED.org_name, ''),         proposer_profiles.org_name),
+  contact_email     = COALESCE(NULLIF(EXCLUDED.contact_email, ''),     proposer_profiles.contact_email),
+  phone             = COALESCE(NULLIF(EXCLUDED.phone, ''),             proposer_profiles.phone),
+  website           = COALESCE(NULLIF(EXCLUDED.website, ''),           proposer_profiles.website),
+  address           = CASE
+                        WHEN EXCLUDED.address IS NULL OR EXCLUDED.address = '' THEN proposer_profiles.address
+                        ELSE EXCLUDED.address
+                      END,
+  city              = COALESCE(NULLIF(EXCLUDED.city, ''),              proposer_profiles.city),
+  country           = COALESCE(NULLIF(EXCLUDED.country, ''),           proposer_profiles.country),
+  whatsapp          = COALESCE(NULLIF(EXCLUDED.whatsapp, ''),          proposer_profiles.whatsapp),
+  telegram_chat_id  = COALESCE(NULLIF(EXCLUDED.telegram_chat_id, ''),  proposer_profiles.telegram_chat_id),
+  telegram_username = COALESCE(NULLIF(EXCLUDED.telegram_username, ''), proposer_profiles.telegram_username),
+  updated_at        = NOW()
     `, [
       wallet,
       vendorName ?? null,
