@@ -3058,6 +3058,10 @@ function authGuard(req, res, next) {
     return res.status(401).json({ error: 'unauthenticated' });
   }
 }
+
+// Back-compat alias (some routes use `requireAuth`)
+const requireAuth = authGuard;
+
 // ========================================================================
 
 // Attach req.user if cookie is present (optional)
