@@ -3513,33 +3513,37 @@ app.post("/auth/switch-role", async (req, res) => {
       return res.status(400).json({ error: 'invalid_role' });
     }
 
-    // 🚫 BLOCK: Admins cannot switch to vendor (unless explicitly allowed)
+    // Block: admins cannot switch to vendor unless explicitly allowed
     if (target === 'vendor' && isAdminAddress(address) && !req.body?.allowAdminVendor) {
       return res.status(403).json({ error: 'admin_cannot_be_vendor' });
     }
 
-    // ❌ DO NOT seed here — no auto-creation of vendor rows
-    // (remove any: await seedVendorFromUserProfile(pool, address);)
-
-    // Recompute roles from DB (authoritative) + admin list
     const lower = address.toLowerCase();
     const roles = [];
-
     if (isAdminAddress(address)) roles.push('admin');
 
+    // vendor role if vendor_profiles row exists
     const v = await pool.query(
       `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
       [lower]
     );
     if (v.rowCount > 0) roles.push('vendor');
 
+    // ✅ proposer role if proposer_profiles row exists
+    const pp = await pool.query(
+      `SELECT 1 FROM proposer_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+      [lower]
+    );
+    if (pp.rowCount > 0) roles.push('proposer');
+
+    // also proposer if they already own any proposals
     const p = await pool.query(
       `SELECT 1 FROM proposals WHERE lower(owner_wallet)=lower($1) LIMIT 1`,
       [lower]
     );
-    if (p.rowCount > 0) roles.push('proposer');
+    if (p.rowCount > 0 && !roles.includes('proposer')) roles.push('proposer');
 
-    // Issue a new token with the preferred role + authoritative roles[]
+    // Issue a new token with preferred role + authoritative roles[]
     const newToken = signJwt({ sub: address, role: target, roles });
     res.cookie("auth_token", newToken, {
       httpOnly: true,
@@ -3548,12 +3552,14 @@ app.post("/auth/switch-role", async (req, res) => {
       maxAge: 7 * 24 * 3600 * 1000,
     });
 
-    return res.json({ role: target, roles });
+    // ✅ return token so client can store Bearer fallback
+    return res.json({ role: target, roles, token: newToken });
   } catch (e) {
     console.error('/auth/switch-role error', e);
     return res.status(500).json({ error: 'server_error' });
   }
 });
+
 
 app.post("/auth/logout", (req, res) => {
   res.clearCookie("auth_token");
