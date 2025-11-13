@@ -3034,11 +3034,12 @@ function verifyJwt(token) {
 // ==== AUTH GUARD (drop-in) ===============================================
 // Place this block **right after** your verifyJwt() definition.
 
-const extractToken = (req) => {
-  const h = req.headers.authorization;
-  if (h && h.startsWith('Bearer ')) return h.slice(7);
-  return req.cookies?.auth_token || null;
-};
+// ---- token helper (header first, then cookie)
+function extractToken(req) {
+  const h = req?.headers?.authorization || '';
+  if (h.startsWith('Bearer ')) return h.slice(7);
+  return req?.cookies?.auth_token || null;
+}
 
 function authGuard(req, res, next) {
   try {
@@ -8646,27 +8647,25 @@ app.get('/vendor/profile', authGuard, async (req, res) => {
   }
 });
 
-/// --- PROPOSER PROFILE -------------------------------------------------------
+// --- PROPOSER / ENTITY PROFILE (UPSERT into proposer_profiles) ---
 app.post('/proposer/profile', requireAuth, async (req, res) => {
   try {
-    const addr = (req.user?.address || '').toLowerCase();
-    if (!addr) return res.status(401).json({ error: 'No wallet' });
-
+    const addr = req.user.address; // already lowercased by guard
     const {
       vendorName, email, phone, website,
       address, city, country,
-      telegram_chat_id, whatsapp
+      telegram_username, telegram_chat_id, whatsapp
     } = req.body || {};
 
     const addressVal =
       typeof address === 'string' ? address :
       address ? JSON.stringify(address) : null;
 
-    await pool.query(`
+    const up = await pool.query(`
       INSERT INTO proposer_profiles
-        (wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_chat_id, whatsapp, updated_at)
+        (wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_username, telegram_chat_id, whatsapp, updated_at)
       VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now())
       ON CONFLICT (wallet_address) DO UPDATE SET
         org_name=EXCLUDED.org_name,
         contact_email=EXCLUDED.contact_email,
@@ -8675,37 +8674,51 @@ app.post('/proposer/profile', requireAuth, async (req, res) => {
         address=EXCLUDED.address,
         city=EXCLUDED.city,
         country=EXCLUDED.country,
+        telegram_username=EXCLUDED.telegram_username,
         telegram_chat_id=EXCLUDED.telegram_chat_id,
         whatsapp=EXCLUDED.whatsapp,
         updated_at=now()
-    `, [addr, vendorName, email, phone, website, addressVal, city, country, telegram_chat_id ?? null, whatsapp ?? null]);
+      RETURNING wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_username, telegram_chat_id, whatsapp, updated_at
+    `, [addr, vendorName, email, phone, website, addressVal, city, country, telegram_username ?? null, telegram_chat_id ?? null, whatsapp ?? null]);
 
-    res.json({ ok: true });
+    res.json({ ok: true, saved: up.rows[0] });
   } catch (e) {
     console.error('POST /proposer/profile error', e);
     res.status(500).json({ error: 'Failed to save proposer profile' });
   }
 });
 
+// Read Entity/Proposer profile **from proposer_profiles**
 app.get('/proposer/profile', requireAuth, async (req, res) => {
   try {
-    const addr = (req.user?.address || '').toLowerCase();
-    if (!addr) return res.status(401).json({ error: 'No wallet' });
-
+    const addr = req.user.address;
     const r = await pool.query(`
-      SELECT org_name, contact_email, phone, website, address, city, country, telegram_chat_id, whatsapp
-      FROM proposer_profiles WHERE wallet_address=$1
+      SELECT org_name, contact_email, phone, website, address, city, country, telegram_username, telegram_chat_id, whatsapp
+      FROM proposer_profiles
+      WHERE lower(wallet_address)=lower($1)
+      LIMIT 1
     `, [addr]);
 
     if (!r.rows.length) return res.json({}); // empty profile
 
     const row = r.rows[0];
-    // address may be string or JSON; normalize to object with line1/city/country if possible
-    let addrObj = null;
-    if (row.address && typeof row.address === 'string') {
-      try { addrObj = JSON.parse(row.address); } catch { addrObj = { line1: row.address, city: row.city, country: row.country }; }
-    } else if (row.address && typeof row.address === 'object') {
-      addrObj = row.address;
+    const norm = (s) => (typeof s === 'string' && s.trim() ? s.trim() : null);
+
+    // address may be JSON or plain text -> normalize both
+    let addrObj = null, addressText = null;
+    if (row.address) {
+      if (typeof row.address === 'string' && row.address.trim().startsWith('{')) {
+        try { addrObj = JSON.parse(row.address); } catch {}
+      }
+      if (addrObj && typeof addrObj === 'object') {
+        const line1 = norm(addrObj.line1);
+        const city  = norm(addrObj.city);
+        const pc    = norm(addrObj.postalCode) || norm(addrObj.postal_code);
+        const ctry  = norm(addrObj.country);
+        addressText = [line1, city, pc, ctry].filter(Boolean).join(', ') || null;
+      } else {
+        addressText = norm(row.address);
+      }
     }
 
     res.json({
@@ -8713,13 +8726,9 @@ app.get('/proposer/profile', requireAuth, async (req, res) => {
       email: row.contact_email || '',
       phone: row.phone || '',
       website: row.website || '',
-      address: addrObj || { line1: '', city: row.city || '', country: row.country || '' },
-      addressText: [
-        addrObj?.line1 || row.address || '',
-        addrObj?.city || row.city || '',
-        addrObj?.postalCode || '',
-        addrObj?.country || row.country || ''
-      ].filter(Boolean).join(', '),
+      address: addrObj || addressText || null,
+      addressText,
+      telegram_username: row.telegram_username ?? null,
       telegram_chat_id: row.telegram_chat_id ?? null,
       whatsapp: row.whatsapp ?? null,
     });
