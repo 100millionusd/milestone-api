@@ -8994,7 +8994,7 @@ app.get('/proposer/profile', requireAuth, async (req, res) => {
 });
 
 // Choose a role AFTER profile save (SAFE — does not wipe proposer fields)
-app.post("/profile/choose-role", async (req, res) => {
+app.post("/profile/choose-role", authGuard, async (req, res) => {
   try {
     const wallet = String(req.user?.sub || "").toLowerCase();
     if (!wallet) return res.status(401).json({ error: "unauthorized" });
