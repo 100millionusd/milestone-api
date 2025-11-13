@@ -144,7 +144,6 @@ const jwt = require("jsonwebtoken");
 let __vendorSeedGuard = 0;
 
 // ==== JWT helpers (put near top of server.js) ====
-const jwt = require('jsonwebtoken'); // if not already required
 const JWT_SECRET = process.env.JWT_SECRET || 'changeme';
 
 function readJwtFromReq(req) {
