@@ -3826,42 +3826,29 @@ app.post("/proposals", authGuard /* or requireAuth */, async (req, res) => {
     const { error, value } = proposalSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
 
-    // Submitter identity (must be set by authGuard/requireAuth)
-    const ownerWallet = String(req.user?.address || req.user?.sub || '').toLowerCase();
+    // identity from auth middleware
+    const ownerWallet = String(req.user?.address || req.user?.sub || "").toLowerCase();
     const ownerEmail  = value.ownerEmail || null;
-    const ownerPhone  = toE164(value.ownerPhone || ""); // keep your helper
+    const ownerPhone  = toE164(value.ownerPhone || "");
 
     if (!ownerWallet) {
       return res.status(401).json({ error: "Login required" });
     }
 
-    // ✅ Accept *either* Vendor or Proposer profile having contact info
+    // ✅ ONLY ENTITY (proposer_profiles) may submit proposals.
+    // Requires at least one contact: email OR phone/WhatsApp OR Telegram (username or chat id).
     const { rows: ok } = await pool.query(
       `
-      SELECT 1 FROM (
-        SELECT
-          email                          AS email,
-          phone                          AS phone,
-          telegram_chat_id               AS telegram_chat_id,
-          telegram_username              AS telegram_username
-        FROM vendor_profiles
-        WHERE lower(wallet_address)=lower($1)
-
-        UNION ALL
-
-        SELECT
-          contact_email                  AS email,
-          phone                          AS phone,
-          telegram_chat_id               AS telegram_chat_id,
-          /* if you added it */ telegram_username        AS telegram_username
+      SELECT 1
         FROM proposer_profiles
-        WHERE lower(wallet_address)=lower($1)
-      ) x
-      WHERE COALESCE(email,'') <> ''
-         OR COALESCE(phone,'') <> ''
-         OR COALESCE(telegram_chat_id,'') <> ''
-         OR COALESCE(telegram_username,'') <> ''
-      LIMIT 1
+       WHERE lower(wallet_address) = lower($1)
+         AND (
+           COALESCE(contact_email,'') <> ''
+        OR COALESCE(phone,'') <> ''
+        OR COALESCE(telegram_chat_id,'') <> ''
+        OR COALESCE(telegram_username,'') <> ''   -- make sure this column exists
+         )
+       LIMIT 1
       `,
       [ownerWallet]
     );
@@ -3898,7 +3885,7 @@ app.post("/proposals", authGuard /* or requireAuth */, async (req, res) => {
       value.cid ?? null,
       ownerWallet,
       ownerEmail,
-      ownerPhone || null,
+      ownerPhone || null
     ];
 
     const { rows } = await pool.query(q, vals);
