@@ -8814,24 +8814,42 @@ app.post("/profile/choose-role", async (req, res) => {
       }
     }
 
-    if (roleIntent === 'proposer' && !roles.includes('proposer')) {
-      await pool.query(
-        `
-        INSERT INTO proposer_profiles
-          (wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_chat_id, whatsapp, status, created_at, updated_at)
-        VALUES
-          ($1, COALESCE($2,''), $3, $4, $5, $6, $7, $8, $9, $10, 'active', NOW(), NOW())
-        ON CONFLICT (wallet_address) DO UPDATE SET
-          org_name=COALESCE($2,''), contact_email=$3, phone=$4, website=$5, address=$6, city=$7, country=$8,
-          telegram_chat_id=$9, whatsapp=$10, updated_at=NOW()
-        `,
-        [
-          wallet,
-          // org_name: prefer display_name as org by default (user can edit later)
-          p.display_name, p.email, p.phone, p.website, p.address, p.city, p.country, p.telegram_chat_id, p.whatsapp
-        ]
-      );
-    }
+ if (roleIntent === 'proposer') {
+  const b = req.body || {};
+
+  // Body-first values; fall back to user_profiles row `p`
+  const orgName  = (b.vendorName ?? b.orgName ?? p.display_name ?? '').trim();
+  const email    = b.email ?? p.email ?? null;
+  const phone    = b.phone ?? p.phone ?? null;
+  const website  = b.website ?? p.website ?? null;
+  const city     = b.city ?? p.city ?? null;
+  const country  = b.country ?? p.country ?? null;
+  const tgChatId = b.telegram_chat_id ?? p.telegram_chat_id ?? null;
+  const whatsapp = b.whatsapp ?? p.whatsapp ?? null;
+
+  // address can be an object or a string in your UI; store string or JSON string
+  const addressVal =
+    typeof b.address === 'string' ? b.address :
+    (b.address ? JSON.stringify(b.address) : (p.address ?? null));
+
+  await pool.query(`
+    INSERT INTO proposer_profiles
+      (wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_chat_id, whatsapp, status, created_at, updated_at)
+    VALUES
+      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active',NOW(),NOW())
+    ON CONFLICT (wallet_address) DO UPDATE SET
+      org_name         = COALESCE(NULLIF(EXCLUDED.org_name,''), proposer_profiles.org_name),
+      contact_email    = COALESCE(EXCLUDED.contact_email,        proposer_profiles.contact_email),
+      phone            = COALESCE(EXCLUDED.phone,                proposer_profiles.phone),
+      website          = COALESCE(EXCLUDED.website,              proposer_profiles.website),
+      address          = COALESCE(EXCLUDED.address,              proposer_profiles.address),
+      city             = COALESCE(EXCLUDED.city,                 proposer_profiles.city),
+      country          = COALESCE(EXCLUDED.country,              proposer_profiles.country),
+      telegram_chat_id = COALESCE(EXCLUDED.telegram_chat_id,     proposer_profiles.telegram_chat_id),
+      whatsapp         = COALESCE(EXCLUDED.whatsapp,             proposer_profiles.whatsapp),
+      updated_at       = NOW()
+  `, [wallet, orgName, email, phone, website, addressVal, city, country, tgChatId, whatsapp]);
+}
 
     // recompute durable roles
     roles = await durableRolesForAddress(wallet);
