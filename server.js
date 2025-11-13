@@ -4186,6 +4186,233 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
   }
 });
 
+
+app.get("/proposer-profile", authGuard, async (req, res) => {
+  try {
+    const wallet = String(req.user?.sub || "").toLowerCase();
+    if (!wallet) return res.status(401).json({ error: "Unauthorized" });
+
+    const { rows } = await pool.query(
+      `SELECT * FROM proposer_profiles WHERE lower(wallet_address)=lower($1)`,
+      [wallet]
+    );
+    
+    if (rows[0]) {
+      return res.json(toCamel(rows[0]));
+    } else {
+      // Return empty profile if none exists
+      return res.json({
+        walletAddress: wallet,
+        orgName: "",
+        contactEmail: "",
+        phone: "",
+        website: "",
+        address: "",
+        city: "",
+        country: "",
+        telegramChatId: "",
+        whatsapp: "",
+        status: "active"
+      });
+    }
+  } catch (err) {
+    console.error("GET /proposer-profile error:", err);
+    return res.status(500).json({ error: "Failed to load profile" });
+  }
+});
+
+// Create or update proposer profile
+app.post("/proposer-profile", authGuard, async (req, res) => {
+  try {
+    const wallet = String(req.user?.sub || "").toLowerCase();
+    if (!wallet) return res.status(401).json({ error: "Unauthorized" });
+
+    const {
+      orgName,
+      contactEmail,
+      phone,
+      website,
+      address,
+      city,
+      country,
+      telegramChatId,
+      whatsapp
+    } = req.body;
+
+    // Validate required fields
+    if (!orgName?.trim()) {
+      return res.status(400).json({ error: "Organization name is required" });
+    }
+
+    if (!contactEmail?.trim()) {
+      return res.status(400).json({ error: "Contact email is required" });
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO proposer_profiles 
+        (wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_chat_id, whatsapp, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+       ON CONFLICT (wallet_address) 
+       DO UPDATE SET 
+         org_name = EXCLUDED.org_name,
+         contact_email = EXCLUDED.contact_email,
+         phone = EXCLUDED.phone,
+         website = EXCLUDED.website,
+         address = EXCLUDED.address,
+         city = EXCLUDED.city,
+         country = EXCLUDED.country,
+         telegram_chat_id = EXCLUDED.telegram_chat_id,
+         whatsapp = EXCLUDED.whatsapp,
+         updated_at = NOW()
+       RETURNING *`,
+      [wallet, orgName, contactEmail, phone, website, address, city, country, telegramChatId, whatsapp]
+    );
+
+    // Also update user_profiles for backward compatibility
+    await pool.query(
+      `INSERT INTO user_profiles 
+        (wallet_address, display_name, email, phone, website, address, city, country, telegram_chat_id, whatsapp, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+       ON CONFLICT (wallet_address) 
+       DO UPDATE SET 
+         display_name = EXCLUDED.display_name,
+         email = EXCLUDED.email,
+         phone = EXCLUDED.phone,
+         website = EXCLUDED.website,
+         address = EXCLUDED.address,
+         city = EXCLUDED.city,
+         country = EXCLUDED.country,
+         telegram_chat_id = EXCLUDED.telegram_chat_id,
+         whatsapp = EXCLUDED.whatsapp,
+         updated_at = NOW()`,
+      [wallet, orgName, contactEmail, phone, website, address, city, country, telegramChatId, whatsapp]
+    );
+
+    return res.json(toCamel(rows[0]));
+  } catch (err) {
+    console.error("POST /proposer-profile error:", err);
+    return res.status(500).json({ error: "Failed to save profile" });
+  }
+});
+
+// Get current user's profile (unified - tries both tables)
+app.get("/user-profile", authGuard, async (req, res) => {
+  try {
+    const wallet = String(req.user?.sub || "").toLowerCase();
+    if (!wallet) return res.status(401).json({ error: "Unauthorized" });
+
+    // Try proposer_profiles first, then user_profiles
+    const { rows: proposerRows } = await pool.query(
+      `SELECT * FROM proposer_profiles WHERE lower(wallet_address)=lower($1)`,
+      [wallet]
+    );
+
+    if (proposerRows[0]) {
+      return res.json(toCamel(proposerRows[0]));
+    }
+
+    const { rows: userRows } = await pool.query(
+      `SELECT * FROM user_profiles WHERE lower(wallet_address)=lower($1)`,
+      [wallet]
+    );
+
+    if (userRows[0]) {
+      return res.json(toCamel(userRows[0]));
+    }
+
+    // Return empty profile structure
+    return res.json({
+      walletAddress: wallet,
+      orgName: "",
+      displayName: "",
+      email: "",
+      phone: "",
+      website: "",
+      address: "",
+      city: "",
+      country: "",
+      telegramChatId: "",
+      whatsapp: ""
+    });
+  } catch (err) {
+    console.error("GET /user-profile error:", err);
+    return res.status(500).json({ error: "Failed to load profile" });
+  }
+});
+
+// Update user profile (unified - updates both tables)
+app.post("/user-profile", authGuard, async (req, res) => {
+  try {
+    const wallet = String(req.user?.sub || "").toLowerCase();
+    if (!wallet) return res.status(401).json({ error: "Unauthorized" });
+
+    const {
+      orgName,
+      displayName,
+      email,
+      phone,
+      website,
+      address,
+      city,
+      country,
+      telegramChatId,
+      whatsapp,
+      vendorName,
+      telegramUsername
+    } = req.body;
+
+    // Update user_profiles
+    const { rows: userRows } = await pool.query(
+      `INSERT INTO user_profiles 
+        (wallet_address, display_name, email, phone, website, address, city, country, telegram_chat_id, whatsapp, vendor_name, telegram_username, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+       ON CONFLICT (wallet_address) 
+       DO UPDATE SET 
+         display_name = EXCLUDED.display_name,
+         email = EXCLUDED.email,
+         phone = EXCLUDED.phone,
+         website = EXCLUDED.website,
+         address = EXCLUDED.address,
+         city = EXCLUDED.city,
+         country = EXCLUDED.country,
+         telegram_chat_id = EXCLUDED.telegram_chat_id,
+         whatsapp = EXCLUDED.whatsapp,
+         vendor_name = EXCLUDED.vendor_name,
+         telegram_username = EXCLUDED.telegram_username,
+         updated_at = NOW()
+       RETURNING *`,
+      [wallet, displayName || orgName, email, phone, website, address, city, country, telegramChatId, whatsapp, vendorName, telegramUsername]
+    );
+
+    // If they provided orgName, also update proposer_profiles
+    if (orgName) {
+      await pool.query(
+        `INSERT INTO proposer_profiles 
+          (wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_chat_id, whatsapp, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+         ON CONFLICT (wallet_address) 
+         DO UPDATE SET 
+           org_name = EXCLUDED.org_name,
+           contact_email = EXCLUDED.contact_email,
+           phone = EXCLUDED.phone,
+           website = EXCLUDED.website,
+           address = EXCLUDED.address,
+           city = EXCLUDED.city,
+           country = EXCLUDED.country,
+           telegram_chat_id = EXCLUDED.telegram_chat_id,
+           whatsapp = EXCLUDED.whatsapp,
+           updated_at = NOW()`,
+        [wallet, orgName, email, phone, website, address, city, country, telegramChatId, whatsapp]
+      );
+    }
+
+    return res.json(toCamel(userRows[0]));
+  } catch (err) {
+    console.error("POST /user-profile error:", err);
+    return res.status(500).json({ error: "Failed to save profile" });
+  }
+});
+
 // ==============================
 // Routes — Bids
 // ==============================
