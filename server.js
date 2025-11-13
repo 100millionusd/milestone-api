@@ -809,6 +809,7 @@ await pool.query(`
 
 await pool.query(`ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS vendor_name TEXT`);
 await pool.query(`ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS telegram_username TEXT`);
+await pool.query(`ALTER TABLE proposer_profiles ADD COLUMN IF NOT EXISTS telegram_username TEXT`);
 
 console.log('[db] proposer_profiles ready');
   } catch (e) {
