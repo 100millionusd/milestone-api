@@ -8686,75 +8686,86 @@ app.get('/proposer/profile', authGuard, async (req, res) => {
   }
 });
 
-// server.js — REPLACE your existing POST /proposer/profile with this whole block
-app.post('/proposer/profile', authGuard, async (req, res) => {
+// --- PROPOSER PROFILE -------------------------------------------------------
+app.post('/proposer/profile', requireAuth, async (req, res) => {
   try {
-    const addr = String(req.user.address || '').toLowerCase();
-    if (!addr) return res.status(401).json({ error: 'unauthenticated' });
+    const addr = (req.user?.address || '').toLowerCase();
+    if (!addr) return res.status(401).json({ error: 'No wallet' });
 
-    const b = req.body || {};
-    // address can be object or plain string
-    const addressJson =
-      b.address && typeof b.address === 'object'
-        ? JSON.stringify(b.address)
-        : (typeof b.address === 'string' ? b.address : null);
+    const {
+      vendorName, email, phone, website,
+      address, city, country,
+      telegram_chat_id, whatsapp
+    } = req.body || {};
 
-    // 1) Keep legacy/validator-friendly copy in user_profiles
+    const addressVal =
+      typeof address === 'string' ? address :
+      address ? JSON.stringify(address) : null;
+
     await pool.query(`
-      INSERT INTO user_profiles (wallet_address, vendor_name, email, phone, website, address, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6, NOW())
+      INSERT INTO proposer_profiles
+        (wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_chat_id, whatsapp, updated_at)
+      VALUES
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
       ON CONFLICT (wallet_address) DO UPDATE SET
-        vendor_name = EXCLUDED.vendor_name,
-        email       = EXCLUDED.email,
-        phone       = EXCLUDED.phone,
-        website     = EXCLUDED.website,
-        address     = EXCLUDED.address,
-        updated_at  = NOW()
-    `, [
-      addr,
-      b.vendorName || '',                 // name/org
-      b.email || '',
-      b.phone || '',
-      b.website || '',
-      addressJson
-    ]);
+        org_name=EXCLUDED.org_name,
+        contact_email=EXCLUDED.contact_email,
+        phone=EXCLUDED.phone,
+        website=EXCLUDED.website,
+        address=EXCLUDED.address,
+        city=EXCLUDED.city,
+        country=EXCLUDED.country,
+        telegram_chat_id=EXCLUDED.telegram_chat_id,
+        whatsapp=EXCLUDED.whatsapp,
+        updated_at=now()
+    `, [addr, vendorName, email, phone, website, addressVal, city, country, telegram_chat_id ?? null, whatsapp ?? null]);
 
-    // 2) Canonical entity record in proposer_profiles
-    await pool.query(`
-      INSERT INTO proposer_profiles (
-        wallet_address, org_name, contact_email, phone, website,
-        address, city, country, telegram_chat_id, whatsapp, updated_at
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NOW())
-      ON CONFLICT (wallet_address) DO UPDATE SET
-        org_name         = EXCLUDED.org_name,
-        contact_email    = EXCLUDED.contact_email,
-        phone            = EXCLUDED.phone,
-        website          = EXCLUDED.website,
-        address          = EXCLUDED.address,
-        city             = EXCLUDED.city,
-        country          = EXCLUDED.country,
-        telegram_chat_id = EXCLUDED.telegram_chat_id,
-        whatsapp         = EXCLUDED.whatsapp,
-        updated_at       = NOW()
-    `, [
-      addr,
-      b.vendorName || '',                 // use same field
-      b.email || '',
-      b.phone || '',
-      b.website || '',
-      addressJson,
-      b.address?.city ?? null,
-      b.address?.country ?? null,
-      b.telegram_chat_id ?? b.telegramChatId ?? null,
-      b.whatsapp ?? null,
-    ]);
-
-    // IMPORTANT: do NOT seed vendor here
-    return res.json({ ok: true });
+    res.json({ ok: true });
   } catch (e) {
     console.error('POST /proposer/profile error', e);
-    return res.status(500).json({ error: 'save_failed' });
+    res.status(500).json({ error: 'Failed to save proposer profile' });
+  }
+});
+
+app.get('/proposer/profile', requireAuth, async (req, res) => {
+  try {
+    const addr = (req.user?.address || '').toLowerCase();
+    if (!addr) return res.status(401).json({ error: 'No wallet' });
+
+    const r = await pool.query(`
+      SELECT org_name, contact_email, phone, website, address, city, country, telegram_chat_id, whatsapp
+      FROM proposer_profiles WHERE wallet_address=$1
+    `, [addr]);
+
+    if (!r.rows.length) return res.json({}); // empty profile
+
+    const row = r.rows[0];
+    // address may be string or JSON; normalize to object with line1/city/country if possible
+    let addrObj = null;
+    if (row.address && typeof row.address === 'string') {
+      try { addrObj = JSON.parse(row.address); } catch { addrObj = { line1: row.address, city: row.city, country: row.country }; }
+    } else if (row.address && typeof row.address === 'object') {
+      addrObj = row.address;
+    }
+
+    res.json({
+      vendorName: row.org_name || '',
+      email: row.contact_email || '',
+      phone: row.phone || '',
+      website: row.website || '',
+      address: addrObj || { line1: '', city: row.city || '', country: row.country || '' },
+      addressText: [
+        addrObj?.line1 || row.address || '',
+        addrObj?.city || row.city || '',
+        addrObj?.postalCode || '',
+        addrObj?.country || row.country || ''
+      ].filter(Boolean).join(', '),
+      telegram_chat_id: row.telegram_chat_id ?? null,
+      whatsapp: row.whatsapp ?? null,
+    });
+  } catch (e) {
+    console.error('GET /proposer/profile error', e);
+    res.status(500).json({ error: 'Failed to load proposer profile' });
   }
 });
 
