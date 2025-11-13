@@ -8884,7 +8884,7 @@ app.get('/vendor/profile', authGuard, async (req, res) => {
 // ── PROPOSER PROFILE (Entity) 
 app.post('/proposer/profile', authGuard /* or requireAuth */, async (req, res) => {
   try {
-    const wallet = String(req.user?.address || '').toLowerCase();
+    const wallet = String(req.user?.address || req.user?.sub || '').toLowerCase();
     if (!wallet) return res.status(401).json({ error: 'unauthenticated' });
 
     const {
