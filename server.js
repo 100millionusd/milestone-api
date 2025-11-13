@@ -3819,39 +3819,59 @@ app.get("/proposals/:id", async (req, res) => {
   }
 });
 
-app.post("/proposals", async (req, res) => {
+const _nonEmpty = (s) => typeof s === 'string' && s.trim() !== ''; 
+
+app.post("/proposals", authGuard /* or requireAuth */, async (req, res) => {
   try {
     const { error, value } = proposalSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
 
-    // Submitter identity (if logged in via Web3Auth)
-    const ownerWallet = (req.user?.sub || null);
-    const ownerEmail  = (value.ownerEmail || null);
-    const ownerPhone  = toE164(value.ownerPhone || ""); // normalize for WhatsApp (optional helper)
-    // Require a completed profile before proposal creation
-if (!ownerWallet) {
-  return res.status(401).json({ error: "Login required" });
-}
-{
-  const { rows: ok } = await pool.query(
-    `SELECT 1
-       FROM vendor_profiles
-      WHERE lower(wallet_address)=lower($1)
-        AND (
-          COALESCE(email,'') <> '' OR
-          COALESCE(phone,'') <> '' OR
-          COALESCE(telegram_chat_id,'') <> '' OR
-          COALESCE(telegram_username,'') <> ''
-        )
-      LIMIT 1`,
-    [ownerWallet]
-  );
-  if (!ok[0]) {
-    return res.status(400).json({
-      error: "Please complete your profile (add email, phone/WhatsApp, or Telegram) before submitting a proposal."
-    });
-  }
-}
+    // Submitter identity (must be set by authGuard/requireAuth)
+    const ownerWallet = String(req.user?.address || req.user?.sub || '').toLowerCase();
+    const ownerEmail  = value.ownerEmail || null;
+    const ownerPhone  = toE164(value.ownerPhone || ""); // keep your helper
+
+    if (!ownerWallet) {
+      return res.status(401).json({ error: "Login required" });
+    }
+
+    // ✅ Accept *either* Vendor or Proposer profile having contact info
+    const { rows: ok } = await pool.query(
+      `
+      SELECT 1 FROM (
+        SELECT
+          email                          AS email,
+          phone                          AS phone,
+          telegram_chat_id               AS telegram_chat_id,
+          telegram_username              AS telegram_username
+        FROM vendor_profiles
+        WHERE lower(wallet_address)=lower($1)
+
+        UNION ALL
+
+        SELECT
+          contact_email                  AS email,
+          phone                          AS phone,
+          telegram_chat_id               AS telegram_chat_id,
+          /* if you added it */ telegram_username        AS telegram_username
+        FROM proposer_profiles
+        WHERE lower(wallet_address)=lower($1)
+      ) x
+      WHERE COALESCE(email,'') <> ''
+         OR COALESCE(phone,'') <> ''
+         OR COALESCE(telegram_chat_id,'') <> ''
+         OR COALESCE(telegram_username,'') <> ''
+      LIMIT 1
+      `,
+      [ownerWallet]
+    );
+
+    if (!ok[0]) {
+      return res.status(400).json({
+        error:
+          "Please complete your profile (add email, phone/WhatsApp, or Telegram) before submitting a proposal."
+      });
+    }
 
     const q = `
       INSERT INTO proposals (
@@ -3875,7 +3895,7 @@ if (!ownerWallet) {
       value.country,
       value.amountUSD,
       JSON.stringify(value.docs || []),
-      value.cid,
+      value.cid ?? null,
       ownerWallet,
       ownerEmail,
       ownerPhone || null,
@@ -3884,7 +3904,6 @@ if (!ownerWallet) {
     const { rows } = await pool.query(q, vals);
     const row = rows[0];
 
-    // Notify admins + proposer on creation (optional; requires NOTIFY_ENABLED & helper)
     if (typeof notifyProposalSubmitted === "function" && NOTIFY_ENABLED) {
       try { await notifyProposalSubmitted(row); } catch (e) { console.warn("notifyProposalSubmitted failed:", e); }
     }
