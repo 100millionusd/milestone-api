@@ -8767,56 +8767,66 @@ function _addrObj(addr, city = null, country = null) {
   return { ...o, addressText };
 }
 
-// === BEGIN PATCH: GET /vendor/profile (no auto-insert) ===
-app.get('/vendor/profile', authGuard, async (req, res) => {
+// server.js — VENDOR PROFILE (GET) — auth only, no vendor-role guard
+app.get('/vendor/profile', authRequired, async (req, res) => {
   try {
-    const wallet = String(req.user.address || '').toLowerCase();
+    const wallet = String(req.user?.address || req.user?.sub || '').toLowerCase();
+    if (!wallet) return res.status(401).json({ error: 'unauthenticated' });
+
     const { rows } = await pool.query(
-      `SELECT vendor_name, email, phone, website, address, telegram_username, telegram_chat_id, whatsapp
+      `SELECT wallet_address, vendor_name, email, phone, website, address
          FROM vendor_profiles
-        WHERE LOWER(wallet_address) = $1
+        WHERE lower(wallet_address) = lower($1)
         LIMIT 1`,
       [wallet]
     );
 
-    if (rows.length === 0) {
-      // Return a read-only empty shape; DO NOT create a DB row here.
+    if (!rows.length) {
+      // Return an empty-but-valid shape so the UI doesn't crash
       return res.json({
-        walletAddress: req.user.address,
+        walletAddress: wallet,
         vendorName: '',
         email: '',
         phone: '',
         website: '',
-        address: { addressText: '' },
-        telegram_chat_id: null,
-        telegramChatId: null,
+        address: { line1: '', city: '', postalCode: '', country: '' }
       });
     }
 
     const r = rows[0];
-    let addrObj = null;
-    if (r.address && typeof r.address === 'object') addrObj = r.address;
-    else if (r.address && typeof r.address === 'string') {
-      const s = r.address.trim();
-      if (s.startsWith('{')) { try { addrObj = JSON.parse(s); } catch {}
-      } else { addrObj = { addressText: s }; }
+
+    // address can be stored as string or JSON; normalize to object
+    let addr = { line1: '', city: '', postalCode: '', country: '' };
+    if (typeof r.address === 'string' && r.address.trim().startsWith('{')) {
+      try {
+        const a = JSON.parse(r.address);
+        addr = {
+          line1: a?.line1 || '',
+          city: a?.city || '',
+          postalCode: a?.postalCode || a?.postal_code || '',
+          country: a?.country || ''
+        };
+      } catch {
+        addr = { line1: r.address || '', city: '', postalCode: '', country: '' };
+      }
+    } else if (typeof r.address === 'string') {
+      addr = { line1: r.address || '', city: '', postalCode: '', country: '' };
     }
 
-    res.json({
-      walletAddress: req.user.address,
+    return res.json({
+      walletAddress: r.wallet_address,
       vendorName: r.vendor_name || '',
       email: r.email || '',
       phone: r.phone || '',
       website: r.website || '',
-      address: addrObj || { addressText: '' },
-      telegram_chat_id: r.telegram_chat_id ?? null,
-      telegramChatId: r.telegram_chat_id ?? null,
+      address: addr
     });
   } catch (e) {
-    console.error('GET /vendor/profile failed', e);
-    res.status(500).json({ error: 'Failed to fetch vendor profile' });
+    console.error('GET /vendor/profile error:', e);
+    return res.status(500).json({ error: 'failed_to_load_vendor_profile' });
   }
 });
+
 
 // ── PROPOSER PROFILE (Entity) — STRICTLY SEPARATE FROM VENDOR ──────────────────
 app.post('/proposer/profile', requireAuth, async (req, res) => {
