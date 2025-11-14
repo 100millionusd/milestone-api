@@ -4350,78 +4350,6 @@ app.get("/user-profile", authGuard, async (req, res) => {
   }
 });
 
-// Update user profile (unified - updates both tables)
-app.post("/user-profile", authGuard, async (req, res) => {
-  try {
-    const wallet = String(req.user?.sub || "").toLowerCase();
-    if (!wallet) return res.status(401).json({ error: "Unauthorized" });
-
-    const {
-      orgName,
-      displayName,
-      email,
-      phone,
-      website,
-      address,
-      city,
-      country,
-      telegramChatId,
-      whatsapp,
-      vendorName,
-      telegramUsername
-    } = req.body;
-
-    // Update user_profiles
-    const { rows: userRows } = await pool.query(
-      `INSERT INTO user_profiles 
-        (wallet_address, display_name, email, phone, website, address, city, country, telegram_chat_id, whatsapp, vendor_name, telegram_username, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
-       ON CONFLICT (wallet_address) 
-       DO UPDATE SET 
-         display_name = EXCLUDED.display_name,
-         email = EXCLUDED.email,
-         phone = EXCLUDED.phone,
-         website = EXCLUDED.website,
-         address = EXCLUDED.address,
-         city = EXCLUDED.city,
-         country = EXCLUDED.country,
-         telegram_chat_id = EXCLUDED.telegram_chat_id,
-         whatsapp = EXCLUDED.whatsapp,
-         vendor_name = EXCLUDED.vendor_name,
-         telegram_username = EXCLUDED.telegram_username,
-         updated_at = NOW()
-       RETURNING *`,
-      [wallet, displayName || orgName, email, phone, website, address, city, country, telegramChatId, whatsapp, vendorName, telegramUsername]
-    );
-
-    // If they provided orgName, also update proposer_profiles
-    if (orgName) {
-      await pool.query(
-        `INSERT INTO proposer_profiles 
-          (wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_chat_id, whatsapp, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-         ON CONFLICT (wallet_address) 
-         DO UPDATE SET 
-           org_name = EXCLUDED.org_name,
-           contact_email = EXCLUDED.contact_email,
-           phone = EXCLUDED.phone,
-           website = EXCLUDED.website,
-           address = EXCLUDED.address,
-           city = EXCLUDED.city,
-           country = EXCLUDED.country,
-           telegram_chat_id = EXCLUDED.telegram_chat_id,
-           whatsapp = EXCLUDED.whatsapp,
-           updated_at = NOW()`,
-        [wallet, orgName, email, phone, website, address, city, country, telegramChatId, whatsapp]
-      );
-    }
-
-    return res.json(toCamel(userRows[0]));
-  } catch (err) {
-    console.error("POST /user-profile error:", err);
-    return res.status(500).json({ error: "Failed to save profile" });
-  }
-});
 
 // ==============================
 // Routes — Bids
@@ -8890,56 +8818,65 @@ app.get('/vendor/profile', authGuard, async (req, res) => {
   }
 });
 
-// ── PROPOSER PROFILE (Entity) 
+// ── PROPOSER PROFILE (Entity) — STRICTLY SEPARATE FROM VENDOR ──────────────────
 app.post('/proposer/profile', requireAuth, async (req, res) => {
   try {
     const wallet = String(req.user?.address || req.user?.sub || '').toLowerCase();
     if (!wallet) return res.status(401).json({ error: 'unauthenticated' });
 
+    // 🔒 HARD SEPARATION:
+    // If this wallet is (now) a proposer, nuke any vendor profile for the same wallet.
+    await pool.query('DELETE FROM vendor_profiles WHERE wallet_address = $1', [wallet]);
+
     const {
-      vendorName,            // maps → org_name
-      email,                 // maps → contact_email
+      vendorName,            // → org_name
+      email,                 // → contact_email
       phone,
       website,
-      address,               // object or string
+      address,               // object OR string
       city,
       country,
       whatsapp,
       telegram_chat_id,
-      telegram_username,     // <- this was missing in your table
+      telegram_username,
     } = req.body || {};
 
+    // Normalize website like in vendor route (prepend https:// if missing)
+    const rawWebsite = (website || '').trim();
+    const websiteNorm = rawWebsite && !/^https?:\/\//i.test(rawWebsite) ? `https://${rawWebsite}` : rawWebsite || null;
+
+    // Store address: keep JSON when object; keep as text when string
     const addressVal =
-      typeof address === 'string' ? address :
-      address ? JSON.stringify(address) : null;
+      typeof address === 'string' ? (address || null)
+      : (address ? JSON.stringify(address) : null);
 
     await pool.query(`
       INSERT INTO proposer_profiles
         (wallet_address, org_name, contact_email, phone, website, address, city, country,
          whatsapp, telegram_chat_id, telegram_username, updated_at)
       VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now())
- ON CONFLICT (wallet_address) DO UPDATE SET
-  org_name          = COALESCE(NULLIF(EXCLUDED.org_name, ''),         proposer_profiles.org_name),
-  contact_email     = COALESCE(NULLIF(EXCLUDED.contact_email, ''),     proposer_profiles.contact_email),
-  phone             = COALESCE(NULLIF(EXCLUDED.phone, ''),             proposer_profiles.phone),
-  website           = COALESCE(NULLIF(EXCLUDED.website, ''),           proposer_profiles.website),
-  address           = CASE
-                        WHEN EXCLUDED.address IS NULL OR EXCLUDED.address = '' THEN proposer_profiles.address
-                        ELSE EXCLUDED.address
-                      END,
-  city              = COALESCE(NULLIF(EXCLUDED.city, ''),              proposer_profiles.city),
-  country           = COALESCE(NULLIF(EXCLUDED.country, ''),           proposer_profiles.country),
-  whatsapp          = COALESCE(NULLIF(EXCLUDED.whatsapp, ''),          proposer_profiles.whatsapp),
-  telegram_chat_id  = COALESCE(NULLIF(EXCLUDED.telegram_chat_id, ''),  proposer_profiles.telegram_chat_id),
-  telegram_username = COALESCE(NULLIF(EXCLUDED.telegram_username, ''), proposer_profiles.telegram_username),
-  updated_at        = NOW()
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW())
+      ON CONFLICT (wallet_address) DO UPDATE SET
+        org_name          = COALESCE(NULLIF(EXCLUDED.org_name, ''),         proposer_profiles.org_name),
+        contact_email     = COALESCE(NULLIF(EXCLUDED.contact_email, ''),     proposer_profiles.contact_email),
+        phone             = COALESCE(NULLIF(EXCLUDED.phone, ''),             proposer_profiles.phone),
+        website           = COALESCE(NULLIF(EXCLUDED.website, ''),           proposer_profiles.website),
+        address           = CASE
+                              WHEN EXCLUDED.address IS NULL OR EXCLUDED.address = '' THEN proposer_profiles.address
+                              ELSE EXCLUDED.address
+                            END,
+        city              = COALESCE(NULLIF(EXCLUDED.city, ''),              proposer_profiles.city),
+        country           = COALESCE(NULLIF(EXCLUDED.country, ''),           proposer_profiles.country),
+        whatsapp          = COALESCE(NULLIF(EXCLUDED.whatsapp, ''),          proposer_profiles.whatsapp),
+        telegram_chat_id  = COALESCE(NULLIF(EXCLUDED.telegram_chat_id, ''),  proposer_profiles.telegram_chat_id),
+        telegram_username = COALESCE(NULLIF(EXCLUDED.telegram_username, ''), proposer_profiles.telegram_username),
+        updated_at        = NOW()
     `, [
       wallet,
       vendorName ?? null,
       email ?? null,
       phone ?? null,
-      website ?? null,
+      websiteNorm,
       addressVal,
       city ?? null,
       country ?? null,
@@ -8948,7 +8885,8 @@ app.post('/proposer/profile', requireAuth, async (req, res) => {
       telegram_username ?? null,
     ]);
 
-    return res.json({ ok: true });
+    // Minimal, consistent response (don’t leak vendor shape)
+    return res.json({ ok: true, role: 'proposer' });
   } catch (e) {
     console.error('POST /proposer/profile error', e);
     return res.status(500).json({ error: 'Failed to save proposer profile' });
@@ -9005,8 +8943,9 @@ app.get('/proposer/profile', requireAuth, async (req, res) => {
   }
 });
 
-// Choose a role AFTER profile save (SAFE — does not wipe proposer fields)
+// Choose a role AFTER profile save (SAFE + EXCLUSIVE)
 app.post("/profile/choose-role", authGuard, async (req, res) => {
+  const client = await pool.connect();
   try {
     const wallet = String(req.user?.address || req.user?.sub || "").toLowerCase();
     if (!wallet) return res.status(401).json({ error: "unauthorized" });
@@ -9016,56 +8955,64 @@ app.post("/profile/choose-role", authGuard, async (req, res) => {
       return res.status(400).json({ error: "role_required" });
     }
 
-    // Base row to seed from (only used on first insert)
-    const { rows: base } = await pool.query(
+    // Seed base from user_profiles (used on first insert / fallback fields)
+    const { rows: base } = await client.query(
       `SELECT display_name, email, phone, website, address, city, country,
               telegram_chat_id, whatsapp
-         FROM user_profiles WHERE lower(wallet_address)=lower($1)`,
+         FROM user_profiles
+        WHERE lower(wallet_address)=lower($1)`,
       [wallet]
     );
     const p = base[0] || {};
-    let roles = await durableRolesForAddress(wallet);
+    const b = req.body || {};
 
-    // ----- VENDOR seeding (unchanged behavior but made safe against blank overwrite)
-    if (roleIntent === "vendor" && !roles.includes("vendor")) {
-      __vendorSeedGuard++;
-      try {
-        await pool.query(
-          `
-          INSERT INTO vendor_profiles
-            (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at, telegram_chat_id, whatsapp)
-          VALUES
-            ($1, COALESCE($2,''), $3, $4, $5, $6, 'pending', NOW(), NOW(), $7, $8)
-          ON CONFLICT (wallet_address) DO UPDATE SET
-            vendor_name       = COALESCE(NULLIF(EXCLUDED.vendor_name,''), vendor_profiles.vendor_name),
-            email             = COALESCE(EXCLUDED.email,    vendor_profiles.email),
-            phone             = COALESCE(EXCLUDED.phone,    vendor_profiles.phone),
-            website           = COALESCE(EXCLUDED.website,  vendor_profiles.website),
-            address           = COALESCE(EXCLUDED.address,  vendor_profiles.address),
-            telegram_chat_id  = COALESCE(EXCLUDED.telegram_chat_id, vendor_profiles.telegram_chat_id),
-            whatsapp          = COALESCE(EXCLUDED.whatsapp, vendor_profiles.whatsapp),
-            updated_at        = NOW()
-          `,
-          [
-            wallet,
-            p.display_name ?? "",
-            p.email ?? null,
-            p.phone ?? null,
-            p.website ?? null,
-            p.address ?? null,
-            p.telegram_chat_id ?? null,
-            p.whatsapp ?? null,
-          ]
-        );
-      } finally {
-        __vendorSeedGuard = Math.max(0, __vendorSeedGuard - 1);
-      }
+    await client.query('BEGIN');
+
+    if (roleIntent === "vendor") {
+      // ---- UPSERT vendor (safe, don't wipe address JSON) ----
+      await client.query(
+        `
+        INSERT INTO vendor_profiles
+          (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at, telegram_chat_id, whatsapp)
+        VALUES
+          ($1, COALESCE($2,''), $3, $4, $5, $6, 'pending', NOW(), NOW(), $7, $8)
+   ON CONFLICT (wallet_address) DO UPDATE SET
+    vendor_name       = COALESCE(NULLIF(EXCLUDED.vendor_name,''), vendor_profiles.vendor_name),
+    email             = COALESCE(EXCLUDED.email,    vendor_profiles.email),
+    phone             = COALESCE(EXCLUDED.phone,    vendor_profiles.phone),
+    website           = COALESCE(EXCLUDED.website,  vendor_profiles.website),
+    address           = CASE
+                          WHEN EXCLUDED.address IS NULL OR EXCLUDED.address = '' THEN vendor_profiles.address
+                          ELSE EXCLUDED.address
+                        END,
+    telegram_chat_id  = COALESCE(EXCLUDED.telegram_chat_id, vendor_profiles.telegram_chat_id),
+    whatsapp          = COALESCE(EXCLUDED.whatsapp, vendor_profiles.whatsapp),
+    status            = COALESCE(NULLIF(vendor_profiles.status,''), 'pending'),
+    updated_at        = NOW()
+        `,
+        [
+          wallet,
+          (b.vendorName ?? p.display_name ?? "").trim(),
+          b.email ?? p.email ?? null,
+          b.phone ?? p.phone ?? null,
+          b.website ?? p.website ?? null,
+          typeof b.address === "string" ? b.address : (b.address ? JSON.stringify(b.address) : (p.address ?? null)),
+          b.telegram_chat_id ?? p.telegram_chat_id ?? null,
+          b.whatsapp ?? p.whatsapp ?? null,
+        ]
+      );
+
+      // ---- EXCLUSIVITY: make proposer side inactive for this wallet ----
+      await client.query(
+        `UPDATE proposer_profiles
+            SET status='inactive', updated_at=NOW()
+          WHERE lower(wallet_address)=lower($1)`,
+        [wallet]
+      );
     }
 
-    // ----- PROPOSER seeding (SAFE UPSERT — DO NOT WIPE EXISTING FIELDS)
     if (roleIntent === "proposer") {
-      const b = req.body || {};
-
+      // Prepare proposer fields (includes telegram_username)
       const orgName  = (b.vendorName ?? b.orgName ?? p.display_name ?? "").trim();
       const email    = b.email   ?? p.email   ?? null;
       const phone    = b.phone   ?? p.phone   ?? null;
@@ -9073,66 +9020,86 @@ app.post("/profile/choose-role", authGuard, async (req, res) => {
       const city     = b.city    ?? p.city    ?? null;
       const country  = b.country ?? p.country ?? null;
       const tgChatId = b.telegram_chat_id ?? p.telegram_chat_id ?? null;
+      const tgUser   = b.telegram_username ?? null; // <- include username
       const whatsapp = b.whatsapp ?? p.whatsapp ?? null;
       const addressVal =
         typeof b.address === "string" ? b.address :
         (b.address ? JSON.stringify(b.address) : (p.address ?? null));
 
-      await pool.query(
+      // ---- UPSERT proposer (safe, don't wipe address JSON) ----
+      await client.query(
         `
         INSERT INTO proposer_profiles
-          (wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_chat_id, whatsapp, status, created_at, updated_at)
+          (wallet_address, org_name, contact_email, phone, website, address, city, country,
+           telegram_chat_id, telegram_username, whatsapp, status, created_at, updated_at)
         VALUES
-          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active',NOW(),NOW())
- ON CONFLICT (wallet_address) DO UPDATE SET
-  org_name         = COALESCE(NULLIF(EXCLUDED.org_name, ''),         proposer_profiles.org_name),
-  contact_email    = COALESCE(NULLIF(EXCLUDED.contact_email, ''),    proposer_profiles.contact_email),
-  phone            = COALESCE(NULLIF(EXCLUDED.phone, ''),            proposer_profiles.phone),
-  website          = COALESCE(NULLIF(EXCLUDED.website, ''),          proposer_profiles.website),
-  address          = COALESCE(NULLIF(EXCLUDED.address, ''),          proposer_profiles.address),
-  city             = COALESCE(NULLIF(EXCLUDED.city, ''),             proposer_profiles.city),
-  country          = COALESCE(NULLIF(EXCLUDED.country, ''),          proposer_profiles.country),
-  telegram_chat_id = COALESCE(NULLIF(EXCLUDED.telegram_chat_id, ''), proposer_profiles.telegram_chat_id),
-  whatsapp         = COALESCE(NULLIF(EXCLUDED.whatsapp, ''),         proposer_profiles.whatsapp),
-  updated_at       = NOW()
+          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',NOW(),NOW())
+   ON CONFLICT (wallet_address) DO UPDATE SET
+    org_name          = COALESCE(NULLIF(EXCLUDED.org_name, ''),         proposer_profiles.org_name),
+    contact_email     = COALESCE(NULLIF(EXCLUDED.contact_email, ''),    proposer_profiles.contact_email),
+    phone             = COALESCE(NULLIF(EXCLUDED.phone, ''),            proposer_profiles.phone),
+    website           = COALESCE(NULLIF(EXCLUDED.website, ''),          proposer_profiles.website),
+    address           = CASE
+                          WHEN EXCLUDED.address IS NULL OR EXCLUDED.address = '' THEN proposer_profiles.address
+                          ELSE EXCLUDED.address
+                        END,
+    city              = COALESCE(NULLIF(EXCLUDED.city, ''),             proposer_profiles.city),
+    country           = COALESCE(NULLIF(EXCLUDED.country, ''),          proposer_profiles.country),
+    telegram_chat_id  = COALESCE(NULLIF(EXCLUDED.telegram_chat_id, ''), proposer_profiles.telegram_chat_id),
+    telegram_username = COALESCE(NULLIF(EXCLUDED.telegram_username, ''),proposer_profiles.telegram_username),
+    whatsapp          = COALESCE(NULLIF(EXCLUDED.whatsapp, ''),         proposer_profiles.whatsapp),
+    status            = 'active',
+    updated_at        = NOW()
         `,
-        [wallet, orgName, email, phone, website, addressVal, city, country, tgChatId, whatsapp]
+        [wallet, orgName, email, phone, website, addressVal, city, country, tgChatId, tgUser, whatsapp]
+      );
+
+      // ---- EXCLUSIVITY: make vendor side inactive for this wallet ----
+      await client.query(
+        `UPDATE vendor_profiles
+            SET status='inactive', updated_at=NOW()
+          WHERE lower(wallet_address)=lower($1)`,
+        [wallet]
       );
     }
 
-    // Recompute durable roles and set token
-    roles = await durableRolesForAddress(wallet);
+    await client.query('COMMIT');
+
+    // Recompute durable roles, choose final role, issue token (unchanged)
+    let roles = await durableRolesForAddress(wallet);
     let role = roleFromDurableOrIntent(roles, roleIntent);
     if (isAdminAddress(wallet)) {
       roles = Array.from(new Set([...(roles || []), "admin"]));
       role = role === "vendor" || role === "proposer" ? role : "admin";
     }
-
     const token = signJwt({ sub: wallet, role, roles });
     res.cookie("auth_token", token, {
       httpOnly: true, secure: true, sameSite: "none", maxAge: 7 * 24 * 3600 * 1000,
     });
-
     return res.json({ ok: true, role, roles, token });
   } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
     console.error("POST /profile/choose-role error", e);
     return res.status(500).json({ error: "choose_role_failed" });
+  } finally {
+    client.release();
   }
 });
 
+
+// VENDOR: create/update ONLY vendor_profiles
 app.post('/vendor/profile', authRequired, async (req, res) => {
   const wallet = String(req.user?.sub || '').toLowerCase();
   const { error, value } = profileSchema.validate(req.body || {}, { abortEarly: false });
   if (error) return res.status(400).json({ error: error.message });
 
-  // normalize website (add https:// if missing)
+  // normalize website
   const rawWebsite = (value.website || '').trim();
   const website = rawWebsite && !/^https?:\/\//i.test(rawWebsite) ? `https://${rawWebsite}` : rawWebsite;
 
-  // normalize address: if object, keep JSON + also a flat display line
+  // normalize address
   let addressText = '';
   let addressJson = null;
-
   if (typeof value.address === 'string') {
     addressText = value.address.trim();
   } else if (value.address && typeof value.address === 'object') {
@@ -9143,15 +9110,14 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
       postalCode: String(a.postalCode || ''),
       country: String(a.country || ''),
     };
-    addressText = [addressJson.line1, addressJson.city, addressJson.postalCode, addressJson.country]
-      .filter(Boolean)
-      .join(', ');
+    addressText = [addressJson.line1, addressJson.city, addressJson.postalCode, addressJson.country].filter(Boolean).join(', ');
   }
-
-  // store address as JSON if object given; otherwise plain text
   const addressToStore = addressJson ? JSON.stringify(addressJson) : addressText;
 
   try {
+    // 🔒 HARD EXCLUSIVITY: a wallet cannot be an entity (proposer) at the same time
+    await pool.query(`DELETE FROM proposer_profiles WHERE wallet_address = $1`, [wallet]);
+
     const { rows } = await pool.query(
       `INSERT INTO vendor_profiles
          (wallet_address, vendor_name, email, phone, address, website, created_at, updated_at)
@@ -9165,27 +9131,16 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
          website     = EXCLUDED.website,
          updated_at  = now()
        RETURNING wallet_address, vendor_name, email, phone, address, website`,
-      [wallet, value.vendorName, value.email || null, value.phone || null, addressToStore, website || null]
+      [wallet, value.vendorName || null, value.email || null, value.phone || null, addressToStore, website || null]
     );
 
-    // echo back using the same GET shape
     const r = rows[0];
     let parsed = null;
     try { parsed = JSON.parse(r.address || ''); } catch {}
     const address =
       parsed && typeof parsed === 'object'
-        ? {
-            line1: parsed.line1 || '',
-            city: parsed.city || '',
-            country: parsed.country || '',
-            postalCode: parsed.postalCode || parsed.postal_code || '',
-          }
-        : {
-            line1: r.address || '',
-            city: '',
-            country: '',
-            postalCode: '',
-          };
+        ? { line1: parsed.line1 || '', city: parsed.city || '', country: parsed.country || '', postalCode: parsed.postalCode || parsed.postal_code || '' }
+        : { line1: r.address || '', city: '', country: '', postalCode: '' };
 
     res.json({
       walletAddress: r.wallet_address,
@@ -9200,6 +9155,7 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
     res.status(500).json({ error: 'Failed to save profile' });
   }
 });
+
 
 // Telegram webhook: supports both "/link 0x..." and deep-link "/start link_0x..."
 app.post('/tg/webhook', async (req, res) => {
@@ -9508,7 +9464,7 @@ app.get('/admin/proofs-bids', adminGuard, async (req, res) => {
   }
 });
 
-// ADMIN: list proposers/entities that submitted proposals (now includes phone + telegram)
+// ADMIN: list proposers/entities (from proposals + fallback to proposer_profiles)
 app.get('/admin/proposers', adminGuard, async (req, res) => {
   try {
     const includeArchived = ['true','1','yes'].includes(String(req.query.includeArchived || '').toLowerCase());
@@ -9519,16 +9475,24 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
     const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? '100'), 10)));
     const offset = (page - 1) * limit;
 
-    const whereParts = [];
-    const paramsList = [];
+    // Build WHERE for proposals and proposer_profiles with consistent placeholder indexing
+    const params = [];
     let p = 0;
 
-    if (!includeArchived) whereParts.push(`status <> 'archived'`);
+    const propWhere = [];
+    if (!includeArchived) propWhere.push(`status <> 'archived'`);
     if (q) {
-      whereParts.push(`(org_name ILIKE $${++p} OR contact ILIKE $${p} OR owner_wallet ILIKE $${p})`);
-      paramsList.push(q);
+      propWhere.push(`(org_name ILIKE $${++p} OR contact ILIKE $${p} OR owner_wallet ILIKE $${p})`);
+      params.push(q);
     }
-    const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+    const whereSql = propWhere.length ? `WHERE ${propWhere.join(' AND ')}` : '';
+
+    const ppWhere = [];
+    if (q) {
+      ppWhere.push(`(org_name ILIKE $${++p} OR contact_email ILIKE $${p} OR wallet_address ILIKE $${p})`);
+      params.push(q);
+    }
+    const ppWhereSql = ppWhere.length ? `WHERE ${ppWhere.join(' AND ')}` : '';
 
     const listSql = `
       WITH base AS (
@@ -9581,24 +9545,89 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
         FROM base
         WHERE addr_display IS NOT NULL
         ORDER BY entity_key, created_at DESC
+      ),
+      -- Fallback source: proposer_profiles (entities even with 0 proposals)
+      pp AS (
+        SELECT
+          COALESCE(LOWER(wallet_address), LOWER(contact_email), LOWER(org_name)) AS entity_key,
+          MAX(org_name) FILTER (WHERE org_name IS NOT NULL AND org_name <> '') AS org_name,
+          MAX(wallet_address) FILTER (WHERE wallet_address IS NOT NULL AND wallet_address <> '') AS wallet_address,
+          MAX(contact_email) FILTER (WHERE contact_email IS NOT NULL AND contact_email <> '') AS contact_email,
+          NULL::text AS owner_email,
+          MAX(phone) FILTER (WHERE phone IS NOT NULL AND phone <> '') AS owner_phone,
+          MAX(telegram_chat_id) FILTER (WHERE telegram_chat_id IS NOT NULL AND telegram_chat_id <> '') AS owner_telegram_chat_id,
+          MAX(telegram_username) FILTER (WHERE telegram_username IS NOT NULL AND telegram_username <> '') AS owner_telegram_username,
+          0::bigint   AS proposals_count,
+          NULL::timestamptz AS last_proposal_at,
+          0::numeric  AS total_budget_usd,
+          0::bigint   AS approved_count,
+          0::bigint   AS pending_count,
+          0::bigint   AS rejected_count,
+          0::bigint   AS archived_count,
+          -- address display (JSON or text) + city/country fallback
+          NULLIF(BTRIM(CONCAT_WS(', ',
+            COALESCE(
+              CASE
+                WHEN address IS NULL OR address = '' THEN NULL
+                WHEN address ~ '^\\s*\\{' THEN (address::jsonb->>'line1')
+                ELSE address
+              END, ''
+            ),
+            NULLIF(city, ''),
+            NULLIF(country, '')
+          )), '') AS addr_display
+        FROM proposer_profiles
+        ${ppWhereSql}
+        GROUP BY COALESCE(LOWER(wallet_address), LOWER(contact_email), LOWER(org_name))
+      ),
+      unioned AS (
+        -- Prefer proposals aggregate when present
+        SELECT g.*, la.addr_display
+        FROM grp g
+        LEFT JOIN latest_addr la USING (entity_key)
+
+        UNION ALL
+
+        SELECT
+          pp.entity_key, pp.org_name, pp.wallet_address, pp.contact_email, pp.owner_email,
+          pp.owner_phone, pp.owner_telegram_chat_id, pp.owner_telegram_username,
+          pp.proposals_count, pp.last_proposal_at, pp.total_budget_usd,
+          pp.approved_count, pp.pending_count, pp.rejected_count, pp.archived_count,
+          pp.addr_display
+        FROM pp
+        WHERE NOT EXISTS (SELECT 1 FROM grp WHERE grp.entity_key = pp.entity_key)
       )
-      SELECT g.*, la.addr_display
-      FROM grp g
-      LEFT JOIN latest_addr la USING (entity_key)
-      ORDER BY g.last_proposal_at DESC NULLS LAST, g.org_name ASC
+      SELECT *
+      FROM unioned
+      ORDER BY last_proposal_at DESC NULLS LAST, org_name ASC
       LIMIT $${++p} OFFSET $${++p};
     `;
-    const listParams = paramsList.concat([limit, offset]);
+    const listParams = params.concat([limit, offset]);
 
     const countSql = `
       WITH base AS (
-        SELECT COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) AS entity_key
+        SELECT
+          COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) AS entity_key
         FROM proposals
         ${whereSql}
+      ),
+      grp AS (
+        SELECT DISTINCT entity_key FROM base
+      ),
+      pp_keys AS (
+        SELECT DISTINCT
+          COALESCE(LOWER(wallet_address), LOWER(contact_email), LOWER(org_name)) AS entity_key
+        FROM proposer_profiles
+        ${ppWhereSql}
+      ),
+      union_keys AS (
+        SELECT entity_key FROM grp
+        UNION
+        SELECT entity_key FROM pp_keys
       )
-      SELECT COUNT(DISTINCT entity_key)::int AS cnt FROM base;
+      SELECT COUNT(*)::int AS cnt FROM union_keys;
     `;
-    const countParams = paramsList.slice();
+    const countParams = params.slice();
 
     const [list, count] = await Promise.all([
       pool.query(listSql, listParams),
@@ -9613,7 +9642,6 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
       contactEmail: r.contact_email || null,
       ownerEmail: r.owner_email || null,
 
-      // NEW: contact channels
       ownerPhone: r.owner_phone || null,
       ownerTelegramChatId: r.owner_telegram_chat_id || null,
       ownerTelegramUsername: r.owner_telegram_username || null,
