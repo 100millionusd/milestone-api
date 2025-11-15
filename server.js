@@ -8771,6 +8771,7 @@ function _addrObj(addr, city = null, country = null) {
 app.get('/vendor/profile', authRequired, async (req, res) => {
   try {
     const wallet = String(req.user?.address || req.user?.sub || '').toLowerCase();
+if (!wallet) return res.status(401).json({ error: 'unauthenticated' });
     if (!wallet) return res.status(401).json({ error: 'unauthenticated' });
 
     const { rows } = await pool.query(
