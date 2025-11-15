@@ -4052,7 +4052,7 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
   }
 });
 
-// /admin/entities — REPLACE ENTIRE ROUTE (includes proposer_profiles even with 0 proposals)
+/// /admin/entities — REPLACE ENTIRE ROUTE (excludes wallets in vendor_profiles; includes proposer_profiles even with 0 proposals)
 app.get('/admin/entities', adminGuard, async (req, res) => {
   try {
     const includeArchived = ['true','1','yes'].includes(
@@ -4060,7 +4060,11 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
     );
 
     const sql = `
-      WITH props AS (
+      WITH vendor_wallets AS (
+        SELECT DISTINCT LOWER(wallet_address) AS w
+        FROM vendor_profiles
+      ),
+      props AS (
         SELECT
           LOWER(COALESCE(p.owner_wallet,''))                       AS owner_wallet,
           COALESCE(MAX(NULLIF(p.org_name,'')), '')                 AS entity_name,
@@ -4091,6 +4095,7 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           COUNT(*) FILTER (WHERE p.status = 'archived')::int      AS archived_count,
           COUNT(*) FILTER (WHERE p.status <> 'archived')::int     AS active_count
         FROM proposals p
+        WHERE NOT EXISTS (SELECT 1 FROM vendor_wallets vw WHERE vw.w = LOWER(p.owner_wallet))
         GROUP BY LOWER(COALESCE(p.owner_wallet,''))
       ),
       ents AS (
@@ -4108,6 +4113,7 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           COALESCE(pp.status,'active')        AS status,
           pp.updated_at                       AS updated_at
         FROM proposer_profiles pp
+        WHERE NOT EXISTS (SELECT 1 FROM vendor_wallets vw WHERE vw.w = LOWER(pp.wallet_address))
       ),
       combined AS (
         SELECT
@@ -4195,7 +4201,6 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
     res.status(500).json({ error: 'Failed to list entities' });
   }
 });
-
 
 app.get("/proposer-profile", authGuard, async (req, res) => {
   try {
