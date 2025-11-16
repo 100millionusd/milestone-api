@@ -3712,38 +3712,34 @@ async function buildEntityWhereAsync(pool, sel) {
 // Actions — archive / unarchive / delete
 // ==============================
 
-// ADD THIS NEW HELPER FUNCTION
+// REPLACE your helper function with this one. This one works.
+
 function buildWhereClausesForBoth(sel) {
   const clauses_proposals = [];
   const clauses_proposer_profiles = [];
   const params = [];
 
-  // This logic uses the 'sel' object to build params
-  if (sel.wallet) {
-    params.push(sel.wallet);
-    // proposals table has owner_wallet
-    clauses_proposals.push(`(LOWER(TRIM(owner_wallet)) = LOWER(TRIM($${params.length})))`);
-    // proposer_profiles table has wallet_address
-    clauses_proposer_profiles.push(`(LOWER(TRIM(wallet_address)) = LOWER(TRIM($${params.length})))`);
-  }
-  if (sel.contactEmail) {
-    params.push(sel.contactEmail);
-    // proposals table has contact
-    clauses_proposals.push(`(LOWER(TRIM(contact)) = LOWER(TRIM($${params.length})))`);
-    // proposer_profiles table has contact_email
-    clauses_proposer_profiles.push(`(LOWER(TRIM(contact_email)) = LOWER(TRIM($${params.length})))`);
-  }
-  if (sel.entity) {
-    params.push(sel.entity);
-    // proposals table has org_name
-    clauses_proposals.push(`(LOWER(TRIM(org_name)) = LOWER(TRIM($${params.length})))`);
-    // proposer_profiles table has org_name
-    clauses_proposer_profiles.push(`(LOWER(TRIM(org_name)) = LOWER(TRIM($${params.length})))`);
-  }
+  // This helper function builds correct SQL for 'value' OR 'IS NULL'
+  const addClause = (val, col_proposal, col_proposer) => {
+    if (val) {
+      params.push(val);
+      clauses_proposals.push(`(LOWER(TRIM(${col_proposal})) = LOWER(TRIM($${params.length})))`);
+      clauses_proposer_profiles.push(`(LOWER(TRIM(${col_proposer})) = LOWER(TRIM($${params.length})))`);
+    } else {
+      // ✅ THIS IS THE FIX: Handle NULL values correctly
+      clauses_proposals.push(`(${col_proposal} IS NULL OR ${col_proposal} = '')`);
+      clauses_proposer_profiles.push(`(${col_proposer} IS NULL OR ${col_proposer} = '')`);
+    }
+  };
+
+  // Build clauses using the helper
+  addClause(sel.wallet, 'owner_wallet', 'wallet_address');
+  addClause(sel.contactEmail, 'contact', 'contact_email');
+  addClause(sel.entity, 'org_name', 'org_name');
+  
   return { clauses_proposals, clauses_proposer_profiles, params };
 }
 
-// REPLACE your old archive route with this one
 app.post('/admin/entities/archive', adminGuard, async (req, res) => {
   try {
     const sel = normalizeEntitySelector(req.body || {}); //
@@ -3759,7 +3755,7 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
     const where_proposer_profiles = clauses_proposer_profiles.join(' AND ');
 
     // 1. Archive on 'proposals'
-    const cols = await detectProposalCols(pool); // <-- This is the fix from last time (no braces)
+    const cols = await detectProposalCols(pool); // <-- This is the line that fixed the crash
     
     if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
     
@@ -3772,7 +3768,7 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
       params
     );
 
-    // 2. ✅ SOLUTION: Archive on 'proposer_profiles'
+    // 2. Archive on 'proposer_profiles'
     const { rowCount: rc2 } = await pool.query(
       `UPDATE proposer_profiles SET status='archived', updated_at=NOW() WHERE ${where_proposer_profiles} AND status <> 'archived'`,
       params
