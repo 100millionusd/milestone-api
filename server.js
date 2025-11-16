@@ -3721,6 +3721,11 @@ function buildWhereClausesForBoth(sel) {
 
   // This helper function builds correct SQL for 'value' OR 'IS NULL'
   const addClause = (val, col_proposal, col_proposer) => {
+    // We only add a clause if the key was provided in the selector
+    // (sel.entity !== undefined, etc.)
+    // But your normalizeSelector() ensures all keys exist,
+    // so we check if the value is non-null.
+    
     if (val) {
       params.push(val);
       clauses_proposals.push(`(LOWER(TRIM(${col_proposal})) = LOWER(TRIM($${params.length})))`);
@@ -3732,7 +3737,8 @@ function buildWhereClausesForBoth(sel) {
     }
   };
 
-  // Build clauses using the helper
+  // Build clauses using the helper for all keys
+  // Your normalizeSelector() provides all three keys
   addClause(sel.wallet, 'owner_wallet', 'wallet_address');
   addClause(sel.contactEmail, 'contact', 'contact_email');
   addClause(sel.entity, 'org_name', 'org_name');
