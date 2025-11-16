@@ -3764,29 +3764,79 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
 
 app.delete('/admin/entities', adminGuard, async (req, res) => {
   try {
+    // This normalizeSelector function is correct and robust
     const sel = normalizeEntitySelector(req.body || {});
-    const { whereSql, params, cols } = await buildEntityWhereAsync(pool, sel);
-    if (!whereSql) return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
+    
+    // We must build WHERE clauses for BOTH tables, as their columns differ.
+    const clauses_proposals = [];
+    const clauses_proposer_profiles = [];
+    const params = [];
+
+    // This logic uses the 'sel' object to build params
+    if (sel.wallet) {
+      params.push(sel.wallet);
+      // proposals table has owner_wallet
+      clauses_proposals.push(`(LOWER(TRIM(owner_wallet)) = LOWER(TRIM($${params.length})))`); 
+      // proposer_profiles table has wallet_address
+      clauses_proposer_profiles.push(`(LOWER(TRIM(wallet_address)) = LOWER(TRIM($${params.length})))`);
+    }
+    if (sel.contactEmail) {
+      params.push(sel.contactEmail);
+      // proposals table has contact
+      clauses_proposals.push(`(LOWER(TRIM(contact)) = LOWER(TRIM($${params.length})))`);
+      // proposer_profiles table has contact_email
+      clauses_proposer_profiles.push(`(LOWER(TRIM(contact_email)) = LOWER(TRIM($${params.length})))`);
+    }
+    if (sel.entity) {
+      params.push(sel.entity);
+      // proposals table has org_name
+      clauses_proposals.push(`(LOWER(TRIM(org_name)) = LOWER(TRIM($${params.length})))`);
+      // proposer_profiles table has org_name
+      clauses_proposer_profiles.push(`(LOWER(TRIM(org_name)) = LOWER(TRIM($${params.length})))`);
+    }
+
+    // Must have at least one valid parameter to build a query
+    if (clauses_proposals.length === 0) {
+      return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
+    }
+
+    // Join with AND (this fixes the other bug from buildEntityWhereAsync)
+    const where_proposals = clauses_proposals.join(' AND ');
+    const where_proposer_profiles = clauses_proposer_profiles.join(' AND ');
 
     const mode = String(req.query.mode || 'soft').toLowerCase();
 
     if (mode === 'hard') {
-      const { rowCount } = await pool.query(`DELETE FROM proposals WHERE ${whereSql}`, params);
-      return res.json({ success: true, deleted: rowCount, mode: 'hard' });
+      // ✅ SOLUTION: DELETE FROM BOTH TABLES
+      const { rowCount: rc1 } = await pool.query(`DELETE FROM proposals WHERE ${where_proposals}`, params);
+      const { rowCount: rc2 } = await pool.query(`DELETE FROM proposer_profiles WHERE ${where_proposer_profiles}`, params);
+      
+      return res.json({ success: true, deleted: (rc1 + rc2), mode: 'hard' });
     }
 
+    // --- SOFT DELETE (Archive) ---
+    
+    // 1. Soft delete on 'proposals'
+    const { cols } = await detectProposalCols(pool); //
     if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
-
-    const setSql = cols.updatedCol
+    
+    const setSql_proposals = cols.updatedCol
       ? `${cols.statusCol}='archived', ${cols.updatedCol}=NOW()`
       : `${cols.statusCol}='archived'`;
 
-    const { rowCount } = await pool.query(
-      `UPDATE proposals SET ${setSql} WHERE ${whereSql} AND ${cols.statusCol} <> 'archived'`,
+    const { rowCount: rc1 } = await pool.query(
+      `UPDATE proposals SET ${setSql_proposals} WHERE ${where_proposals} AND ${cols.statusCol} <> 'archived'`,
       params
     );
 
-    return res.json({ success: true, archived: rowCount, mode: 'soft' });
+    // 2. ✅ SOLUTION: Soft delete on 'proposer_profiles'
+    const { rowCount: rc2 } = await pool.query(
+      `UPDATE proposer_profiles SET status='archived', updated_at=NOW() WHERE ${where_proposer_profiles} AND status <> 'archived'`,
+      params
+    );
+
+    return res.json({ success: true, archived: (rc1 + rc2), mode: 'soft' });
+
   } catch (e) {
     console.error('delete entity error', e);
     return res.status(500).json({ error: 'Failed to delete entity' });
