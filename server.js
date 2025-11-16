@@ -3712,114 +3712,156 @@ async function buildEntityWhereAsync(pool, sel) {
 // Actions — archive / unarchive / delete
 // ==============================
 
-function buildWhereClausesForBoth(sel) {
-  const clauses_proposals = [];
-  const clauses_proposer_profiles = [];
+// New helper function focused on identifying profiles
+function buildWhereClauseForProfiles(sel) {
+  const clauses = [];
   const params = [];
 
-  // This helper function adds a WHERE clause ONLY if the selector value is provided.
-  const addClause = (val, col_proposal, col_proposer) => {
-    // We only add a clause if the value is truthy (non-null, non-empty string).
+  const addClause = (val, col) => {
+    // Only add a clause if the value is provided (truthy)
     if (val) {
       params.push(val);
-      const paramIndex = params.length;
-      // Add clause for specific match
-      clauses_proposals.push(`(LOWER(TRIM(${col_proposal})) = LOWER(TRIM($${paramIndex})))`);
-      clauses_proposer_profiles.push(`(LOWER(TRIM(${col_proposer})) = LOWER(TRIM($${paramIndex})))`);
+      // Use LOWER(TRIM()) for case-insensitive, whitespace-tolerant matching
+      clauses.push(`(LOWER(TRIM(${col})) = LOWER(TRIM($${params.length})))`);
     }
-    // ✅ FIX: If val is null or empty, we do nothing. We should not restrict the query to NULL values.
+    // If val is not provided, we ignore this criteria.
   };
 
-  // Build clauses using the helper for all keys
-  addClause(sel.wallet, 'owner_wallet', 'wallet_address');
-  addClause(sel.contactEmail, 'contact', 'contact_email');
-  addClause(sel.entity, 'org_name', 'org_name');
-  
-  return { clauses_proposals, clauses_proposer_profiles, params };
+  // Build the WHERE clause based on the primary profile table columns
+  addClause(sel.wallet, 'wallet_address');
+  addClause(sel.contactEmail, 'contact_email');
+  addClause(sel.entity, 'org_name');
+
+  // Combine with AND to match based on all provided criteria
+  return { whereClause: clauses.join(' AND '), params };
 }
 
 app.post('/admin/entities/archive', adminGuard, async (req, res) => {
   try {
-    const sel = normalizeEntitySelector(req.body || {}); //
+    const sel = normalizeEntitySelector(req.body || {});
     
-    // Use the new helper to build WHERE for both tables
-    const { clauses_proposals, clauses_proposer_profiles, params } = buildWhereClausesForBoth(sel);
+    // 1. Identify the target profiles
+    const { whereClause, params } = buildWhereClauseForProfiles(sel);
     
-    if (clauses_proposals.length === 0) {
+    if (!whereClause) {
       return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
     }
 
-    const where_proposals = clauses_proposals.join(' AND ');
-    const where_proposer_profiles = clauses_proposer_profiles.join(' AND ');
-
-    // 1. Archive on 'proposals'
-    const cols = await detectProposalCols(pool); // <-- This is the line that fixed the crash
+    // Find the definitive identifiers (wallet addresses) of the profiles matching the criteria.
+    // We only look for non-archived profiles initially.
+    const profileQuery = `
+      SELECT wallet_address 
+      FROM proposer_profiles 
+      WHERE ${whereClause} AND status <> 'archived'
+    `;
     
+    const { rows } = await pool.query(profileQuery, params);
+    
+    if (rows.length === 0) {
+      return res.json({ ok: true, affected: 0 });
+    }
+
+    // Extract the wallet addresses
+    const walletAddresses = rows.map(row => row.wallet_address).filter(Boolean);
+
+    if (walletAddresses.length === 0) {
+        console.warn("Matching profiles found, but no wallet addresses associated.", sel);
+        return res.json({ ok: true, affected: 0 });
+    }
+
+    // 2. Archive the 'proposer_profiles' using the definitive identifiers (wallets)
+    const { rowCount: rc1 } = await pool.query(
+      `UPDATE proposer_profiles 
+       SET status='archived', updated_at=NOW() 
+       WHERE wallet_address = ANY($1) AND status <> 'archived'`,
+      [walletAddresses] // Pass as an array for the PostgreSQL ANY($1) operator
+    );
+
+    // 3. Archive ALL associated 'proposals' using the same identifiers (wallets)
+    const cols = await detectProposalCols(pool);    
     if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
     
     const setSql = cols.updatedCol
       ? `${cols.statusCol}='archived', ${cols.updatedCol}=NOW()`
       : `${cols.statusCol}='archived'`;
 
-    const { rowCount: rc1 } = await pool.query(
-      `UPDATE proposals SET ${setSql} WHERE ${where_proposals} AND ${cols.statusCol} <> 'archived'`,
-      params
-    );
-
-    // 2. Archive on 'proposer_profiles'
+    // ✅ THE FIX: Update based on the link (owner_wallet), ignoring potentially inconsistent org_name/contact data.
     const { rowCount: rc2 } = await pool.query(
-      `UPDATE proposer_profiles SET status='archived', updated_at=NOW() WHERE ${where_proposer_profiles} AND status <> 'archived'`,
-      params
+      `UPDATE proposals 
+       SET ${setSql} 
+       WHERE owner_wallet = ANY($1) AND ${cols.statusCol} <> 'archived'`,
+      [walletAddresses]
     );
 
     return res.json({ ok: true, affected: (rc1 + rc2) });
+
   } catch (e) {
     console.error('archive entity error', e);
     return res.status(500).json({ error: 'Failed to archive entity' });
   }
 });
 
-// REPLACE your old unarchive route with this one
 app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
   try {
-    const sel = normalizeEntitySelector(req.body || {}); //
+    const sel = normalizeEntitySelector(req.body || {});
 
-    // Use the new helper to build WHERE for both tables
-    const { clauses_proposals, clauses_proposer_profiles, params } = buildWhereClausesForBoth(sel);
+    // 1. Identify the target profiles (that are currently archived)
+    const { whereClause, params } = buildWhereClauseForProfiles(sel);
 
-    if (clauses_proposals.length === 0) {
+    if (!whereClause) {
       return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
     }
 
-    const where_proposals = clauses_proposals.join(' AND ');
-    const where_proposer_profiles = clauses_proposer_profiles.join(' AND ');
+    // Find the wallet addresses
+    const profileQuery = `
+      SELECT wallet_address 
+      FROM proposer_profiles 
+      WHERE ${whereClause} AND status = 'archived'
+    `;
+    
+    const { rows } = await pool.query(profileQuery, params);
 
+    if (rows.length === 0) {
+      return res.json({ ok: true, affected: 0 });
+    }
+
+    const walletAddresses = rows.map(row => row.wallet_address).filter(Boolean);
+
+     if (walletAddresses.length === 0) {
+        console.warn("Matching archived profiles found, but no wallet addresses associated.", sel);
+        return res.json({ ok: true, affected: 0 });
+    }
+
+    // 2. Unarchive 'proposer_profiles' (set to 'active')
+    const { rowCount: rc1 } = await pool.query(
+      `UPDATE proposer_profiles 
+       SET status='active', updated_at=NOW() 
+       WHERE wallet_address = ANY($1) AND status = 'archived'`,
+      [walletAddresses]
+    );
+
+    // 3. Unarchive associated 'proposals'
     const toStatusRaw = String(req.body?.toStatus || 'pending').toLowerCase();
     const toStatus = ['pending','approved','rejected'].includes(toStatusRaw) ? toStatusRaw : 'pending';
 
-    const params_with_status = [...params, toStatus];
-
-    // 1. Unarchive on 'proposals'
-    const cols = await detectProposalCols(pool); // <-- This is the fix from last time (no braces)
-
+    const cols = await detectProposalCols(pool);
     if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
 
+    // Note the parameter indexing: $1 is the wallet array, $2 is the status string
     const setSql = cols.updatedCol
-      ? `${cols.statusCol}=$${params_with_status.length}, ${cols.updatedCol}=NOW()`
-      : `${cols.statusCol}=$${params_with_status.length}`;
+      ? `${cols.statusCol}=$2, ${cols.updatedCol}=NOW()`
+      : `${cols.statusCol}=$2`;
 
-    const { rowCount: rc1 } = await pool.query(
-      `UPDATE proposals SET ${setSql} WHERE ${where_proposals} AND ${cols.statusCol}='archived'`,
-      params_with_status
-    );
-
-    // 2. ✅ SOLUTION: Unarchive on 'proposer_profiles' (set to 'active')
+    // ✅ Apply the fix: update based on the link (owner_wallet)
     const { rowCount: rc2 } = await pool.query(
-      `UPDATE proposer_profiles SET status='active', updated_at=NOW() WHERE ${where_proposer_profiles} AND status = 'archived'`,
-      params
+      `UPDATE proposals 
+       SET ${setSql} 
+       WHERE owner_wallet = ANY($1) AND ${cols.statusCol}='archived'`,
+      [walletAddresses, toStatus] // Pass both parameters
     );
 
     return res.json({ ok: true, affected: (rc1 + rc2), toStatus });
+
   } catch (e) {
     console.error('unarchive entity error', e);
     return res.status(500).json({ error: 'Failed to unarchive entity' });
