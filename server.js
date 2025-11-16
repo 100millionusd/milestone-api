@@ -3744,12 +3744,12 @@ function buildWhereClausesForBoth(sel) {
   return { clauses_proposals, clauses_proposer_profiles, params };
 }
 
-// REPLACE your old archive route with this one
+// REPLACE your archive route with this
 app.post('/admin/entities/archive', adminGuard, async (req, res) => {
   try {
     const sel = normalizeEntitySelector(req.body || {}); //
     
-    // Use the new helper to build WHERE for both tables
+    // Use the helper to build WHERE for both tables
     const { clauses_proposals, clauses_proposer_profiles, params } = buildWhereClausesForBoth(sel);
     
     if (clauses_proposals.length === 0) {
@@ -3760,7 +3760,8 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
     const where_proposer_profiles = clauses_proposer_profiles.join(' AND ');
 
     // 1. Archive on 'proposals'
-    const { cols } = await detectProposalCols(pool); //
+    const cols = await detectProposalCols(pool); // <--- ✅ THIS IS THE FIX (no destructuring)
+    
     if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
     
     const setSql = cols.updatedCol
@@ -3772,7 +3773,7 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
       params
     );
 
-    // 2. ✅ SOLUTION: Archive on 'proposer_profiles'
+    // 2. Archive on 'proposer_profiles'
     const { rowCount: rc2 } = await pool.query(
       `UPDATE proposer_profiles SET status='archived', updated_at=NOW() WHERE ${where_proposer_profiles} AND status <> 'archived'`,
       params
@@ -3785,12 +3786,12 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
   }
 });
 
-/// REPLACE your old unarchive route with this one
+// REPLACE your unarchive route with this one
 app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
   try {
     const sel = normalizeEntitySelector(req.body || {}); //
 
-    // Use the new helper to build WHERE for both tables
+    // Use the helper to build WHERE for both tables
     const { clauses_proposals, clauses_proposer_profiles, params } = buildWhereClausesForBoth(sel);
 
     if (clauses_proposals.length === 0) {
@@ -3806,7 +3807,8 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
     const params_with_status = [...params, toStatus];
 
     // 1. Unarchive on 'proposals'
-    const { cols } = await detectProposalCols(pool); //
+    const cols = await detectProposalCols(pool); // <--- ✅ THIS IS THE FIX (no destructuring)
+
     if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
 
     const setSql = cols.updatedCol
@@ -3818,7 +3820,7 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
       params_with_status
     );
 
-    // 2. ✅ SOLUTION: Unarchive on 'proposer_profiles' (set to 'active')
+    // 2. Unarchive on 'proposer_profiles' (set to 'active')
     const { rowCount: rc2 } = await pool.query(
       `UPDATE proposer_profiles SET status='active', updated_at=NOW() WHERE ${where_proposer_profiles} AND status = 'archived'`,
       params
