@@ -3737,89 +3737,114 @@ function buildWhereClauseForProfiles(sel) {
 }
 
 app.post('/admin/entities/archive', adminGuard, async (req, res) => {
+  // 1. Get a dedicated client from the pool for the transaction
+  const client = await pool.connect();
+
   try {
     const sel = normalizeEntitySelector(req.body || {});
-    
-    // 1. Identify the target profiles
+
+    // --- Identify the target profiles ---
     const { whereClause, params } = buildWhereClauseForProfiles(sel);
     
     if (!whereClause) {
       return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
     }
 
-    // Find the definitive identifiers (wallet addresses) of the profiles matching the criteria.
-    // We only look for non-archived profiles initially.
+    // Find the wallet addresses (using the dedicated client)
     const profileQuery = `
       SELECT wallet_address 
       FROM proposer_profiles 
       WHERE ${whereClause} AND status <> 'archived'
     `;
     
-    const { rows } = await pool.query(profileQuery, params);
+    // Use client.query, NOT pool.query
+    const { rows } = await client.query(profileQuery, params);
     
     if (rows.length === 0) {
       return res.json({ ok: true, affected: 0 });
     }
 
-    // Extract the wallet addresses
     const walletAddresses = rows.map(row => row.wallet_address).filter(Boolean);
 
     if (walletAddresses.length === 0) {
-        console.warn("Matching profiles found, but no wallet addresses associated.", sel);
-        return res.json({ ok: true, affected: 0 });
+       console.warn("Matching profiles found, but no wallet addresses associated.", sel);
+       return res.json({ ok: true, affected: 0 });
     }
 
-    // 2. Archive the 'proposer_profiles' using the definitive identifiers (wallets)
-    const { rowCount: rc1 } = await pool.query(
+    // 2. START THE TRANSACTION
+    await client.query('BEGIN');
+
+    // 3. Archive 'proposer_profiles' (using the client)
+    const { rowCount: rc1 } = await client.query(
       `UPDATE proposer_profiles 
        SET status='archived', updated_at=NOW() 
        WHERE wallet_address = ANY($1) AND status <> 'archived'`,
-      [walletAddresses] // Pass as an array for the PostgreSQL ANY($1) operator
+      [walletAddresses]
     );
 
-    // 3. Archive ALL associated 'proposals' using the same identifiers (wallets)
-    const cols = await detectProposalCols(pool);    
-    if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
+    // 4. Archive associated 'proposals' (using the client)
+    const cols = await detectProposalCols(pool); 
+    if (!cols.statusCol) {
+      // We MUST roll back before throwing or returning
+      await client.query('ROLLBACK');
+      return res.status(500).json({ error: 'proposals.status column not found' });
+    }
     
     const setSql = cols.updatedCol
       ? `${cols.statusCol}='archived', ${cols.updatedCol}=NOW()`
       : `${cols.statusCol}='archived'`;
 
-    // ✅ THE FIX: Update based on the link (owner_wallet), ignoring potentially inconsistent org_name/contact data.
-    const { rowCount: rc2 } = await pool.query(
+    const { rowCount: rc2 } = await client.query(
       `UPDATE proposals 
        SET ${setSql} 
        WHERE owner_wallet = ANY($1) AND ${cols.statusCol} <> 'archived'`,
       [walletAddresses]
     );
 
+    // 5. COMMIT THE TRANSACTION
+    // This makes the changes permanent
+    await client.query('COMMIT');
+
     return res.json({ ok: true, affected: (rc1 + rc2) });
 
   } catch (e) {
+    // 6. ROLL BACK ON ANY ERROR
+    // If anything failed, undo all changes from this transaction
+    await client.query('ROLLBACK');
+    
     console.error('archive entity error', e);
     return res.status(500).json({ error: 'Failed to archive entity' });
+    
+  } finally {
+    // 7. ALWAYS RELEASE THE CLIENT
+    // This returns the client to the pool, whether we committed or rolled back.
+    client.release();
   }
 });
 
 app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
+  // 1. Get a dedicated client from the pool
+  const client = await pool.connect();
+
   try {
     const sel = normalizeEntitySelector(req.body || {});
 
-    // 1. Identify the target profiles (that are currently archived)
+    // --- Identify the target profiles (that are currently archived) ---
     const { whereClause, params } = buildWhereClauseForProfiles(sel);
 
     if (!whereClause) {
       return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
     }
 
-    // Find the wallet addresses
+    // Find the wallet addresses (using the dedicated client)
     const profileQuery = `
       SELECT wallet_address 
       FROM proposer_profiles 
       WHERE ${whereClause} AND status = 'archived'
     `;
     
-    const { rows } = await pool.query(profileQuery, params);
+    // Use client.query, NOT pool.query
+    const { rows } = await client.query(profileQuery, params);
 
     if (rows.length === 0) {
       return res.json({ ok: true, affected: 0 });
@@ -3827,44 +3852,58 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
 
     const walletAddresses = rows.map(row => row.wallet_address).filter(Boolean);
 
-     if (walletAddresses.length === 0) {
-        console.warn("Matching archived profiles found, but no wallet addresses associated.", sel);
-        return res.json({ ok: true, affected: 0 });
+    if (walletAddresses.length === 0) {
+       console.warn("Matching archived profiles found, but no wallet addresses associated.", sel);
+       return res.json({ ok: true, affected: 0 });
     }
 
-    // 2. Unarchive 'proposer_profiles' (set to 'active')
-    const { rowCount: rc1 } = await pool.query(
+    // 2. START THE TRANSACTION
+    await client.query('BEGIN');
+
+    // 3. Unarchive 'proposer_profiles' (set to 'active')
+    const { rowCount: rc1 } = await client.query(
       `UPDATE proposer_profiles 
        SET status='active', updated_at=NOW() 
        WHERE wallet_address = ANY($1) AND status = 'archived'`,
       [walletAddresses]
     );
 
-    // 3. Unarchive associated 'proposals'
+    // 4. Unarchive associated 'proposals'
     const toStatusRaw = String(req.body?.toStatus || 'pending').toLowerCase();
     const toStatus = ['pending','approved','rejected'].includes(toStatusRaw) ? toStatusRaw : 'pending';
 
     const cols = await detectProposalCols(pool);
-    if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
+    if (!cols.statusCol) {
+      // We MUST roll back
+      await client.query('ROLLBACK');
+      return res.status(500).json({ error: 'proposals.status column not found' });
+    }
 
-    // Note the parameter indexing: $1 is the wallet array, $2 is the status string
     const setSql = cols.updatedCol
       ? `${cols.statusCol}=$2, ${cols.updatedCol}=NOW()`
       : `${cols.statusCol}=$2`;
 
-    // ✅ Apply the fix: update based on the link (owner_wallet)
-    const { rowCount: rc2 } = await pool.query(
+    const { rowCount: rc2 } = await client.query(
       `UPDATE proposals 
        SET ${setSql} 
        WHERE owner_wallet = ANY($1) AND ${cols.statusCol}='archived'`,
       [walletAddresses, toStatus] // Pass both parameters
     );
 
+    // 5. COMMIT THE TRANSACTION
+    await client.query('COMMIT');
+
     return res.json({ ok: true, affected: (rc1 + rc2), toStatus });
 
   } catch (e) {
+    // 6. ROLL BACK ON ANY ERROR
+    await client.query('ROLLBACK');
+    
     console.error('unarchive entity error', e);
     return res.status(500).json({ error: 'Failed to unarchive entity' });
+  } finally {
+    // 7. ALWAYS RELEASE THE CLIENT
+    client.release();
   }
 });
 
