@@ -3712,33 +3712,25 @@ async function buildEntityWhereAsync(pool, sel) {
 // Actions — archive / unarchive / delete
 // ==============================
 
-// REPLACE your helper function with this one. This one works.
-
 function buildWhereClausesForBoth(sel) {
   const clauses_proposals = [];
   const clauses_proposer_profiles = [];
   const params = [];
 
-  // This helper function builds correct SQL for 'value' OR 'IS NULL'
+  // This helper function adds a WHERE clause ONLY if the selector value is provided.
   const addClause = (val, col_proposal, col_proposer) => {
-    // We only add a clause if the key was provided in the selector
-    // (sel.entity !== undefined, etc.)
-    // But your normalizeSelector() ensures all keys exist,
-    // so we check if the value is non-null.
-    
+    // We only add a clause if the value is truthy (non-null, non-empty string).
     if (val) {
       params.push(val);
-      clauses_proposals.push(`(LOWER(TRIM(${col_proposal})) = LOWER(TRIM($${params.length})))`);
-      clauses_proposer_profiles.push(`(LOWER(TRIM(${col_proposer})) = LOWER(TRIM($${params.length})))`);
-    } else {
-      // ✅ THIS IS THE FIX: Handle NULL values correctly
-      clauses_proposals.push(`(${col_proposal} IS NULL OR ${col_proposal} = '')`);
-      clauses_proposer_profiles.push(`(${col_proposer} IS NULL OR ${col_proposer} = '')`);
+      const paramIndex = params.length;
+      // Add clause for specific match
+      clauses_proposals.push(`(LOWER(TRIM(${col_proposal})) = LOWER(TRIM($${paramIndex})))`);
+      clauses_proposer_profiles.push(`(LOWER(TRIM(${col_proposer})) = LOWER(TRIM($${paramIndex})))`);
     }
+    // ✅ FIX: If val is null or empty, we do nothing. We should not restrict the query to NULL values.
   };
 
   // Build clauses using the helper for all keys
-  // Your normalizeSelector() provides all three keys
   addClause(sel.wallet, 'owner_wallet', 'wallet_address');
   addClause(sel.contactEmail, 'contact', 'contact_email');
   addClause(sel.entity, 'org_name', 'org_name');
