@@ -3712,50 +3712,111 @@ async function buildEntityWhereAsync(pool, sel) {
 // Actions — archive / unarchive / delete
 // ==============================
 
+// ADD THIS NEW HELPER FUNCTION
+function buildWhereClausesForBoth(sel) {
+  const clauses_proposals = [];
+  const clauses_proposer_profiles = [];
+  const params = [];
+
+  if (sel.wallet) {
+    params.push(sel.wallet);
+    clauses_proposals.push(`(LOWER(TRIM(owner_wallet)) = LOWER(TRIM($${params.length})))`);
+    clauses_proposer_profiles.push(`(LOWER(TRIM(wallet_address)) = LOWER(TRIM($${params.length})))`);
+  }
+  if (sel.contactEmail) {
+    params.push(sel.contactEmail);
+    clauses_proposals.push(`(LOWER(TRIM(contact)) = LOWER(TRIM($${params.length})))`);
+    clauses_proposer_profiles.push(`(LOWER(TRIM(contact_email)) = LOWER(TRIM($${params.length})))`);
+  }
+  if (sel.entity) {
+    params.push(sel.entity);
+    clauses_proposals.push(`(LOWER(TRIM(org_name)) = LOWER(TRIM($${params.length})))`);
+    clauses_proposer_profiles.push(`(LOWER(TRIM(org_name)) = LOWER(TRIM($${params.length})))`);
+  }
+  return { clauses_proposals, clauses_proposer_profiles, params };
+}
+
+// REPLACE your old archive route with this one
 app.post('/admin/entities/archive', adminGuard, async (req, res) => {
   try {
-    const sel = normalizeEntitySelector(req.body || {});
-    const { whereSql, params, cols } = await buildEntityWhereAsync(pool, sel);
-    if (!whereSql) return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
-    if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
+    const sel = normalizeEntitySelector(req.body || {}); //
+    
+    // Use the new helper to build WHERE for both tables
+    const { clauses_proposals, clauses_proposer_profiles, params } = buildWhereClausesForBoth(sel);
+    
+    if (clauses_proposals.length === 0) {
+      return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
+    }
 
+    const where_proposals = clauses_proposals.join(' AND ');
+    const where_proposer_profiles = clauses_proposer_profiles.join(' AND ');
+
+    // 1. Archive on 'proposals'
+    const { cols } = await detectProposalCols(pool); //
+    if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
+    
     const setSql = cols.updatedCol
       ? `${cols.statusCol}='archived', ${cols.updatedCol}=NOW()`
       : `${cols.statusCol}='archived'`;
 
-    const { rowCount } = await pool.query(
-      `UPDATE proposals SET ${setSql} WHERE ${whereSql} AND ${cols.statusCol} <> 'archived'`,
+    const { rowCount: rc1 } = await pool.query(
+      `UPDATE proposals SET ${setSql} WHERE ${where_proposals} AND ${cols.statusCol} <> 'archived'`,
       params
     );
 
-    return res.json({ ok: true, affected: rowCount });
+    // 2. ✅ SOLUTION: Archive on 'proposer_profiles'
+    const { rowCount: rc2 } = await pool.query(
+      `UPDATE proposer_profiles SET status='archived', updated_at=NOW() WHERE ${where_proposer_profiles} AND status <> 'archived'`,
+      params
+    );
+
+    return res.json({ ok: true, affected: (rc1 + rc2) });
   } catch (e) {
     console.error('archive entity error', e);
     return res.status(500).json({ error: 'Failed to archive entity' });
   }
 });
 
+// REPLACE your old unarchive route with this one
 app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
   try {
-    const sel = normalizeEntitySelector(req.body || {});
-    const { whereSql, params, cols } = await buildEntityWhereAsync(pool, sel);
-    if (!whereSql) return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
-    if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
+    const sel = normalizeEntitySelector(req.body || {}); //
+
+    // Use the new helper to build WHERE for both tables
+    const { clauses_proposals, clauses_proposer_profiles, params } = buildWhereClausesForBoth(sel);
+
+    if (clauses_proposals.length === 0) {
+      return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
+    }
+
+    const where_proposals = clauses_proposals.join(' AND ');
+    const where_proposer_profiles = clauses_proposer_profiles.join(' AND ');
 
     const toStatusRaw = String(req.body?.toStatus || 'pending').toLowerCase();
     const toStatus = ['pending','approved','rejected'].includes(toStatusRaw) ? toStatusRaw : 'pending';
 
-    params.push(toStatus);
-    const setSql = cols.updatedCol
-      ? `${cols.statusCol}=$${params.length}, ${cols.updatedCol}=NOW()`
-      : `${cols.statusCol}=$${params.length}`;
+    const params_with_status = [...params, toStatus];
 
-    const { rowCount } = await pool.query(
-      `UPDATE proposals SET ${setSql} WHERE ${whereSql} AND ${cols.statusCol}='archived'`,
+    // 1. Unarchive on 'proposals'
+    const { cols } = await detectProposalCols(pool); //
+    if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
+
+    const setSql = cols.updatedCol
+      ? `${cols.statusCol}=$${params_with_status.length}, ${cols.updatedCol}=NOW()`
+      : `${cols.statusCol}=$${params_with_status.length}`;
+
+    const { rowCount: rc1 } = await pool.query(
+      `UPDATE proposals SET ${setSql} WHERE ${where_proposals} AND ${cols.statusCol}='archived'`,
+      params_with_status
+    );
+
+    // 2. ✅ SOLUTION: Unarchive on 'proposer_profiles' (set to 'active')
+    const { rowCount: rc2 } = await pool.query(
+      `UPDATE proposer_profiles SET status='active', updated_at=NOW() WHERE ${where_proposer_profiles} AND status = 'archived'`,
       params
     );
 
-    return res.json({ ok: true, affected: rowCount, toStatus });
+    return res.json({ ok: true, affected: (rc1 + rc2), toStatus });
   } catch (e) {
     console.error('unarchive entity error', e);
     return res.status(500).json({ error: 'Failed to unarchive entity' });
