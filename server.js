@@ -2975,7 +2975,7 @@ function normalizeEntitySelector(body = {}) {
   };
 }
 
-// --- Build WHERE using all present cols; also handle entityKey fallback
+// ✅ This is the correct version. Use this for both.
 async function buildEntityWhereAsync(pool, sel) {
   const cols = await detectProposalCols(pool);
   const clauses = [];
@@ -3005,7 +3005,8 @@ async function buildEntityWhereAsync(pool, sel) {
     }
   }
 
-  const whereSql = clauses.length ? clauses.join(' OR ') : '';
+  // If we have multiple clauses (wallet, email, entity), join with AND
+  const whereSql = clauses.length ? clauses.join(' AND ') : ''; // <--- THIS IS THE FIX
   return { whereSql, params, cols };
 }
 
@@ -3672,7 +3673,7 @@ function normalizeEntitySelector(body = {}) {
   };
 }
 
-// ---- Build WHERE using any present columns; also supports entityKey fallback
+// ✅ This is the correct version. Use this for both.
 async function buildEntityWhereAsync(pool, sel) {
   const cols = await detectProposalCols(pool);
   const clauses = [];
@@ -3688,12 +3689,12 @@ async function buildEntityWhereAsync(pool, sel) {
     }
   };
 
-  // 1) explicit fields
+  // 1) explicit fields (any that are present)
   addEq(sel.wallet,       cols.walletCols);
   addEq(sel.contactEmail, cols.emailCols);
   addEq(sel.entity,       cols.orgCols);
 
-  // 2) fallback single key from old UIs (match against any column)
+  // 2) fallback: id/entityKey from /admin/proposers (match across any col)
   if (!clauses.length && sel.entityKey) {
     const all = [...cols.walletCols, ...cols.emailCols, ...cols.orgCols];
     if (all.length) {
@@ -3702,7 +3703,8 @@ async function buildEntityWhereAsync(pool, sel) {
     }
   }
 
-  const whereSql = clauses.length ? clauses.join(' OR ') : '';
+  // If we have multiple clauses (wallet, email, entity), join with AND
+  const whereSql = clauses.length ? clauses.join(' AND ') : ''; // <--- THIS IS THE FIX
   return { whereSql, params, cols };
 }
 
