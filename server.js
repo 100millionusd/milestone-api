@@ -3713,24 +3713,32 @@ async function buildEntityWhereAsync(pool, sel) {
 // ==============================
 
 // ADD THIS NEW HELPER FUNCTION
+// ADD THIS NEW HELPER FUNCTION
 function buildWhereClausesForBoth(sel) {
   const clauses_proposals = [];
   const clauses_proposer_profiles = [];
   const params = [];
 
+  // This logic uses the 'sel' object to build params
   if (sel.wallet) {
     params.push(sel.wallet);
+    // proposals table has owner_wallet
     clauses_proposals.push(`(LOWER(TRIM(owner_wallet)) = LOWER(TRIM($${params.length})))`);
+    // proposer_profiles table has wallet_address
     clauses_proposer_profiles.push(`(LOWER(TRIM(wallet_address)) = LOWER(TRIM($${params.length})))`);
   }
   if (sel.contactEmail) {
     params.push(sel.contactEmail);
+    // proposals table has contact
     clauses_proposals.push(`(LOWER(TRIM(contact)) = LOWER(TRIM($${params.length})))`);
+    // proposer_profiles table has contact_email
     clauses_proposer_profiles.push(`(LOWER(TRIM(contact_email)) = LOWER(TRIM($${params.length})))`);
   }
   if (sel.entity) {
     params.push(sel.entity);
+    // proposals table has org_name
     clauses_proposals.push(`(LOWER(TRIM(org_name)) = LOWER(TRIM($${params.length})))`);
+    // proposer_profiles table has org_name
     clauses_proposer_profiles.push(`(LOWER(TRIM(org_name)) = LOWER(TRIM($${params.length})))`);
   }
   return { clauses_proposals, clauses_proposer_profiles, params };
@@ -3777,7 +3785,7 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
   }
 });
 
-// REPLACE your old unarchive route with this one
+/// REPLACE your old unarchive route with this one
 app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
   try {
     const sel = normalizeEntitySelector(req.body || {}); //
