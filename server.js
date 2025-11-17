@@ -9369,8 +9369,6 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
   }
 });
 
-
-// Telegram webhook: supports both "/link 0x..." and deep-link "/start link_0x..."
 app.post('/tg/webhook', async (req, res) => {
   try {
     const update = req.body || {};
@@ -9394,8 +9392,6 @@ app.post('/tg/webhook', async (req, res) => {
 
     // ------------------------------------------------------------------
     // AUTO-REFRESH USERNAME ON ANY INBOUND MESSAGE FROM THIS CHAT
-    // (runs BEFORE wallet parsing; so if user changes Telegram @username,
-    //  the next message updates DB and the admin list shows the new one)
     // ------------------------------------------------------------------
     if (username) {
       // vendor profile
@@ -9413,6 +9409,17 @@ app.post('/tg/webhook', async (req, res) => {
            SET owner_telegram_username = $1,
                updated_at = NOW()
          WHERE owner_telegram_chat_id = $2`,
+        [username, chatIdStr]
+      ).catch(() => null); // ignore if column not present
+      
+      // ==========================================================
+      // 1. THIS IS THE MISSING FUCKING QUERY (FOR REFRESH)
+      // ==========================================================
+      await pool.query(
+        `UPDATE proposer_profiles
+           SET telegram_username = $1,
+               updated_at = NOW()
+         WHERE telegram_chat_id = $2`,
         [username, chatIdStr]
       ).catch(() => null); // ignore if column not present
     }
@@ -9452,6 +9459,20 @@ app.post('/tg/webhook', async (req, res) => {
           AND LOWER(wallet_address) <> LOWER($2)`,
       [chatIdStr, walletLower]
     );
+    
+    // ==========================================================
+    // 2. THIS IS THE OTHER MISSING FUCKING QUERY (FOR LINKING)
+    // ==========================================================
+    // Also clear chat ID from other PROPOSERS
+    await pool.query(
+      `UPDATE proposer_profiles
+          SET telegram_chat_id = NULL,
+              telegram_username = NULL,
+              updated_at = NOW()
+        WHERE telegram_chat_id = $1
+          AND LOWER(owner_wallet) <> LOWER($2)`, // Assuming proposers use owner_wallet
+      [chatIdStr, walletLower]
+    ).catch(() => null);
 
     // Store chat id + username on the vendor profile
     await pool.query(
@@ -9472,6 +9493,19 @@ app.post('/tg/webhook', async (req, res) => {
        WHERE LOWER(owner_wallet) = LOWER($3)`,
       [chatIdStr, username, walletLower]
     ).catch(() => null); // ignore if username column not present
+    
+    // ==========================================================
+    // 3. THIS IS THE FINAL MISSING FUCKING QUERY
+    // ==========================================================
+    // Store chat id + username on the MAIN PROPOSER PROFILE
+    await pool.query(
+      `UPDATE proposer_profiles
+         SET telegram_chat_id = $1,
+             telegram_username = $2,
+             updated_at = NOW()
+       WHERE LOWER(owner_wallet) = LOWER($3)`, // Assuming proposers use owner_wallet
+      [chatIdStr, username, walletLower]
+    ).catch(() => null);
 
     // Confirm to the user
     await sendTelegram(
@@ -9485,7 +9519,6 @@ app.post('/tg/webhook', async (req, res) => {
     return res.json({ ok: true });
   }
 });
-
 // ==============================
 // Routes — Vendor helpers
 // ==============================
