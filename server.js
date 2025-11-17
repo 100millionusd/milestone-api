@@ -8983,15 +8983,15 @@ function _addrObj(addr, city = null, country = null) {
   return { ...o, addressText };
 }
 
-// server.js — VENDOR PROFILE (GET) — auth only, no vendor-role guard
 app.get('/vendor/profile', authRequired, async (req, res) => {
   try {
     const wallet = String(req.user?.address || req.user?.sub || '').toLowerCase();
-if (!wallet) return res.status(401).json({ error: 'unauthenticated' });
     if (!wallet) return res.status(401).json({ error: 'unauthenticated' });
 
+    // 1. [FIX] Added telegram_chat_id and telegram_username to the SQL query
     const { rows } = await pool.query(
-      `SELECT wallet_address, vendor_name, email, phone, website, address
+      `SELECT wallet_address, vendor_name, email, phone, website, address,
+              telegram_chat_id, telegram_username
          FROM vendor_profiles
         WHERE lower(wallet_address) = lower($1)
         LIMIT 1`,
@@ -9006,7 +9006,9 @@ if (!wallet) return res.status(401).json({ error: 'unauthenticated' });
         email: '',
         phone: '',
         website: '',
-        address: { line1: '', city: '', postalCode: '', country: '' }
+        address: { line1: '', city: '', postalCode: '', country: '' },
+        telegram_chat_id: null,
+        telegram_username: null,
       });
     }
 
@@ -9030,20 +9032,25 @@ if (!wallet) return res.status(401).json({ error: 'unauthenticated' });
       addr = { line1: r.address || '', city: '', postalCode: '', country: '' };
     }
 
+    // 2. [FIX] Added the new fields to the JSON response
+    // The frontend page checks for all these property names
     return res.json({
       walletAddress: r.wallet_address,
       vendorName: r.vendor_name || '',
       email: r.email || '',
       phone: r.phone || '',
       website: r.website || '',
-      address: addr
+      address: addr,
+      telegram_chat_id: r.telegram_chat_id,
+      telegramChatId: r.telegram_chat_id, // Alias for frontend
+      telegram_username: r.telegram_username,
+      telegramUsername: r.telegram_username // Alias for frontend
     });
   } catch (e) {
     console.error('GET /vendor/profile error:', e);
     return res.status(500).json({ error: 'failed_to_load_vendor_profile' });
   }
 });
-
 
 // ── PROPOSER PROFILE (Entity) — STRICTLY SEPARATE FROM VENDOR ──────────────────
 app.post('/proposer/profile', requireAuth, async (req, res) => {
