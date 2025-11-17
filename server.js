@@ -4306,6 +4306,7 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           NULLIF(pp.city,'')                  AS city,
           NULLIF(pp.country,'')               AS country,
           NULLIF(pp.telegram_chat_id::text,'')AS telegram_chat_id,
+          NULLIF(pp.telegram_username,'')     AS telegram_username,
           NULLIF(pp.whatsapp,'')              AS whatsapp,
           COALESCE(pp.status,'active')        AS status,
           pp.updated_at                       AS updated_at
@@ -4318,6 +4319,8 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           COALESCE(NULLIF(ents.org_name,''), props.entity_name, '')       AS entity_name,
           COALESCE(ents.contact_email, props.email)                       AS email,
           COALESCE(ents.phone, props.phone)                               AS phone,
+          COALESCE(ents.telegram_chat_id, props.telegram_chat_id)         AS telegram_chat_id,  
+          COALESCE(ents.telegram_username, props.telegram_username)       AS telegram_username, 
           COALESCE(ents.address_raw, props.address_raw)                   AS address_raw,
           COALESCE(ents.city, props.city)                                 AS city,
           COALESCE(ents.country, props.country)                           AS country,
@@ -4336,6 +4339,8 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
         entity_name,
         email,
         phone,
+        telegram_chat_id,  
+        telegram_username, 
         address_raw,
         city,
         country,
@@ -4364,6 +4369,8 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
       const city             = norm(r.city);
       const country          = norm(r.country);
       const flat             = [line1, city, country].filter(Boolean).join(', ') || null;
+      const telegramChatId   = norm(r.telegram_chat_id);   
+      const telegramUsername = norm(r.telegram_username); 
 
       return {
         entityName: r.entity_name || '',
@@ -4383,6 +4390,13 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
         ownerEmail: email,
         phone,
         whatsapp: phone,
+
+        // 5. ADDED THESE 5 LINES
+        telegramChatId: telegramChatId,
+        telegramUsername: telegramUsername,
+        telegramConnected: !!(telegramChatId || telegramUsername),
+        ownerTelegramUsername: telegramUsername, // For AdminEntitiesTable component
+        ownerTelegramChatId: telegramChatId,     // For AdminEntitiesTable component
 
         address: flat,
         addressText: flat,
