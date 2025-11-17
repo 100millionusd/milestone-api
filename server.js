@@ -9386,13 +9386,10 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
 app.post('/tg/webhook', async (req, res) => {
   try {
     const update = req.body || {};
-
-    // Extract chat id + username + message text (handle normal/callback cases)
     const from    = update?.message?.from || update?.callback_query?.from || {};
     const chatObj = update?.message?.chat || update?.callback_query?.message?.chat || {};
     const chatId  = chatObj?.id ?? from?.id;
-    const username = from?.username || chatObj?.username || null; // may be null
-
+    const username = from?.username || chatObj?.username || null;
     const textRaw =
       update?.message?.text ??
       update?.callback_query?.data ??
@@ -9400,50 +9397,46 @@ app.post('/tg/webhook', async (req, res) => {
       '';
     const text = String(textRaw).trim();
 
-    if (!chatId) return res.json({ ok: true }); // we need chatId at minimum
-
+    if (!chatId) return res.json({ ok: true });
     const chatIdStr = String(chatId);
 
     // ------------------------------------------------------------------
-    // AUTO-REFRESH USERNAME ON ANY INBOUND MESSAGE FROM THIS CHAT
+    // AUTO-REFRESH USERNAME
     // ------------------------------------------------------------------
     if (username) {
-      // vendor profile
+      // Update vendor_profiles
       await pool.query(
         `UPDATE vendor_profiles
            SET telegram_username = $1,
                updated_at = NOW()
          WHERE telegram_chat_id = $2`,
         [username, chatIdStr]
-      );
+      ).catch(() => null);
 
-      // proposals (if you have owner_telegram_username column)
+      // Update proposals
       await pool.query(
         `UPDATE proposals
            SET owner_telegram_username = $1,
                updated_at = NOW()
          WHERE owner_telegram_chat_id = $2`,
         [username, chatIdStr]
-      ).catch(() => null); // ignore if column not present
+      ).catch(() => null); 
       
-      // ==========================================================
-      // 1. THIS IS THE MISSING FUCKING QUERY (FOR REFRESH)
-      // ==========================================================
+      // Update proposer_profiles
       await pool.query(
         `UPDATE proposer_profiles
            SET telegram_username = $1,
                updated_at = NOW()
          WHERE telegram_chat_id = $2`,
         [username, chatIdStr]
-      ).catch(() => null); // ignore if column not present
+      ).catch(() => null);
     }
 
-    // If there's no text, we're done after the username refresh
     if (!text) return res.json({ ok: true });
 
-    // Parse wallet from either:
-    // 1) "/link 0xABC..."     (manual)
-    // 2) "/start link_0xABC"  (deep link)
+    // ------------------------------------------------------------------
+    // LINK NEW WALLET
+    // ------------------------------------------------------------------
     let wallet = '';
     if (/^\/link\s+/i.test(text)) {
       wallet = text.slice(6).trim();
@@ -9452,10 +9445,8 @@ app.post('/tg/webhook', async (req, res) => {
       if (m) wallet = m[1];
     }
 
-    // Ignore unrelated messages
     if (!wallet) return res.json({ ok: true });
 
-    // Validate wallet
     if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
       await sendTelegram([chatIdStr], 'Send: /link 0xYourWalletAddress');
       return res.json({ ok: true });
@@ -9463,7 +9454,9 @@ app.post('/tg/webhook', async (req, res) => {
 
     const walletLower = wallet.toLowerCase();
 
-    // Ensure a Telegram chat is NOT linked to multiple vendors
+    // --- Unlink this chat ID from any OTHER profiles ---
+    
+    // Clear from other vendors
     await pool.query(
       `UPDATE vendor_profiles
           SET telegram_chat_id = NULL,
@@ -9472,33 +9465,45 @@ app.post('/tg/webhook', async (req, res) => {
         WHERE telegram_chat_id = $1
           AND LOWER(wallet_address) <> LOWER($2)`,
       [chatIdStr, walletLower]
-    );
+    ).catch(() => null);
     
-    // ==========================================================
-    // 2. THIS IS THE OTHER MISSING FUCKING QUERY (FOR LINKING)
-    // ==========================================================
-    // Also clear chat ID from other PROPOSERS
+    // Clear from other proposer_profiles
     await pool.query(
       `UPDATE proposer_profiles
           SET telegram_chat_id = NULL,
               telegram_username = NULL,
               updated_at = NOW()
         WHERE telegram_chat_id = $1
-          AND LOWER(owner_wallet) <> LOWER($2)`, // Assuming proposers use owner_wallet
+          AND LOWER(wallet_address) <> LOWER($2)`, // Using 'wallet_address'
       [chatIdStr, walletLower]
     ).catch(() => null);
 
-    // Store chat id + username on the vendor profile
-    await pool.query(
-      `UPDATE vendor_profiles
-          SET telegram_chat_id = $1,
-              telegram_username = $2,
-              updated_at = NOW()
-        WHERE LOWER(wallet_address) = LOWER($3)`,
-      [chatIdStr, username, walletLower]
-    );
+    // --- Link this chat ID to the correct profile ---
 
-    // ALSO store chat id + username on proposals for proposers/entities
+    // ====================================================================
+    // 1. [THE FIX] UPSERT (INSERT OR UPDATE) 'vendor_profiles'
+    // ====================================================================
+    // This will create a new row if one doesn't exist for this wallet
+    await pool.query(
+      `INSERT INTO vendor_profiles (
+         wallet_address, 
+         telegram_chat_id, 
+         telegram_username, 
+         created_at, 
+         updated_at
+       )
+       VALUES ($1, $2, $3, NOW(), NOW())
+       ON CONFLICT (wallet_address)
+       DO UPDATE SET
+         telegram_chat_id = EXCLUDED.telegram_chat_id,
+         telegram_username = EXCLUDED.telegram_username,
+         updated_at = NOW()`,
+      [walletLower, chatIdStr, username]
+    ).catch((dbErr) => {
+      console.error("WEBHOOK VENDOR UPSERT FAILED:", dbErr);
+    });
+
+    // Link to proposals (This is an UPDATE, it's fine)
     await pool.query(
       `UPDATE proposals
          SET owner_telegram_chat_id = $1,
@@ -9506,33 +9511,44 @@ app.post('/tg/webhook', async (req, res) => {
              updated_at = NOW()
        WHERE LOWER(owner_wallet) = LOWER($3)`,
       [chatIdStr, username, walletLower]
-    ).catch(() => null); // ignore if username column not present
+    ).catch(() => null); 
     
-    // ==========================================================
-    // 3. THIS IS THE FINAL MISSING FUCKING QUERY
-    // ==========================================================
-    // Store chat id + username on the MAIN PROPOSER PROFILE
+    // ====================================================================
+    // 2. [THE FIX] UPSERT (INSERT OR UPDATE) 'proposer_profiles'
+    // ====================================================================
+    // This will create a new row if one doesn't exist for this wallet
     await pool.query(
-      `UPDATE proposer_profiles
-         SET telegram_chat_id = $1,
-             telegram_username = $2,
-             updated_at = NOW()
-       WHERE LOWER(owner_wallet) = LOWER($3)`, // Assuming proposers use owner_wallet
-      [chatIdStr, username, walletLower]
-    ).catch(() => null);
+      `INSERT INTO proposer_profiles (
+         wallet_address, 
+         telegram_chat_id, 
+         telegram_username, 
+         created_at, 
+         updated_at
+       )
+       VALUES ($1, $2, $3, NOW(), NOW())
+       ON CONFLICT (wallet_address)
+       DO UPDATE SET
+         telegram_chat_id = EXCLUDED.telegram_chat_id,
+         telegram_username = EXCLUDED.telegram_username,
+         updated_at = NOW()`,
+      [walletLower, chatIdStr, username]
+    ).catch((dbErr) => {
+      console.error("WEBHOOK PROPOSER UPSERT FAILED:", dbErr);
+    });
 
-    // Confirm to the user
+    // --- Confirm to user ---
     await sendTelegram(
       [chatIdStr],
       `✅ Telegram linked to ${wallet}${username ? ` as @${username}` : ''}`
     );
 
     return res.json({ ok: true });
-  } catch (_e) {
-    // Always 200 so Telegram doesn't retry forever
+  } catch (e) {
+    console.error("WEBHOOK GLOBAL ERROR:", e);
     return res.json({ ok: true });
   }
 });
+
 // ==============================
 // Routes — Vendor helpers
 // ==============================
