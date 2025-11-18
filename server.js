@@ -3600,21 +3600,40 @@ app.get("/test", (_req, res) => res.json({ ok: true }));
 // ==============================
 // Routes — Proposals
 // ==============================
+// ==============================
+// Routes — Proposals
+// ==============================
 app.get("/proposals", async (req, res) => {
   try {
-    const status = (req.query.status || "").toLowerCase().trim();
+    // 1. Determine if the caller is an admin
+    const isAdmin = (req.user?.role === 'admin') || (req.user?.sub && isAdminAddress(req.user.sub));
+
+    // 2. Parse query params
+    const statusParam = (req.query.status || "").toLowerCase().trim();
     const includeArchived = String(req.query.includeArchived || "").toLowerCase();
 
     let q = "SELECT * FROM proposals";
     const params = [];
+    const conditions = [];
 
-    if (status) {
-      q += " WHERE status=$1";
-      params.push(status);
-    } else if (!["true", "1", "yes"].includes(includeArchived)) {
-      q += " WHERE status != 'archived'";
+    // 3. Apply Filtering Logic
+    if (!isAdmin) {
+      // 🔒 SECURITY: Non-admins (Public/Guests/Vendors) see ONLY approved proposals
+      conditions.push("status = 'approved'");
+    } else {
+      // 🔓 ADMIN: Can filter by specific status, otherwise sees all non-archived
+      if (statusParam) {
+        params.push(statusParam);
+        conditions.push(`status = $${params.length}`);
+      } else if (!["true", "1", "yes"].includes(includeArchived)) {
+        conditions.push("status != 'archived'");
+      }
     }
 
+    // 4. Construct Query
+    if (conditions.length > 0) {
+      q += " WHERE " + conditions.join(" AND ");
+    }
     q += " ORDER BY created_at DESC";
 
     const { rows } = await pool.query(q, params);
@@ -3623,7 +3642,6 @@ app.get("/proposals", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 /// ==============================
 // Admin — “Entities” (proposers) helpers + routes  (REPLACE WHOLE SECTION)
 // ==============================
