@@ -3643,6 +3643,7 @@ app.get("/proposals", async (req, res) => {
   }
 });
 
+
 /// ==============================
 // Admin — “Entities” (proposers) helpers + routes  (REPLACE WHOLE SECTION)
 // ==============================
