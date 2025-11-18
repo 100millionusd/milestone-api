@@ -3642,6 +3642,7 @@ app.get("/proposals", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 /// ==============================
 // Admin — “Entities” (proposers) helpers + routes  (REPLACE WHOLE SECTION)
 // ==============================
