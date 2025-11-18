@@ -2158,40 +2158,54 @@ async function waitForPdfInfoFromDoc(doc, { maxMs = 12000, stepMs = 1500 } = {})
 // ==============================
 async function pinataUploadFile(file) {
   if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) throw new Error("Pinata not configured");
+  
   const form = new FormData();
   const buf = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data);
-  form.append("file", buf, { filename: file.name, contentType: file.mimetype });
+  
+  // 1. Tell form-data the length immediately (optimization)
+  form.append("file", buf, { 
+    filename: file.name, 
+    contentType: file.mimetype,
+    knownLength: buf.length 
+  });
+
+  // 2. Calculate explicit Content-Length (Critical for Pinata stability)
+  const length = await new Promise((resolve, reject) => {
+    form.getLength((err, len) => {
+      if (err) reject(err);
+      else resolve(len);
+    });
+  });
+
+  // 3. Send request with explicit length
   const { status, body } = await sendRequest(
     "POST",
     "https://api.pinata.cloud/pinning/pinFileToIPFS",
-    { ...form.getHeaders(), pinata_api_key: PINATA_API_KEY, pinata_secret_api_key: PINATA_SECRET_API_KEY, Accept: "application/json" },
+    { 
+      ...form.getHeaders(), 
+      "Content-Length": length,
+      pinata_api_key: PINATA_API_KEY, 
+      pinata_secret_api_key: PINATA_SECRET_API_KEY, 
+      Accept: "application/json" 
+    },
     form
   );
-  const json = JSON.parse(body || "{}");
-  if (status < 200 || status >= 300) throw new Error(json?.error || "Pinata error");
+
+  // 4. Safe JSON parsing (Prevents crash on HTML errors)
+  let json;
+  try {
+    json = JSON.parse(body || "{}");
+  } catch (e) {
+    console.error("[Pinata Error Body]:", body); // Log raw HTML to console for debugging
+    throw new Error(`Pinata returned non-JSON response (Status ${status})`);
+  }
+
+  if (status < 200 || status >= 300) {
+    throw new Error(json?.error || json?.message || `Pinata upload failed with status ${status}`);
+  }
+
   const cid = json.IpfsHash;
   return { cid, url: `https://${PINATA_GATEWAY}/ipfs/${cid}`, size: file.size, name: file.name };
-}
-
-async function pinataUploadJson(data) {
-  if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) throw new Error("Pinata not configured");
-  const payload = JSON.stringify({ pinataContent: data });
-  const { status, body } = await sendRequest(
-    "POST",
-    "https://api.pinata.cloud/pinning/pinJSONToIPFS",
-    {
-      "Content-Type": "application/json",
-      pinata_api_key: PINATA_API_KEY,
-      pinata_secret_api_key: PINATA_SECRET_API_KEY,
-      Accept: "application/json",
-      "Content-Length": Buffer.byteLength(payload),
-    },
-    payload
-  );
-  const json = JSON.parse(body || "{}");
-  if (status < 200 || status >= 300) throw new Error(json?.error || "Pinata error");
-  const cid = json.IpfsHash;
-  return { cid, url: `https://${PINATA_GATEWAY}/ipfs/${cid}` };
 }
 
 // --- Check if a CID is still pinned on Pinata (returns true when MISSING/unpinned) ---
