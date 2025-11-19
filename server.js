@@ -10911,17 +10911,22 @@ const { rows: bidRows } = await pool.query(
   [id]
 );
 
-// normalize attachments: ensure files is an array; parse json text; keep doc object or null
-const bidsOut = bidRows.map(r => {
-  let doc = r.doc;
-  if (typeof doc === 'string') { try { doc = JSON.parse(doc); } catch {} }
+// 2. INSERT THIS FIX: Hydrate bids with payment status (clears "Pending" if tx exists)
+    const hydratedBids = await Promise.all(
+      bidRows.map(b => overlayPaidFromMp(b, pool))
+    );
 
-  let files = r.files;
-  if (typeof files === 'string') { try { files = JSON.parse(files); } catch {} }
-  if (!Array.isArray(files)) files = files ? [files] : [];
+    // 3. Update the next line to use 'hydratedBids' instead of 'bidRows'
+    const bidsOut = hydratedBids.map(r => {
+      let doc = r.doc;
+      if (typeof doc === 'string') { try { doc = JSON.parse(doc); } catch {} }
 
-  return { ...r, doc: doc || null, files };
-});
+      let files = r.files;
+      if (typeof files === 'string') { try { files = JSON.parse(files); } catch {} }
+      if (!Array.isArray(files)) files = files ? [files] : [];
+
+      return { ...r, doc: doc || null, files };
+    });
 
 const bidIds = bidsOut.map(b => b.bid_id);
 
