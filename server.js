@@ -561,6 +561,8 @@ async function _finalizePaidInDb({ bidId, milestoneIndex, txHash, safeTxHash }) 
 }
 
 // --- Overlay "Paid" status from milestone_payments into bid.milestones for responses ---
+// server.js
+
 async function overlayPaidFromMp(bid, pool) {
   const bidId = bid.bid_id ?? bid.bidId;
   if (!bidId) return bid;
@@ -579,19 +581,25 @@ async function overlayPaidFromMp(bid, pool) {
     [bidId]
   );
 
-  if (!mpRows.length) {
-    return { ...bid, milestones: msArr };
-  }
-
+  // Create a map for O(1) lookup
   const byIdx = new Map(mpRows.map(r => [Number(r.milestone_index), r]));
 
-  // Pass 1: mark already-released as paid (no network calls)
+  // Pass 1: Rebuild status based strictly on milestone_payments table
   for (let i = 0; i < msArr.length; i++) {
     const r = byIdx.get(i);
-    if (!r) continue;
+    
+    // If no payment row exists in DB, clear any stuck "Pending" flag from the JSON
+    if (!r) {
+      if (msArr[i].paymentPending) {
+        msArr[i] = { ...msArr[i], paymentPending: false };
+      }
+      continue;
+    }
 
     const s = String(r.status || '').toLowerCase();
-    const alreadyReleased = s === 'released' || !!r.tx_hash || !!r.released_at;
+    // FIX: Use tx_hash existence as the source of truth
+    const hasTx = !!r.tx_hash && r.tx_hash.length > 10; 
+    const alreadyReleased = s === 'released' || hasTx || !!r.released_at;
 
     if (alreadyReleased) {
       const paidIso = r.released_at
@@ -604,27 +612,31 @@ async function overlayPaidFromMp(bid, pool) {
         safePaymentTxHash: msArr[i]?.safePaymentTxHash || r.safe_tx_hash || null,
         paymentDate: msArr[i]?.paymentDate || paidIso,
         paidAt: msArr[i]?.paidAt || paidIso,
-        paymentPending: false,
+        paymentPending: false, // <--- FORCE CLEAR
         status: 'paid',
       };
+    } else if (s === 'pending') {
+       // It is genuinely pending in the DB (no tx hash yet)
+       msArr[i].paymentPending = true;
     }
   }
 
-  // Build list of still-pending-with-safe rows, newest first
+  // ... (Keep the rest of Pass 2 Safe Logic exactly as it was) ...
+  // Build list of still-pending-with-safe rows
   let lookupsLeft =
     process.env.SAFE_LOOKUPS_PER_REQUEST !== undefined
       ? Math.max(0, Math.floor(Number(process.env.SAFE_LOOKUPS_PER_REQUEST)))
-      : SAFE_LOOKUPS_PER_REQUEST;
+      : 8; // (SAFE_LOOKUPS_PER_REQUEST default)
 
   const pending = mpRows
     .filter(r => {
       const s = String(r.status || '').toLowerCase();
-      const alreadyReleased = s === 'released' || !!r.tx_hash || !!r.released_at;
+      const hasTx = !!r.tx_hash && r.tx_hash.length > 10;
+      const alreadyReleased = s === 'released' || hasTx || !!r.released_at;
       return !alreadyReleased && r.safe_tx_hash != null;
     })
     .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
 
-  // Pass 2: spend lookup budget; handle replaced Safe tx at same nonce
   const tasks = [];
   for (const r of pending) {
     if (lookupsLeft <= 0) break;
@@ -637,7 +649,6 @@ async function overlayPaidFromMp(bid, pool) {
     const nonce = r.safe_nonce ?? null;
 
     tasks.push((async () => {
-      // 2a) Check the recorded safe tx hash
       const st = await _getSafeTxStatus(safeHash);
       if (st?.isExecuted) {
         const iso = new Date().toISOString();
@@ -654,7 +665,6 @@ async function overlayPaidFromMp(bid, pool) {
         return;
       }
 
-      // 2b) Fallback: if a different Safe tx at the SAME NONCE got executed (rebroadcast / replacement)
       const alt = await _findExecutedByNonce(nonce);
       if (alt?.isExecuted) {
         const iso = new Date().toISOString();
@@ -670,8 +680,8 @@ async function overlayPaidFromMp(bid, pool) {
         await _finalizePaidInDb({ bidId, milestoneIndex: idx, txHash: alt.txHash, safeTxHash: alt.safeTxHash });
         return;
       }
-
-      // 2c) Still pending — keep in-flight markers for the UI
+      
+      // Still pending
       msArr[idx] = {
         ...(msArr[idx] || {}),
         safePaymentTxHash: msArr[idx]?.safePaymentTxHash || safeHash,
@@ -682,21 +692,7 @@ async function overlayPaidFromMp(bid, pool) {
       };
     })());
   }
-
-  // Any remaining pending we didn’t check (budget spent) → leave as submitted
-  for (const r of pending.slice(lookupsLeft < 0 ? 0 : SAFE_LOOKUPS_PER_REQUEST)) {
-    const idx = Number(r.milestone_index);
-    if (!Number.isFinite(idx)) continue;
-    msArr[idx] = {
-      ...(msArr[idx] || {}),
-      safePaymentTxHash: msArr[idx]?.safePaymentTxHash || r.safe_tx_hash,
-      safeTxHash: msArr[idx]?.safeTxHash || r.safe_tx_hash,
-      safeNonce: msArr[idx]?.safeNonce ?? r.safe_nonce ?? null,
-      safeStatus: msArr[idx]?.safeStatus || 'submitted',
-      paymentPending: true,
-    };
-  }
-
+  
   if (tasks.length) await Promise.all(tasks);
 
   return { ...bid, milestones: msArr };
