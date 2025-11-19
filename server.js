@@ -731,18 +731,21 @@ async function attachPaymentState(bids) {
       ? b.milestones
       : JSON.parse(b.milestones || '[]');
 
-    milestones = milestones.map((m, i) => {
+ milestones = milestones.map((m, i) => {
       const hit = byKey.get(`${bidId}:${i}`);
       if (!hit) return m;
 
-      if (hit.status === 'pending') {
+      // FIX: Check if tx_hash is missing. If a hash exists, treat it as released/paid.
+      if (hit.status === 'pending' && !hit.tx_hash) {
         // show the amber "Payment Pending" pill and hide the green button
         return { ...m, paymentPending: true };
       }
-      if (hit.status === 'released') {
+      
+      // If released OR if we have a tx_hash (even if status is pending)
+      if (hit.status === 'released' || hit.tx_hash) {
         // make sure the UI sees it as paid
         const tx = hit.tx_hash || m.paymentTxHash || null;
-        return { ...m, paymentTxHash: tx, paid: true };
+        return { ...m, paymentTxHash: tx, paid: true, paymentPending: false };
       }
       return m;
     });
