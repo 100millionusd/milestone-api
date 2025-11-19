@@ -2662,7 +2662,7 @@ class BlockchainService {
     }
   }
 
-  async sendToken(tokenSymbol, toAddress, amount) {
+ async sendToken(tokenSymbol, toAddress, amount) {
     if (!this.signer) throw new Error("Blockchain not configured");
     const token = TOKENS[tokenSymbol];
     const contract = new ethers.Contract(token.address, ERC20_ABI, this.signer);
@@ -2670,12 +2670,18 @@ class BlockchainService {
     const amt = ethers.utils.parseUnits(amount.toString(), decimals);
 
     const balance = await contract.balanceOf(this.signer.address);
-    if (balance < amt) throw new Error("Insufficient balance");
+    if (balance.lt(amt)) throw new Error("Insufficient balance");
 
+    // --- CHANGED SECTION START ---
+    // Send the transaction
     const tx = await contract.transfer(toAddress, amt);
-    const receipt = await tx.wait();
-    if (!receipt.status) throw new Error("Transaction failed");
-    return { hash: receipt.hash, amount, token: tokenSymbol };
+    
+    // CRITICAL FIX: Do NOT await tx.wait() here. 
+    // Return the hash immediately so the database gets updated instantly.
+    console.log(`[Blockchain] Sent ${amount} ${tokenSymbol} -> ${toAddress}. Hash: ${tx.hash}`);
+    
+    return { hash: tx.hash, amount, token: tokenSymbol };
+    // --- CHANGED SECTION END ---
   }
 
   async getBalance(tokenSymbol) {
