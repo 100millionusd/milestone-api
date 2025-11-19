@@ -6703,6 +6703,8 @@ app.post('/bids/:id/analyze', adminOrBidOwnerGuard, async (req, res) => {
 // ==============================
 // Routes — Proofs
 // ==============================
+// server.js
+
 app.get("/proofs", async (req, res) => {
   try {
     const bidId = Number(req.query.bidId);
@@ -6711,22 +6713,33 @@ app.get("/proofs", async (req, res) => {
       return res.status(400).json({ error: "Provide bidId or proposalId" });
     }
 
+    // FIX: Added LEFT JOIN to milestone_payments (mp) to fetch payment status and tx_hash
+    // We coalesce payment_tx_hash: prefer the one in milestone_payments, fallback to proof/bid logic if needed
+    const selectSql = `
+      SELECT
+        p.*,
+        mp.tx_hash AS payment_tx_hash,
+        mp.safe_tx_hash AS safe_payment_tx_hash,
+        mp.status AS payment_status,
+        mp.released_at AS paid_at
+      FROM proofs p
+      LEFT JOIN milestone_payments mp
+        ON mp.bid_id = p.bid_id
+        AND mp.milestone_index = p.milestone_index
+    `;
+
     let rows;
     if (Number.isFinite(bidId)) {
       ({ rows } = await pool.query(
-        `SELECT p.*
-           FROM proofs p
-          WHERE p.bid_id = $1
-          ORDER BY p.proof_id ASC`,
+        `${selectSql} WHERE p.bid_id = $1 ORDER BY p.proof_id ASC`,
         [bidId]
       ));
     } else {
       ({ rows } = await pool.query(
-        `SELECT p.*
-           FROM proofs p
-           JOIN bids b ON b.bid_id = p.bid_id
-          WHERE b.proposal_id = $1
-          ORDER BY p.proof_id ASC`,
+        `${selectSql}
+         JOIN bids b ON b.bid_id = p.bid_id
+         WHERE b.proposal_id = $1
+         ORDER BY p.proof_id ASC`,
         [proposalId]
       ));
     }
@@ -6737,7 +6750,15 @@ app.get("/proofs", async (req, res) => {
       o.files      = coerceJson(o.files)      || [];
       o.fileMeta   = coerceJson(o.fileMeta)   || [];
       o.aiAnalysis = coerceJson(o.aiAnalysis) || null;
-      o.geo        = await buildSafeGeoForProof(o); // safe city/state/country (+rounded coords)
+      o.geo        = await buildSafeGeoForProof(o);
+
+      // FIX: Explicitly set 'paid' flag if we found a hash or 'released' status
+      if (o.paymentTxHash || o.paymentStatus === 'released') {
+        o.paid = true;
+        // Ensure tx hash is visible even if only found in mp table
+        o.paymentTxHash = o.paymentTxHash || r.payment_tx_hash;
+      }
+
       return o;
     }));
 
