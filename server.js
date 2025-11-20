@@ -2155,89 +2155,46 @@ async function waitForPdfInfoFromDoc(doc, { maxMs = 12000, stepMs = 1500 } = {})
 // ==============================
 // Pinata / IPFS
 // ==============================
+const { Readable } = require('stream');
+const pinataSDK = require('@pinata/sdk');
+const pinata = pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECRET_API_KEY);
+
 async function pinataUploadFile(file) {
-  if (!PINATA_API_KEY || !PINATA_SECRET_API_KEY) throw new Error("Pinata not configured");
-  
-  const form = new FormData();
-  const buf = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data);
-  
-  // 1. Tell form-data the length immediately (optimization)
-  form.append("file", buf, { 
-    filename: file.name, 
-    contentType: file.mimetype,
-    knownLength: buf.length 
-  });
+  if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
+    throw new Error("Pinata not configured");
+  }
 
-  // 2. Calculate explicit Content-Length (Critical for Pinata stability)
-  const length = await new Promise((resolve, reject) => {
-    form.getLength((err, len) => {
-      if (err) reject(err);
-      else resolve(len);
-    });
-  });
+  // 1. Convert the Buffer (RAM) into a Readable Stream
+  const stream = Readable.from(file.data);
+  
+  // 2. IMPORTANT: The SDK needs a 'path' property to name the file correctly
+  // Without this, Pinata rejects the stream because it doesn't know the filetype.
+  stream.path = file.name; 
 
-  // 3. Send request with explicit length
-  const { status, body } = await sendRequest(
-    "POST",
-    "https://api.pinata.cloud/pinning/pinFileToIPFS",
-    { 
-      ...form.getHeaders(), 
-      "Content-Length": length,
-      pinata_api_key: PINATA_API_KEY, 
-      pinata_secret_api_key: PINATA_SECRET_API_KEY, 
-      Accept: "application/json" 
+  const options = {
+    pinataMetadata: {
+      name: file.name,
     },
-    form
-  );
-
-  // 4. Safe JSON parsing (Prevents crash on HTML errors)
-  let json;
-  try {
-    json = JSON.parse(body || "{}");
-  } catch (e) {
-    console.error("[Pinata Error Body]:", body); // Log raw HTML to console for debugging
-    throw new Error(`Pinata returned non-JSON response (Status ${status})`);
-  }
-
-  if (status < 200 || status >= 300) {
-    throw new Error(json?.error || json?.message || `Pinata upload failed with status ${status}`);
-  }
-
-  const cid = json.IpfsHash;
-  return { cid, url: `https://${PINATA_GATEWAY}/ipfs/${cid}`, size: file.size, name: file.name };
-}
-
-// --- Check if a CID is still pinned on Pinata (returns true when MISSING/unpinned) ---
-async function isMissingOnPinata(cid) {
-  if (!cid) return false;
-
-  // We support either a JWT or key/secret (use whichever you already have configured)
-  const hasJwt = !!PINATA_JWT;
-  const hasKeys = !!PINATA_API_KEY && !!PINATA_SECRET_API_KEY;
-  if (!hasJwt && !hasKeys) {
-    // Not configured to query Pinata — fall back to 'alive' checks only
-    return false;
-  }
-
-  const url = `https://api.pinata.cloud/data/pinList?hashContains=${encodeURIComponent(cid)}&status=pinned&pageLimit=1`;
-
-  const headers = { Accept: "application/json" };
-  if (hasJwt) {
-    headers.Authorization = `Bearer ${PINATA_JWT}`;
-  } else {
-    headers.pinata_api_key = PINATA_API_KEY;
-    headers.pinata_secret_api_key = PINATA_SECRET_API_KEY;
-  }
+    pinataOptions: {
+      cidVersion: 0,
+    }
+  };
 
   try {
-    const { status, body } = await sendRequest("GET", url, headers);
-    if (status < 200 || status >= 300) return false; // treat Pinata API hiccups as "unknown" (don’t flag)
-    const json = JSON.parse(body || "{}");
-    const rows = json?.rows || json?.items || [];
-    // If zero pinned rows returned, consider it unpinned/deleted on Pinata
-    return !rows || rows.length === 0;
-  } catch {
-    return false; // network error => don't flag
+    // 3. Upload using the official SDK
+    const result = await pinata.pinFileToIPFS(stream, options);
+
+    // 4. Return the exact format your frontend expects
+    return {
+      cid: result.IpfsHash,
+      url: `https://gateway.pinata.cloud/ipfs/${result.IpfsHash}`,
+      name: file.name,
+      size: result.PinSize, 
+      timestamp: result.Timestamp
+    };
+  } catch (err) {
+    console.error("Pinata SDK Error:", err);
+    throw new Error("Pinata upload failed: " + err.message);
   }
 }
 
