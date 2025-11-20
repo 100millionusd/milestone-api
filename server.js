@@ -2158,10 +2158,10 @@ async function waitForPdfInfoFromDoc(doc, { maxMs = 12000, stepMs = 1500 } = {})
 const { Readable } = require('stream');
 const pinataSDK = require('@pinata/sdk');
 
-// Initialize with 'new' (Critical!)
+// Initialize SDK
 const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECRET_API_KEY);
 
-// Helper to wait (sleep)
+// Helper: Wait with jitter (randomness) to prevent synchronized retries
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function pinataUploadFile(file) {
@@ -2169,21 +2169,22 @@ async function pinataUploadFile(file) {
     throw new Error("Pinata not configured");
   }
 
-  const maxRetries = 3;
+  // Increase max retries to 5 to be very safe
+  const maxRetries = 5;
   let attempt = 0;
 
   while (attempt < maxRetries) {
     try {
-      // 1. Re-create the stream for every attempt (streams get consumed!)
+      // 1. Create fresh stream for this attempt
       const stream = Readable.from(file.data);
-      stream.path = file.name; // Critical for Pinata
+      stream.path = file.name;
 
       const options = {
         pinataMetadata: { name: file.name },
         pinataOptions: { cidVersion: 0 }
       };
 
-      // 2. Try to Upload
+      // 2. Try Upload
       const result = await pinata.pinFileToIPFS(stream, options);
 
       return {
@@ -2195,16 +2196,21 @@ async function pinataUploadFile(file) {
       };
 
     } catch (err) {
-      // 3. Check if we got Rate Limited
+      // 3. Check for Rate Limit errors
       const isRateLimit = err?.reason === 'RATE_LIMITED' || 
                           (err?.details && String(err.details).includes('slow down'));
 
       if (isRateLimit && attempt < maxRetries - 1) {
-        console.warn(`[Pinata] Rate limited. Retrying in 2 seconds... (Attempt ${attempt + 1})`);
-        await delay(2000); // Wait 2 seconds before trying again
+        // EXPONENTIAL BACKOFF: 2s -> 4s -> 8s -> 16s
+        // We add Math.random() * 1000 to prevent two uploads from retrying at the exact same millisecond
+        const waitTime = Math.pow(2, attempt + 1) * 1000 + (Math.random() * 1000);
+        
+        console.warn(`[Pinata] Rate limited. Pausing for ${Math.round(waitTime)}ms... (Attempt ${attempt + 1}/${maxRetries})`);
+        
+        await delay(waitTime);
         attempt++;
       } else {
-        // Real error (or out of retries) -> Crash
+        // If it's not a rate limit (e.g. auth error) or we ran out of retries
         console.error("Pinata SDK Error:", err);
         throw new Error("Pinata upload failed: " + (err.details || err.message));
       }
