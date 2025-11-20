@@ -2158,41 +2158,57 @@ async function waitForPdfInfoFromDoc(doc, { maxMs = 12000, stepMs = 1500 } = {})
 const { Readable } = require('stream');
 const pinataSDK = require('@pinata/sdk');
 
-// ✅ FIX: Added 'new' keyword here. This was the cause of the crash.
+// Initialize with 'new' (Critical!)
 const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECRET_API_KEY);
+
+// Helper to wait (sleep)
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function pinataUploadFile(file) {
   if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
     throw new Error("Pinata not configured");
   }
 
-  // 1. Convert Buffer to Stream
-  const stream = Readable.from(file.data);
-  stream.path = file.name; // Critical for Pinata to detect file type
+  const maxRetries = 3;
+  let attempt = 0;
 
-  const options = {
-    pinataMetadata: {
-      name: file.name,
-    },
-    pinataOptions: {
-      cidVersion: 0,
+  while (attempt < maxRetries) {
+    try {
+      // 1. Re-create the stream for every attempt (streams get consumed!)
+      const stream = Readable.from(file.data);
+      stream.path = file.name; // Critical for Pinata
+
+      const options = {
+        pinataMetadata: { name: file.name },
+        pinataOptions: { cidVersion: 0 }
+      };
+
+      // 2. Try to Upload
+      const result = await pinata.pinFileToIPFS(stream, options);
+
+      return {
+        cid: result.IpfsHash,
+        url: `https://gateway.pinata.cloud/ipfs/${result.IpfsHash}`,
+        name: file.name,
+        size: result.PinSize,
+        timestamp: result.Timestamp
+      };
+
+    } catch (err) {
+      // 3. Check if we got Rate Limited
+      const isRateLimit = err?.reason === 'RATE_LIMITED' || 
+                          (err?.details && String(err.details).includes('slow down'));
+
+      if (isRateLimit && attempt < maxRetries - 1) {
+        console.warn(`[Pinata] Rate limited. Retrying in 2 seconds... (Attempt ${attempt + 1})`);
+        await delay(2000); // Wait 2 seconds before trying again
+        attempt++;
+      } else {
+        // Real error (or out of retries) -> Crash
+        console.error("Pinata SDK Error:", err);
+        throw new Error("Pinata upload failed: " + (err.details || err.message));
+      }
     }
-  };
-
-  try {
-    // 2. Upload using the SDK instance
-    const result = await pinata.pinFileToIPFS(stream, options);
-
-    return {
-      cid: result.IpfsHash,
-      url: `https://gateway.pinata.cloud/ipfs/${result.IpfsHash}`,
-      name: file.name,
-      size: result.PinSize,
-      timestamp: result.Timestamp
-    };
-  } catch (err) {
-    console.error("Pinata SDK Error:", err);
-    throw new Error("Pinata upload failed: " + err.message);
   }
 }
 
