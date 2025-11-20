@@ -2157,19 +2157,18 @@ async function waitForPdfInfoFromDoc(doc, { maxMs = 12000, stepMs = 1500 } = {})
 // ==============================
 const { Readable } = require('stream');
 const pinataSDK = require('@pinata/sdk');
-const pinata = pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECRET_API_KEY);
+
+// ✅ FIX: Added 'new' keyword here. This was the cause of the crash.
+const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECRET_API_KEY);
 
 async function pinataUploadFile(file) {
   if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
     throw new Error("Pinata not configured");
   }
 
-  // 1. Convert the Buffer (RAM) into a Readable Stream
+  // 1. Convert Buffer to Stream
   const stream = Readable.from(file.data);
-  
-  // 2. IMPORTANT: The SDK needs a 'path' property to name the file correctly
-  // Without this, Pinata rejects the stream because it doesn't know the filetype.
-  stream.path = file.name; 
+  stream.path = file.name; // Critical for Pinata to detect file type
 
   const options = {
     pinataMetadata: {
@@ -2181,15 +2180,14 @@ async function pinataUploadFile(file) {
   };
 
   try {
-    // 3. Upload using the official SDK
+    // 2. Upload using the SDK instance
     const result = await pinata.pinFileToIPFS(stream, options);
 
-    // 4. Return the exact format your frontend expects
     return {
       cid: result.IpfsHash,
       url: `https://gateway.pinata.cloud/ipfs/${result.IpfsHash}`,
       name: file.name,
-      size: result.PinSize, 
+      size: result.PinSize,
       timestamp: result.Timestamp
     };
   } catch (err) {
