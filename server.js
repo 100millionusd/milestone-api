@@ -6470,16 +6470,24 @@ Rules:
     { type: 'text', text: `User request: ${lastUserText}\n\nCompare BEFORE (proposal docs) vs AFTER (proofs) images.` },
   ];
 
-  if (beforeImages.length) {
+if (beforeImages.length) {
     userVisionContent.push({ type: 'text', text: 'BEFORE (from proposal):' });
-    for (const f of beforeImages) userVisionContent.push({ type: 'image_url', image_url: { url: f.url } });
+    for (const f of beforeImages) {
+      // 🛡️ FIX: Remove trailing dot/punctuation so OpenAI doesn't crash
+      const clean = (f.url || "").trim().replace(/[.,;]+$/, "");
+      userVisionContent.push({ type: 'image_url', image_url: { url: clean } });
+    }
   } else {
     userVisionContent.push({ type: 'text', text: 'BEFORE: (none attached in proposal docs)' });
   }
 
-  if (afterImages.length) {
+ if (afterImages.length) {
     userVisionContent.push({ type: 'text', text: 'AFTER (from proofs):' });
-    for (const f of afterImages) userVisionContent.push({ type: 'image_url', image_url: { url: f.url } });
+    for (const f of afterImages) {
+      // 🛡️ FIX: Clean URL here too
+      const clean = (f.url || "").trim().replace(/[.,;]+$/, "");
+      userVisionContent.push({ type: 'image_url', image_url: { url: clean } });
+    }
   } else {
     userVisionContent.push({ type: 'text', text: 'AFTER: (no proof images found)' });
   }
