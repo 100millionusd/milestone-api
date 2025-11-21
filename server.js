@@ -6334,11 +6334,16 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
 
       if (pdfFile && pdfFile.url) {
         try {
-          const info = await withTimeout(
-            waitForPdfInfoFromDoc({ url: pdfFile.url, name: pdfFile.name || 'attachment.pdf', mimetype: 'application/pdf' }),
-            8000,
-            () => ({ used: false, reason: 'timeout' })
-          );
+const info = await withTimeout(
+  waitForPdfInfoFromDoc({ 
+    // 🛡️ FIX: Remove trailing dot/punctuation before downloading
+    url: (pdfFile.url || "").trim().replace(/[.,;]+$/, ""), 
+    name: pdfFile.name || 'attachment.pdf', 
+    mimetype: 'application/pdf' 
+  }),
+  8000,
+  () => ({ used: false, reason: 'timeout' })
+);
           if (info.used) {
             const txt = (info.text || '').slice(0, 6000);
             pdfNote = `PDF EXTRACT (truncated): """${txt}"""`;
