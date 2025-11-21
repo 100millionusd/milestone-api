@@ -2320,8 +2320,10 @@ async function checkCidAlive(cid) {
 }
 
 /** Fetch a URL into a Buffer (supports mypinata.cloud auth + public fallbacks) */
+/** Fetch a URL into a Buffer (supports mypinata.cloud auth + public fallbacks) */
 async function fetchAsBuffer(urlStr) {
-  const orig = String(urlStr);
+  // 🛡️ SANITIZE: Remove trailing dots/punctuation that confuse the fetcher
+  const orig = String(urlStr).trim().replace(/[.,;]+$/, "");
 
   function tryOnce(u, headers = {}) {
   return new Promise((resolve, reject) => {
