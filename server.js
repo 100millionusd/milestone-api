@@ -6316,6 +6316,31 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
       [bidId]
     );
 
+    // ==================================================================================
+    // 🛡️ MASTER FIX: Clean trailing dots from ALL URLs immediately after loading from DB
+    // ==================================================================================
+
+    // 1. Clean Proposal Docs
+    if (proposal.docs) {
+      let docs = Array.isArray(proposal.docs) ? proposal.docs : (typeof proposal.docs === 'string' ? JSON.parse(proposal.docs || '[]') : []);
+      proposal.docs = docs.map(d => ({
+        ...d,
+        // Remove trailing dot/comma/semicolon from the URL
+        url: (d.url || "").trim().replace(/[.,;]+$/, "") 
+      }));
+    }
+
+    // 2. Clean Proof Files
+    for (const row of proofRows) {
+      let files = Array.isArray(row.files) ? row.files : (typeof row.files === 'string' ? JSON.parse(row.files || '[]') : []);
+      row.files = files.map(f => ({
+        ...f,
+        // Remove trailing dot/comma/semicolon from the URL
+        url: (f.url || "").trim().replace(/[.,;]+$/, "")
+      }));
+    }
+    // ==================================================================================
+
     // Normalize + (best-effort) PDF extraction for each proof
     const proofsCtx = [];
     for (const pr of proofRows) {
