@@ -6473,7 +6473,7 @@ Rules:
 if (beforeImages.length) {
     userVisionContent.push({ type: 'text', text: 'BEFORE (from proposal):' });
     for (const f of beforeImages) {
-      // 🛡️ FIX: Remove trailing dot/punctuation so OpenAI doesn't crash
+      // 🛡️ FIX: Clean trailing dot so OpenAI can download the image
       const clean = (f.url || "").trim().replace(/[.,;]+$/, "");
       userVisionContent.push({ type: 'image_url', image_url: { url: clean } });
     }
@@ -6481,10 +6481,10 @@ if (beforeImages.length) {
     userVisionContent.push({ type: 'text', text: 'BEFORE: (none attached in proposal docs)' });
   }
 
- if (afterImages.length) {
+  if (afterImages.length) {
     userVisionContent.push({ type: 'text', text: 'AFTER (from proofs):' });
     for (const f of afterImages) {
-      // 🛡️ FIX: Clean URL here too
+      // 🛡️ FIX: Clean trailing dot here too
       const clean = (f.url || "").trim().replace(/[.,;]+$/, "");
       userVisionContent.push({ type: 'image_url', image_url: { url: clean } });
     }
