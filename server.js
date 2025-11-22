@@ -6316,31 +6316,6 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
       [bidId]
     );
 
-    // ==================================================================================
-    // 🛡️ MASTER FIX: Clean trailing dots from ALL URLs immediately after loading from DB
-    // ==================================================================================
-
-    // 1. Clean Proposal Docs
-    if (proposal.docs) {
-      let docs = Array.isArray(proposal.docs) ? proposal.docs : (typeof proposal.docs === 'string' ? JSON.parse(proposal.docs || '[]') : []);
-      proposal.docs = docs.map(d => ({
-        ...d,
-        // Remove trailing dot/comma/semicolon from the URL
-        url: (d.url || "").trim().replace(/[.,;]+$/, "") 
-      }));
-    }
-
-    // 2. Clean Proof Files
-    for (const row of proofRows) {
-      let files = Array.isArray(row.files) ? row.files : (typeof row.files === 'string' ? JSON.parse(row.files || '[]') : []);
-      row.files = files.map(f => ({
-        ...f,
-        // Remove trailing dot/comma/semicolon from the URL
-        url: (f.url || "").trim().replace(/[.,;]+$/, "")
-      }));
-    }
-    // ==================================================================================
-
     // Normalize + (best-effort) PDF extraction for each proof
     const proofsCtx = [];
     for (const pr of proofRows) {
@@ -6464,28 +6439,12 @@ let stream;
 if ((imageFiles.length > 0) || (proposalImages.length > 0)) {
   const systemMsg = `
 You are Agent2 for LithiumX.
-
-You CAN analyze the attached images (URLs). You CANNOT browse the web or reverse-image-search; only mention this if asked. Avoid generic disclaimers.
-
-Task: Compare "BEFORE" (proposal) vs "AFTER" (proof) images to assess progress/changes and possible image reuse.
-
+You CAN analyze the attached images (URLs). You CANNOT browse the web or reverse-image-search.
+Task: Compare "BEFORE" (proposal) vs "AFTER" (proof) images to assess progress/changes.
 ALWAYS provide:
-1) 1–2 sentence conclusion (done/partial/unclear).
-2) Bullets with:
-   • Evidence (specific visual cues, materials, measurements, signage, timestamps)
-   • Differences/Progress (what changed between BEFORE and AFTER)
-   • Possible reuse / duplicates (same photo reused, tiny edits, stock-like anomalies)
-   • Inconsistencies (lighting/shadows mismatch, warped text, repetitive textures)
-   • OCR text (short bullets of visible text)
-   • Fit-to-proof (how AFTER matches the proof claim & milestone scope)
-   • Next checks (alt angles, close-ups, wider context, side-by-side, clearer doc page, etc.)
-   • Confidence [0–1]
-
-Rules:
-- Be concrete and cite visible cues.
-- If BEFORE is missing but AFTER exists, still analyze plausibility & completeness.
-- If AFTER is missing, say so.
-- If angles differ, note how that limits certainty.
+1) 1–2 sentence conclusion.
+2) Bullets with Evidence, Differences, Inconsistencies, OCR text, and Confidence [0–1].
+Rules: Be concrete and cite visible cues.
 `.trim();
 
   const beforeImages = proposalImages.slice(0, 6);
@@ -6495,12 +6454,21 @@ Rules:
     { type: 'text', text: `User request: ${lastUserText}\n\nCompare BEFORE (proposal docs) vs AFTER (proofs) images.` },
   ];
 
-if (beforeImages.length) {
+  // --- HELPER: Clean URL + Swap Gateway to Cloudflare (Fixes Dot + Timeout) ---
+  const cleanImg = (u) => {
+    if (!u) return "";
+    // 1. Remove trailing dot/punctuation
+    let out = u.trim().replace(/[.,;]+$/, ""); 
+    // 2. Force swap to Cloudflare IPFS (Pinata is too slow for OpenAI)
+    return out.replace("gateway.pinata.cloud", "cf-ipfs.com");
+  };
+
+  if (beforeImages.length) {
     userVisionContent.push({ type: 'text', text: 'BEFORE (from proposal):' });
     for (const f of beforeImages) {
-      // 🛡️ FIX: Clean trailing dot so OpenAI can download the image
-      const clean = (f.url || "").trim().replace(/[.,;]+$/, "");
-      userVisionContent.push({ type: 'image_url', image_url: { url: clean } });
+      // 🛡️ USE HELPER HERE
+      const safeUrl = cleanImg(f.url);
+      userVisionContent.push({ type: 'image_url', image_url: { url: safeUrl } });
     }
   } else {
     userVisionContent.push({ type: 'text', text: 'BEFORE: (none attached in proposal docs)' });
@@ -6509,15 +6477,18 @@ if (beforeImages.length) {
   if (afterImages.length) {
     userVisionContent.push({ type: 'text', text: 'AFTER (from proofs):' });
     for (const f of afterImages) {
-      // 🛡️ FIX: Clean trailing dot here too
-      const clean = (f.url || "").trim().replace(/[.,;]+$/, "");
-      userVisionContent.push({ type: 'image_url', image_url: { url: clean } });
+      // 🛡️ USE HELPER HERE
+      const safeUrl = cleanImg(f.url);
+      userVisionContent.push({ type: 'image_url', image_url: { url: safeUrl } });
     }
   } else {
     userVisionContent.push({ type: 'text', text: 'AFTER: (no proof images found)' });
   }
 
   userVisionContent.push({ type: 'text', text: `\n\n--- CONTEXT ---\n${systemContext}` });
+
+  // Debug log to verify URL is clean (Check your terminal after running!)
+  console.log("Sending Vision URLs:", userVisionContent.filter(x => x.type==='image_url').map(x => x.image_url.url));
 
   stream = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
