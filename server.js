@@ -6315,6 +6315,46 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
       [bidId]
     );
 
+    // ==================================================================
+    // 🆕 NEW: Extract Text from the BID PDF (Proposal Document)
+    // ==================================================================
+    let bidPdfText = "No bid PDF attached.";
+    
+    // 1. Get files from bid.files (array) or bid.doc (legacy single object)
+    let bidRawFiles = Array.isArray(bid.files) ? bid.files : (bid.files ? JSON.parse(bid.files) : []);
+    if (bid.doc) {
+      const d = typeof bid.doc === 'string' ? JSON.parse(bid.doc) : bid.doc;
+      if (d) bidRawFiles.push(d);
+    }
+
+    // 2. Find the first PDF
+    const bidPdfFile = bidRawFiles.find(f => {
+      const n = (f.name || f.url || '').toLowerCase();
+      return n.endsWith('.pdf') || n.includes('.pdf?') || (f.mimetype || '').includes('pdf');
+    });
+
+    // 3. Extract text (using the robust fetcher we fixed earlier)
+    if (bidPdfFile && bidPdfFile.url) {
+      try {
+        const cleanUrl = bidPdfFile.url.trim().replace(/[.,;]+$/, ""); // 🛡️ Fix trailing dot
+        const info = await withTimeout(
+          waitForPdfInfoFromDoc({ ...bidPdfFile, url: cleanUrl }),
+          10000, // 10s timeout
+          () => ({ used: false, reason: 'timeout' })
+        );
+        
+        if (info.used && info.text) {
+          bidPdfText = `BID PDF CONTENT (Truncated):\n"""\n${info.text.slice(0, 12000)}\n"""`;
+        } else {
+          bidPdfText = `Bid PDF found but could not be read (Reason: ${info.reason})`;
+        }
+      } catch (e) {
+        console.warn("Bid PDF extraction failed:", e.message);
+        bidPdfText = "Bid PDF extraction failed.";
+      }
+    }
+    // ==================================================================
+
     // Normalize + (best-effort) PDF extraction for each proof
     const proofsCtx = [];
     for (const pr of proofRows) {
@@ -6398,7 +6438,7 @@ ${p.pdfNote}`.trim();
     }).join('\n\n')
   : '(no proofs submitted for this bid)';
 
-    const systemContext =
+ const systemContext =
 `You are Agent2 for LithiumX.
 
 Proposal:
@@ -6413,16 +6453,19 @@ Bid:
 - Days: ${bid.days ?? 0}
 - Notes: ${bid.notes || ""}
 
-Existing Bid Analysis (may omit proofs):
+--- BID DOCUMENTATION (PDF) ---
+${bidPdfText}
+
+Existing Bid Analysis (Static):
 ${ai ? JSON.stringify(ai).slice(0, 2000) : "(none)"}
 
 Submitted Proofs (latest first):
 ${proofsBlock}
 
 Instruction:
-- Answer questions about BOTH the bid and its submitted proofs.
-- If the user asks about “the proof”, “attachment”, or “PDF”, base your answer on the Proofs section above.
-- If a PDF extract was available, use it; otherwise clearly say that no usable PDF text was available.
+- You have access to the BID PDF text above. Use it to answer questions about the bid details.
+- If the user asks about "the proof" or "after images", check the "Submitted Proofs" section.
+- If the user asks about "the bid document" or "proposal details", use the "BID DOCUMENTATION" section.
 - Be concise.`;
 
     // One last user line to steer the answer
