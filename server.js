@@ -6434,93 +6434,98 @@ const lastUserText =
 const proposalImages = collectProposalImages(proposal);
 
 // Decide vision vs. text (compare BEFORE vs AFTER when any images exist)
-let stream;
-if ((imageFiles.length > 0) || (proposalImages.length > 0)) {
-  const systemMsg = `
+    let stream;
+    if ((imageFiles.length > 0) || (proposalImages.length > 0)) {
+      const systemMsg = `
 You are Agent2 for LithiumX.
-You CAN analyze the attached images (URLs). You CANNOT browse the web or reverse-image-search.
+You CAN analyze the attached images.
 Task: Compare "BEFORE" (proposal) vs "AFTER" (proof) images to assess progress/changes.
 ALWAYS provide:
-1) 1–2 sentence conclusion.
+1) 1–2 sentence conclusion (done/partial/unclear).
 2) Bullets with Evidence, Differences, Inconsistencies, OCR text, and Confidence [0–1].
 Rules: Be concrete and cite visible cues.
 `.trim();
 
-  const beforeImages = proposalImages.slice(0, 6);
-  const afterImages  = imageFiles.slice(0, 6);
+      const userVisionContent = [
+        { type: 'text', text: `User request: ${lastUserText}\n\nCompare BEFORE (proposal docs) vs AFTER (proofs) images.` },
+      ];
 
-  const userVisionContent = [
-    { type: 'text', text: `User request: ${lastUserText}\n\nCompare BEFORE (proposal docs) vs AFTER (proofs) images.` },
-  ];
+      // ——— HELPER: Download & Convert to Base64 (Bypasses OpenAI Download Errors) ———
+      const urlToContent = async (f) => {
+        // 1. Filter non-images
+        const name = (f.name || f.url || "").toLowerCase();
+        const mime = (f.mimetype || "").toLowerCase();
+        if (!mime.startsWith("image/") && !/\.(jpe?g|png|webp|gif)$/.test(name)) return null;
 
-  // ——— HELPERS (Defined ONCE here) ———
-  const isLikelyImage = (f) => {
-    const name = (f.name || f.url || "").toLowerCase();
-    const mime = (f.mimetype || "").toLowerCase();
-    return (
-      mime.startsWith("image/") || 
-      /\.(jpg|jpeg|png|webp|gif|bmp|tiff)(\?|$)/.test(name)
-    );
-  };
+        try {
+          // 2. Clean URL
+          const url = (f.url || "").trim().replace(/[.,;]+$/, "");
+          
+          // 3. Download on YOUR server (Reliable)
+          // We use your existing 'fetchAsBuffer' which handles retries/timeouts
+          const buf = await fetchAsBuffer(url);
+          
+          // 4. Convert to Base64
+          const b64 = buf.toString('base64');
+          let finalMime = mime.startsWith("image/") ? mime : "image/jpeg"; // Fallback
+          
+          return { type: 'image_url', image_url: { url: `data:${finalMime};base64,${b64}` } };
+        } catch (e) {
+          console.warn(`[Vision] Skipped unreadable image ${f.url}:`, e.message);
+          return null;
+        }
+      };
+      // ——————————————————————————————————————————————————————————————————————————————
 
-  const cleanImg = (u) => {
-    if (!u) return "";
-    // Remove dot, then force Cloudflare gateway
-    let out = u.trim().replace(/[.,;]+$/, ""); 
-    return out.replace("gateway.pinata.cloud", "cf-ipfs.com");
-  };
-  // ———————————————————————————————————
+      // Process BEFORE Images (Limit to 3 to keep payload size manageable)
+      const beforeProcessed = await Promise.all(proposalImages.slice(0, 3).map(urlToContent));
+      const validBefore = beforeProcessed.filter(Boolean);
+      
+      if (validBefore.length > 0) {
+        userVisionContent.push({ type: 'text', text: 'BEFORE (from proposal):' });
+        userVisionContent.push(...validBefore);
+      } else {
+        userVisionContent.push({ type: 'text', text: 'BEFORE: (none or failed to load)' });
+      }
 
-  if (beforeImages.length) {
-    userVisionContent.push({ type: 'text', text: 'BEFORE (from proposal):' });
-    for (const f of beforeImages) {
-      if (!isLikelyImage(f)) continue; // Skip PDFs
-      const safeUrl = cleanImg(f.url);
-      userVisionContent.push({ type: 'image_url', image_url: { url: safeUrl } });
+      // Process AFTER Images (Limit to 3)
+      const afterProcessed = await Promise.all(imageFiles.slice(0, 3).map(urlToContent));
+      const validAfter = afterProcessed.filter(Boolean);
+
+      if (validAfter.length > 0) {
+        userVisionContent.push({ type: 'text', text: 'AFTER (from proofs):' });
+        userVisionContent.push(...validAfter);
+      } else {
+        userVisionContent.push({ type: 'text', text: 'AFTER: (none or failed to load)' });
+      }
+
+      userVisionContent.push({ type: 'text', text: `\n\n--- CONTEXT ---\n${systemContext}` });
+
+      console.log(`[Agent2] Sending Vision request with ${validBefore.length} before + ${validAfter.length} after images.`);
+
+      stream = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.2,
+        stream: true,
+        messages: [
+          { role: 'system', content: systemMsg },
+          { role: 'user', content: userVisionContent },
+        ],
+      });
+
+    } else {
+      // Text-only fallback
+      const msgs = [
+        { role: 'system', content: 'Be concise. If citing evidence, quote the exact line from the proof/PDF text.' },
+        { role: 'user', content: `${lastUserText}\n\n--- CONTEXT ---\n${systemContext}` },
+      ];
+      stream = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.2,
+        messages: msgs,
+        stream: true,
+      });
     }
-  } else {
-    userVisionContent.push({ type: 'text', text: 'BEFORE: (none attached in proposal docs)' });
-  }
-
-  if (afterImages.length) {
-    userVisionContent.push({ type: 'text', text: 'AFTER (from proofs):' });
-    for (const f of afterImages) {
-      if (!isLikelyImage(f)) continue; // Skip PDFs
-      const safeUrl = cleanImg(f.url);
-      userVisionContent.push({ type: 'image_url', image_url: { url: safeUrl } });
-    }
-  } else {
-    userVisionContent.push({ type: 'text', text: 'AFTER: (no proof images found)' });
-  }
-
-  userVisionContent.push({ type: 'text', text: `\n\n--- CONTEXT ---\n${systemContext}` });
-
-  // Debug log
-  console.log("Sending Vision URLs:", userVisionContent.filter(x => x.type==='image_url').map(x => x.image_url.url));
-
-  stream = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    temperature: 0.2,
-    stream: true,
-    messages: [
-      { role: 'system', content: systemMsg },
-      { role: 'user', content: userVisionContent },
-    ],
-  });
-
-} else {
-  // Text-only fallback (matches your existing else block)
-  const msgs = [
-    { role: 'system', content: 'Be concise. If citing evidence, quote the exact line from the proof/PDF text.' },
-    { role: 'user', content: `${lastUserText}\n\n--- CONTEXT ---\n${systemContext}` },
-  ];
-  stream = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    temperature: 0.2,
-    messages: msgs,
-    stream: true,
-  });
-}
 
 // === SSE streaming loop (buffer + footer) ===
 let fullText = '';
