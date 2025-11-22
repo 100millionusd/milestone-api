@@ -2308,11 +2308,12 @@ async function checkCidAlive(cid) {
   }
   if (await headOk(primary, headers)) return true;
 
-  // 2) public fallbacks
+  // 2) public fallbacks (Added your Dedicated Gateway at the top)
   const fallbacks = [
+    `https://sapphire-given-snake-741.mypinata.cloud/ipfs/${cid}`, // ⚡ Fastest
+    `https://cf-ipfs.com/ipfs/${cid}`,                             // Fast public
     `${(PINATA_PUBLIC_GATEWAY || 'https://gateway.pinata.cloud/ipfs/').replace(/\/+$/, '/')}${cid}`,
     `https://ipfs.io/ipfs/${cid}`,
-    `https://cf-ipfs.com/ipfs/${cid}`,
     `https://dweb.link/ipfs/${cid}`,
   ];
   for (const u of fallbacks) if (await headOk(u)) return true;
@@ -2371,11 +2372,12 @@ async function fetchAsBuffer(urlStr) {
   try {
     return await tryOnce(orig, headers);
   } catch (e) {
-    // 2) Fall back to public gateways
+    // 2) Fall back to gateways (Added your Dedicated Gateway at the top)
     const candidates = [
+      rewriteToGateway(orig, "https://sapphire-given-snake-741.mypinata.cloud/ipfs/"), // ⚡ Fastest
+      rewriteToGateway(orig, "https://cf-ipfs.com/ipfs/"),                             // Fast public
       toPublicGateway(orig),
       rewriteToGateway(orig, "https://ipfs.io/ipfs/"),
-      rewriteToGateway(orig, "https://cf-ipfs.com/ipfs/"),
       rewriteToGateway(orig, "https://dweb.link/ipfs/"),
     ];
     let lastErr = e;
