@@ -6316,42 +6316,55 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
     );
 
     // ==================================================================
-    // 🆕 NEW: Extract Text from the BID PDF (Proposal Document)
+    // 1. Extract Text from the BID PDF (The Vendor's Offer)
     // ==================================================================
     let bidPdfText = "No bid PDF attached.";
     
-    // 1. Get files from bid.files (array) or bid.doc (legacy single object)
     let bidRawFiles = Array.isArray(bid.files) ? bid.files : (bid.files ? JSON.parse(bid.files) : []);
     if (bid.doc) {
       const d = typeof bid.doc === 'string' ? JSON.parse(bid.doc) : bid.doc;
       if (d) bidRawFiles.push(d);
     }
 
-    // 2. Find the first PDF
     const bidPdfFile = bidRawFiles.find(f => {
       const n = (f.name || f.url || '').toLowerCase();
       return n.endsWith('.pdf') || n.includes('.pdf?') || (f.mimetype || '').includes('pdf');
     });
 
-    // 3. Extract text (using the robust fetcher we fixed earlier)
     if (bidPdfFile && bidPdfFile.url) {
       try {
-        const cleanUrl = bidPdfFile.url.trim().replace(/[.,;]+$/, ""); // 🛡️ Fix trailing dot
+        const cleanUrl = bidPdfFile.url.trim().replace(/[.,;]+$/, ""); 
         const info = await withTimeout(
-          waitForPdfInfoFromDoc({ ...bidPdfFile, url: cleanUrl }),
-          10000, // 10s timeout
-          () => ({ used: false, reason: 'timeout' })
+          waitForPdfInfoFromDoc({ ...bidPdfFile, url: cleanUrl }), 8000, () => ({ used: false, reason: 'timeout' })
         );
-        
         if (info.used && info.text) {
-          bidPdfText = `BID PDF CONTENT (Truncated):\n"""\n${info.text.slice(0, 12000)}\n"""`;
-        } else {
-          bidPdfText = `Bid PDF found but could not be read (Reason: ${info.reason})`;
+          bidPdfText = `BID PDF CONTENT (Truncated):\n"""\n${info.text.slice(0, 10000)}\n"""`;
         }
-      } catch (e) {
-        console.warn("Bid PDF extraction failed:", e.message);
-        bidPdfText = "Bid PDF extraction failed.";
-      }
+      } catch (e) { /* ignore */ }
+    }
+
+    // ==================================================================
+    // 2. Extract Text from the PROPOSAL PDF (The Requirements)
+    // ==================================================================
+    let proposalPdfText = "No proposal PDF attached.";
+
+    let propRawFiles = Array.isArray(proposal.docs) ? proposal.docs : (proposal.docs ? JSON.parse(proposal.docs) : []);
+    
+    const propPdfFile = propRawFiles.find(f => {
+      const n = (f.name || f.url || '').toLowerCase();
+      return n.endsWith('.pdf') || n.includes('.pdf?') || (f.mimetype || '').includes('pdf');
+    });
+
+    if (propPdfFile && propPdfFile.url) {
+      try {
+        const cleanUrl = propPdfFile.url.trim().replace(/[.,;]+$/, ""); 
+        const info = await withTimeout(
+          waitForPdfInfoFromDoc({ ...propPdfFile, url: cleanUrl }), 8000, () => ({ used: false, reason: 'timeout' })
+        );
+        if (info.used && info.text) {
+          proposalPdfText = `PROPOSAL PDF CONTENT (Truncated):\n"""\n${info.text.slice(0, 10000)}\n"""`;
+        }
+      } catch (e) { /* ignore */ }
     }
     // ==================================================================
 
@@ -6441,31 +6454,32 @@ ${p.pdfNote}`.trim();
  const systemContext =
 `You are Agent2 for LithiumX.
 
-Proposal:
-- Org: ${proposal.org_name || ""}
-- Title: ${proposal.title || ""}
-- Summary: ${proposal.summary || ""}
-- BudgetUSD: ${proposal.amount_usd ?? 0}
+--- PROPOSAL DETAILS ---
+Org: ${proposal.org_name || ""}
+Title: ${proposal.title || ""}
+Summary: ${proposal.summary || ""}
+Budget: $${proposal.amount_usd ?? 0}
 
-Bid:
-- Vendor: ${bid.vendor_name || ""}
-- PriceUSD: ${bid.price_usd ?? 0}
-- Days: ${bid.days ?? 0}
-- Notes: ${bid.notes || ""}
+--- PROPOSAL DOCUMENTS (Requirements) ---
+${proposalPdfText}
 
---- BID DOCUMENTATION (PDF) ---
+--- BID DETAILS ---
+Vendor: ${bid.vendor_name || ""}
+Price: $${bid.price_usd ?? 0}
+Timeline: ${bid.days ?? 0} days
+Notes: ${bid.notes || ""}
+
+--- BID DOCUMENTS (Offer) ---
 ${bidPdfText}
 
-Existing Bid Analysis (Static):
-${ai ? JSON.stringify(ai).slice(0, 2000) : "(none)"}
-
-Submitted Proofs (latest first):
+--- SUBMITTED PROOFS (Progress) ---
 ${proofsBlock}
 
 Instruction:
-- You have access to the BID PDF text above. Use it to answer questions about the bid details.
-- If the user asks about "the proof" or "after images", check the "Submitted Proofs" section.
-- If the user asks about "the bid document" or "proposal details", use the "BID DOCUMENTATION" section.
+- Compare the "BID DOCUMENTS" against the "PROPOSAL DOCUMENTS" to verify if the offer matches the requirements.
+- Use the "SUBMITTED PROOFS" to verify actual progress.
+- If the user asks about "the spec" or "requirements", check the Proposal PDF.
+- If the user asks about "the offer" or "vendor plan", check the Bid PDF.
 - Be concise.`;
 
     // One last user line to steer the answer
