@@ -2320,7 +2320,6 @@ async function checkCidAlive(cid) {
 }
 
 /** Fetch a URL into a Buffer (supports mypinata.cloud auth + public fallbacks) */
-/** Fetch a URL into a Buffer (supports mypinata.cloud auth + public fallbacks) */
 async function fetchAsBuffer(urlStr) {
   // 🛡️ SANITIZE: Remove trailing dots/punctuation that confuse the fetcher
   const orig = String(urlStr).trim().replace(/[.,;]+$/, "");
@@ -6454,8 +6453,7 @@ Rules: Be concrete and cite visible cues.
     { type: 'text', text: `User request: ${lastUserText}\n\nCompare BEFORE (proposal docs) vs AFTER (proofs) images.` },
   ];
 
-  // ——————————————————————————————————————————————————————————————————————————
-  // 1. HELPER: Filter out PDFs (OpenAI Vision crashes on them)
+  // ——— HELPERS (Defined ONCE here) ———
   const isLikelyImage = (f) => {
     const name = (f.name || f.url || "").toLowerCase();
     const mime = (f.mimetype || "").toLowerCase();
@@ -6465,56 +6463,18 @@ Rules: Be concrete and cite visible cues.
     );
   };
 
-  // 2. HELPER: Clean URL + Swap Pinata for Cloudflare (Fixes Timeout)
   const cleanImg = (u) => {
     if (!u) return "";
-    let out = u.trim().replace(/[.,;]+$/, ""); // Remove dot
-    return out.replace("gateway.pinata.cloud", "cf-ipfs.com"); // Swap gateway
-  };
-
-  // 3. Add BEFORE images (Proposal)
-  if (beforeImages.length) {
-    userVisionContent.push({ type: 'text', text: 'BEFORE (from proposal):' });
-    for (const f of beforeImages) {
-      // Skip PDFs to prevent "invalid_image_url" error
-      if (!isLikelyImage(f)) continue; 
-
-      const safeUrl = cleanImg(f.url);
-      userVisionContent.push({ type: 'image_url', image_url: { url: safeUrl } });
-    }
-  } else {
-    userVisionContent.push({ type: 'text', text: 'BEFORE: (none attached in proposal docs)' });
-  }
-
-  // 4. Add AFTER images (Proofs)
-  if (afterImages.length) {
-    userVisionContent.push({ type: 'text', text: 'AFTER (from proofs):' });
-    for (const f of afterImages) {
-      // Skip PDFs here too
-      if (!isLikelyImage(f)) continue;
-
-      const safeUrl = cleanImg(f.url);
-      userVisionContent.push({ type: 'image_url', image_url: { url: safeUrl } });
-    }
-  } else {
-    userVisionContent.push({ type: 'text', text: 'AFTER: (no proof images found)' });
-  }
-  // ——————————————————————————————————————————————————————————————————————————
-
-  userVisionContent.push({ type: 'text', text: `\n\n--- CONTEXT ---\n${systemContext}` });
-  // --- HELPER: Clean URL + Swap Gateway to Cloudflare (Fixes Dot + Timeout) ---
-  const cleanImg = (u) => {
-    if (!u) return "";
-    // 1. Remove trailing dot/punctuation
+    // Remove dot, then force Cloudflare gateway
     let out = u.trim().replace(/[.,;]+$/, ""); 
-    // 2. Force swap to Cloudflare IPFS (Pinata is too slow for OpenAI)
     return out.replace("gateway.pinata.cloud", "cf-ipfs.com");
   };
+  // ———————————————————————————————————
 
   if (beforeImages.length) {
     userVisionContent.push({ type: 'text', text: 'BEFORE (from proposal):' });
     for (const f of beforeImages) {
-      // 🛡️ USE HELPER HERE
+      if (!isLikelyImage(f)) continue; // Skip PDFs
       const safeUrl = cleanImg(f.url);
       userVisionContent.push({ type: 'image_url', image_url: { url: safeUrl } });
     }
@@ -6525,7 +6485,7 @@ Rules: Be concrete and cite visible cues.
   if (afterImages.length) {
     userVisionContent.push({ type: 'text', text: 'AFTER (from proofs):' });
     for (const f of afterImages) {
-      // 🛡️ USE HELPER HERE
+      if (!isLikelyImage(f)) continue; // Skip PDFs
       const safeUrl = cleanImg(f.url);
       userVisionContent.push({ type: 'image_url', image_url: { url: safeUrl } });
     }
@@ -6535,7 +6495,7 @@ Rules: Be concrete and cite visible cues.
 
   userVisionContent.push({ type: 'text', text: `\n\n--- CONTEXT ---\n${systemContext}` });
 
-  // Debug log to verify URL is clean (Check your terminal after running!)
+  // Debug log
   console.log("Sending Vision URLs:", userVisionContent.filter(x => x.type==='image_url').map(x => x.image_url.url));
 
   stream = await openai.chat.completions.create({
@@ -6549,7 +6509,7 @@ Rules: Be concrete and cite visible cues.
   });
 
 } else {
-  // Text-only fallback (no images anywhere)
+  // Text-only fallback (matches your existing else block)
   const msgs = [
     { role: 'system', content: 'Be concise. If citing evidence, quote the exact line from the proof/PDF text.' },
     { role: 'user', content: `${lastUserText}\n\n--- CONTEXT ---\n${systemContext}` },
