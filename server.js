@@ -2321,67 +2321,75 @@ async function checkCidAlive(cid) {
 }
 
 /** Fetch a URL into a Buffer (supports mypinata.cloud auth + public fallbacks) */
+/** Fetch a URL into a Buffer (supports mypinata.cloud auth + public fallbacks) */
 async function fetchAsBuffer(urlStr) {
-  // 🛡️ SANITIZE: Remove trailing dots/punctuation that confuse the fetcher
-  const orig = String(urlStr).trim().replace(/[.,;]+$/, "");
+  // 1. 🛡️ SANITIZE: Remove trailing dots/punctuation
+  let orig = String(urlStr).trim().replace(/[.,;]+$/, "");
+
+  // 2. ⚡ HIJACK: If URL is using the slow public gateway, force swap to your FAST Dedicated Gateway
+  // This prevents waiting 15s for a timeout before trying the good link.
+  if (orig.includes("gateway.pinata.cloud")) {
+    orig = orig.replace("gateway.pinata.cloud", "sapphire-given-snake-741.mypinata.cloud");
+  }
 
   function tryOnce(u, headers = {}) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(u);
-    const lib = url.protocol === "https:" ? https : http;
-    const options = {
-      method: "GET",
-      hostname: url.hostname,
-      port: url.port || (url.protocol === "https:" ? 443 : 80),
-      path: url.pathname + url.search,
-      headers,
-      timeout: 15000
-    };
-    const req = lib.request(options, (res) => {
-      const code = res.statusCode || 0;
-      if (code >= 400) return reject(new Error(`HTTP ${code} fetching ${u}`));
-      const chunks = [];
-      let total = 0;
-      const CAP = 25 * 1024 * 1024; // 25MB
-      res.on("data", (d) => {
-        total += d.length;
-        if (total > CAP) {
-          req.destroy(new Error("Response too large"));
-          return;
-        }
-        chunks.push(d);
+    return new Promise((resolve, reject) => {
+      const url = new URL(u);
+      const lib = url.protocol === "https:" ? https : http;
+      const options = {
+        method: "GET",
+        hostname: url.hostname,
+        port: url.port || (url.protocol === "https:" ? 443 : 80),
+        path: url.pathname + url.search,
+        headers,
+        timeout: 60000 // ⚡ Increased to 60s to prevent premature timeouts on large files
+      };
+      const req = lib.request(options, (res) => {
+        const code = res.statusCode || 0;
+        if (code >= 400) return reject(new Error(`HTTP ${code} fetching ${u}`));
+        const chunks = [];
+        let total = 0;
+        const CAP = 25 * 1024 * 1024; // 25MB
+        res.on("data", (d) => {
+          total += d.length;
+          if (total > CAP) {
+            req.destroy(new Error("Response too large"));
+            return;
+          }
+          chunks.push(d);
+        });
+        res.on("end", () => resolve(Buffer.concat(chunks)));
       });
-      res.on("end", () => resolve(Buffer.concat(chunks)));
+      req.on("timeout", () => { req.destroy(new Error("Timeout")); });
+      req.on("error", reject);
+      req.end();
     });
-    req.on("timeout", () => { req.destroy(new Error("Timeout")); });
-    req.on("error", reject);
-    req.end();
-  });
-}
+  }
 
+  // 3. Setup Auth for Dedicated Gateway (Now applies to 'orig' because we swapped the domain above)
   const isDedicated = /\.mypinata\.cloud$/i.test(new URL(orig).hostname);
   const headers = {};
-
-  // If it’s a dedicated Pinata subdomain, send auth if available
   if (isDedicated) {
     if (PINATA_JWT)           headers["Authorization"] = `Bearer ${PINATA_JWT}`;
     if (PINATA_GATEWAY_TOKEN) headers["x-pinata-gateway-token"] = PINATA_GATEWAY_TOKEN;
   }
 
-  // 1) Try original URL (with headers for dedicated gateway)
+  // 4. Try the FAST URL first
   try {
     return await tryOnce(orig, headers);
   } catch (e) {
-    // 2) Fall back to gateways (Added your Dedicated Gateway at the top)
+    // 5. Fallback Candidates (If Sapphire fails, try these)
     const candidates = [
-      rewriteToGateway(orig, "https://sapphire-given-snake-741.mypinata.cloud/ipfs/"), // ⚡ Fastest
-      rewriteToGateway(orig, "https://cf-ipfs.com/ipfs/"),                             // Fast public
-      toPublicGateway(orig),
-      rewriteToGateway(orig, "https://ipfs.io/ipfs/"),
-      rewriteToGateway(orig, "https://dweb.link/ipfs/"),
+      rewriteToGateway(orig, "https://cf-ipfs.com/ipfs/"),             // Cloudflare (Fast Public)
+      rewriteToGateway(orig, "https://ipfs.io/ipfs/"),                 // IPFS Main
+      rewriteToGateway(orig, "https://dweb.link/ipfs/"),               // Dweb
+      toPublicGateway(orig)                                            // Original Public Pinata (Slowest)
     ];
+
     let lastErr = e;
     for (const u of candidates) {
+      // Don't retry the exact same URL we just failed on
+      if (u === orig) continue;
       try {
         return await tryOnce(u);
       } catch (err) {
