@@ -8914,13 +8914,23 @@ const locationBlock = loc ? [
     // 5) Choose vision vs text model
     let stream;
     if (hasAnyImages) {
-      const systemMsg = `
+const systemMsg = `
 You are Agent2 for LithiumX.
 You CAN analyze the attached images.
 Task: Compare "BEFORE" (proposal) vs "AFTER" (proof) images to assess progress.
+
+CRITICAL INSTRUCTION:
+- You MUST cross-reference the "IMAGE/VIDEO METADATA" and "KNOWN LOCATION" sections provided in the Context below.
+- If GPS coordinates or dates are present in the metadata, mention them in your evidence.
+
 ALWAYS provide:
 1) 1–2 sentence conclusion.
-2) Bullets with Evidence, Differences, Inconsistencies, OCR text, and Confidence [0–1].
+2) Bullets with:
+   • Evidence (Visual cues, materials, etc.)
+   • Location Verification (Does the GPS/Metadata match the project?)
+   • Differences/Progress
+   • Inconsistencies
+   • Confidence [0–1]
 `.trim();
 
       const userContent = [
