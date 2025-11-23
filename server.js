@@ -1037,18 +1037,16 @@ console.log('[db] proposer_profiles ready');
 // Utilities
 // ==============================
 
-// [ADD THIS NEW FUNCTION]
-// Automatically attaches the Railway token to private Gateway URLs
+// 1. The URL Signer (Must be defined first)
 function signUrl(url) {
   if (typeof url === "string" && url.includes("mypinata.cloud/ipfs/") && !url.includes("token=")) {
      const token = process.env.PINATA_GATEWAY_TOKEN; 
-     // Only append if we actually have a token
      return token ? `${url}?token=${token}` : url;
   }
   return url;
 }
 
-// [REPLACE YOUR EXISTING toCamel FUNCTION WITH THIS]
+// 2. The Converter (Uses signUrl)
 function toCamel(row) {
   if (!row || typeof row !== "object") return row;
   const out = {};
@@ -1056,37 +1054,36 @@ function toCamel(row) {
     const camel = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
     let val = row[key];
 
-    // --- MAGICAL FIX: Sign Pinata URLs automatically ---
-    
-    // 1. Handle arrays of files (e.g. from 'bids' or 'proofs')
+    // Handle arrays of files (e.g. proofs or bids files)
     if (Array.isArray(val)) {
        val = val.map(item => {
-         // If it's a file object with a URL, sign it
          if (item && typeof item === 'object' && item.url) {
             return { ...item, url: signUrl(item.url) };
          }
          return item;
        });
     }
-
-    // 2. Handle single file objects (e.g. 'doc')
-    if (key === 'doc' && val && val.url) {
+    // Handle single file objects (e.g. doc)
+    else if (key === 'doc' && val && val.url) {
         val = { ...val, url: signUrl(val.url) };
     }
-
-    // 3. Handle direct URL strings (if any)
-    if (key === 'url' || key === 'cid') {
+    // Handle direct URL strings
+    else if ((key === 'url' || key === 'cid') && typeof val === 'string') {
         val = signUrl(val);
     }
-    // ---------------------------------------------------
 
     out[camel] = val;
   }
   return out;
 }
 
-// 3. The List Mapper (THIS WAS MISSING)
-function mapRows(rows) { return rows.map(toCamel); }
+// 3. The List Mapper (Must be defined last)
+function mapRows(rows) { 
+  if (!Array.isArray(rows)) return [];
+  return rows.map(toCamel); 
+}
+
+// ==========================================
 
 // ==============================
 // Notifications (Telegram, Email via Resend, WhatsApp via Twilio)
