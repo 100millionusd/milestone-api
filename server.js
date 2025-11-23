@@ -8888,52 +8888,72 @@ const locationBlock = loc ? [
     : `--- NO PDF TEXT AVAILABLE ---`,
 ].join('\n');
 
+// ——— FIX: Base64 Proxy for Proof Chat (Prevents Timeouts) ———
+    const urlToContent = async (f) => {
+      const name = (f.name || f.url || "").toLowerCase();
+      const mime = (f.mimetype || "").toLowerCase();
+      if (!mime.startsWith("image/") && !/\.(jpe?g|png|webp|gif)$/.test(name)) return null;
+
+      try {
+        // Clean URL & Force Cloudflare (Fastest Download)
+        let url = (f.url || "").trim().replace(/[.,;]+$/, "");
+        url = url.replace("gateway.pinata.cloud", "cf-ipfs.com");
+        
+        // Download buffer using your robust fetcher
+        const buf = await fetchAsBuffer(url);
+        const b64 = buf.toString('base64');
+        let finalMime = mime.startsWith("image/") ? mime : "image/jpeg"; 
+        
+        return { type: 'image_url', image_url: { url: `data:${finalMime};base64,${b64}` } };
+      } catch (e) {
+        console.warn(`[ProofChat] Skipped image ${f.url}:`, e.message);
+        return null;
+      }
+    };
+
     // 5) Choose vision vs text model
     let stream;
     if (hasAnyImages) {
-      const beforeImgs = proposalImages.slice(0, 6);
-      const afterImgs  = proofImages.slice(0, 6);
-
       const systemMsg = `
 You are Agent2 for LithiumX.
-
-You CAN analyze the attached images (URLs). You CANNOT browse the web or reverse-image-search.
-
-Task: Compare "BEFORE" (proposal) vs "AFTER" (proof) images to assess progress/changes and possible image reuse.
-
+You CAN analyze the attached images.
+Task: Compare "BEFORE" (proposal) vs "AFTER" (proof) images to assess progress.
 ALWAYS provide:
-1) 1–2 sentence conclusion (done/partial/unclear).
-2) Bullets with:
-   • Evidence (visual cues, materials, measurements, signage, timestamps)
-   • Differences/Progress
-   • Possible reuse/duplicates
-   • Inconsistencies (warped text/repetitive textures)
-   • OCR snippets (short)
-   • Fit-to-proof (does AFTER match the milestone claim?)
-   • Next checks
-   • Confidence [0–1]
+1) 1–2 sentence conclusion.
+2) Bullets with Evidence, Differences, Inconsistencies, OCR text, and Confidence [0–1].
+`.trim();
 
-Be concrete and cite visible cues.`.trim();
-
-      const content = [
+      const userContent = [
         { type: 'text', text: `User request: ${userText}\n\nCompare BEFORE (proposal docs) vs AFTER (proof) images.` },
       ];
 
-      if (beforeImgs.length) {
-        content.push({ type: 'text', text: 'BEFORE (from proposal):' });
-        for (const f of beforeImgs) content.push({ type: 'image_url', image_url: { url: f.url } });
+      // Process BEFORE Images (Proposal) - Limit 3
+      const beforeImgs = proposalImages.slice(0, 3);
+      const beforeProcessed = await Promise.all(beforeImgs.map(urlToContent));
+      const validBefore = beforeProcessed.filter(Boolean);
+
+      if (validBefore.length > 0) {
+        userContent.push({ type: 'text', text: 'BEFORE (from proposal):' });
+        userContent.push(...validBefore);
       } else {
-        content.push({ type: 'text', text: 'BEFORE: (none)' });
+        userContent.push({ type: 'text', text: 'BEFORE: (none available)' });
       }
 
-      if (afterImgs.length) {
-        content.push({ type: 'text', text: 'AFTER (from proof):' });
-        for (const f of afterImgs) content.push({ type: 'image_url', image_url: { url: f.url } });
+      // Process AFTER Images (Proof) - Limit 3
+      const afterImgs = proofImages.slice(0, 3);
+      const afterProcessed = await Promise.all(afterImgs.map(urlToContent));
+      const validAfter = afterProcessed.filter(Boolean);
+
+      if (validAfter.length > 0) {
+        userContent.push({ type: 'text', text: 'AFTER (from proof):' });
+        userContent.push(...validAfter);
       } else {
-        content.push({ type: 'text', text: 'AFTER: (none)' });
+        userContent.push({ type: 'text', text: 'AFTER: (none available)' });
       }
 
-      content.push({ type: 'text', text: `\n\n--- CONTEXT ---\n${context}` });
+      userContent.push({ type: 'text', text: `\n\n--- CONTEXT ---\n${context}` });
+
+      console.log(`[ProofChat] Sending Vision request: ${validBefore.length} before + ${validAfter.length} after.`);
 
       stream = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
@@ -8941,10 +8961,12 @@ Be concrete and cite visible cues.`.trim();
         stream: true,
         messages: [
           { role: 'system', content: systemMsg },
-          { role: 'user', content },
+          { role: 'user', content: userContent },
         ],
       });
+
     } else {
+      // Text-only fallback (unchanged)
       stream = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         temperature: 0.2,
