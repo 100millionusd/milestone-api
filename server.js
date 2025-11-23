@@ -1036,88 +1036,23 @@ console.log('[db] proposer_profiles ready');
 // ==============================
 // Utilities
 // ==============================
-/// ============================================================
-// SAFE HELPER BLOCK (Restores UI Stability)
-// ============================================================
-
-// 1. The URL Signer
-function signUrl(url) {
-  if (typeof url !== "string") return url;
-  // Only touch Pinata URLs
-  if (url.includes("mypinata.cloud/ipfs/") || url.includes("gateway.pinata.cloud/ipfs/")) {
-     const token = process.env.PINATA_GATEWAY_TOKEN;
-     if (!token) return url; 
-
-     // Force correct gateway
-     let finalUrl = url.replace("gateway.pinata.cloud", "sapphire-given-snake-741.mypinata.cloud");
-
-     // Append token if missing
-     if (!finalUrl.includes("token=")) {
-        const separator = finalUrl.includes("?") ? "&" : "?";
-        finalUrl = `${finalUrl}${separator}token=${token}`;
-     }
-     return finalUrl;
-  }
-  return url;
-}
-
-// 2. The Converter (Your ORIGINAL logic + Signing)
 function toCamel(row) {
   if (!row || typeof row !== "object") return row;
-  
   const out = {};
   for (const key of Object.keys(row)) {
-    // 1. Basic conversion (Keep this simple like before)
     const camel = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
-    let val = row[key];
-
-    // 2. Specific File Handling (Only touch these fields)
-    if (['files', 'doc', 'docs', 'file', 'aiAnalysis'].includes(camel)) {
-        // Safe Parse
-        if (typeof val === "string" && (val.startsWith("{") || val.startsWith("["))) {
-            try { val = JSON.parse(val); } catch (e) {}
-        }
-        
-        // Sign Arrays
-        if (Array.isArray(val)) {
-            val = val.map(item => {
-                if (item && typeof item === 'object' && item.url) {
-                    return { ...item, url: signUrl(item.url) };
-                }
-                return item;
-            });
-        } 
-        // Sign Objects
-        else if (val && typeof val === 'object' && val.url) {
-            val = { ...val, url: signUrl(val.url) };
-        }
-    }
-    
-    // 3. Sign Direct URLs
-    if ((key === 'url' || key === 'cid') && typeof val === 'string') {
-        val = signUrl(val);
-    }
-
-    out[camel] = val;
+    out[camel] = row[key];
   }
   return out;
 }
-
-// 3. Helper Wrappers
-function mapRows(rows) { 
-  if (!Array.isArray(rows)) return [];
-  return rows.map(toCamel); 
-}
-
+function mapRows(rows) { return rows.map(toCamel); }
 function coerceJson(val) {
   if (!val) return null;
-  if (typeof val === "object") return val;
   if (typeof val === "string") {
     try { return JSON.parse(val); } catch { return null; }
   }
   return val;
 }
-// ============================================================
 
 // ==============================
 // Notifications (Telegram, Email via Resend, WhatsApp via Twilio)
