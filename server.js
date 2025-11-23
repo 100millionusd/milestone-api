@@ -1037,16 +1037,44 @@ console.log('[db] proposer_profiles ready');
 // Utilities
 // ==============================
 
-// 1. The URL Signer (Must be defined first)
+// ============================================================
+// HELPER BLOCK: Paste this to replace ALL existing helpers
+// (signUrl, toCamel, mapRows, coerceJson)
+// ============================================================
+
+// 1. The URL Signer (Now with Debugging)
 function signUrl(url) {
-  if (typeof url === "string" && url.includes("mypinata.cloud/ipfs/") && !url.includes("token=")) {
-     const token = process.env.PINATA_GATEWAY_TOKEN; 
-     return token ? `${url}?token=${token}` : url;
+  if (typeof url !== "string") return url;
+  
+  // Check if it's a Pinata URL
+  if (url.includes("mypinata.cloud/ipfs/") || url.includes("gateway.pinata.cloud/ipfs/")) {
+     
+     // Load token
+     const token = process.env.PINATA_GATEWAY_TOKEN;
+     
+     // DEBUG: If this logs "Missing", check Railway Variables again
+     if (!token) {
+         console.warn("⚠️ PINATA_GATEWAY_TOKEN is missing in process.env");
+         return url;
+     }
+
+     // Force upgrade to your specific Sapphire gateway
+     // This ensures it matches the 401 URL you are seeing in the console
+     let finalUrl = url.replace("gateway.pinata.cloud", "sapphire-given-snake-741.mypinata.cloud");
+
+     // Attach token if it's not already there
+     if (!finalUrl.includes("token=")) {
+        // Check if URL already has query params (like ?filename=...)
+        const separator = finalUrl.includes("?") ? "&" : "?";
+        finalUrl = `${finalUrl}${separator}token=${token}`;
+        // console.log("✅ Signed URL:", finalUrl); // Uncomment to see every signed URL in logs
+     }
+     return finalUrl;
   }
   return url;
 }
 
-// 2. The Converter (Uses signUrl)
+// 2. The Converter (Fixes the JSON String issue)
 function toCamel(row) {
   if (!row || typeof row !== "object") return row;
   const out = {};
@@ -1054,21 +1082,26 @@ function toCamel(row) {
     const camel = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
     let val = row[key];
 
-    // Handle arrays of files (e.g. proofs or bids files)
+    // Auto-detect and parse JSON strings for file columns
+    // This fixes the issue where the DB returns a string, causing the signer to skip it
+    if (['files', 'doc', 'docs', 'file', 'aiAnalysis'].includes(camel) && typeof val === "string") {
+        try { 
+            const parsed = JSON.parse(val);
+            val = parsed; // Convert string -> object/array
+        } catch (e) { /* keep as string if parse fails */ }
+    }
+
+    // Now handle the values (whether they were originally objects or just parsed)
     if (Array.isArray(val)) {
-       val = val.map(item => {
-         if (item && typeof item === 'object' && item.url) {
-            return { ...item, url: signUrl(item.url) };
-         }
-         return item;
-       });
-    }
-    // Handle single file objects (e.g. doc)
-    else if (key === 'doc' && val && val.url) {
+        val = val.map(item => {
+            if (item && typeof item === 'object' && item.url) {
+                return { ...item, url: signUrl(item.url) };
+            }
+            return item;
+        });
+    } else if (val && typeof val === 'object' && val.url) {
         val = { ...val, url: signUrl(val.url) };
-    }
-    // Handle direct URL strings
-    else if ((key === 'url' || key === 'cid') && typeof val === 'string') {
+    } else if (typeof val === 'string' && (key === 'url' || key === 'cid')) {
         val = signUrl(val);
     }
 
@@ -1077,23 +1110,23 @@ function toCamel(row) {
   return out;
 }
 
-// 3. The List Mapper (Must be defined last)
+// 3. The List Mapper
 function mapRows(rows) { 
   if (!Array.isArray(rows)) return [];
   return rows.map(toCamel); 
 }
 
-// Paste this RIGHT AFTER the mapRows function
-
+// 4. The JSON Coercer (Required for existing routes)
 function coerceJson(val) {
   if (!val) return null;
+  // If it's already an object (because toCamel parsed it), return it
+  if (typeof val === "object") return val;
   if (typeof val === "string") {
     try { return JSON.parse(val); } catch { return null; }
   }
   return val;
 }
-
-// ==========================================
+// ============================================================
 
 // ==============================
 // Notifications (Telegram, Email via Resend, WhatsApp via Twilio)
