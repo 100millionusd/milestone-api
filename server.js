@@ -1085,6 +1085,9 @@ function toCamel(row) {
   return out;
 }
 
+// 3. The List Mapper (THIS WAS MISSING)
+function mapRows(rows) { return rows.map(toCamel); }
+
 // ==============================
 // Notifications (Telegram, Email via Resend, WhatsApp via Twilio)
 // ==============================
