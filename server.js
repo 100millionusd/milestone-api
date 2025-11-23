@@ -1036,22 +1036,53 @@ console.log('[db] proposer_profiles ready');
 // ==============================
 // Utilities
 // ==============================
+
+// [ADD THIS NEW FUNCTION]
+// Automatically attaches the Railway token to private Gateway URLs
+function signUrl(url) {
+  if (typeof url === "string" && url.includes("mypinata.cloud/ipfs/") && !url.includes("token=")) {
+     const token = process.env.PINATA_GATEWAY_TOKEN; 
+     // Only append if we actually have a token
+     return token ? `${url}?token=${token}` : url;
+  }
+  return url;
+}
+
+// [REPLACE YOUR EXISTING toCamel FUNCTION WITH THIS]
 function toCamel(row) {
   if (!row || typeof row !== "object") return row;
   const out = {};
   for (const key of Object.keys(row)) {
     const camel = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
-    out[camel] = row[key];
+    let val = row[key];
+
+    // --- MAGICAL FIX: Sign Pinata URLs automatically ---
+    
+    // 1. Handle arrays of files (e.g. from 'bids' or 'proofs')
+    if (Array.isArray(val)) {
+       val = val.map(item => {
+         // If it's a file object with a URL, sign it
+         if (item && typeof item === 'object' && item.url) {
+            return { ...item, url: signUrl(item.url) };
+         }
+         return item;
+       });
+    }
+
+    // 2. Handle single file objects (e.g. 'doc')
+    if (key === 'doc' && val && val.url) {
+        val = { ...val, url: signUrl(val.url) };
+    }
+
+    // 3. Handle direct URL strings (if any)
+    if (key === 'url' || key === 'cid') {
+        val = signUrl(val);
+    }
+    // ---------------------------------------------------
+
+    out[camel] = val;
   }
   return out;
-}
-function mapRows(rows) { return rows.map(toCamel); }
-function coerceJson(val) {
-  if (!val) return null;
-  if (typeof val === "string") {
-    try { return JSON.parse(val); } catch { return null; }
-  }
-  return val;
 }
 
 // ==============================
