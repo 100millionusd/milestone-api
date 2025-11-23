@@ -1083,6 +1083,16 @@ function mapRows(rows) {
   return rows.map(toCamel); 
 }
 
+// Paste this RIGHT AFTER the mapRows function
+
+function coerceJson(val) {
+  if (!val) return null;
+  if (typeof val === "string") {
+    try { return JSON.parse(val); } catch { return null; }
+  }
+  return val;
+}
+
 // ==========================================
 
 // ==============================
