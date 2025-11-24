@@ -11259,6 +11259,39 @@ if (bidIds.length) {
 }
 });
 
+// In server.js, add this route
+app.get("/auth/pinata-token", requireAuth, async (req, res) => {
+  try {
+    const uuid = crypto.randomUUID();
+    const body = {
+      keyName: `temp_upload_${uuid}`,
+      permissions: {
+        endpoints: {
+          pinning: {
+            pinFileToIPFS: true,
+            pinJSONToIPFS: true
+          }
+        }
+      },
+      maxUses: 10 // Allow enough for 4 files + JSON + retries
+    };
+
+    const response = await fetch("https://api.pinata.cloud/users/generateApiKey", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.PINATA_JWT || process.env.PINATA_API_KEY}` // Use your JWT here
+      },
+      body: JSON.stringify(body)
+    });
+
+    const keyData = await response.json();
+    res.json(keyData);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to generate upload token" });
+  }
+});
+
 // ==============================
 // Routes — Payments (legacy)
 // ==============================
