@@ -11343,20 +11343,27 @@ app.post("/ipfs/upload-file", async (req, res) => {
 });
 
 // ✅ QUEUE-PROTECTED JSON ROUTE
+// This prevents the "Proposal JSON" step from crashing due to rate limits
 app.post("/ipfs/upload-json", async (req, res) => {
   try {
     // Add to the SAME global queue as the files
     await (globalPinataQueue = globalPinataQueue.then(async () => {
+        
+        // 1. Attempt the upload
         const result = await pinataUploadJson(req.body || {});
         
-        // Safety delay after JSON upload too
-        console.log(`[Pinata] Uploaded JSON. Waiting...`);
-        await new Promise(r => setTimeout(r, 1500)); 
+        // 2. Safety delay: Cool down the API key after this upload
+        console.log(`[Pinata] Uploaded JSON Metadata. Waiting...`);
+        await new Promise(r => setTimeout(r, 2000)); 
         
+        // 3. Send response
         res.json(result);
+
     }).catch(err => {
+        // If the queue fails, throw so the outer catch block handles it
         throw err;
     }));
+
   } catch (err) {
     console.error("JSON Upload error:", err);
     res.status(500).json({ error: err.message });
