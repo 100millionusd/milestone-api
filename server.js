@@ -2164,7 +2164,7 @@ const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECR
 // Helper: Wait with jitter (randomness) to prevent synchronized retries
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Replace your existing pinataUploadFile with this robust version:
+
 /// Precise Pinata Upload (Calculates Content-Length to fix 400 Error)
 async function pinataUploadFile(file) {
   if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
@@ -2247,6 +2247,38 @@ async function pinataUploadFile(file) {
       }
     }
   }
+}
+
+async function pinataUploadJson(body) {
+  if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
+    throw new Error("Pinata not configured");
+  }
+  const payload = JSON.stringify(body);
+  const headers = {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(payload),
+  };
+  if (process.env.PINATA_JWT) {
+    headers["Authorization"] = `Bearer ${process.env.PINATA_JWT}`;
+  } else {
+    headers["pinata_api_key"] = process.env.PINATA_API_KEY;
+    headers["pinata_secret_api_key"] = process.env.PINATA_SECRET_API_KEY;
+  }
+
+  const { status, body: resBody } = await sendRequest(
+    "POST",
+    "https://api.pinata.cloud/pinning/pinJSONToIPFS",
+    headers,
+    payload
+  );
+
+  if (status >= 400) throw new Error(`Pinata JSON Error ${status}: ${resBody}`);
+  const result = JSON.parse(resBody);
+  return {
+    cid: result.IpfsHash,
+    url: `https://gateway.pinata.cloud/ipfs/${result.IpfsHash}`,
+    timestamp: result.Timestamp
+  };
 }
 
 // ==============================
