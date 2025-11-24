@@ -11209,51 +11209,27 @@ function normalizeMilestone(x) {
 // ==============================
 // Routes — IPFS via Pinata
 // ==============================
-// --- GLOBAL UPLOAD QUEUE (Prevents Pinata 429 Errors) ---
-const _pinataQueue = [];
-let _isUploading = false;
-
-const _processUploadQueue = async () => {
-  if (_isUploading || _pinataQueue.length === 0) return;
-  _isUploading = true;
-
-  const { file, resolve, reject } = _pinataQueue.shift();
-  try {
-    const result = await pinataUploadFile(file);
-    resolve(result);
-  } catch (err) {
-    reject(err);
-  } finally {
-    // Force a 500ms cool-down between uploads to satisfy Pinata limits
-    setTimeout(() => {
-      _isUploading = false;
-      _processUploadQueue();
-    }, 500);
-  }
-};
-
 app.post("/ipfs/upload-file", async (req, res) => {
   try {
     if (!req.files || !req.files.file) return res.status(400).json({ error: "No file uploaded" });
 
-    // Handle both single file and array of files (batch upload)
+    // Handle both single file and array of files
     const fileInput = req.files.file;
     const files = Array.isArray(fileInput) ? fileInput : [fileInput];
     const results = [];
 
+    // ✅ SEQUENTIAL UPLOAD: Uploads one by one to avoid 429 bursts
     for (const f of files) {
-      // Push each file to the global queue and await its turn
-      const result = await new Promise((resolve, reject) => {
-        _pinataQueue.push({ file: f, resolve, reject });
-        _processUploadQueue();
-      });
+      const result = await pinataUploadFile(f);
       results.push(result);
+      
+      // Small pause between files to help with rate limits
+      await new Promise(r => setTimeout(r, 300));
     }
 
-    // Return single object if input was single, else array
     res.json(files.length === 1 ? results[0] : results);
   } catch (err) {
-    console.error("Upload Queue Error:", err);
+    console.error("Upload error:", err);
     res.status(500).json({ error: err.message });
   }
 });
