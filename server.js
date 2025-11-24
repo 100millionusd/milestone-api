@@ -11324,7 +11324,7 @@ app.post("/ipfs/upload-file", async (req, res) => {
                 
                 // 3. SAFETY DELAY: 1000ms is safer than 300ms for free/tier-1 plans
                 console.log(`[Pinata] Uploaded ${f.name}. Waiting...`);
-                await new Promise(r => setTimeout(r, 1000)); 
+                await new Promise(r => setTimeout(r, 1500)); 
             } catch (innerErr) {
                 console.error(`[Pinata] Failed to upload ${f.name}`, innerErr);
                 throw innerErr; // Stop this batch if a file fails
@@ -11342,11 +11342,23 @@ app.post("/ipfs/upload-file", async (req, res) => {
   }
 });
 
+// ✅ QUEUE-PROTECTED JSON ROUTE
 app.post("/ipfs/upload-json", async (req, res) => {
   try {
-    const result = await pinataUploadJson(req.body || {});
-    res.json(result);
+    // Add to the SAME global queue as the files
+    await (globalPinataQueue = globalPinataQueue.then(async () => {
+        const result = await pinataUploadJson(req.body || {});
+        
+        // Safety delay after JSON upload too
+        console.log(`[Pinata] Uploaded JSON. Waiting...`);
+        await new Promise(r => setTimeout(r, 1500)); 
+        
+        res.json(result);
+    }).catch(err => {
+        throw err;
+    }));
   } catch (err) {
+    console.error("JSON Upload error:", err);
     res.status(500).json({ error: err.message });
   }
 });
