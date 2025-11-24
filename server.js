@@ -2803,12 +2803,16 @@ const proposalSchema = Joi.object({
   address: Joi.string().allow(""),
   city: Joi.string().allow(""),
   country: Joi.string().allow(""),
-  amountUSD: Joi.number().min(0).default(0),
+  
+  // FIX: Allow both amountUSD and legacy amount
+  amountUSD: Joi.number().min(0).optional(),
+  amount: Joi.number().min(0).optional(),
+  
   docs: Joi.array().default([]),
   cid: Joi.string().allow(""),
-  ownerEmail: Joi.string().email().allow(""), // ✅ NEW (optional)
+  ownerEmail: Joi.string().email().allow(""),
   ownerPhone: Joi.string().allow("").optional(), 
-});
+}).unknown(true); // <--- FIX: Allow unknown fields to prevent 400 errors
 
 const proposalUpdateSchema = Joi.object({
   orgName: Joi.string().min(2).max(160),
@@ -4175,18 +4179,18 @@ app.post("/proposals", authGuard, async (req, res) => {
 
     if (!ownerWallet) return res.status(401).json({ error: "Login required" });
 
-    // ... (Keep your existing proposer profile check logic here) ...
+    // ... (keep your existing proposer profile checks) ...
 
-    // --- NEW: ENRICH DOCS WITH GPS/DATE BEFORE SAVING ---
+    // --- Enrich Docs Logic (Keep this from previous steps) ---
     let finalDocs = value.docs || [];
     try {
-      // This runs on the server, so it's fast and persistent
       finalDocs = await enrichDocsWithMeta(finalDocs);
     } catch (e) {
       console.warn("Docs enrichment failed:", e);
-      // Fallback to raw docs if enrichment fails
     }
-    // ----------------------------------------------------
+    
+    // FIX: Handle 'amount' (frontend) OR 'amountUSD' (backend preferred)
+    const budget = value.amountUSD !== undefined ? value.amountUSD : (value.amount || 0);
 
     const q = `
       INSERT INTO proposals (
@@ -4207,8 +4211,8 @@ app.post("/proposals", authGuard, async (req, res) => {
       value.address,
       value.city,
       value.country,
-      value.amountUSD,
-      JSON.stringify(finalDocs), // <--- Save the enriched docs
+      budget, // <--- Use the resolved budget variable
+      JSON.stringify(finalDocs),
       value.cid ?? null,
       ownerWallet,
       ownerEmail,
