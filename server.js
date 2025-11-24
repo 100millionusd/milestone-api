@@ -2165,39 +2165,43 @@ const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECR
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Replace your existing pinataUploadFile with this robust version:
-// Robust Pinata Upload (Native Fetch + Buffer)
+/// Precise Pinata Upload (Calculates Content-Length to fix 400 Error)
 async function pinataUploadFile(file) {
   if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
     throw new Error("Pinata not configured");
   }
 
   const FormData = require('form-data');
-
-  // Increase retries for safety
   const maxRetries = 6;
   let attempt = 0;
 
   while (attempt < maxRetries) {
     try {
       const form = new FormData();
-
-      // FIX: Pass Buffer directly (file.data) instead of a Stream.
-      // This ensures Content-Length is calculated correctly.
+      
+      // Append the Buffer (file.data) with required metadata
       form.append('file', file.data, { 
         filename: file.name || 'file', 
         contentType: file.mimetype || 'application/octet-stream'
       });
-
-      form.append('pinataMetadata', JSON.stringify({
-        name: file.name || 'upload'
-      }));
       
-      form.append('pinataOptions', JSON.stringify({
-        cidVersion: 0
-      }));
+      form.append('pinataMetadata', JSON.stringify({ name: file.name || 'upload' }));
+      form.append('pinataOptions', JSON.stringify({ cidVersion: 0 }));
 
-      // Prepare headers (API Key or JWT)
-      const headers = { ...form.getHeaders() };
+      // CRITICAL FIX: Calculate exact Content-Length so Pinata accepts the format
+      const length = await new Promise((resolve, reject) => {
+        form.getLength((err, len) => {
+          if (err) reject(err);
+          else resolve(len);
+        });
+      });
+
+      // Prepare headers with Length and Auth
+      const headers = { 
+        ...form.getHeaders(),
+        'Content-Length': length 
+      };
+
       if (process.env.PINATA_JWT) {
         headers['Authorization'] = `Bearer ${process.env.PINATA_JWT}`;
       } else {
@@ -2205,25 +2209,21 @@ async function pinataUploadFile(file) {
         headers['pinata_secret_api_key'] = process.env.PINATA_SECRET_API_KEY;
       }
 
-      // Send Request
-      const res = await fetch('https://api.pinata.cloud/pinning/pinFileToIPFS', {
-        method: 'POST',
-        headers: headers,
-        body: form,
-      });
+      // Use existing sendRequest helper
+      const { status, body } = await sendRequest(
+        'POST',
+        'https://api.pinata.cloud/pinning/pinFileToIPFS',
+        headers,
+        form
+      );
 
-      // Handle Response
-      if (!res.ok) {
-        const text = await res.text();
-        // 429 = Rate Limit, 400 = Bad Format (should be fixed now), 403 = Auth
-        if (res.status === 429) {
-          throw new Error('RATE_LIMITED');
-        }
-        throw new Error(`Pinata Error ${res.status}: ${text}`);
+      // Handle Responses
+      if (status >= 400) {
+        if (status === 429) throw new Error('RATE_LIMITED');
+        throw new Error(`Pinata Error ${status}: ${body}`);
       }
 
-      const result = await res.json();
-      
+      const result = JSON.parse(body);
       return {
         cid: result.IpfsHash,
         url: `https://gateway.pinata.cloud/ipfs/${result.IpfsHash}`,
@@ -2236,14 +2236,13 @@ async function pinataUploadFile(file) {
       const isRateLimit = err.message === 'RATE_LIMITED' || (err.message || '').includes('Too Many Requests');
       
       if (isRateLimit && attempt < maxRetries - 1) {
-        // Aggressive Backoff: 3s, 6s, 12s, 24s...
+        // Aggressive backoff: 3s, 6s, 12s, 24s...
         const waitTime = 3000 * Math.pow(2, attempt);
-        console.warn(`[Pinata] Rate limit hit. Pausing for ${waitTime / 1000}s...`);
+        console.warn(`[Pinata] Rate limit. Pausing ${waitTime/1000}s...`);
         await new Promise(r => setTimeout(r, waitTime));
         attempt++;
       } else {
-        // Fatal error (like 400 Bad Request or 401 Unauthorized) -> Stop trying
-        console.error("Pinata Upload Fatal Error:", err);
+        console.error("Pinata Upload Fatal:", err.message);
         throw err;
       }
     }
