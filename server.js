@@ -4296,13 +4296,17 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           COALESCE(MAX(NULLIF(p.org_name,'')), '')                 AS entity_name,
           COUNT(*)::int                                            AS proposals_count,
           MAX(COALESCE(p.updated_at, p.created_at))               AS last_proposal_at,
-          COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
+ COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
                             THEN COALESCE(p.amount_usd,0) ELSE 0 END),0)::numeric AS total_awarded_usd,
 
-          -- FIX: Explicitly count statuses so the frontend knows what is approved
-          COUNT(*) FILTER (WHERE p.status = 'approved')::int      AS approved_count,
-          COUNT(*) FILTER (WHERE p.status = 'pending')::int       AS pending_count,
-          COUNT(*) FILTER (WHERE p.status = 'rejected')::int      AS rejected_count,
+          -- FIX: Count 'funded' and 'completed' as approved too
+          COUNT(*) FILTER (WHERE lower(p.status) IN ('approved', 'funded', 'completed'))::int AS approved_count,
+          
+          -- FIX: Handle pending case-insensitively just in case
+          COUNT(*) FILTER (WHERE lower(p.status) = 'pending')::int       AS pending_count,
+          
+          -- FIX: Handle rejected case-insensitively
+          COUNT(*) FILTER (WHERE lower(p.status) = 'rejected')::int      AS rejected_count,
 
           -- EMAIL: prefer owner_email; else extract from 'contact' if it contains an email
           MAX(
