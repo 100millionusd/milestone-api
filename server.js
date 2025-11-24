@@ -4278,6 +4278,7 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
 });
 
 /// /admin/entities — REPLACE ENTIRE ROUTE (excludes wallets in vendor_profiles; includes proposer_profiles even with 0 proposals)
+/// /admin/entities — REPLACE ENTIRE ROUTE (excludes wallets in vendor_profiles; includes proposer_profiles even with 0 proposals)
 app.get('/admin/entities', adminGuard, async (req, res) => {
   try {
     const includeArchived = ['true','1','yes'].includes(
@@ -4297,6 +4298,11 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           MAX(COALESCE(p.updated_at, p.created_at))               AS last_proposal_at,
           COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
                             THEN COALESCE(p.amount_usd,0) ELSE 0 END),0)::numeric AS total_awarded_usd,
+
+          -- FIX: Explicitly count statuses so the frontend knows what is approved
+          COUNT(*) FILTER (WHERE p.status = 'approved')::int      AS approved_count,
+          COUNT(*) FILTER (WHERE p.status = 'pending')::int       AS pending_count,
+          COUNT(*) FILTER (WHERE p.status = 'rejected')::int      AS rejected_count,
 
           -- EMAIL: prefer owner_email; else extract from 'contact' if it contains an email
           MAX(
@@ -4353,6 +4359,12 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           COALESCE(ents.city, props.city)                                 AS city,
           COALESCE(ents.country, props.country)                           AS country,
           COALESCE(props.proposals_count, 0)::int                         AS proposals_count,
+          
+          -- Pass counts through from props CTE
+          COALESCE(props.approved_count, 0)::int                          AS approved_count,
+          COALESCE(props.pending_count, 0)::int                           AS pending_count,
+          COALESCE(props.rejected_count, 0)::int                          AS rejected_count,
+
           COALESCE(props.last_proposal_at, ents.updated_at)               AS last_activity_at,
           COALESCE(props.total_awarded_usd, 0)::numeric                   AS total_awarded_usd,
           COALESCE(props.archived_count, 0)::int                          AS archived_count,
@@ -4373,6 +4385,9 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
         city,
         country,
         proposals_count,
+        approved_count, -- Select these in final query
+        pending_count,
+        rejected_count,
         last_activity_at,
         total_awarded_usd,
         archived_count,
@@ -4413,18 +4428,23 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
         lastActivityAt: r.last_activity_at,
         totalBudgetUSD: Number(r.total_awarded_usd) || 0,
 
+        // FIX: Map the counts to the JSON response
+        approvedCount: Number(r.approved_count) || 0,
+        pendingCount: Number(r.pending_count) || 0,
+        rejectedCount: Number(r.rejected_count) || 0,
+        archivedCount: Number(r.archived_count) || 0,
+
         email,
         contactEmail: email,
         ownerEmail: email,
         phone,
         whatsapp: phone,
 
-        // 5. ADDED THESE 5 LINES
         telegramChatId: telegramChatId,
         telegramUsername: telegramUsername,
         telegramConnected: !!(telegramChatId || telegramUsername),
-        ownerTelegramUsername: telegramUsername, // For AdminEntitiesTable component
-        ownerTelegramChatId: telegramChatId,     // For AdminEntitiesTable component
+        ownerTelegramUsername: telegramUsername,
+        ownerTelegramChatId: telegramChatId,
 
         address: flat,
         addressText: flat,
