@@ -11259,13 +11259,15 @@ if (bidIds.length) {
 }
 });
 
-// In server.js, add this route
 app.get("/auth/pinata-token", requireAuth, async (req, res) => {
   try {
     const uuid = crypto.randomUUID();
+    
+    // Payload for generating a scoped key
     const body = {
       keyName: `temp_upload_${uuid}`,
       permissions: {
+        admin: false, // Explicitly set false if defining specific endpoints
         endpoints: {
           pinning: {
             pinFileToIPFS: true,
@@ -11273,21 +11275,29 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
           }
         }
       },
-      maxUses: 10 // Allow enough for 4 files + JSON + retries
+      maxUses: 10
     };
 
     const response = await fetch("https://api.pinata.cloud/users/generateApiKey", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.PINATA_JWT || process.env.PINATA_API_KEY}` // Use your JWT here
+        // Ensure this ENV var is an ADMIN key
+        "Authorization": `Bearer ${process.env.PINATA_JWT}` 
       },
       body: JSON.stringify(body)
     });
 
+    if (!response.ok) {
+      const txt = await response.text();
+      console.error("Pinata Generate Key Failed:", txt);
+      return res.status(500).json({ error: "Pinata refused to generate key" });
+    }
+
     const keyData = await response.json();
-    res.json(keyData);
+    res.json(keyData); // Should return { JWT: "...", pinata_api_key: "..." }
   } catch (err) {
+    console.error("Pinata Token Error:", err);
     res.status(500).json({ error: "Failed to generate upload token" });
   }
 });
