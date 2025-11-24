@@ -2166,80 +2166,99 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 
 /// Precise Pinata Upload (Calculates Content-Length to fix 400 Error)
+// Precise Pinata Upload (Manual Buffer + Dedicated Gateway Return)
 async function pinataUploadFile(file) {
   if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
     throw new Error("Pinata not configured");
   }
 
-  const FormData = require('form-data');
+  // ⚡ YOUR DEDICATED GATEWAY
+  const GATEWAY_DOMAIN = "sapphire-given-snake-741.mypinata.cloud"; 
+
+  const boundary = `--------------------------${Date.now().toString(16)}`;
+  const crlf = "\r\n";
+
+  // 1. Construct payload parts manually (Fixes "Invalid request format")
+  const metaPart = [
+    `--${boundary}`,
+    `Content-Disposition: form-data; name="pinataMetadata"`,
+    "",
+    JSON.stringify({ name: file.name || "upload" }),
+  ].join(crlf);
+
+  const optionsPart = [
+    `--${boundary}`,
+    `Content-Disposition: form-data; name="pinataOptions"`,
+    "",
+    JSON.stringify({ cidVersion: 0 }),
+  ].join(crlf);
+
+  const fileHeader = [
+    `--${boundary}`,
+    `Content-Disposition: form-data; name="file"; filename="${file.name || "file"}"`,
+    `Content-Type: ${file.mimetype || "application/octet-stream"}`,
+    "",
+    "",
+  ].join(crlf);
+
+  const endBoundary = `${crlf}--${boundary}--${crlf}`;
+
+  const payload = Buffer.concat([
+    Buffer.from(metaPart + crlf),
+    Buffer.from(optionsPart + crlf),
+    Buffer.from(fileHeader),
+    file.data, 
+    Buffer.from(endBoundary)
+  ]);
+
+  // 2. Retry Logic
   const maxRetries = 6;
   let attempt = 0;
 
   while (attempt < maxRetries) {
     try {
-      const form = new FormData();
-      
-      // Append the Buffer (file.data) with required metadata
-      form.append('file', file.data, { 
-        filename: file.name || 'file', 
-        contentType: file.mimetype || 'application/octet-stream'
-      });
-      
-      form.append('pinataMetadata', JSON.stringify({ name: file.name || 'upload' }));
-      form.append('pinataOptions', JSON.stringify({ cidVersion: 0 }));
-
-      // CRITICAL FIX: Calculate exact Content-Length so Pinata accepts the format
-      const length = await new Promise((resolve, reject) => {
-        form.getLength((err, len) => {
-          if (err) reject(err);
-          else resolve(len);
-        });
-      });
-
-      // Prepare headers with Length and Auth
-      const headers = { 
-        ...form.getHeaders(),
-        'Content-Length': length 
+      const headers = {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": payload.length, // <--- CRITICAL FIX
       };
 
       if (process.env.PINATA_JWT) {
-        headers['Authorization'] = `Bearer ${process.env.PINATA_JWT}`;
+        headers["Authorization"] = `Bearer ${process.env.PINATA_JWT}`;
       } else {
-        headers['pinata_api_key'] = process.env.PINATA_API_KEY;
-        headers['pinata_secret_api_key'] = process.env.PINATA_SECRET_API_KEY;
+        headers["pinata_api_key"] = process.env.PINATA_API_KEY;
+        headers["pinata_secret_api_key"] = process.env.PINATA_SECRET_API_KEY;
       }
 
-      // Use existing sendRequest helper
+      // 3. Send to API (Must use api.pinata.cloud for writing)
       const { status, body } = await sendRequest(
-        'POST',
-        'https://api.pinata.cloud/pinning/pinFileToIPFS',
+        "POST",
+        "https://api.pinata.cloud/pinning/pinFileToIPFS",
         headers,
-        form
+        payload
       );
 
-      // Handle Responses
       if (status >= 400) {
-        if (status === 429) throw new Error('RATE_LIMITED');
+        if (status === 429) throw new Error("RATE_LIMITED");
         throw new Error(`Pinata Error ${status}: ${body}`);
       }
 
       const result = JSON.parse(body);
+      
+      // 4. RETURN YOUR DEDICATED URL
       return {
         cid: result.IpfsHash,
-        url: `https://gateway.pinata.cloud/ipfs/${result.IpfsHash}`,
+        url: `https://${GATEWAY_DOMAIN}/ipfs/${result.IpfsHash}`, 
         name: file.name,
         size: result.PinSize,
-        timestamp: result.Timestamp
+        timestamp: result.Timestamp,
       };
 
     } catch (err) {
-      const isRateLimit = err.message === 'RATE_LIMITED' || (err.message || '').includes('Too Many Requests');
-      
+      const isRateLimit = err.message === "RATE_LIMITED" || (err.message || "").includes("Too Many Requests");
       if (isRateLimit && attempt < maxRetries - 1) {
-        // Aggressive backoff: 3s, 6s, 12s, 24s...
         const waitTime = 3000 * Math.pow(2, attempt);
-        console.warn(`[Pinata] Rate limit. Pausing ${waitTime/1000}s...`);
-        await new Promise(r => setTimeout(r, waitTime));
+        console.warn(`[Pinata] Rate limit. Pausing ${waitTime / 1000}s...`);
+        await new Promise((r) => setTimeout(r, waitTime));
         attempt++;
       } else {
         console.error("Pinata Upload Fatal:", err.message);
@@ -2503,48 +2522,55 @@ function isMediaFile(f) {
   return MEDIA_EXT_RE.test(n) || mt.startsWith("image/") || mt.startsWith("video/");
 }
 
-// --- Helper: Enrich Proposal Docs with Metadata (GPS + Location Name) ---
+// --- Helper: Auto-extract GPS & Date for Proposal Docs ---
 async function enrichDocsWithMeta(docs) {
   if (!Array.isArray(docs) || docs.length === 0) return [];
 
+  // Process in parallel
   return await Promise.all(docs.map(async (doc) => {
-    // optimization: if already enriched (has location), skip
-    if (doc.location || (doc.exif && doc.exif.gpsLatitude)) return doc;
-    if (!doc.url) return doc;
+    // Skip if not a file URL or already has location data
+    if (!doc.url || doc.location) return doc;
 
-    // 1. Extract EXIF (GPS, Date, Camera)
-    // extractFileMetaFromUrl is already defined in your server.js
-    const meta = await extractFileMetaFromUrl(doc); 
-    
-    // 2. Extract Coordinates
-    const lat = meta?.exif?.gpsLatitude;
-    const lon = meta?.exif?.gpsLongitude;
+    try {
+      // 1. Get Metadata (Exif, Hash, Size)
+      // Uses your existing fetchAsBuffer -> exiftool logic
+      const meta = await extractFileMetaFromUrl(doc); 
+      
+      // 2. Check for GPS
+      const lat = meta?.exif?.gpsLatitude;
+      const lon = meta?.exif?.gpsLongitude;
+      
+      // 3. Get Date (Taken At)
+      const takenAt = meta?.exif?.createDate || meta?.exif?.dateTimeOriginal || null;
 
-    // 3. Reverse Geocode (Coords -> "Potosí, Bolivia")
-    // reverseGeocode is already defined in your server.js
-    let location = null;
-    if (Number.isFinite(lat) && Number.isFinite(lon)) {
-      try {
-        const geo = await reverseGeocode(lat, lon);
-        if (geo) {
-          location = {
-            label: geo.label, // "Potosí, Bolivia"
-            city: geo.city,
-            country: geo.country,
-            approx: { lat, lon }
-          };
-        }
-      } catch (e) {
-        console.warn("Reverse geocode failed for doc:", doc.name);
+      // 4. Reverse Geocode (Coords -> City, Country)
+      let location = null;
+      if (Number.isFinite(lat) && Number.isFinite(lon)) {
+        try {
+          // Uses your existing reverseGeocode helper
+          const geo = await reverseGeocode(lat, lon);
+          if (geo) {
+            location = {
+              label: geo.label, // e.g. "Potosí, Bolivia"
+              city: geo.city,
+              country: geo.country,
+              approx: { lat, lon }
+            };
+          }
+        } catch (e) { /* ignore geo error */ }
       }
-    }
 
-    // 4. Return merged object
-    return {
-      ...doc,
-      ...meta, // adds: size, hashSha256, exif (createDate, etc)
-      location // adds: { label, city, country }
-    };
+      // Return enriched object
+      return {
+        ...doc,
+        ...meta,       // adds: size, exif
+        location,      // adds: { label, city... }
+        takenAt        // adds: ISO date string
+      };
+    } catch (e) {
+      console.warn("Enrichment failed for:", doc.url);
+      return doc; // return original on fail
+    }
   }));
 }
 
@@ -4170,7 +4196,8 @@ const _nonEmpty = (s) => typeof s === 'string' && s.trim() !== '';
 
 app.post("/proposals", authGuard, async (req, res) => {
   try {
-    const { error, value } = proposalSchema.validate(req.body);
+    // 1. Validate
+    const { error, value } = proposalSchema.validate(req.body, { allowUnknown: true });
     if (error) return res.status(400).json({ error: error.message });
 
     const ownerWallet = String(req.user?.address || req.user?.sub || "").toLowerCase();
@@ -4181,10 +4208,19 @@ app.post("/proposals", authGuard, async (req, res) => {
 
     // ... (keep your existing proposer profile checks) ...
 
-    // --- Enrich Docs Logic (Keep this from previous steps) ---
+    // --- Enrich Docs Logic (Updated) ---
     let finalDocs = value.docs || [];
+    
     try {
-      finalDocs = await enrichDocsWithMeta(finalDocs);
+      // 1. Existing metadata enrichment (keep if you have it)
+      if (typeof enrichDocsWithMeta === 'function') {
+         finalDocs = await enrichDocsWithMeta(finalDocs);
+      }
+
+      // 2. NEW: GPS Enrichment
+      // This reads the URLs in finalDocs, extracts EXIF, and updates the object
+      finalDocs = await enrichDocsWithGPS(finalDocs);
+
     } catch (e) {
       console.warn("Docs enrichment failed:", e);
     }
@@ -4211,8 +4247,8 @@ app.post("/proposals", authGuard, async (req, res) => {
       value.address,
       value.city,
       value.country,
-      budget, // <--- Use the resolved budget variable
-      JSON.stringify(finalDocs),
+      budget, 
+      JSON.stringify(finalDocs), // Now includes .location { lat, lon } inside the JSON
       value.cid ?? null,
       ownerWallet,
       ownerEmail,
