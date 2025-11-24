@@ -11259,21 +11259,20 @@ if (bidIds.length) {
 }
 });
 
+// ==================================================================
+// FIX: "Admin" and "Endpoints" cannot coexist. We choose Admin.
+// This fixes the "body syntax validation" error.
+// ==================================================================
 app.get("/auth/pinata-token", requireAuth, async (req, res) => {
   try {
     const uuid = crypto.randomUUID();
     
-    // Payload for generating a scoped key
     const body = {
       keyName: `temp_upload_${uuid}`,
       permissions: {
-        admin: false, // Explicitly set false if defining specific endpoints
-        endpoints: {
-          pinning: {
-            pinFileToIPFS: true,
-            pinJSONToIPFS: true
-          }
-        }
+        admin: true 
+        // ❌ DELETED: endpoints: { ... } 
+        // You cannot send 'endpoints' when 'admin' is true.
       },
       maxUses: 10
     };
@@ -11282,8 +11281,7 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        // Ensure this ENV var is an ADMIN key
-        "Authorization": `Bearer ${process.env.PINATA_JWT}` 
+        "Authorization": `Bearer ${process.env.PINATA_JWT}`
       },
       body: JSON.stringify(body)
     });
@@ -11291,11 +11289,16 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
     if (!response.ok) {
       const txt = await response.text();
       console.error("Pinata Generate Key Failed:", txt);
+      
+      // If rate limited, tell the frontend to wait
+      if (response.status === 429) {
+        return res.status(429).json({ error: "Rate limited by Pinata" });
+      }
       return res.status(500).json({ error: "Pinata refused to generate key" });
     }
 
     const keyData = await response.json();
-    res.json(keyData); // Should return { JWT: "...", pinata_api_key: "..." }
+    res.json(keyData); 
   } catch (err) {
     console.error("Pinata Token Error:", err);
     res.status(500).json({ error: "Failed to generate upload token" });
