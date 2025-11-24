@@ -2165,28 +2165,38 @@ const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECR
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Replace your existing pinataUploadFile with this robust version:
+// Robust Pinata Upload (Native Fetch + Buffer)
 async function pinataUploadFile(file) {
   if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
     throw new Error("Pinata not configured");
   }
 
   const FormData = require('form-data');
-  const { Readable } = require('stream');
 
-  // Retry up to 6 times with heavy backoff
+  // Increase retries for safety
   const maxRetries = 6;
   let attempt = 0;
 
   while (attempt < maxRetries) {
     try {
-      // 1. Prepare the form data (Native way, no SDK)
       const form = new FormData();
-      form.append('file', Readable.from(file.data), { filename: file.name });
-      form.append('pinataMetadata', JSON.stringify({ name: file.name }));
-      form.append('pinataOptions', JSON.stringify({ cidVersion: 0 }));
 
-      // 2. Send Request using standard fetch
-      // We accept either JWT or API Keys
+      // FIX: Pass Buffer directly (file.data) instead of a Stream.
+      // This ensures Content-Length is calculated correctly.
+      form.append('file', file.data, { 
+        filename: file.name || 'file', 
+        contentType: file.mimetype || 'application/octet-stream'
+      });
+
+      form.append('pinataMetadata', JSON.stringify({
+        name: file.name || 'upload'
+      }));
+      
+      form.append('pinataOptions', JSON.stringify({
+        cidVersion: 0
+      }));
+
+      // Prepare headers (API Key or JWT)
       const headers = { ...form.getHeaders() };
       if (process.env.PINATA_JWT) {
         headers['Authorization'] = `Bearer ${process.env.PINATA_JWT}`;
@@ -2195,23 +2205,25 @@ async function pinataUploadFile(file) {
         headers['pinata_secret_api_key'] = process.env.PINATA_SECRET_API_KEY;
       }
 
+      // Send Request
       const res = await fetch('https://api.pinata.cloud/pinning/pinFileToIPFS', {
         method: 'POST',
         headers: headers,
         body: form,
       });
 
-      // 3. Handle Errors
+      // Handle Response
       if (!res.ok) {
         const text = await res.text();
+        // 429 = Rate Limit, 400 = Bad Format (should be fixed now), 403 = Auth
         if (res.status === 429) {
           throw new Error('RATE_LIMITED');
         }
         throw new Error(`Pinata Error ${res.status}: ${text}`);
       }
 
-      // 4. Success
       const result = await res.json();
+      
       return {
         cid: result.IpfsHash,
         url: `https://gateway.pinata.cloud/ipfs/${result.IpfsHash}`,
@@ -2221,18 +2233,18 @@ async function pinataUploadFile(file) {
       };
 
     } catch (err) {
-      // 5. Smart Backoff
       const isRateLimit = err.message === 'RATE_LIMITED' || (err.message || '').includes('Too Many Requests');
       
       if (isRateLimit && attempt < maxRetries - 1) {
-        // Wait 3s, then 6s, 12s, 24s... (Aggressive backoff to fix your crash)
+        // Aggressive Backoff: 3s, 6s, 12s, 24s...
         const waitTime = 3000 * Math.pow(2, attempt);
-        console.warn(`[Pinata] Rate limit hit. Pausing for ${waitTime / 1000}s before retry...`);
+        console.warn(`[Pinata] Rate limit hit. Pausing for ${waitTime / 1000}s...`);
         await new Promise(r => setTimeout(r, waitTime));
         attempt++;
       } else {
+        // Fatal error (like 400 Bad Request or 401 Unauthorized) -> Stop trying
         console.error("Pinata Upload Fatal Error:", err);
-        throw err; // Fatal error or max retries reached
+        throw err;
       }
     }
   }
