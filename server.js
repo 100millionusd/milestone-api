@@ -11260,59 +11260,65 @@ if (bidIds.length) {
 });
 
 // ==================================================================
-// ROUTE: Generate Temp Pinata Keys (With Rate Limit Protection)
+// GLOBAL CACHE: Stores one Upload Key to reuse for all users.
+// This reduces Pinata API calls from N per user -> 1 per day.
 // ==================================================================
+let _cachedPinataToken = null;
+
 app.get("/auth/pinata-token", requireAuth, async (req, res) => {
-  const maxRetries = 3; // Try 3 times before giving up
-  let attempt = 0;
-
-  while (attempt < maxRetries) {
-    try {
-      const uuid = crypto.randomUUID();
-      const body = {
-        keyName: `temp_upload_${uuid}`,
-        permissions: { admin: true }, // 'admin: true' is required to fix syntax error
-        maxUses: 10
-      };
-
-      const response = await fetch("https://api.pinata.cloud/users/generateApiKey", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${process.env.PINATA_JWT}`
-        },
-        body: JSON.stringify(body)
-      });
-
-      // ✅ Success: Return the key
-      if (response.ok) {
-        const keyData = await response.json();
-        return res.json(keyData);
-      }
-
-      // ⚠️ Rate Limit (429): Wait and Retry
-      if (response.status === 429) {
-        const waitTime = 2500 * Math.pow(2, attempt); // 2.5s -> 5s -> 10s
-        console.warn(`[Pinata KeyGen] Rate limited. Waiting ${waitTime}ms... (Attempt ${attempt + 1})`);
-        await new Promise(r => setTimeout(r, waitTime));
-        attempt++;
-        continue; // Restart loop
-      }
-
-      // ❌ Other Errors: Fail immediately
-      const txt = await response.text();
-      console.error("Pinata Generate Key Failed:", txt);
-      return res.status(500).json({ error: "Pinata refused to generate key" });
-
-    } catch (err) {
-      console.error("Pinata Token Exception:", err);
-      attempt++;
-      await new Promise(r => setTimeout(r, 1000));
+  try {
+    // 1. Check if we have a valid cached key (reuse it!)
+    if (_cachedPinataToken && _cachedPinataToken.expiresAt > Date.now()) {
+      // console.log("Using cached Pinata token..."); // Optional debug
+      return res.json(_cachedPinataToken.data);
     }
-  }
 
-  // If all retries failed
-  res.status(429).json({ error: "Rate limited by Pinata (Max retries exceeded)" });
+    console.log("Generating NEW Pinata Token (This should happen rarely)...");
+
+    const uuid = crypto.randomUUID();
+    const body = {
+      keyName: `global_upload_key_${uuid}`,
+      permissions: {
+        admin: false, // Scoped for security (since we reuse it)
+        endpoints: {
+          pinning: {
+            pinFileToIPFS: true,
+            pinJSONToIPFS: true
+          }
+        }
+      },
+      maxUses: 10000 // High usage limit so it lasts all day
+    };
+
+    const response = await fetch("https://api.pinata.cloud/users/generateApiKey", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.PINATA_JWT}`
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      console.error("Pinata KeyGen Failed:", text);
+      return res.status(500).json({ error: "Failed to generate key from Pinata" });
+    }
+
+    const keyData = await response.json();
+
+    // 2. Save to Cache (Valid for 24 hours)
+    _cachedPinataToken = {
+      data: keyData,
+      expiresAt: Date.now() + (24 * 60 * 60 * 1000) // 24 hours
+    };
+
+    res.json(keyData);
+
+  } catch (err) {
+    console.error("Pinata Token Route Error:", err);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
 });
 
 // ==============================
