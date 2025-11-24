@@ -4278,7 +4278,6 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
 });
 
 /// /admin/entities — REPLACE ENTIRE ROUTE (excludes wallets in vendor_profiles; includes proposer_profiles even with 0 proposals)
-/// /admin/entities — REPLACE ENTIRE ROUTE (excludes wallets in vendor_profiles; includes proposer_profiles even with 0 proposals)
 app.get('/admin/entities', adminGuard, async (req, res) => {
   try {
     const includeArchived = ['true','1','yes'].includes(
@@ -4296,17 +4295,19 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           COALESCE(MAX(NULLIF(p.org_name,'')), '')                 AS entity_name,
           COUNT(*)::int                                            AS proposals_count,
           MAX(COALESCE(p.updated_at, p.created_at))               AS last_proposal_at,
- COALESCE(SUM(CASE WHEN p.status IN ('approved','funded','completed')
+          
+          -- FIX: Use LOWER(TRIM()) for safer checks
+          COALESCE(SUM(CASE WHEN LOWER(TRIM(p.status)) IN ('approved','funded','completed')
                             THEN COALESCE(p.amount_usd,0) ELSE 0 END),0)::numeric AS total_awarded_usd,
 
-          -- FIX: Count 'funded' and 'completed' as approved too
-          COUNT(*) FILTER (WHERE lower(p.status) IN ('approved', 'funded', 'completed'))::int AS approved_count,
+          -- FIX: Count 'funded' and 'completed' as approved too; use LOWER(TRIM())
+          COUNT(*) FILTER (WHERE LOWER(TRIM(p.status)) IN ('approved', 'funded', 'completed'))::int AS approved_count,
           
-          -- FIX: Handle pending case-insensitively just in case
-          COUNT(*) FILTER (WHERE lower(p.status) = 'pending')::int       AS pending_count,
+          -- FIX: Handle pending case-insensitively
+          COUNT(*) FILTER (WHERE LOWER(TRIM(p.status)) = 'pending')::int       AS pending_count,
           
           -- FIX: Handle rejected case-insensitively
-          COUNT(*) FILTER (WHERE lower(p.status) = 'rejected')::int      AS rejected_count,
+          COUNT(*) FILTER (WHERE LOWER(TRIM(p.status)) = 'rejected')::int      AS rejected_count,
 
           -- EMAIL: prefer owner_email; else extract from 'contact' if it contains an email
           MAX(
@@ -10001,18 +10002,18 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
           COUNT(*) AS proposals_count,
           MAX(created_at) AS last_proposal_at,
           
-          -- 1. BUDGET: Sums up approved, funded, and completed
+          -- 1. BUDGET: Sums up approved, funded, and completed (FIX: Use LOWER(TRIM))
           COALESCE(SUM(CASE 
-            WHEN LOWER(status) IN ('approved', 'funded', 'completed') THEN amount_usd 
+            WHEN LOWER(TRIM(status)) IN ('approved', 'funded', 'completed') THEN amount_usd 
             ELSE 0 
           END), 0)::numeric AS total_budget_usd,
 
-          -- 2. COUNT (THE FIX): Must match the budget logic exactly
-          COUNT(*) FILTER (WHERE LOWER(status) IN ('approved', 'funded', 'completed'))::int AS approved_count,
+          -- 2. COUNT: Must match the budget logic exactly (FIX: Use LOWER(TRIM))
+          COUNT(*) FILTER (WHERE LOWER(TRIM(status)) IN ('approved', 'funded', 'completed'))::int AS approved_count,
           
-          COUNT(*) FILTER (WHERE LOWER(status) = 'pending')::int  AS pending_count,
-          COUNT(*) FILTER (WHERE LOWER(status) = 'rejected')::int AS rejected_count,
-          COUNT(*) FILTER (WHERE LOWER(status) = 'archived')::int AS archived_count
+          COUNT(*) FILTER (WHERE LOWER(TRIM(status)) = 'pending')::int  AS pending_count,
+          COUNT(*) FILTER (WHERE LOWER(TRIM(status)) = 'rejected')::int AS rejected_count,
+          COUNT(*) FILTER (WHERE LOWER(TRIM(status)) = 'archived')::int AS archived_count
         FROM base
         GROUP BY entity_key
       ),
