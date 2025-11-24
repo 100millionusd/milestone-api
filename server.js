@@ -10001,15 +10001,18 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
           COUNT(*) AS proposals_count,
           MAX(created_at) AS last_proposal_at,
           
-          -- 1. Sum budget for approved/funded/completed
-          COALESCE(SUM(CASE WHEN status IN ('approved','funded','completed') THEN amount_usd ELSE 0 END),0)::numeric AS total_budget_usd,
+          -- 1. BUDGET: Sums up approved, funded, and completed
+          COALESCE(SUM(CASE 
+            WHEN LOWER(status) IN ('approved', 'funded', 'completed') THEN amount_usd 
+            ELSE 0 
+          END), 0)::numeric AS total_budget_usd,
 
-          -- 2. FIX: Count 'funded' and 'completed' as Approved
-          COUNT(*) FILTER (WHERE status IN ('approved', 'funded', 'completed')) AS approved_count,
+          -- 2. COUNT (THE FIX): Must match the budget logic exactly
+          COUNT(*) FILTER (WHERE LOWER(status) IN ('approved', 'funded', 'completed'))::int AS approved_count,
           
-          COUNT(*) FILTER (WHERE status='pending')  AS pending_count,
-          COUNT(*) FILTER (WHERE status='rejected') AS rejected_count,
-          COUNT(*) FILTER (WHERE status='archived') AS archived_count
+          COUNT(*) FILTER (WHERE LOWER(status) = 'pending')::int  AS pending_count,
+          COUNT(*) FILTER (WHERE LOWER(status) = 'rejected')::int AS rejected_count,
+          COUNT(*) FILTER (WHERE LOWER(status) = 'archived')::int AS archived_count
         FROM base
         GROUP BY entity_key
       ),
