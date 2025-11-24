@@ -9987,7 +9987,7 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
         FROM proposals
         ${whereSql}
       ),
-      grp AS (
+ grp AS (
         SELECT
           entity_key,
           MAX(org_name) FILTER (WHERE org_name IS NOT NULL AND org_name <> '') AS org_name,
@@ -9997,10 +9997,16 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
           MAX(owner_phone) FILTER (WHERE owner_phone IS NOT NULL AND owner_phone <> '') AS owner_phone,
           MAX(owner_telegram_chat_id) FILTER (WHERE owner_telegram_chat_id IS NOT NULL AND owner_telegram_chat_id <> '') AS owner_telegram_chat_id,
           MAX(owner_telegram_username) FILTER (WHERE owner_telegram_username IS NOT NULL AND owner_telegram_username <> '') AS owner_telegram_username,
+          
           COUNT(*) AS proposals_count,
           MAX(created_at) AS last_proposal_at,
-          COALESCE(SUM(amount_usd),0)::numeric AS total_budget_usd,
-          COUNT(*) FILTER (WHERE status='approved') AS approved_count,
+          
+          -- 1. Sum budget for approved/funded/completed
+          COALESCE(SUM(CASE WHEN status IN ('approved','funded','completed') THEN amount_usd ELSE 0 END),0)::numeric AS total_budget_usd,
+
+          -- 2. FIX: Count 'funded' and 'completed' as Approved
+          COUNT(*) FILTER (WHERE status IN ('approved', 'funded', 'completed')) AS approved_count,
+          
           COUNT(*) FILTER (WHERE status='pending')  AS pending_count,
           COUNT(*) FILTER (WHERE status='rejected') AS rejected_count,
           COUNT(*) FILTER (WHERE status='archived') AS archived_count
