@@ -3845,22 +3845,6 @@ function normalizeEntitySelector(body = {}) {
   };
 }
 
-// ✅ This is the correct version. Use this for both.
-async function buildEntityWhereAsync(pool, sel) {
-  const cols = await detectProposalCols(pool);
-  const clauses = [];
-  const params = [];
-
-  const eqGroup = (colsArr, idx) =>
-    colsArr.map(c => `LOWER(TRIM(${c})) = LOWER(TRIM($${idx}))`).join(' OR ');
-
-  const addEq = (value, colsArr) => {
-    if (value && colsArr.length) {
-      params.push(value);
-      clauses.push(`(${eqGroup(colsArr, params.length)})`);
-    }
-  };
-
   // 1) explicit fields (any that are present)
   addEq(sel.wallet,       cols.walletCols);
   addEq(sel.contactEmail, cols.emailCols);
