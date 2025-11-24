@@ -2164,146 +2164,58 @@ const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECR
 // Helper: Wait with jitter (randomness) to prevent synchronized retries
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-
-// Precise Pinata Upload (Manual Buffer + Dedicated Gateway Return)
 async function pinataUploadFile(file) {
   if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
     throw new Error("Pinata not configured");
   }
 
-  // ⚡ YOUR DEDICATED GATEWAY
-  const GATEWAY_DOMAIN = "sapphire-given-snake-741.mypinata.cloud"; 
-
-  const boundary = `--------------------------${Date.now().toString(16)}`;
-  const crlf = "\r\n";
-
-  // 1. Construct payload parts manually (Fixes "Invalid request format")
-  const metaPart = [
-    `--${boundary}`,
-    `Content-Disposition: form-data; name="pinataMetadata"`,
-    "",
-    JSON.stringify({ name: file.name || "upload" }),
-  ].join(crlf);
-
-  const optionsPart = [
-    `--${boundary}`,
-    `Content-Disposition: form-data; name="pinataOptions"`,
-    "",
-    JSON.stringify({ cidVersion: 0 }),
-  ].join(crlf);
-
-  const fileHeader = [
-    `--${boundary}`,
-    `Content-Disposition: form-data; name="file"; filename="${file.name || "file"}"`,
-    `Content-Type: ${file.mimetype || "application/octet-stream"}`,
-    "",
-    "",
-  ].join(crlf);
-
-  const endBoundary = `${crlf}--${boundary}--${crlf}`;
-
-  const payload = Buffer.concat([
-    Buffer.from(metaPart + crlf),
-    Buffer.from(optionsPart + crlf),
-    Buffer.from(fileHeader),
-    file.data, 
-    Buffer.from(endBoundary)
-  ]);
-
-  // 2. Retry Logic
-  const maxRetries = 6;
+  // Increase max retries to 5 to be very safe
+  const maxRetries = 5;
   let attempt = 0;
 
   while (attempt < maxRetries) {
     try {
-      const headers = {
-        "Content-Type": `multipart/form-data; boundary=${boundary}`,
-        "Content-Length": payload.length, // <--- CRITICAL FIX
+      // 1. Create fresh stream for this attempt
+      const stream = Readable.from(file.data);
+      stream.path = file.name;
+
+      const options = {
+        pinataMetadata: { name: file.name },
+        pinataOptions: { cidVersion: 0 }
       };
 
-      if (process.env.PINATA_JWT) {
-        headers["Authorization"] = `Bearer ${process.env.PINATA_JWT}`;
-      } else {
-        headers["pinata_api_key"] = process.env.PINATA_API_KEY;
-        headers["pinata_secret_api_key"] = process.env.PINATA_SECRET_API_KEY;
-      }
+      // 2. Try Upload
+      const result = await pinata.pinFileToIPFS(stream, options);
 
-      // 3. Send to API (Must use api.pinata.cloud for writing)
-      const { status, body } = await sendRequest(
-        "POST",
-        "https://api.pinata.cloud/pinning/pinFileToIPFS",
-        headers,
-        payload
-      );
-
-      if (status >= 400) {
-        if (status === 429) throw new Error("RATE_LIMITED");
-        throw new Error(`Pinata Error ${status}: ${body}`);
-      }
-
-      const result = JSON.parse(body);
-      
-      // 4. RETURN YOUR DEDICATED URL
       return {
         cid: result.IpfsHash,
-        url: `https://${GATEWAY_DOMAIN}/ipfs/${result.IpfsHash}`, 
+        url: `https://gateway.pinata.cloud/ipfs/${result.IpfsHash}`,
         name: file.name,
         size: result.PinSize,
-        timestamp: result.Timestamp,
+        timestamp: result.Timestamp
       };
 
-  } catch (err) {
-      const isRateLimit = err.message === "RATE_LIMITED" || (err.message || "").includes("Too Many Requests");
-      if (isRateLimit && attempt < maxRetries - 1) {
-        
-        // --- CHANGED LOGIC START ---
-        // Base wait: 3s, 6s, 12s...
-        const baseWait = 3000 * Math.pow(2, attempt); 
-        // Add random jitter between 0ms and 1000ms
-        const jitter = Math.floor(Math.random() * 1000); 
-        const totalWait = baseWait + jitter;
-        
-        console.warn(`[Pinata] Rate limit. Pausing ${(totalWait/1000).toFixed(1)}s...`);
-        await new Promise((r) => setTimeout(r, totalWait));
-        // --- CHANGED LOGIC END ---
+    } catch (err) {
+      // 3. Check for Rate Limit errors
+      const isRateLimit = err?.reason === 'RATE_LIMITED' || 
+                          (err?.details && String(err.details).includes('slow down'));
 
+      if (isRateLimit && attempt < maxRetries - 1) {
+        // EXPONENTIAL BACKOFF: 2s -> 4s -> 8s -> 16s
+        // We add Math.random() * 1000 to prevent two uploads from retrying at the exact same millisecond
+        const waitTime = Math.pow(2, attempt + 1) * 1000 + (Math.random() * 1000);
+        
+        console.warn(`[Pinata] Rate limited. Pausing for ${Math.round(waitTime)}ms... (Attempt ${attempt + 1}/${maxRetries})`);
+        
+        await delay(waitTime);
         attempt++;
       } else {
-        console.error("Pinata Upload Fatal:", err.message);
-        throw err;
+        // If it's not a rate limit (e.g. auth error) or we ran out of retries
+        console.error("Pinata SDK Error:", err);
+        throw new Error("Pinata upload failed: " + (err.details || err.message));
       }
     }
-
-async function pinataUploadJson(body) {
-  if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
-    throw new Error("Pinata not configured");
   }
-  const payload = JSON.stringify(body);
-  const headers = {
-    "Content-Type": "application/json",
-    "Content-Length": Buffer.byteLength(payload),
-  };
-  if (process.env.PINATA_JWT) {
-    headers["Authorization"] = `Bearer ${process.env.PINATA_JWT}`;
-  } else {
-    headers["pinata_api_key"] = process.env.PINATA_API_KEY;
-    headers["pinata_secret_api_key"] = process.env.PINATA_SECRET_API_KEY;
-  }
-
-  const { status, body: resBody } = await sendRequest(
-    "POST",
-    "https://api.pinata.cloud/pinning/pinJSONToIPFS",
-    headers,
-    payload
-  );
-
-  if (status >= 400) throw new Error(`Pinata JSON Error ${status}: ${resBody}`);
-  const result = JSON.parse(resBody);
-  return {
-    cid: result.IpfsHash,
-    url: `https://gateway.pinata.cloud/ipfs/${result.IpfsHash}`,
-    timestamp: result.Timestamp
-  };
 }
 
 // ==============================
@@ -2526,58 +2438,6 @@ function isMediaFile(f) {
   const n = String(f.name || f.url || "").toLowerCase();
   const mt = String(f.mimetype || "").toLowerCase();
   return MEDIA_EXT_RE.test(n) || mt.startsWith("image/") || mt.startsWith("video/");
-}
-
-// --- Helper: Auto-extract GPS & Date for Proposal Docs ---
-async function enrichDocsWithMeta(docs) {
-  if (!Array.isArray(docs) || docs.length === 0) return [];
-
-  // Process in parallel
-  return await Promise.all(docs.map(async (doc) => {
-    // Skip if not a file URL or already has location data
-    if (!doc.url || doc.location) return doc;
-
-    try {
-      // 1. Get Metadata (Exif, Hash, Size)
-      // Uses your existing fetchAsBuffer -> exiftool logic
-      const meta = await extractFileMetaFromUrl(doc); 
-      
-      // 2. Check for GPS
-      const lat = meta?.exif?.gpsLatitude;
-      const lon = meta?.exif?.gpsLongitude;
-      
-      // 3. Get Date (Taken At)
-      const takenAt = meta?.exif?.createDate || meta?.exif?.dateTimeOriginal || null;
-
-      // 4. Reverse Geocode (Coords -> City, Country)
-      let location = null;
-      if (Number.isFinite(lat) && Number.isFinite(lon)) {
-        try {
-          // Uses your existing reverseGeocode helper
-          const geo = await reverseGeocode(lat, lon);
-          if (geo) {
-            location = {
-              label: geo.label, // e.g. "Potosí, Bolivia"
-              city: geo.city,
-              country: geo.country,
-              approx: { lat, lon }
-            };
-          }
-        } catch (e) { /* ignore geo error */ }
-      }
-
-      // Return enriched object
-      return {
-        ...doc,
-        ...meta,       // adds: size, exif
-        location,      // adds: { label, city... }
-        takenAt        // adds: ISO date string
-      };
-    } catch (e) {
-      console.warn("Enrichment failed for:", doc.url);
-      return doc; // return original on fail
-    }
-  }));
 }
 
 /** Convert a file URL to a small metadata object (EXIF/GPS, hashes) */
@@ -2835,16 +2695,12 @@ const proposalSchema = Joi.object({
   address: Joi.string().allow(""),
   city: Joi.string().allow(""),
   country: Joi.string().allow(""),
-  
-  // FIX: Allow both amountUSD and legacy amount
-  amountUSD: Joi.number().min(0).optional(),
-  amount: Joi.number().min(0).optional(),
-  
+  amountUSD: Joi.number().min(0).default(0),
   docs: Joi.array().default([]),
   cid: Joi.string().allow(""),
-  ownerEmail: Joi.string().email().allow(""),
+  ownerEmail: Joi.string().email().allow(""), // ✅ NEW (optional)
   ownerPhone: Joi.string().allow("").optional(), 
-}).unknown(true); // <--- FIX: Allow unknown fields to prevent 400 errors
+});
 
 const proposalUpdateSchema = Joi.object({
   orgName: Joi.string().min(2).max(160),
@@ -3831,6 +3687,35 @@ async function detectProposalCols(pool) {
   return globalThis.__lxProposalColsCache;
 }
 
+// ---- Accept camelCase / snake_case / legacy keys
+function normalizeEntitySelector(body = {}) {
+  const norm = (v) => (v == null ? null : String(v).trim());
+  return {
+    // explicit triple
+    entity:       norm(body.entity ?? body.orgName ?? body.org_name),
+    contactEmail: norm(body.contactEmail ?? body.ownerEmail ?? body.owner_email ?? body.contact ?? body.contact_email),
+    wallet:       norm(body.wallet ?? body.ownerWallet ?? body.owner_wallet ?? body.wallet_address),
+
+    // fallback key used by some older UIs
+    entityKey:    norm(body.id ?? body.entityKey ?? body.entity_key),
+  };
+}
+
+// ✅ This is the correct version. Use this for both.
+async function buildEntityWhereAsync(pool, sel) {
+  const cols = await detectProposalCols(pool);
+  const clauses = [];
+  const params = [];
+
+  const eqGroup = (colsArr, idx) =>
+    colsArr.map(c => `LOWER(TRIM(${c})) = LOWER(TRIM($${idx}))`).join(' OR ');
+
+  const addEq = (value, colsArr) => {
+    if (value && colsArr.length) {
+      params.push(value);
+      clauses.push(`(${eqGroup(colsArr, params.length)})`);
+    }
+  };
 
   // 1) explicit fields (any that are present)
   addEq(sel.wallet,       cols.walletCols);
@@ -4171,34 +4056,44 @@ app.get("/proposals/:id", async (req, res) => {
 
 const _nonEmpty = (s) => typeof s === 'string' && s.trim() !== ''; 
 
-app.post("/proposals", authGuard, async (req, res) => {
+app.post("/proposals", authGuard /* or requireAuth */, async (req, res) => {
   try {
-    // 1. Validate
-    const { error, value } = proposalSchema.validate(req.body, { allowUnknown: true });
+    const { error, value } = proposalSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
 
+    // identity from auth middleware
     const ownerWallet = String(req.user?.address || req.user?.sub || "").toLowerCase();
     const ownerEmail  = value.ownerEmail || null;
     const ownerPhone  = toE164(value.ownerPhone || "");
 
-    if (!ownerWallet) return res.status(401).json({ error: "Login required" });
-
-    // ... (keep your existing proposer profile checks) ...
-
-    // --- Enrich Docs Logic (Fixed) ---
-    let finalDocs = value.docs || [];
-    
-    try {
-      // Use your existing helper (uses exiftool + reverse geocoding)
-      if (typeof enrichDocsWithMeta === 'function') {
-         finalDocs = await enrichDocsWithMeta(finalDocs);
-      }
-    } catch (e) {
-      console.warn("Docs enrichment failed:", e);
+    if (!ownerWallet) {
+      return res.status(401).json({ error: "Login required" });
     }
-    
-    // FIX: Handle 'amount' (frontend) OR 'amountUSD' (backend preferred)
-    const budget = value.amountUSD !== undefined ? value.amountUSD : (value.amount || 0);
+
+    // ✅ ONLY ENTITY (proposer_profiles) may submit proposals.
+    // Requires at least one contact: email OR phone/WhatsApp OR Telegram (username or chat id).
+    const { rows: ok } = await pool.query(
+      `
+      SELECT 1
+        FROM proposer_profiles
+       WHERE lower(wallet_address) = lower($1)
+         AND (
+           COALESCE(contact_email,'') <> ''
+        OR COALESCE(phone,'') <> ''
+        OR COALESCE(telegram_chat_id,'') <> ''
+        OR COALESCE(telegram_username,'') <> ''   -- make sure this column exists
+         )
+       LIMIT 1
+      `,
+      [ownerWallet]
+    );
+
+    if (!ok[0]) {
+      return res.status(400).json({
+        error:
+          "Please complete your profile (add email, phone/WhatsApp, or Telegram) before submitting a proposal."
+      });
+    }
 
     const q = `
       INSERT INTO proposals (
@@ -4208,7 +4103,8 @@ app.post("/proposals", authGuard, async (req, res) => {
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',
         $11,$12,$13, NOW()
       )
-      RETURNING *
+      RETURNING proposal_id, org_name, title, summary, contact, address, city, country,
+                amount_usd, docs, cid, status, created_at, owner_wallet, owner_email, owner_phone, updated_at
     `;
 
     const vals = [
@@ -4219,8 +4115,8 @@ app.post("/proposals", authGuard, async (req, res) => {
       value.address,
       value.city,
       value.country,
-      budget, 
-      JSON.stringify(finalDocs), // This now includes .location and .exif from enrichDocsWithMeta
+      value.amountUSD,
+      JSON.stringify(value.docs || []),
       value.cid ?? null,
       ownerWallet,
       ownerEmail,
@@ -4231,7 +4127,7 @@ app.post("/proposals", authGuard, async (req, res) => {
     const row = rows[0];
 
     if (typeof notifyProposalSubmitted === "function" && NOTIFY_ENABLED) {
-      try { await notifyProposalSubmitted(row); } catch (e) {}
+      try { await notifyProposalSubmitted(row); } catch (e) { console.warn("notifyProposalSubmitted failed:", e); }
     }
 
     return res.json(toCamel(row));
@@ -4250,11 +4146,18 @@ app.patch("/proposals/:id", adminOrProposalOwnerGuard, async (req, res) => {
     const { error, value } = proposalUpdateSchema.validate(req.body || {}, { abortEarly: false });
     if (error) return res.status(400).json({ error: error.message });
 
+    // Map JS keys -> DB columns
     const map = {
-      orgName: 'org_name', title: 'title', summary: 'summary',
-      contact: 'contact', address: 'address', city: 'city',
-      country: 'country', amountUSD: 'amount_usd',
-      ownerEmail: 'owner_email', ownerPhone: 'owner_phone',
+      orgName: 'org_name',
+      title: 'title',
+      summary: 'summary',
+      contact: 'contact',
+      address: 'address',
+      city: 'city',
+      country: 'country',
+      amountUSD: 'amount_usd',
+      ownerEmail: 'owner_email',
+      ownerPhone: 'owner_phone',
       docs: 'docs',
     };
 
@@ -4265,17 +4168,9 @@ app.patch("/proposals/:id", adminOrProposalOwnerGuard, async (req, res) => {
     for (const [k, v] of Object.entries(value)) {
       const col = map[k];
       if (!col) continue;
-
       if (k === 'docs') {
-        // --- NEW: ENRICH DOCS ON UPDATE ---
-        let richDocs = v || [];
-        try {
-           richDocs = await enrichDocsWithMeta(richDocs);
-        } catch (e) { console.warn("Patch enrichment failed", e); }
-        // ----------------------------------
-
         sets.push(`${col}=$${i++}`);
-        vals.push(JSON.stringify(richDocs));
+        vals.push(JSON.stringify(v || []));
       } else {
         sets.push(`${col}=$${i++}`);
         vals.push(v);
@@ -4284,7 +4179,9 @@ app.patch("/proposals/:id", adminOrProposalOwnerGuard, async (req, res) => {
 
     if (sets.length === 0) return res.status(400).json({ error: "No valid fields to update" });
 
+    // Always bump updated_at
     sets.push(`updated_at=NOW()`);
+
     const sql = `UPDATE proposals SET ${sets.join(', ')} WHERE proposal_id=$${i} RETURNING *`;
     vals.push(id);
 
@@ -11346,37 +11243,36 @@ function normalizeMilestone(x) {
 // ==============================
 // Routes — IPFS via Pinata
 // ==============================
-// --- ADD THIS VARIABLE ABOVE THE ROUTE ---
-let _pinataGlobalQueue = Promise.resolve();
-
 app.post("/ipfs/upload-file", async (req, res) => {
   try {
     if (!req.files || !req.files.file) return res.status(400).json({ error: "No file uploaded" });
 
+    // Handle both single file and array of files
     const fileInput = req.files.file;
     const files = Array.isArray(fileInput) ? fileInput : [fileInput];
     const results = [];
 
-    // Chain these uploads to the global queue so they NEVER run in parallel
+    // ✅ SEQUENTIAL UPLOAD: Uploads one by one to avoid 429 bursts
     for (const f of files) {
-      // Add to the end of the global promise chain
-      const uploadTask = _pinataGlobalQueue.then(async () => {
-        const res = await pinataUploadFile(f);
-        // Force a 2-second cooldown AFTER the upload finishes for safety
-        await new Promise(r => setTimeout(r, 2000)); 
-        return res;
-      });
-
-      // Update the global queue pointer
-      _pinataGlobalQueue = uploadTask.catch(() => {}); // Catch errors so the queue doesn't jam
-
-      // Wait for this specific file to finish before moving to the next
-      results.push(await uploadTask);
+      const result = await pinataUploadFile(f);
+      results.push(result);
+      
+      // Small pause between files to help with rate limits
+      await new Promise(r => setTimeout(r, 300));
     }
 
     res.json(files.length === 1 ? results[0] : results);
   } catch (err) {
     console.error("Upload error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/ipfs/upload-json", async (req, res) => {
+  try {
+    const result = await pinataUploadJson(req.body || {});
+    res.json(result);
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
