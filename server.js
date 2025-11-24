@@ -4208,19 +4208,14 @@ app.post("/proposals", authGuard, async (req, res) => {
 
     // ... (keep your existing proposer profile checks) ...
 
-    // --- Enrich Docs Logic (Updated) ---
+    // --- Enrich Docs Logic (Fixed) ---
     let finalDocs = value.docs || [];
     
     try {
-      // 1. Existing metadata enrichment (keep if you have it)
+      // Use your existing helper (uses exiftool + reverse geocoding)
       if (typeof enrichDocsWithMeta === 'function') {
          finalDocs = await enrichDocsWithMeta(finalDocs);
       }
-
-      // 2. NEW: GPS Enrichment
-      // This reads the URLs in finalDocs, extracts EXIF, and updates the object
-      finalDocs = await enrichDocsWithGPS(finalDocs);
-
     } catch (e) {
       console.warn("Docs enrichment failed:", e);
     }
@@ -4248,7 +4243,7 @@ app.post("/proposals", authGuard, async (req, res) => {
       value.city,
       value.country,
       budget, 
-      JSON.stringify(finalDocs), // Now includes .location { lat, lon } inside the JSON
+      JSON.stringify(finalDocs), // This now includes .location and .exif from enrichDocsWithMeta
       value.cid ?? null,
       ownerWallet,
       ownerEmail,
