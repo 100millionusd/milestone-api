@@ -2165,7 +2165,6 @@ const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECR
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 
-/// Precise Pinata Upload (Calculates Content-Length to fix 400 Error)
 // Precise Pinata Upload (Manual Buffer + Dedicated Gateway Return)
 async function pinataUploadFile(file) {
   if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
@@ -2253,20 +2252,27 @@ async function pinataUploadFile(file) {
         timestamp: result.Timestamp,
       };
 
-    } catch (err) {
+  } catch (err) {
       const isRateLimit = err.message === "RATE_LIMITED" || (err.message || "").includes("Too Many Requests");
       if (isRateLimit && attempt < maxRetries - 1) {
-        const waitTime = 3000 * Math.pow(2, attempt);
-        console.warn(`[Pinata] Rate limit. Pausing ${waitTime / 1000}s...`);
-        await new Promise((r) => setTimeout(r, waitTime));
+        
+        // --- CHANGED LOGIC START ---
+        // Base wait: 3s, 6s, 12s...
+        const baseWait = 3000 * Math.pow(2, attempt); 
+        // Add random jitter between 0ms and 1000ms
+        const jitter = Math.floor(Math.random() * 1000); 
+        const totalWait = baseWait + jitter;
+        
+        console.warn(`[Pinata] Rate limit. Pausing ${(totalWait/1000).toFixed(1)}s...`);
+        await new Promise((r) => setTimeout(r, totalWait));
+        // --- CHANGED LOGIC END ---
+
         attempt++;
       } else {
         console.error("Pinata Upload Fatal:", err.message);
         throw err;
       }
     }
-  }
-}
 
 async function pinataUploadJson(body) {
   if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
@@ -11369,6 +11375,9 @@ function normalizeMilestone(x) {
 // ==============================
 // Routes — IPFS via Pinata
 // ==============================
+// --- ADD THIS VARIABLE ABOVE THE ROUTE ---
+let _pinataGlobalQueue = Promise.resolve();
+
 app.post("/ipfs/upload-file", async (req, res) => {
   try {
     if (!req.files || !req.files.file) return res.status(400).json({ error: "No file uploaded" });
@@ -11377,26 +11386,26 @@ app.post("/ipfs/upload-file", async (req, res) => {
     const files = Array.isArray(fileInput) ? fileInput : [fileInput];
     const results = [];
 
+    // Chain these uploads to the global queue so they NEVER run in parallel
     for (const f of files) {
-      const result = await pinataUploadFile(f);
-      results.push(result);
-      
-      // INCREASED DELAY: Wait 1 second between files to be kind to the API
-      if (files.length > 1) await new Promise(r => setTimeout(r, 1000));
+      // Add to the end of the global promise chain
+      const uploadTask = _pinataGlobalQueue.then(async () => {
+        const res = await pinataUploadFile(f);
+        // Force a 2-second cooldown AFTER the upload finishes for safety
+        await new Promise(r => setTimeout(r, 2000)); 
+        return res;
+      });
+
+      // Update the global queue pointer
+      _pinataGlobalQueue = uploadTask.catch(() => {}); // Catch errors so the queue doesn't jam
+
+      // Wait for this specific file to finish before moving to the next
+      results.push(await uploadTask);
     }
 
     res.json(files.length === 1 ? results[0] : results);
   } catch (err) {
     console.error("Upload error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/ipfs/upload-json", async (req, res) => {
-  try {
-    const result = await pinataUploadJson(req.body || {});
-    res.json(result);
-  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
