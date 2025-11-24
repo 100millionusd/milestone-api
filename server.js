@@ -2164,29 +2164,54 @@ const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECR
 // Helper: Wait with jitter (randomness) to prevent synchronized retries
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Replace your existing pinataUploadFile with this robust version:
 async function pinataUploadFile(file) {
   if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
     throw new Error("Pinata not configured");
   }
 
-  // Increase max retries to 5 to be very safe
-  const maxRetries = 5;
+  const FormData = require('form-data');
+  const { Readable } = require('stream');
+
+  // Retry up to 6 times with heavy backoff
+  const maxRetries = 6;
   let attempt = 0;
 
   while (attempt < maxRetries) {
     try {
-      // 1. Create fresh stream for this attempt
-      const stream = Readable.from(file.data);
-      stream.path = file.name;
+      // 1. Prepare the form data (Native way, no SDK)
+      const form = new FormData();
+      form.append('file', Readable.from(file.data), { filename: file.name });
+      form.append('pinataMetadata', JSON.stringify({ name: file.name }));
+      form.append('pinataOptions', JSON.stringify({ cidVersion: 0 }));
 
-      const options = {
-        pinataMetadata: { name: file.name },
-        pinataOptions: { cidVersion: 0 }
-      };
+      // 2. Send Request using standard fetch
+      // We accept either JWT or API Keys
+      const headers = { ...form.getHeaders() };
+      if (process.env.PINATA_JWT) {
+        headers['Authorization'] = `Bearer ${process.env.PINATA_JWT}`;
+      } else {
+        headers['pinata_api_key'] = process.env.PINATA_API_KEY;
+        headers['pinata_secret_api_key'] = process.env.PINATA_SECRET_API_KEY;
+      }
 
-      // 2. Try Upload
-      const result = await pinata.pinFileToIPFS(stream, options);
+      const res = await fetch('https://api.pinata.cloud/pinning/pinFileToIPFS', {
+        method: 'POST',
+        headers: headers,
+        body: form,
+      });
 
+      // 3. Handle Errors
+      if (!res.ok) {
+        const text = await res.text();
+        if (res.status === 429) {
+          throw new Error('RATE_LIMITED');
+        }
+        throw new Error(`Pinata Error ${res.status}: ${text}`);
+      }
+
+      // 4. Success
+      const result = await res.json();
       return {
         cid: result.IpfsHash,
         url: `https://gateway.pinata.cloud/ipfs/${result.IpfsHash}`,
@@ -2196,23 +2221,18 @@ async function pinataUploadFile(file) {
       };
 
     } catch (err) {
-      // 3. Check for Rate Limit errors
-      const isRateLimit = err?.reason === 'RATE_LIMITED' || 
-                          (err?.details && String(err.details).includes('slow down'));
-
+      // 5. Smart Backoff
+      const isRateLimit = err.message === 'RATE_LIMITED' || (err.message || '').includes('Too Many Requests');
+      
       if (isRateLimit && attempt < maxRetries - 1) {
-        // EXPONENTIAL BACKOFF: 2s -> 4s -> 8s -> 16s
-        // We add Math.random() * 1000 to prevent two uploads from retrying at the exact same millisecond
-        const waitTime = Math.pow(2, attempt + 1) * 1000 + (Math.random() * 1000);
-        
-        console.warn(`[Pinata] Rate limited. Pausing for ${Math.round(waitTime)}ms... (Attempt ${attempt + 1}/${maxRetries})`);
-        
-        await delay(waitTime);
+        // Wait 3s, then 6s, 12s, 24s... (Aggressive backoff to fix your crash)
+        const waitTime = 3000 * Math.pow(2, attempt);
+        console.warn(`[Pinata] Rate limit hit. Pausing for ${waitTime / 1000}s before retry...`);
+        await new Promise(r => setTimeout(r, waitTime));
         attempt++;
       } else {
-        // If it's not a rate limit (e.g. auth error) or we ran out of retries
-        console.error("Pinata SDK Error:", err);
-        throw new Error("Pinata upload failed: " + (err.details || err.message));
+        console.error("Pinata Upload Fatal Error:", err);
+        throw err; // Fatal error or max retries reached
       }
     }
   }
@@ -11275,18 +11295,16 @@ app.post("/ipfs/upload-file", async (req, res) => {
   try {
     if (!req.files || !req.files.file) return res.status(400).json({ error: "No file uploaded" });
 
-    // Handle both single file and array of files
     const fileInput = req.files.file;
     const files = Array.isArray(fileInput) ? fileInput : [fileInput];
     const results = [];
 
-    // ✅ SEQUENTIAL UPLOAD: Uploads one by one to avoid 429 bursts
     for (const f of files) {
       const result = await pinataUploadFile(f);
       results.push(result);
       
-      // Small pause between files to help with rate limits
-      await new Promise(r => setTimeout(r, 300));
+      // INCREASED DELAY: Wait 1 second between files to be kind to the API
+      if (files.length > 1) await new Promise(r => setTimeout(r, 1000));
     }
 
     res.json(files.length === 1 ? results[0] : results);
