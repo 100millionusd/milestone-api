@@ -2218,6 +2218,63 @@ async function pinataUploadFile(file) {
   }
 }
 
+// =====================================================================
+// MISSING FUNCTION: pinataUploadJson
+// Paste this immediately after the 'pinataUploadFile' function
+// =====================================================================
+async function pinataUploadJson(jsonData) {
+  if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
+    throw new Error("Pinata not configured");
+  }
+
+  // Safety: Ensure we have an object
+  const body = (typeof jsonData === 'string') ? JSON.parse(jsonData) : jsonData;
+
+  // Retry logic config
+  const maxRetries = 5;
+  let attempt = 0;
+
+  while (attempt < maxRetries) {
+    try {
+      const options = {
+        pinataMetadata: {
+          name: body.name || `json_${Date.now()}`, // Fallback name
+        },
+        pinataOptions: {
+          cidVersion: 0
+        }
+      };
+
+      // Perform the upload
+      const result = await pinata.pinJSONToIPFS(body, options);
+
+      return {
+        cid: result.IpfsHash,
+        url: `https://gateway.pinata.cloud/ipfs/${result.IpfsHash}`,
+        timestamp: result.Timestamp
+      };
+
+    } catch (err) {
+      // Check for Rate Limit errors (same logic as your file uploader)
+      const isRateLimit = err?.reason === 'RATE_LIMITED' || 
+                          (err?.details && String(err.details).includes('slow down'));
+
+      if (isRateLimit && attempt < maxRetries - 1) {
+        // Exponential Backoff with Jitter
+        const waitTime = Math.pow(2, attempt + 1) * 1000 + (Math.random() * 1000);
+        
+        console.warn(`[Pinata JSON] Rate limited. Pausing for ${Math.round(waitTime)}ms... (Attempt ${attempt + 1}/${maxRetries})`);
+        
+        await delay(waitTime); // Uses your existing delay() helper
+        attempt++;
+      } else {
+        // Fatal error
+        console.error("Pinata JSON Upload Error:", err);
+        throw new Error("Pinata JSON upload failed: " + (err.details || err.message));
+      }
+    }
+  }
+}
 // ==============================
 // HTTP helpers
 // ==============================
@@ -11243,23 +11300,40 @@ function normalizeMilestone(x) {
 // ==============================
 // Routes — IPFS via Pinata
 // ==============================
+// -------------------------------------------------------
+// 1. GLOBAL QUEUE: Prevents parallel requests from crashing the server
+// -------------------------------------------------------
+let globalPinataQueue = Promise.resolve();
+
 app.post("/ipfs/upload-file", async (req, res) => {
   try {
     if (!req.files || !req.files.file) return res.status(400).json({ error: "No file uploaded" });
 
-    // Handle both single file and array of files
     const fileInput = req.files.file;
     const files = Array.isArray(fileInput) ? fileInput : [fileInput];
     const results = [];
 
-    // ✅ SEQUENTIAL UPLOAD: Uploads one by one to avoid 429 bursts
-    for (const f of files) {
-      const result = await pinataUploadFile(f);
-      results.push(result);
-      
-      // Small pause between files to help with rate limits
-      await new Promise(r => setTimeout(r, 300));
-    }
+    // 2. QUEUEING LOGIC: Wait for previous uploads to finish before starting this batch
+    // This effectively locks the upload process to one-at-a-time across the whole server.
+    await (globalPinataQueue = globalPinataQueue.then(async () => {
+        for (const f of files) {
+            try {
+                // Upload
+                const result = await pinataUploadFile(f);
+                results.push(result);
+                
+                // 3. SAFETY DELAY: 1000ms is safer than 300ms for free/tier-1 plans
+                console.log(`[Pinata] Uploaded ${f.name}. Waiting...`);
+                await new Promise(r => setTimeout(r, 1000)); 
+            } catch (innerErr) {
+                console.error(`[Pinata] Failed to upload ${f.name}`, innerErr);
+                throw innerErr; // Stop this batch if a file fails
+            }
+        }
+    }).catch(err => {
+        // If the queue broke, re-throw so we send a 500 error below
+        throw err;
+    }));
 
     res.json(files.length === 1 ? results[0] : results);
   } catch (err) {
