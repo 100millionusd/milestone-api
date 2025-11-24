@@ -3831,19 +3831,6 @@ async function detectProposalCols(pool) {
   return globalThis.__lxProposalColsCache;
 }
 
-// ---- Accept camelCase / snake_case / legacy keys
-function normalizeEntitySelector(body = {}) {
-  const norm = (v) => (v == null ? null : String(v).trim());
-  return {
-    // explicit triple
-    entity:       norm(body.entity ?? body.orgName ?? body.org_name),
-    contactEmail: norm(body.contactEmail ?? body.ownerEmail ?? body.owner_email ?? body.contact ?? body.contact_email),
-    wallet:       norm(body.wallet ?? body.ownerWallet ?? body.owner_wallet ?? body.wallet_address),
-
-    // fallback key used by some older UIs
-    entityKey:    norm(body.id ?? body.entityKey ?? body.entity_key),
-  };
-}
 
   // 1) explicit fields (any that are present)
   addEq(sel.wallet,       cols.walletCols);
