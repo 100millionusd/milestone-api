@@ -127,27 +127,45 @@ function buildBothVariants(rows) {
 /* --------------------------
    DB row loader (with cutoff)
 ---------------------------*/
+/* --------------------------
+   DB row loader (with cutoff)
+---------------------------*/
 async function loadRowsForPeriod(pool, periodId, cutoffEpochSec /* or null */) {
+  // Calculate the end of the current period (approx) to ensure we don't grab future data if running ahead
+  // But primarily, we want to REMOVE the strict "to_char" equality check for the specific hour
+  // so we can grab older orphans.
+
   if (cutoffEpochSec) {
-    // Only include rows created at/earlier than the anchor block time
+    // Case A: Linking to an EXISTING anchor (Must be precise to reproduce the tree)
+    // We strictly rely on the timestamp cutoff.
     const q = await pool.query(
       `SELECT audit_id, leaf_hash
          FROM bid_audits
         WHERE batch_id IS NULL
           AND leaf_hash IS NOT NULL
-          AND to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') = $1
+          -- Fix: Grab this period's data OR any older un-batched data
           AND created_at <= to_timestamp($2)
         ORDER BY audit_id ASC`,
-      [periodId, cutoffEpochSec]
+      [periodId, cutoffEpochSec] // Note: periodId ($1) is technically unused in query now, but kept for param alignment if you want to keep the signature
     );
     return q.rows;
   }
+
+  // Case B: Creating a NEW anchor
+  // We grab everything currently available up to the end of this period (or just everything unbatched).
+  // To avoid grabbing data from "the future" (if clock skews), we can keep a loose upper bound or just grab all unbatched.
+  
+  // Recommended Fix: Grab all unbatched items created up to "Now" (end of this period hour)
+  // We assume periodId corresponds to "current processing time". 
+  
   const q = await pool.query(
     `SELECT audit_id, leaf_hash
        FROM bid_audits
       WHERE batch_id IS NULL
         AND leaf_hash IS NOT NULL
-        AND to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') = $1
+        -- Fix: Instead of restricting to ONE hour, we take everything unbatched 
+        -- that is created before the next hour starts.
+        AND created_at < (to_timestamp($1, 'YYYY-MM-DD"T"HH24') + interval '1 hour')
       ORDER BY audit_id ASC`,
     [periodId]
   );
