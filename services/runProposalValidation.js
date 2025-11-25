@@ -1,53 +1,75 @@
 // services/runProposalValidation.js
 const OpenAI = require("openai");
+const fs = require("fs");
+const path = require("path");
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+// Helper: Convert local file to Base64 so the AI can "see" it
+function encodeImage(filePath) {
+  try {
+    const fileBuffer = fs.readFileSync(filePath);
+    return fileBuffer.toString("base64");
+  } catch (error) {
+    console.error(`Error reading file ${filePath}:`, error);
+    return null;
+  }
+}
+
 async function runProposalValidation(proposal) {
   try {
-    const docs = (proposal.docs || []).map(d => d.name).join(", ");
-    const detectedLocation = proposal.submissionLocation || "Unknown / Not detected";
+    // 1. Prepare the content array for the User Message
+    // We start with the text prompt
+    const contentArray = [
+      {
+        type: "text",
+        text: `
+        Validate this proposal.
+        
+        CLAIMED DATA:
+        Org: ${proposal.orgName}
+        Address: ${proposal.address || "N/A"}
+        Budget: $${proposal.amountUSD}
 
-    const prompt = `
-    You are a strict validation agent. Validate this proposal:
+        INSTRUCTIONS:
+        1. Look at the attached images/screenshots.
+        2. **EXTRACT LOCATION**: specificially look for text indicating a location (like "Potosí, Bolivia" or GPS coordinates) in the pixels of the image.
+        3. **COMPARE**: Check if that detected location matches the Claimed Address (${proposal.address}).
+        4. Return JSON with keys: { orgValid, addressValid, detectedLocation, locationConsistencyCheck, issues }.
+        `
+      }
+    ];
 
-    --- CLAIMED DATA ---
-    Org Name: ${proposal.orgName}
-    Address: ${proposal.address || "N/A"}
-    Contact Email: ${proposal.contact || "N/A"}
-    Budget: $${proposal.amountUSD}
-    
-    --- EVIDENCE ---
-    Attachments: ${docs || "none"}
-    Detected GPS Location: ${detectedLocation}
-
-    --- INSTRUCTIONS ---
-    1. **Org Existence Check**: 
-       - Check if the 'Org Name' matches the 'Contact Email' domain (e.g., Org "Heitaria" vs email "...@heitaria.ch"). If they match, it is likely real.
-       - If the Org Name looks like a typo (e.g. "fty", "test") or is generic (e.g. "gmail.com"), flag it as 'Suspicious'.
-       - Check your internal knowledge base: Is this a known NGO or company?
-    
-    2. **Location Consistency**: 
-       - Compare 'Address' vs 'Detected GPS Location'. 
-       - Flag if they are in different countries.
-
-    3. **Return JSON** strictly.
-
-    Output JSON format: 
-    { 
-      "orgValid": boolean, 
-      "orgExistenceCheck": "string (comment on if it looks real/fake)", 
-      "addressValid": boolean, 
-      "locationConsistencyCheck": "string (pass/fail analysis)", 
-      "issues": ["list", "of", "issues"] 
+    // 2. Loop through docs and attach valid images to the payload
+    if (proposal.docs && proposal.docs.length > 0) {
+      for (const doc of proposal.docs) {
+        // Ensure we have a path and it's an image
+        if (doc.path && /\.(jpg|jpeg|png|webp)$/i.test(doc.name)) {
+          const base64Image = encodeImage(doc.path);
+          if (base64Image) {
+            contentArray.push({
+              type: "image_url",
+              image_url: {
+                url: `data:image/jpeg;base64,${base64Image}`,
+                detail: "high" // "high" allows it to read small text like "Potosí"
+              }
+            });
+          }
+        }
+      }
     }
-    `;
 
+    // 3. Send the request with the images included
     const resp = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
+      model: "gpt-4o-mini", // This model supports Vision (images)
+      messages: [
+        { 
+          role: "user", 
+          content: contentArray // Sends both Text + Images
+        }
+      ],
       response_format: { type: "json_object" },
     });
 
