@@ -7784,11 +7784,11 @@ if (Number.isFinite(gpsLat) && Number.isFinite(gpsLon)) {
     ];
     const { rows: pr } = await pool.query(insertQ, insertVals);
     let proofRow = pr[0];
-    await writeAudit(bidId, req, {
+await writeAudit(bidId, req, {
   proof_submitted: {
     index: milestoneIndex,
     proofId: proofRow.proof_id,
-    files: (files || []).length,
+    files: files, 
     hasGps: Number.isFinite(gpsLat) && Number.isFinite(gpsLon)
   }
 });
@@ -11583,6 +11583,23 @@ const files = Array.isArray(b.files)
 
     const { rows } = await pool.query(insertQ, insertVals);
     const inserted = rows[0];
+
+    try {
+  const actorWallet = (req.user && (req.user.address || req.user.sub)) || null;
+  const actorRole   = (req.user && req.user.role) || "vendor";
+
+  const ins = await pool.query(
+    `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
+     VALUES ($1,$2,$3,$4)
+     RETURNING audit_id`,
+    [ Number(inserted.bid_id), actorWallet, actorRole, { created: true, source: 'template' } ]
+  );
+  if (typeof enrichAuditRow === "function") {
+    enrichAuditRow(pool, ins.rows[0].audit_id).catch(() => null);
+  }
+} catch (e) {
+  console.error("Template bid audit failed:", e);
+}
 
     // Inline Agent2 analysis (same behavior as /bids)
     const { rows: pr } = await pool.query(`SELECT * FROM proposals WHERE proposal_id=$1`, [inserted.proposal_id]);
