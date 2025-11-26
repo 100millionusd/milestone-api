@@ -169,7 +169,7 @@ function verifyJwt(t) {
 }
 
 // === ROLE HELPERS (paste once, under auth utilities; do NOT redeclare JWT_SECRET) =========
-const VALID_ROLES = ['vendor', 'proposer', 'admin'];
+const VALID_ROLES = ['vendor', 'proposer', 'admin', 'reporter']; // ✅ Added 'reporter'
 
 /** normalize role intent from query/body */
 function normalizeRoleIntent(v) {
@@ -181,8 +181,8 @@ function roleFromDurableOrIntent(roles, intent) {
   if (!Array.isArray(roles)) roles = [];
   // if they already only have one durable role and no intent, use it
   if (roles.length === 1 && !intent) return roles[0];
-  // explicit intent wins (only allow vendor/proposer here)
-  if (intent === 'vendor' || intent === 'proposer') return intent;
+  // explicit intent wins (only allow vendor/proposer/reporter here)
+  if (intent === 'vendor' || intent === 'proposer' || intent === 'reporter') return intent;
   // if there’s a single non-admin durable role, pick it
   const nonAdmin = roles.filter(r => r !== 'admin');
   if (nonAdmin.length === 1) return nonAdmin[0];
@@ -832,6 +832,23 @@ await pool.query(`
 `);
 
 await pool.query(`ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS vendor_name TEXT`);
+// --- INSERT START: Sally Uyuni App Tables ---
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS school_reports (
+        report_id      TEXT PRIMARY KEY,
+        school_name    TEXT,
+        description    TEXT,
+        rating         INTEGER,
+        image_cid      TEXT,
+        image_url      TEXT,
+        ai_analysis    JSONB,
+        location       JSONB,
+        wallet_address TEXT,
+        created_at     TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    console.log('[db] school_reports ready');
+    // --- INSERT END ---
 await pool.query(`ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS telegram_username TEXT`);
 await pool.query(`ALTER TABLE proposer_profiles ADD COLUMN IF NOT EXISTS telegram_username TEXT`);
 
@@ -11638,6 +11655,51 @@ const files = Array.isArray(b.files)
     res.json({ ok: true, bidId: inserted.bid_id });
   } catch (e) {
     res.status(500).json({ error: 'failed_create_bid_from_template' });
+  }
+});
+
+// ==============================
+// Sally Uyuni App Routes
+// ==============================
+
+// Submit a school report
+app.post('/api/reports', authRequired, async (req, res) => {
+  try {
+    const {
+      id,
+      schoolName,
+      description,
+      rating,
+      imageCid,
+      imageUrl,
+      aiAnalysis,
+      location
+    } = req.body;
+
+    const wallet = String(req.user?.sub || "").toLowerCase();
+
+    await pool.query(
+      `INSERT INTO school_reports 
+       (report_id, school_name, description, rating, image_cid, image_url, ai_analysis, location, wallet_address, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+       ON CONFLICT (report_id) DO NOTHING`,
+      [
+        id, 
+        schoolName, 
+        description, 
+        rating, 
+        imageCid || null, 
+        imageUrl || null, 
+        JSON.stringify(aiAnalysis || {}), 
+        JSON.stringify(location || {}), 
+        wallet
+      ]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("POST /api/reports error:", err);
+    res.status(500).json({ error: "Failed to submit report" });
   }
 });
 
