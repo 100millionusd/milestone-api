@@ -887,6 +887,19 @@ console.log('[db] proposer_profiles ready');
   }
 })();
 
+// --- DB MIGRATION: Add location column to proposals ---
+(async () => {
+  try {
+    await pool.query(`
+      ALTER TABLE proposals
+      ADD COLUMN IF NOT EXISTS location JSONB;
+    `);
+    console.log('[db] Successfully added "location" column to proposals table');
+  } catch (e) {
+    console.error('[db] Failed to add location column:', e);
+  }
+})();
+
 (async () => {
   try {
     await pool.query(`
