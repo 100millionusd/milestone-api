@@ -304,6 +304,8 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || DEF
   .map((s) => s.trim())
   .filter(Boolean);
 
+CORS_ORIGINS.push("https://sally-uyuni-855007491806.us-west1.run.app");
+
 const PINATA_API_KEY = (process.env.PINATA_API_KEY || "").trim();
 const PINATA_SECRET_API_KEY = (process.env.PINATA_SECRET_API_KEY || "").trim();
 const PINATA_GATEWAY = process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud";
