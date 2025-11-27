@@ -11664,7 +11664,28 @@ const files = Array.isArray(b.files)
 // Sally Uyuni App Routes
 // ==============================
 
-// Submit a school report AND pay reward
+// --- 1. CONFIG: School Locations (Coordinates Only) ---
+// We look up the VENDOR dynamically from the DB, but we keep coordinates static here for GPS verification.
+// REMOVED: const SCHOOL_LOCATIONS = { ... }; 
+
+// --- 2. HELPER: Calculate Distance (Haversine Formula) ---
+function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
+  const R = 6371; // Radius of the earth in km
+  const dLat = deg2rad(lat2 - lat1); 
+  const dLon = deg2rad(lon2 - lon1); 
+  const a = 
+    Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) * Math.sin(dLon/2) * Math.sin(dLon/2); 
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)); 
+  const d = R * c; // Distance in km
+  return d;
+}
+
+function deg2rad(deg) {
+  return deg * (Math.PI/180);
+}
+
+// --- 3. ROUTE: Submit Report ---
 app.post('/api/reports', authRequired, async (req, res) => {
   try {
     const {
@@ -11674,11 +11695,77 @@ app.post('/api/reports', authRequired, async (req, res) => {
       rating,
       imageCid,
       imageUrl,
-      aiAnalysis,
+      aiAnalysis = {}, 
       location
     } = req.body;
 
     const wallet = String(req.user?.sub || "").toLowerCase();
+
+    // --- LOGIC: Auto-Identify Vendor & Verify GPS ---
+    let finalAnalysis = { ...aiAnalysis }; 
+    
+    // A) DYNAMIC VENDOR LOOKUP (SQL)
+    // Find the 'approved' bid for a proposal where org_name matches schoolName
+    // This connects the report to the vendor who is contractually delivering to this school.
+    const { rows: winners } = await pool.query(`
+      SELECT b.vendor_name 
+      FROM proposals p
+      JOIN bids b ON b.proposal_id = p.proposal_id
+      WHERE LOWER(p.org_name) = LOWER($1)
+        AND b.status = 'approved'
+      LIMIT 1
+    `, [schoolName]);
+
+    // Use the DB result to identify who is responsible for this delivery
+    finalAnalysis.vendor = winners.length > 0 ? winners[0].vendor_name : "Unknown (No Active Contract)";
+
+    // B) Verify Report Location (Anti-Spam / Validity Check)
+    // Ensure the report was submitted from the actual school location
+    
+    // FETCH SCHOOL GPS FROM PROPOSAL
+    // Assuming 'location' column in proposals table stores { lat, lon } JSON or similar
+    // You might need to adjust the column name based on your schema.
+    const { rows: schoolData } = await pool.query(`
+      SELECT location 
+      FROM proposals 
+      WHERE LOWER(org_name) = LOWER($1)
+      LIMIT 1
+    `, [schoolName]);
+
+    const schoolLoc = schoolData.length > 0 ? schoolData[0].location : null;
+
+    if (schoolLoc && schoolLoc.lat && schoolLoc.lon) { // Check if school location exists in DB
+        if (location && location.lat && location.lon) {
+            const distance = getDistanceFromLatLonInKm(
+                location.lat, 
+                location.lon, 
+                schoolLoc.lat, 
+                schoolLoc.lon
+            );
+
+            if (distance <= 0.5) {
+                // Report is valid: Submitted from the school premises
+                finalAnalysis.verification = "verified";
+                finalAnalysis.location_status = "match";
+                finalAnalysis.confidence = 0.98;
+                finalAnalysis.highlights = [...(finalAnalysis.highlights || []), "GPS Verified"];
+            } else {
+                // Report is suspicious: Submitted from far away
+                finalAnalysis.verification = "flagged";
+                finalAnalysis.location_status = "mismatch";
+                finalAnalysis.confidence = 0.45; 
+                finalAnalysis.issues = [...(finalAnalysis.issues || []), "Location Mismatch (Reported off-site)"];
+                finalAnalysis.distance_off = `${distance.toFixed(2)} km`;
+            }
+        } else {
+            finalAnalysis.verification = "unknown";
+            finalAnalysis.location_status = "missing_gps";
+        }
+    } else {
+        // School found but no GPS coordinates in proposal
+        finalAnalysis.verification = "unknown_school_coords";
+    }
+    // -----------------------------------------------------------
 
     // 1. Save to Database
     await pool.query(
@@ -11693,32 +11780,29 @@ app.post('/api/reports', authRequired, async (req, res) => {
         rating, 
         imageCid || null, 
         imageUrl || null, 
-        JSON.stringify(aiAnalysis || {}), 
+        JSON.stringify(finalAnalysis), 
         JSON.stringify(location || {}), 
         wallet
       ]
     );
 
     // 2. 💸 SEND REAL CRYPTO REWARD 💸
-    // This uses your server's wallet (PRIVATE_KEY) to send tokens to the user
     let txHash = null;
     try {
-        const REWARD_AMOUNT = 0.05; // Amount in USDT
-        const TOKEN_SYMBOL = "USDT"; // Ensure this matches keys in your 'TOKENS' config
+        const REWARD_AMOUNT = 0.05; 
+        const TOKEN_SYMBOL = "USDT"; 
 
         console.log(`[Reward] Sending ${REWARD_AMOUNT} ${TOKEN_SYMBOL} to ${wallet}...`);
         
-        // Use the existing blockchainService
         const receipt = await blockchainService.sendToken(TOKEN_SYMBOL, wallet, REWARD_AMOUNT);
         txHash = receipt.hash;
         
         console.log(`[Reward] Success! Tx: ${txHash}`);
     } catch (payErr) {
         console.error(`[Reward] Payment failed:`, payErr.message);
-        // We log the error but don't crash the request, report was still saved.
     }
 
-    res.json({ success: true, rewardTx: txHash });
+    res.json({ success: true, rewardTx: txHash, identifiedVendor: finalAnalysis.vendor });
 
   } catch (err) {
     console.error("POST /api/reports error:", err);
