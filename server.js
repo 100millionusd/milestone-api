@@ -11662,11 +11662,7 @@ const files = Array.isArray(b.files)
 
 // ==============================
 // Sally Uyuni App Routes
-// ==============================
-
-/ --- 1. CONFIG: School Locations (Coordinates Only) ---
-// We look up the VENDOR dynamically from the DB, but we keep coordinates static here for GPS verification.
-// REMOVED: const SCHOOL_LOCATIONS = { ... }; 
+// =============================
 
 // --- 2. HELPER: Calculate Distance (Haversine Formula) ---
 function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
