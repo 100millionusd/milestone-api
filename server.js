@@ -11664,7 +11664,7 @@ const files = Array.isArray(b.files)
 // Sally Uyuni App Routes
 // ==============================
 
-// Submit a school report
+// Submit a school report AND pay reward
 app.post('/api/reports', authRequired, async (req, res) => {
   try {
     const {
@@ -11680,6 +11680,7 @@ app.post('/api/reports', authRequired, async (req, res) => {
 
     const wallet = String(req.user?.sub || "").toLowerCase();
 
+    // 1. Save to Database
     await pool.query(
       `INSERT INTO school_reports 
        (report_id, school_name, description, rating, image_cid, image_url, ai_analysis, location, wallet_address, created_at)
@@ -11698,7 +11699,27 @@ app.post('/api/reports', authRequired, async (req, res) => {
       ]
     );
 
-    res.json({ success: true });
+    // 2. 💸 SEND REAL CRYPTO REWARD 💸
+    // This uses your server's wallet (PRIVATE_KEY) to send tokens to the user
+    let txHash = null;
+    try {
+        const REWARD_AMOUNT = 0.05; // Amount in USDT
+        const TOKEN_SYMBOL = "USDT"; // Ensure this matches keys in your 'TOKENS' config
+
+        console.log(`[Reward] Sending ${REWARD_AMOUNT} ${TOKEN_SYMBOL} to ${wallet}...`);
+        
+        // Use the existing blockchainService
+        const receipt = await blockchainService.sendToken(TOKEN_SYMBOL, wallet, REWARD_AMOUNT);
+        txHash = receipt.hash;
+        
+        console.log(`[Reward] Success! Tx: ${txHash}`);
+    } catch (payErr) {
+        console.error(`[Reward] Payment failed:`, payErr.message);
+        // We log the error but don't crash the request, report was still saved.
+    }
+
+    res.json({ success: true, rewardTx: txHash });
+
   } catch (err) {
     console.error("POST /api/reports error:", err);
     res.status(500).json({ error: "Failed to submit report" });
