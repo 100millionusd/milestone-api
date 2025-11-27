@@ -11664,7 +11664,7 @@ const files = Array.isArray(b.files)
 // Sally Uyuni App Routes
 // ==============================
 
-// --- 1. CONFIG: School Locations (Coordinates Only) ---
+/ --- 1. CONFIG: School Locations (Coordinates Only) ---
 // We look up the VENDOR dynamically from the DB, but we keep coordinates static here for GPS verification.
 // REMOVED: const SCHOOL_LOCATIONS = { ... }; 
 
@@ -11724,7 +11724,6 @@ app.post('/api/reports', authRequired, async (req, res) => {
     
     // FETCH SCHOOL GPS FROM PROPOSAL
     // Assuming 'location' column in proposals table stores { lat, lon } JSON or similar
-    // You might need to adjust the column name based on your schema.
     const { rows: schoolData } = await pool.query(`
       SELECT location 
       FROM proposals 
@@ -11794,6 +11793,7 @@ app.post('/api/reports', authRequired, async (req, res) => {
 
         console.log(`[Reward] Sending ${REWARD_AMOUNT} ${TOKEN_SYMBOL} to ${wallet}...`);
         
+        // Use the existing blockchainService
         const receipt = await blockchainService.sendToken(TOKEN_SYMBOL, wallet, REWARD_AMOUNT);
         txHash = receipt.hash;
         
