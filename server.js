@@ -11758,7 +11758,7 @@ app.post('/api/reports', authRequired, async (req, res) => {
       imageCid,
       imageUrl,
       aiAnalysis = {}, 
-      location // Device location
+      location // Device location from App
     } = req.body;
 
     const wallet = String(req.user?.sub || "").toLowerCase();
@@ -11771,18 +11771,29 @@ app.post('/api/reports', authRequired, async (req, res) => {
       WHERE LOWER(b.status) IN ('approved', 'completed', 'paid', 'funded')
     `);
 
-    // Helper: Normalize strings for matching
-    const normalizeStr = (str) => 
-        (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
-
-    // Helper: Normalize Coords (Handle lat/lon, latitude/longitude, arrays)
+    // [FIX] Helper: Normalize Coords (Handles Strings, Objects, Arrays)
     const normalizeCoords = (loc) => {
         if (!loc) return null;
-        const lat = loc.lat ?? loc.latitude ?? (Array.isArray(loc.coordinates) ? loc.coordinates[1] : null);
-        const lon = loc.lon ?? loc.longitude ?? (Array.isArray(loc.coordinates) ? loc.coordinates[0] : null);
-        if (lat != null && lon != null) return { lat: Number(lat), lon: Number(lon) };
+        
+        // 1. Try to parse if string
+        let obj = loc;
+        if (typeof loc === 'string') {
+            try { obj = JSON.parse(loc); } catch { return null; }
+        }
+        if (typeof obj !== 'object') return null;
+
+        // 2. Find Lat/Lon
+        const lat = obj.lat ?? obj.latitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[1] : null);
+        const lon = obj.lon ?? obj.longitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[0] : null);
+        
+        if (lat != null && lon != null && !isNaN(Number(lat))) {
+            return { lat: Number(lat), lon: Number(lon) };
+        }
         return null;
     };
+
+    const normalizeStr = (str) => 
+        (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
 
     const stopWords = new Set(['school', 'colegio', 'unidad', 'educativa', 'escuela', 'de', 'la', 'el', 'los', 'las', 'del', 'the']);
     const targetName = normalizeStr(schoolName);
@@ -11803,7 +11814,6 @@ app.post('/api/reports', authRequired, async (req, res) => {
         }
     });
 
-    // Fallback: simple substring match
     if (!bestMatch) {
         bestMatch = candidates.find(c => {
             const rawDb = normalizeStr(c.org_name + " " + c.title);
@@ -11812,41 +11822,50 @@ app.post('/api/reports', authRequired, async (req, res) => {
     }
 
     let finalAnalysis = { ...aiAnalysis }; 
-    finalAnalysis.vendor = bestMatch ? bestMatch.vendor_name : "Unknown (No Active Contract)";
     
-    // --- 2. FORCE EXIF EXTRACTION FROM IMAGE ---
-    // If device location is missing, try to get it from the photo
+    // DEBUG LOGS
+    if (bestMatch) {
+        console.log(`[Report] Match Found: "${bestMatch.org_name}" (ID: ${bestMatch.proposal_id})`);
+        console.log(`[Report] Raw Proposal Location:`, bestMatch.location);
+        finalAnalysis.vendor = bestMatch.vendor_name;
+    } else {
+        console.log(`[Report] No match found for school: "${schoolName}"`);
+        finalAnalysis.vendor = "Unknown (No Active Contract)";
+    }
+    
+    // --- 2. FORCE EXIF EXTRACTION ---
     let reportLoc = normalizeCoords(location);
 
     if (!reportLoc && imageUrl) {
-        console.log(`[Report] No device GPS. Attempting EXIF extraction from: ${imageUrl}`);
+        console.log(`[Report] No device GPS. Attempting EXIF from image...`);
         try {
             const meta = await extractFileMetaFromUrl({ url: imageUrl });
-            if (meta?.exif?.gpsLatitude && meta?.exif?.gpsLongitude) {
-                const exifLat = meta.exif.gpsLatitude;
-                const exifLon = meta.exif.gpsLongitude;
-                console.log(`[Report] EXIF GPS Found: ${exifLat}, ${exifLon}`);
-                
-                // Save specific structure for Admin UI recursive finder
-                finalAnalysis.geo = { lat: exifLat, lon: exifLon, source: "image_exif" };
-                reportLoc = { lat: exifLat, lon: exifLon };
+            if (meta?.exif?.gpsLatitude) {
+                console.log(`[Report] EXIF GPS Found: ${meta.exif.gpsLatitude}`);
+                finalAnalysis.geo = { 
+                    lat: meta.exif.gpsLatitude, 
+                    lon: meta.exif.gpsLongitude, 
+                    source: "image_exif" 
+                };
+                reportLoc = { lat: meta.exif.gpsLatitude, lon: meta.exif.gpsLongitude };
             }
-        } catch (exifErr) {
-            console.warn(`[Report] EXIF extraction failed:`, exifErr.message);
-        }
+        } catch (exifErr) { console.warn("EXIF failed", exifErr.message); }
     }
 
-    // --- 3. VERIFY LOCATION (Distance Check) ---
-    // Safely get Proposal GPS using the new helper
+    // --- 3. VERIFY LOCATION ---
+    // [FIX] Use the smarter normalizer
     const schoolLoc = bestMatch ? normalizeCoords(bestMatch.location) : null;
 
     if (schoolLoc) {
+        console.log(`[Report] Target GPS: ${schoolLoc.lat}, ${schoolLoc.lon}`);
         if (reportLoc) {
+            console.log(`[Report] User GPS: ${reportLoc.lat}, ${reportLoc.lon}`);
+            
             const distance = getDistanceFromLatLonInKm(
                 reportLoc.lat, reportLoc.lon, schoolLoc.lat, schoolLoc.lon
             );
+            console.log(`[Report] Distance: ${distance.toFixed(3)} km`);
 
-            // 0.5km (500m) tolerance
             if (distance <= 0.5) {
                 finalAnalysis.verification = "verified";
                 finalAnalysis.location_status = "match";
@@ -11864,45 +11883,32 @@ app.post('/api/reports', authRequired, async (req, res) => {
             finalAnalysis.location_status = "missing_gps";
         }
     } else {
+        console.log(`[Report] Target Proposal has NO Valid GPS data.`);
         finalAnalysis.verification = "unknown_school_coords";
     }
 
-    // 4. Save to Database
+    // 4. Save
     await pool.query(
       `INSERT INTO school_reports 
        (report_id, school_name, description, rating, image_cid, image_url, ai_analysis, location, wallet_address, status, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', NOW())
        ON CONFLICT (report_id) DO NOTHING`,
       [
-        id, 
-        schoolName, 
-        description, 
-        rating, 
-        imageCid || null, 
-        imageUrl || null, 
-        JSON.stringify(finalAnalysis), 
-        JSON.stringify(location || {}), 
-        wallet
+        id, schoolName, description, rating, imageCid || null, imageUrl || null, 
+        JSON.stringify(finalAnalysis), JSON.stringify(location || {}), wallet
       ]
     );
 
-    // 5. Pay Reward
+    // 5. Pay
     let txHash = null;
     try {
-        const REWARD_AMOUNT = 0.05; 
-        const TOKEN_SYMBOL = "USDT"; 
-        
-        const receipt = await blockchainService.sendToken(TOKEN_SYMBOL, wallet, REWARD_AMOUNT);
+        const receipt = await blockchainService.sendToken("USDT", wallet, 0.05);
         txHash = receipt.hash;
-        
         await pool.query(
             `UPDATE school_reports SET status = 'paid', tx_hash = $1 WHERE report_id = $2`,
             [txHash, id]
         );
-
-    } catch (payErr) {
-        console.error(`[Reward] Payment failed:`, payErr.message);
-    }
+    } catch (payErr) { console.error(`[Reward] Payment failed:`, payErr.message); }
 
     res.json({ success: true, rewardTx: txHash, identifiedVendor: finalAnalysis.vendor });
 
