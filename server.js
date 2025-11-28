@@ -11763,43 +11763,57 @@ app.post('/api/reports', authRequired, async (req, res) => {
 
     const wallet = String(req.user?.sub || "").toLowerCase();
     
-    // [FIX] Prepare Fuzzy Search Term
-    // matches "Incos de Potosi" inside "School Incos de Potosi"
-    const searchTerm = `%${(schoolName || '').trim()}%`;
-
-    let finalAnalysis = { ...aiAnalysis }; 
-    
-    // --- A) DYNAMIC VENDOR LOOKUP (FUZZY MATCH) ---
-    const { rows: winners } = await pool.query(`
-      SELECT b.vendor_name 
+    // --- SMART VENDOR MATCHING (JS-SIDE) ---
+    // 1. Fetch ALL active contracts (Proposals + Approved Bids)
+    //    We fetch all because strict SQL matching is failing on accents/typos.
+    const { rows: candidates } = await pool.query(`
+      SELECT p.proposal_id, p.org_name, p.title, p.location, b.vendor_name
       FROM proposals p
       JOIN bids b ON b.proposal_id = p.proposal_id
-      WHERE (
-        p.org_name ILIKE $1 
-        OR 
-        p.title ILIKE $1
-      )
-      AND LOWER(b.status) IN ('approved', 'completed', 'paid', 'funded')
-      LIMIT 1
-    `, [searchTerm]);
+      WHERE LOWER(b.status) IN ('approved', 'completed', 'paid', 'funded')
+    `);
 
-    finalAnalysis.vendor = winners.length > 0 
-        ? winners[0].vendor_name 
-        : "Unknown (No Active Contract)";
+    // 2. Normalization Helper (Removes accents, lowercase, trims)
+    const normalize = (str) => 
+        (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
 
-    // --- B) Verify Report Location (Using same fuzzy search) ---
-    const { rows: schoolData } = await pool.query(`
-      SELECT location 
-      FROM proposals p
-      WHERE (
-        p.org_name ILIKE $1 
-        OR 
-        p.title ILIKE $1
-      )
-      LIMIT 1
-    `, [searchTerm]);
+    // 3. Prepare Search Keywords (from the Report's School Name)
+    //    Filter out common noise words to focus on unique names (e.g. "Incos", "Potosi")
+    const stopWords = new Set(['school', 'colegio', 'unidad', 'educativa', 'escuela', 'de', 'la', 'el', 'los', 'las', 'del']);
+    const targetName = normalize(schoolName);
+    
+    const keywords = targetName.split(/[^a-z0-9]+/).filter(w => w.length > 2 && !stopWords.has(w));
+    // Fallback: if name was very short (e.g. "U.E. 1"), keep original tokens
+    const finalKeywords = keywords.length > 0 ? keywords : targetName.split(/\s+/);
 
-    const schoolLoc = schoolData.length > 0 ? schoolData[0].location : null;
+    // 4. Find Best Match
+    let bestMatch = null;
+    let maxScore = 0;
+
+    candidates.forEach(cand => {
+        // Combine Org Name + Title for search text
+        const dbText = normalize(cand.org_name + " " + cand.title);
+        
+        // Count how many keywords appear in the DB text
+        let hits = 0;
+        finalKeywords.forEach(k => {
+            if (dbText.includes(k)) hits++;
+        });
+
+        const score = hits / finalKeywords.length; // e.g. 2/2 = 1.0 (Perfect)
+
+        // We accept a match if > 50% of significant words are found
+        if (score > 0.5 && score > maxScore) {
+            maxScore = score;
+            bestMatch = cand;
+        }
+    });
+
+    let finalAnalysis = { ...aiAnalysis }; 
+    finalAnalysis.vendor = bestMatch ? bestMatch.vendor_name : "Unknown (No Active Contract)";
+    
+    // --- Verify Location (using the matched proposal's location) ---
+    const schoolLoc = bestMatch ? bestMatch.location : null;
 
     if (schoolLoc && schoolLoc.lat && schoolLoc.lon) { 
         if (location && location.lat && location.lon) {
@@ -11807,7 +11821,7 @@ app.post('/api/reports', authRequired, async (req, res) => {
                 location.lat, location.lon, schoolLoc.lat, schoolLoc.lon
             );
 
-            // Allow 500m radius
+            // 0.5km radius tolerance
             if (distance <= 0.5) {
                 finalAnalysis.verification = "verified";
                 finalAnalysis.location_status = "match";
@@ -11856,7 +11870,6 @@ app.post('/api/reports', authRequired, async (req, res) => {
         const receipt = await blockchainService.sendToken(TOKEN_SYMBOL, wallet, REWARD_AMOUNT);
         txHash = receipt.hash;
         
-        // Update DB to 'paid'
         await pool.query(
             `UPDATE school_reports SET status = 'paid', tx_hash = $1 WHERE report_id = $2`,
             [txHash, id]
