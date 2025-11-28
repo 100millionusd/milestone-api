@@ -11758,15 +11758,12 @@ app.post('/api/reports', authRequired, async (req, res) => {
       imageCid,
       imageUrl,
       aiAnalysis = {}, 
-      location
+      location // Device location (might be null if user denied permission)
     } = req.body;
 
     const wallet = String(req.user?.sub || "").toLowerCase();
     
-    console.log(`[Report] Processing report for school: "${schoolName}"`);
-
-    // --- SMART VENDOR MATCHING (JS-SIDE) ---
-    // 1. Fetch ALL active contracts
+    // 1. SMART VENDOR MATCHING
     const { rows: candidates } = await pool.query(`
       SELECT p.proposal_id, p.org_name, p.title, p.location, b.vendor_name
       FROM proposals p
@@ -11774,50 +11771,29 @@ app.post('/api/reports', authRequired, async (req, res) => {
       WHERE LOWER(b.status) IN ('approved', 'completed', 'paid', 'funded')
     `);
 
-    console.log(`[Report] Found ${candidates.length} active contracts in DB to check against.`);
-
-    // 2. Normalization Helper
     const normalize = (str) => 
         (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
 
-    // 3. Prepare Search Keywords
     const stopWords = new Set(['school', 'colegio', 'unidad', 'educativa', 'escuela', 'de', 'la', 'el', 'los', 'las', 'del']);
     const targetName = normalize(schoolName);
-    
     const keywords = targetName.split(/[^a-z0-9]+/).filter(w => w.length > 2 && !stopWords.has(w));
     const finalKeywords = keywords.length > 0 ? keywords : targetName.split(/\s+/);
 
-    console.log(`[Report] Keywords:`, finalKeywords);
-
-    // 4. Find Best Match
     let bestMatch = null;
     let maxScore = 0;
 
     candidates.forEach(cand => {
         const dbText = normalize(cand.org_name + " " + cand.title);
-        
         let hits = 0;
-        finalKeywords.forEach(k => {
-            if (dbText.includes(k)) hits++;
-        });
-
+        finalKeywords.forEach(k => { if (dbText.includes(k)) hits++; });
         const score = hits / finalKeywords.length;
-
-        // DEBUG LOG: Only show partial matches to reduce noise
-        if (score > 0) {
-            console.log(`   -> Candidate: "${cand.org_name}" | Score: ${score.toFixed(2)}`);
-        }
-
-        // Lowered threshold to >= 0.4 to catch partial matches (e.g. 1 out of 2 words)
         if (score >= 0.4 && score > maxScore) {
             maxScore = score;
             bestMatch = cand;
         }
     });
 
-    // 5. Fallback: Simple Substring Match (if smart match failed)
     if (!bestMatch) {
-        console.log(`[Report] No smart match found. Trying simple substring fallback...`);
         bestMatch = candidates.find(c => {
             const rawDb = normalize(c.org_name + " " + c.title);
             return rawDb.includes(targetName) || targetName.includes(rawDb);
@@ -11825,21 +11801,44 @@ app.post('/api/reports', authRequired, async (req, res) => {
     }
 
     let finalAnalysis = { ...aiAnalysis }; 
-    if (bestMatch) {
-        console.log(`[Report] MATCH FOUND! Vendor: ${bestMatch.vendor_name}`);
-        finalAnalysis.vendor = bestMatch.vendor_name;
-    } else {
-        console.warn(`[Report] NO MATCH found for "${schoolName}"`);
-        finalAnalysis.vendor = "Unknown (No Active Contract)";
-    }
+    finalAnalysis.vendor = bestMatch ? bestMatch.vendor_name : "Unknown (No Active Contract)";
     
-    // --- Verify Location ---
+    // --- 2. [NEW] FORCE EXIF EXTRACTION FROM IMAGE ---
+    // If we have an image but no device location, try to pull GPS from the file
+    let reportLat = location?.lat;
+    let reportLon = location?.lon;
+
+    if ((!reportLat || !reportLon) && imageUrl) {
+        console.log(`[Report] No device GPS. Attempting EXIF extraction from: ${imageUrl}`);
+        try {
+            // Use existing helper 'extractFileMetaFromUrl'
+            const meta = await extractFileMetaFromUrl({ url: imageUrl });
+            if (meta?.exif?.gpsLatitude && meta?.exif?.gpsLongitude) {
+                console.log(`[Report] EXIF GPS Found: ${meta.exif.gpsLatitude}, ${meta.exif.gpsLongitude}`);
+                
+                // Save to finalAnalysis so Admin UI sees "IMG" location
+                finalAnalysis.geo = {
+                    lat: meta.exif.gpsLatitude,
+                    lon: meta.exif.gpsLongitude,
+                    source: "image_exif"
+                };
+                
+                // Use these for verification below
+                reportLat = meta.exif.gpsLatitude;
+                reportLon = meta.exif.gpsLongitude;
+            }
+        } catch (exifErr) {
+            console.warn(`[Report] EXIF extraction failed:`, exifErr.message);
+        }
+    }
+
+    // --- 3. VERIFY LOCATION ---
     const schoolLoc = bestMatch ? bestMatch.location : null;
 
     if (schoolLoc && schoolLoc.lat && schoolLoc.lon) { 
-        if (location && location.lat && location.lon) {
+        if (reportLat && reportLon) {
             const distance = getDistanceFromLatLonInKm(
-                location.lat, location.lon, schoolLoc.lat, schoolLoc.lon
+                reportLat, reportLon, schoolLoc.lat, schoolLoc.lon
             );
 
             if (distance <= 0.5) {
@@ -11859,10 +11858,11 @@ app.post('/api/reports', authRequired, async (req, res) => {
             finalAnalysis.location_status = "missing_gps";
         }
     } else {
-        finalAnalysis.verification = "unknown_school_coords";
+        // This is why you saw "unknown_school_coords"
+        finalAnalysis.verification = "unknown_school_coords"; 
     }
 
-    // 1. Save to Database
+    // 4. Save to Database
     await pool.query(
       `INSERT INTO school_reports 
        (report_id, school_name, description, rating, image_cid, image_url, ai_analysis, location, wallet_address, status, created_at)
@@ -11881,7 +11881,7 @@ app.post('/api/reports', authRequired, async (req, res) => {
       ]
     );
 
-    // 2. Pay Reward
+    // 5. Pay Reward
     let txHash = null;
     try {
         const REWARD_AMOUNT = 0.05; 
