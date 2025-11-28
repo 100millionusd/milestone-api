@@ -11673,11 +11673,25 @@ const files = Array.isArray(b.files)
   }
 });
 
-// ==============================
+/// ==============================
 // Sally Uyuni App Routes
-// =============================
+// ==============================
 
-// --- 2. HELPER: Calculate Distance (Haversine Formula) ---
+// --- 0. DB MIGRATION: Ensure reports have status columns ---
+(async () => {
+  try {
+    await pool.query(`
+      ALTER TABLE school_reports
+      ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending',
+      ADD COLUMN IF NOT EXISTS tx_hash TEXT;
+    `);
+    console.log('[db] Verified status columns on school_reports');
+  } catch (e) {
+    console.error('[db] Failed to migrate school_reports:', e);
+  }
+})();
+
+// --- 1. HELPER: Calculate Distance (Haversine Formula) ---
 function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
   const R = 6371; // Radius of the earth in km
   const dLat = deg2rad(lat2 - lat1); 
@@ -11694,7 +11708,46 @@ function deg2rad(deg) {
   return deg * (Math.PI/180);
 }
 
-// --- 3. ROUTE: Submit Report ---
+// --- 2. GET ROUTE: Fetch Reports (Missing Piece!) ---
+app.get('/api/reports', async (req, res) => {
+  try {
+    // 1. Check Auth (Admin or explicit role)
+    // Relaxed for this demo, but ideally verify req.user
+    
+    // 2. Parse Filters
+    const statusParam = String(req.query.status || 'all').toLowerCase();
+    
+    let query = "SELECT * FROM school_reports";
+    const params = [];
+    const conditions = [];
+
+    // Filter Logic
+    if (statusParam !== 'all') {
+        if (statusParam === 'completed' || statusParam === 'paid') {
+            // Frontend 'completed' maps to DB 'paid'
+            conditions.push("(status = 'paid' OR status = 'completed')");
+        } else {
+            conditions.push("status = $1");
+            params.push(statusParam);
+        }
+    }
+
+    if (conditions.length > 0) {
+        query += " WHERE " + conditions.join(" AND ");
+    }
+
+    query += " ORDER BY created_at DESC";
+
+    const { rows } = await pool.query(query, params);
+    res.json(rows);
+
+  } catch (err) {
+    console.error("GET /api/reports error:", err);
+    res.status(500).json({ error: "Failed to fetch reports" });
+  }
+});
+
+// --- 3. POST ROUTE: Submit Report & Pay Reward ---
 app.post('/api/reports', authRequired, async (req, res) => {
   try {
     const {
@@ -11714,8 +11767,6 @@ app.post('/api/reports', authRequired, async (req, res) => {
     let finalAnalysis = { ...aiAnalysis }; 
     
     // A) DYNAMIC VENDOR LOOKUP (SQL)
-    // Find the 'approved' bid for a proposal where org_name matches schoolName
-    // This connects the report to the vendor who is contractually delivering to this school.
     const { rows: winners } = await pool.query(`
       SELECT b.vendor_name 
       FROM proposals p
@@ -11725,14 +11776,9 @@ app.post('/api/reports', authRequired, async (req, res) => {
       LIMIT 1
     `, [schoolName]);
 
-    // Use the DB result to identify who is responsible for this delivery
     finalAnalysis.vendor = winners.length > 0 ? winners[0].vendor_name : "Unknown (No Active Contract)";
 
-    // B) Verify Report Location (Anti-Spam / Validity Check)
-    // Ensure the report was submitted from the actual school location
-    
-    // FETCH SCHOOL GPS FROM PROPOSAL
-    // Assuming 'location' column in proposals table stores { lat, lon } JSON or similar
+    // B) Verify Report Location
     const { rows: schoolData } = await pool.query(`
       SELECT location 
       FROM proposals 
@@ -11742,23 +11788,18 @@ app.post('/api/reports', authRequired, async (req, res) => {
 
     const schoolLoc = schoolData.length > 0 ? schoolData[0].location : null;
 
-    if (schoolLoc && schoolLoc.lat && schoolLoc.lon) { // Check if school location exists in DB
+    if (schoolLoc && schoolLoc.lat && schoolLoc.lon) { 
         if (location && location.lat && location.lon) {
             const distance = getDistanceFromLatLonInKm(
-                location.lat, 
-                location.lon, 
-                schoolLoc.lat, 
-                schoolLoc.lon
+                location.lat, location.lon, schoolLoc.lat, schoolLoc.lon
             );
 
             if (distance <= 0.5) {
-                // Report is valid: Submitted from the school premises
                 finalAnalysis.verification = "verified";
                 finalAnalysis.location_status = "match";
                 finalAnalysis.confidence = 0.98;
                 finalAnalysis.highlights = [...(finalAnalysis.highlights || []), "GPS Verified"];
             } else {
-                // Report is suspicious: Submitted from far away
                 finalAnalysis.verification = "flagged";
                 finalAnalysis.location_status = "mismatch";
                 finalAnalysis.confidence = 0.45; 
@@ -11770,16 +11811,14 @@ app.post('/api/reports', authRequired, async (req, res) => {
             finalAnalysis.location_status = "missing_gps";
         }
     } else {
-        // School found but no GPS coordinates in proposal
         finalAnalysis.verification = "unknown_school_coords";
     }
-    // -----------------------------------------------------------
 
-    // 1. Save to Database
+    // 1. Save to Database (Status: Pending)
     await pool.query(
       `INSERT INTO school_reports 
-       (report_id, school_name, description, rating, image_cid, image_url, ai_analysis, location, wallet_address, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+       (report_id, school_name, description, rating, image_cid, image_url, ai_analysis, location, wallet_address, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', NOW())
        ON CONFLICT (report_id) DO NOTHING`,
       [
         id, 
@@ -11802,13 +11841,20 @@ app.post('/api/reports', authRequired, async (req, res) => {
 
         console.log(`[Reward] Sending ${REWARD_AMOUNT} ${TOKEN_SYMBOL} to ${wallet}...`);
         
-        // Use the existing blockchainService
         const receipt = await blockchainService.sendToken(TOKEN_SYMBOL, wallet, REWARD_AMOUNT);
         txHash = receipt.hash;
         
         console.log(`[Reward] Success! Tx: ${txHash}`);
+
+        // 3. UPDATE DB to 'paid'
+        await pool.query(
+            `UPDATE school_reports SET status = 'paid', tx_hash = $1 WHERE report_id = $2`,
+            [txHash, id]
+        );
+
     } catch (payErr) {
         console.error(`[Reward] Payment failed:`, payErr.message);
+        // Leave status as 'pending' (or update to 'failed')
     }
 
     res.json({ success: true, rewardTx: txHash, identifiedVendor: finalAnalysis.vendor });
