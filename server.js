@@ -11747,7 +11747,7 @@ app.get('/api/reports', async (req, res) => {
   }
 });
 
-/// --- 3. ROUTE: Submit Report & Pay Reward ---
+// --- 3. ROUTE: Submit Report & Pay Reward ---
 app.post('/api/reports', authRequired, async (req, res) => {
   try {
     const {
@@ -11771,22 +11771,23 @@ app.post('/api/reports', authRequired, async (req, res) => {
       WHERE LOWER(b.status) IN ('approved', 'completed', 'paid', 'funded')
     `);
 
-    // [FIX] Helper: Normalize Coords (Handles Strings, Objects, Arrays)
+    // Helper: Normalize Coords (Handles Strings, Objects, Arrays)
     const normalizeCoords = (loc) => {
         if (!loc) return null;
         
-        // 1. Try to parse if string
         let obj = loc;
+        // Handle stringified JSON (e.g. "{\"lat\":...}")
         if (typeof loc === 'string') {
             try { obj = JSON.parse(loc); } catch { return null; }
         }
         if (typeof obj !== 'object') return null;
 
-        // 2. Find Lat/Lon
+        // Extract Lat/Lon from various key styles
         const lat = obj.lat ?? obj.latitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[1] : null);
         const lon = obj.lon ?? obj.longitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[0] : null);
         
-        if (lat != null && lon != null && !isNaN(Number(lat))) {
+        // Ensure they are valid numbers
+        if (lat != null && lon != null && !isNaN(Number(lat)) && Number(lat) !== 0) {
             return { lat: Number(lat), lon: Number(lon) };
         }
         return null;
@@ -11814,6 +11815,7 @@ app.post('/api/reports', authRequired, async (req, res) => {
         }
     });
 
+    // Fallback: simple substring match
     if (!bestMatch) {
         bestMatch = candidates.find(c => {
             const rawDb = normalizeStr(c.org_name + " " + c.title);
@@ -11823,25 +11825,27 @@ app.post('/api/reports', authRequired, async (req, res) => {
 
     let finalAnalysis = { ...aiAnalysis }; 
     
-    // DEBUG LOGS
+    // --- DEBUG INFO FOR DASHBOARD ---
     if (bestMatch) {
-        console.log(`[Report] Match Found: "${bestMatch.org_name}" (ID: ${bestMatch.proposal_id})`);
-        console.log(`[Report] Raw Proposal Location:`, bestMatch.location);
         finalAnalysis.vendor = bestMatch.vendor_name;
+        // This will appear in the Admin Tooltip so you can see WHICH proposal it matched
+        finalAnalysis.debug_target = {
+            id: bestMatch.proposal_id,
+            name: bestMatch.org_name,
+            raw_location: bestMatch.location // Check this value in the tooltip!
+        };
     } else {
-        console.log(`[Report] No match found for school: "${schoolName}"`);
         finalAnalysis.vendor = "Unknown (No Active Contract)";
+        finalAnalysis.debug_target = "No Match Found";
     }
     
     // --- 2. FORCE EXIF EXTRACTION ---
     let reportLoc = normalizeCoords(location);
 
     if (!reportLoc && imageUrl) {
-        console.log(`[Report] No device GPS. Attempting EXIF from image...`);
         try {
             const meta = await extractFileMetaFromUrl({ url: imageUrl });
             if (meta?.exif?.gpsLatitude) {
-                console.log(`[Report] EXIF GPS Found: ${meta.exif.gpsLatitude}`);
                 finalAnalysis.geo = { 
                     lat: meta.exif.gpsLatitude, 
                     lon: meta.exif.gpsLongitude, 
@@ -11853,20 +11857,17 @@ app.post('/api/reports', authRequired, async (req, res) => {
     }
 
     // --- 3. VERIFY LOCATION ---
-    // [FIX] Use the smarter normalizer
     const schoolLoc = bestMatch ? normalizeCoords(bestMatch.location) : null;
 
     if (schoolLoc) {
-        console.log(`[Report] Target GPS: ${schoolLoc.lat}, ${schoolLoc.lon}`);
         if (reportLoc) {
-            console.log(`[Report] User GPS: ${reportLoc.lat}, ${reportLoc.lon}`);
-            
             const distance = getDistanceFromLatLonInKm(
                 reportLoc.lat, reportLoc.lon, schoolLoc.lat, schoolLoc.lon
             );
-            console.log(`[Report] Distance: ${distance.toFixed(3)} km`);
+            
+            finalAnalysis.distance_km = distance.toFixed(3); // Save exact distance
 
-            if (distance <= 0.5) {
+            if (distance <= 0.5) { // 500m tolerance
                 finalAnalysis.verification = "verified";
                 finalAnalysis.location_status = "match";
                 finalAnalysis.confidence = 0.98;
@@ -11875,15 +11876,14 @@ app.post('/api/reports', authRequired, async (req, res) => {
                 finalAnalysis.verification = "flagged";
                 finalAnalysis.location_status = "mismatch";
                 finalAnalysis.confidence = 0.45; 
-                finalAnalysis.issues = [...(finalAnalysis.issues || []), "Location Mismatch (Reported off-site)"];
-                finalAnalysis.distance_off = `${distance.toFixed(2)} km`;
+                finalAnalysis.issues = [...(finalAnalysis.issues || []), `Location Mismatch (${distance.toFixed(1)}km off)`];
             }
         } else {
             finalAnalysis.verification = "unknown";
-            finalAnalysis.location_status = "missing_gps";
+            finalAnalysis.location_status = "missing_report_gps";
         }
     } else {
-        console.log(`[Report] Target Proposal has NO Valid GPS data.`);
+        // This error means the PROPOSAL (DB) has no valid location
         finalAnalysis.verification = "unknown_school_coords";
     }
 
