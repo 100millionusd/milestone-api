@@ -4150,17 +4150,13 @@ app.post("/proposals", authGuard /* or requireAuth */, async (req, res) => {
     const { error, value } = proposalSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
 
-    // identity from auth middleware
     const ownerWallet = String(req.user?.address || req.user?.sub || "").toLowerCase();
     const ownerEmail  = value.ownerEmail || null;
     const ownerPhone  = toE164(value.ownerPhone || "");
 
-    if (!ownerWallet) {
-      return res.status(401).json({ error: "Login required" });
-    }
+    if (!ownerWallet) return res.status(401).json({ error: "Login required" });
 
     // ✅ ONLY ENTITY (proposer_profiles) may submit proposals.
-    // Requires at least one contact: email OR phone/WhatsApp OR Telegram (username or chat id).
     const { rows: ok } = await pool.query(
       `
       SELECT 1
@@ -4170,7 +4166,7 @@ app.post("/proposals", authGuard /* or requireAuth */, async (req, res) => {
            COALESCE(contact_email,'') <> ''
         OR COALESCE(phone,'') <> ''
         OR COALESCE(telegram_chat_id,'') <> ''
-        OR COALESCE(telegram_username,'') <> ''   -- make sure this column exists
+        OR COALESCE(telegram_username,'') <> ''
          )
        LIMIT 1
       `,
@@ -4179,23 +4175,24 @@ app.post("/proposals", authGuard /* or requireAuth */, async (req, res) => {
 
     if (!ok[0]) {
       return res.status(400).json({
-        error:
-          "Please complete your profile (add email, phone/WhatsApp, or Telegram) before submitting a proposal."
+        error: "Please complete your profile (add email, phone/WhatsApp, or Telegram) before submitting a proposal."
       });
     }
 
+    // [FIXED] Added 'location' column to INSERT and RETURNING
     const q = `
       INSERT INTO proposals (
         org_name, title, summary, contact, address, city, country, amount_usd, docs, cid, status,
-        owner_wallet, owner_email, owner_phone, updated_at
+        owner_wallet, owner_email, owner_phone, location, updated_at
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',
-        $11,$12,$13, NOW()
+        $11,$12,$13, $14, NOW()
       )
       RETURNING proposal_id, org_name, title, summary, contact, address, city, country,
-                amount_usd, docs, cid, status, created_at, owner_wallet, owner_email, owner_phone, updated_at
+                amount_usd, docs, cid, status, created_at, owner_wallet, owner_email, owner_phone, location, updated_at
     `;
 
+    // [FIXED] Added value.location to vals array (index 13 -> $14)
     const vals = [
       value.orgName,
       value.title,
@@ -4209,7 +4206,8 @@ app.post("/proposals", authGuard /* or requireAuth */, async (req, res) => {
       value.cid ?? null,
       ownerWallet,
       ownerEmail,
-      ownerPhone || null
+      ownerPhone || null,
+      value.location ? JSON.stringify(value.location) : null // <--- THIS IS CRITICAL
     ];
 
     const { rows } = await pool.query(q, vals);
