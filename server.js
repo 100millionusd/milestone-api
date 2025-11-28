@@ -11762,39 +11762,42 @@ app.post('/api/reports', authRequired, async (req, res) => {
     } = req.body;
 
     const wallet = String(req.user?.sub || "").toLowerCase();
+    
+    // [FIX] Prepare Fuzzy Search Term
+    // matches "Incos de Potosi" inside "School Incos de Potosi"
+    const searchTerm = `%${(schoolName || '').trim()}%`;
 
     let finalAnalysis = { ...aiAnalysis }; 
     
-    // [FIXED] ROBUST VENDOR LOOKUP
-    // 1. Checks both Organization Name AND Proposal Title
-    // 2. Ignores extra spaces (TRIM)
-    // 3. Case insensitive
+    // --- A) DYNAMIC VENDOR LOOKUP (FUZZY MATCH) ---
     const { rows: winners } = await pool.query(`
       SELECT b.vendor_name 
       FROM proposals p
       JOIN bids b ON b.proposal_id = p.proposal_id
       WHERE (
-        LOWER(TRIM(p.org_name)) = LOWER(TRIM($1)) 
+        p.org_name ILIKE $1 
         OR 
-        LOWER(TRIM(p.title)) = LOWER(TRIM($1))
+        p.title ILIKE $1
       )
-      AND LOWER(b.status) = 'approved'
+      AND LOWER(b.status) IN ('approved', 'completed', 'paid', 'funded')
       LIMIT 1
-    `, [schoolName]);
+    `, [searchTerm]);
 
-    finalAnalysis.vendor = winners.length > 0 ? winners[0].vendor_name : "Unknown (No Active Contract)";
+    finalAnalysis.vendor = winners.length > 0 
+        ? winners[0].vendor_name 
+        : "Unknown (No Active Contract)";
 
-    // --- B) Verify Report Location ---
+    // --- B) Verify Report Location (Using same fuzzy search) ---
     const { rows: schoolData } = await pool.query(`
       SELECT location 
       FROM proposals p
       WHERE (
-        LOWER(TRIM(p.org_name)) = LOWER(TRIM($1)) 
+        p.org_name ILIKE $1 
         OR 
-        LOWER(TRIM(p.title)) = LOWER(TRIM($1))
+        p.title ILIKE $1
       )
       LIMIT 1
-    `, [schoolName]);
+    `, [searchTerm]);
 
     const schoolLoc = schoolData.length > 0 ? schoolData[0].location : null;
 
@@ -11804,6 +11807,7 @@ app.post('/api/reports', authRequired, async (req, res) => {
                 location.lat, location.lon, schoolLoc.lat, schoolLoc.lon
             );
 
+            // Allow 500m radius
             if (distance <= 0.5) {
                 finalAnalysis.verification = "verified";
                 finalAnalysis.location_status = "match";
@@ -11849,7 +11853,6 @@ app.post('/api/reports', authRequired, async (req, res) => {
         const REWARD_AMOUNT = 0.05; 
         const TOKEN_SYMBOL = "USDT"; 
         
-        // Only pay if not already paid (check strictly if needed, but handled by tx failure usually)
         const receipt = await blockchainService.sendToken(TOKEN_SYMBOL, wallet, REWARD_AMOUNT);
         txHash = receipt.hash;
         
