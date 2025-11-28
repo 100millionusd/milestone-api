@@ -11747,7 +11747,7 @@ app.get('/api/reports', async (req, res) => {
   }
 });
 
-// --- 3. ROUTE: Submit Report & Pay Reward ---
+/// --- 3. ROUTE: Submit Report & Pay Reward ---
 app.post('/api/reports', authRequired, async (req, res) => {
   try {
     const {
@@ -11758,12 +11758,12 @@ app.post('/api/reports', authRequired, async (req, res) => {
       imageCid,
       imageUrl,
       aiAnalysis = {}, 
-      location // Device location (might be null if user denied permission)
+      location // Device location
     } = req.body;
 
     const wallet = String(req.user?.sub || "").toLowerCase();
     
-    // 1. SMART VENDOR MATCHING
+    // --- 1. SMART VENDOR MATCHING ---
     const { rows: candidates } = await pool.query(`
       SELECT p.proposal_id, p.org_name, p.title, p.location, b.vendor_name
       FROM proposals p
@@ -11771,11 +11771,21 @@ app.post('/api/reports', authRequired, async (req, res) => {
       WHERE LOWER(b.status) IN ('approved', 'completed', 'paid', 'funded')
     `);
 
-    const normalize = (str) => 
+    // Helper: Normalize strings for matching
+    const normalizeStr = (str) => 
         (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
 
-    const stopWords = new Set(['school', 'colegio', 'unidad', 'educativa', 'escuela', 'de', 'la', 'el', 'los', 'las', 'del']);
-    const targetName = normalize(schoolName);
+    // Helper: Normalize Coords (Handle lat/lon, latitude/longitude, arrays)
+    const normalizeCoords = (loc) => {
+        if (!loc) return null;
+        const lat = loc.lat ?? loc.latitude ?? (Array.isArray(loc.coordinates) ? loc.coordinates[1] : null);
+        const lon = loc.lon ?? loc.longitude ?? (Array.isArray(loc.coordinates) ? loc.coordinates[0] : null);
+        if (lat != null && lon != null) return { lat: Number(lat), lon: Number(lon) };
+        return null;
+    };
+
+    const stopWords = new Set(['school', 'colegio', 'unidad', 'educativa', 'escuela', 'de', 'la', 'el', 'los', 'las', 'del', 'the']);
+    const targetName = normalizeStr(schoolName);
     const keywords = targetName.split(/[^a-z0-9]+/).filter(w => w.length > 2 && !stopWords.has(w));
     const finalKeywords = keywords.length > 0 ? keywords : targetName.split(/\s+/);
 
@@ -11783,7 +11793,7 @@ app.post('/api/reports', authRequired, async (req, res) => {
     let maxScore = 0;
 
     candidates.forEach(cand => {
-        const dbText = normalize(cand.org_name + " " + cand.title);
+        const dbText = normalizeStr(cand.org_name + " " + cand.title);
         let hits = 0;
         finalKeywords.forEach(k => { if (dbText.includes(k)) hits++; });
         const score = hits / finalKeywords.length;
@@ -11793,9 +11803,10 @@ app.post('/api/reports', authRequired, async (req, res) => {
         }
     });
 
+    // Fallback: simple substring match
     if (!bestMatch) {
         bestMatch = candidates.find(c => {
-            const rawDb = normalize(c.org_name + " " + c.title);
+            const rawDb = normalizeStr(c.org_name + " " + c.title);
             return rawDb.includes(targetName) || targetName.includes(rawDb);
         });
     }
@@ -11803,44 +11814,39 @@ app.post('/api/reports', authRequired, async (req, res) => {
     let finalAnalysis = { ...aiAnalysis }; 
     finalAnalysis.vendor = bestMatch ? bestMatch.vendor_name : "Unknown (No Active Contract)";
     
-    // --- 2. [NEW] FORCE EXIF EXTRACTION FROM IMAGE ---
-    // If we have an image but no device location, try to pull GPS from the file
-    let reportLat = location?.lat;
-    let reportLon = location?.lon;
+    // --- 2. FORCE EXIF EXTRACTION FROM IMAGE ---
+    // If device location is missing, try to get it from the photo
+    let reportLoc = normalizeCoords(location);
 
-    if ((!reportLat || !reportLon) && imageUrl) {
+    if (!reportLoc && imageUrl) {
         console.log(`[Report] No device GPS. Attempting EXIF extraction from: ${imageUrl}`);
         try {
-            // Use existing helper 'extractFileMetaFromUrl'
             const meta = await extractFileMetaFromUrl({ url: imageUrl });
             if (meta?.exif?.gpsLatitude && meta?.exif?.gpsLongitude) {
-                console.log(`[Report] EXIF GPS Found: ${meta.exif.gpsLatitude}, ${meta.exif.gpsLongitude}`);
+                const exifLat = meta.exif.gpsLatitude;
+                const exifLon = meta.exif.gpsLongitude;
+                console.log(`[Report] EXIF GPS Found: ${exifLat}, ${exifLon}`);
                 
-                // Save to finalAnalysis so Admin UI sees "IMG" location
-                finalAnalysis.geo = {
-                    lat: meta.exif.gpsLatitude,
-                    lon: meta.exif.gpsLongitude,
-                    source: "image_exif"
-                };
-                
-                // Use these for verification below
-                reportLat = meta.exif.gpsLatitude;
-                reportLon = meta.exif.gpsLongitude;
+                // Save specific structure for Admin UI recursive finder
+                finalAnalysis.geo = { lat: exifLat, lon: exifLon, source: "image_exif" };
+                reportLoc = { lat: exifLat, lon: exifLon };
             }
         } catch (exifErr) {
             console.warn(`[Report] EXIF extraction failed:`, exifErr.message);
         }
     }
 
-    // --- 3. VERIFY LOCATION ---
-    const schoolLoc = bestMatch ? bestMatch.location : null;
+    // --- 3. VERIFY LOCATION (Distance Check) ---
+    // Safely get Proposal GPS using the new helper
+    const schoolLoc = bestMatch ? normalizeCoords(bestMatch.location) : null;
 
-    if (schoolLoc && schoolLoc.lat && schoolLoc.lon) { 
-        if (reportLat && reportLon) {
+    if (schoolLoc) {
+        if (reportLoc) {
             const distance = getDistanceFromLatLonInKm(
-                reportLat, reportLon, schoolLoc.lat, schoolLoc.lon
+                reportLoc.lat, reportLoc.lon, schoolLoc.lat, schoolLoc.lon
             );
 
+            // 0.5km (500m) tolerance
             if (distance <= 0.5) {
                 finalAnalysis.verification = "verified";
                 finalAnalysis.location_status = "match";
@@ -11858,8 +11864,7 @@ app.post('/api/reports', authRequired, async (req, res) => {
             finalAnalysis.location_status = "missing_gps";
         }
     } else {
-        // This is why you saw "unknown_school_coords"
-        finalAnalysis.verification = "unknown_school_coords"; 
+        finalAnalysis.verification = "unknown_school_coords";
     }
 
     // 4. Save to Database
