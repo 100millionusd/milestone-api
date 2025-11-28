@@ -11769,22 +11769,16 @@ app.post('/api/reports', authRequired, async (req, res) => {
       WHERE LOWER(b.status) IN ('approved', 'completed', 'paid', 'funded')
     `);
 
-    // Helper: Normalize Coords (Handles Strings, Objects, Arrays)
+    // Helper: Normalize Coords
     const normalizeCoords = (loc) => {
         if (!loc) return null;
-        
         let obj = loc;
-        // Handle stringified JSON (e.g. "{\"lat\":...}")
         if (typeof loc === 'string') {
             try { obj = JSON.parse(loc); } catch { return null; }
         }
         if (typeof obj !== 'object') return null;
-
-        // Extract Lat/Lon from various key styles
         const lat = obj.lat ?? obj.latitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[1] : null);
         const lon = obj.lon ?? obj.longitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[0] : null);
-        
-        // Ensure they are valid numbers
         if (lat != null && lon != null && !isNaN(Number(lat)) && Number(lat) !== 0) {
             return { lat: Number(lat), lon: Number(lon) };
         }
@@ -11813,7 +11807,6 @@ app.post('/api/reports', authRequired, async (req, res) => {
         }
     });
 
-    // Fallback: simple substring match
     if (!bestMatch) {
         bestMatch = candidates.find(c => {
             const rawDb = normalizeStr(c.org_name + " " + c.title);
@@ -11823,14 +11816,12 @@ app.post('/api/reports', authRequired, async (req, res) => {
 
     let finalAnalysis = { ...aiAnalysis }; 
     
-    // --- DEBUG INFO FOR DASHBOARD ---
     if (bestMatch) {
         finalAnalysis.vendor = bestMatch.vendor_name;
-        // This will appear in the Admin Tooltip so you can see WHICH proposal it matched
         finalAnalysis.debug_target = {
             id: bestMatch.proposal_id,
             name: bestMatch.org_name,
-            raw_location: bestMatch.location // Check this value in the tooltip!
+            raw_location: bestMatch.location 
         };
     } else {
         finalAnalysis.vendor = "Unknown (No Active Contract)";
@@ -11862,8 +11853,7 @@ app.post('/api/reports', authRequired, async (req, res) => {
             const distance = getDistanceFromLatLonInKm(
                 reportLoc.lat, reportLoc.lon, schoolLoc.lat, schoolLoc.lon
             );
-            
-            finalAnalysis.distance_km = distance.toFixed(3); // Save exact distance
+            finalAnalysis.distance_km = distance.toFixed(3);
 
             if (distance <= 0.5) { // 500m tolerance
                 finalAnalysis.verification = "verified";
@@ -11881,11 +11871,10 @@ app.post('/api/reports', authRequired, async (req, res) => {
             finalAnalysis.location_status = "missing_report_gps";
         }
     } else {
-        // This error means the PROPOSAL (DB) has no valid location
         finalAnalysis.verification = "unknown_school_coords";
     }
 
-    // 4. Save
+    // 4. Save Initial Report
     await pool.query(
       `INSERT INTO school_reports 
        (report_id, school_name, description, rating, image_cid, image_url, ai_analysis, location, wallet_address, status, created_at)
@@ -11897,18 +11886,46 @@ app.post('/api/reports', authRequired, async (req, res) => {
       ]
     );
 
-    // 5. Pay
+    // --- 5. CONDITIONAL PAYMENT LOGIC (FIXED) ---
     let txHash = null;
-    try {
-        const receipt = await blockchainService.sendToken("USDT", wallet, 0.05);
-        txHash = receipt.hash;
-        await pool.query(
-            `UPDATE school_reports SET status = 'paid', tx_hash = $1 WHERE report_id = $2`,
-            [txHash, id]
-        );
-    } catch (payErr) { console.error(`[Reward] Payment failed:`, payErr.message); }
+    let finalStatus = 'pending';
 
-    res.json({ success: true, rewardTx: txHash, identifiedVendor: finalAnalysis.vendor });
+    // Criteria 1: Must have detected food (score > 0)
+    // Criteria 2: Must have valid GPS (reportLoc is not null)
+    // Criteria 3: Must NOT be flagged for location mismatch (optional, but recommended)
+    const isFood = (finalAnalysis.score > 0) || (finalAnalysis.isFood === true);
+    const hasGPS = !!reportLoc;
+    const isFlagged = finalAnalysis.verification === 'flagged';
+
+    if (isFood && hasGPS && !isFlagged) {
+        try {
+            console.log(`[Reward] Sending 0.05 USDT to ${wallet}`);
+            const receipt = await blockchainService.sendToken("USDT", wallet, 0.05);
+            txHash = receipt.hash;
+            finalStatus = 'paid';
+        } catch (payErr) { 
+            console.error(`[Reward] Payment failed:`, payErr.message); 
+            finalStatus = 'payment_failed';
+        }
+    } else {
+        // Log why we skipped payment
+        const reason = !isFood ? 'no_food_detected' : (!hasGPS ? 'no_gps_data' : 'location_mismatch');
+        console.log(`[Reward] Skipped. Reason: ${reason}`);
+        finalStatus = reason; // e.g. 'no_food_detected'
+    }
+
+    // Update DB with final status
+    await pool.query(
+        `UPDATE school_reports SET status = $1, tx_hash = $2 WHERE report_id = $3`,
+        [finalStatus, txHash, id]
+    );
+
+    res.json({ 
+        success: true, 
+        rewardTx: txHash, 
+        status: finalStatus,
+        identifiedVendor: finalAnalysis.vendor 
+    });
 
   } catch (err) {
     console.error("POST /api/reports error:", err);
