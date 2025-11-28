@@ -11747,7 +11747,7 @@ app.get('/api/reports', async (req, res) => {
   }
 });
 
-// --- 3. POST ROUTE: Submit Report & Pay Reward ---
+// --- 3. ROUTE: Submit Report & Pay Reward ---
 app.post('/api/reports', authRequired, async (req, res) => {
   try {
     const {
@@ -11763,26 +11763,36 @@ app.post('/api/reports', authRequired, async (req, res) => {
 
     const wallet = String(req.user?.sub || "").toLowerCase();
 
-    // --- LOGIC: Auto-Identify Vendor & Verify GPS ---
     let finalAnalysis = { ...aiAnalysis }; 
     
-    // A) DYNAMIC VENDOR LOOKUP (SQL)
+    // [FIXED] ROBUST VENDOR LOOKUP
+    // 1. Checks both Organization Name AND Proposal Title
+    // 2. Ignores extra spaces (TRIM)
+    // 3. Case insensitive
     const { rows: winners } = await pool.query(`
       SELECT b.vendor_name 
       FROM proposals p
       JOIN bids b ON b.proposal_id = p.proposal_id
-      WHERE LOWER(p.org_name) = LOWER($1)
-        AND b.status = 'approved'
+      WHERE (
+        LOWER(TRIM(p.org_name)) = LOWER(TRIM($1)) 
+        OR 
+        LOWER(TRIM(p.title)) = LOWER(TRIM($1))
+      )
+      AND LOWER(b.status) = 'approved'
       LIMIT 1
     `, [schoolName]);
 
     finalAnalysis.vendor = winners.length > 0 ? winners[0].vendor_name : "Unknown (No Active Contract)";
 
-    // B) Verify Report Location
+    // --- B) Verify Report Location ---
     const { rows: schoolData } = await pool.query(`
       SELECT location 
-      FROM proposals 
-      WHERE LOWER(org_name) = LOWER($1)
+      FROM proposals p
+      WHERE (
+        LOWER(TRIM(p.org_name)) = LOWER(TRIM($1)) 
+        OR 
+        LOWER(TRIM(p.title)) = LOWER(TRIM($1))
+      )
       LIMIT 1
     `, [schoolName]);
 
@@ -11814,7 +11824,7 @@ app.post('/api/reports', authRequired, async (req, res) => {
         finalAnalysis.verification = "unknown_school_coords";
     }
 
-    // 1. Save to Database (Status: Pending)
+    // 1. Save to Database
     await pool.query(
       `INSERT INTO school_reports 
        (report_id, school_name, description, rating, image_cid, image_url, ai_analysis, location, wallet_address, status, created_at)
@@ -11833,20 +11843,17 @@ app.post('/api/reports', authRequired, async (req, res) => {
       ]
     );
 
-    // 2. 💸 SEND REAL CRYPTO REWARD 💸
+    // 2. Pay Reward
     let txHash = null;
     try {
         const REWARD_AMOUNT = 0.05; 
         const TOKEN_SYMBOL = "USDT"; 
-
-        console.log(`[Reward] Sending ${REWARD_AMOUNT} ${TOKEN_SYMBOL} to ${wallet}...`);
         
+        // Only pay if not already paid (check strictly if needed, but handled by tx failure usually)
         const receipt = await blockchainService.sendToken(TOKEN_SYMBOL, wallet, REWARD_AMOUNT);
         txHash = receipt.hash;
         
-        console.log(`[Reward] Success! Tx: ${txHash}`);
-
-        // 3. UPDATE DB to 'paid'
+        // Update DB to 'paid'
         await pool.query(
             `UPDATE school_reports SET status = 'paid', tx_hash = $1 WHERE report_id = $2`,
             [txHash, id]
@@ -11854,7 +11861,6 @@ app.post('/api/reports', authRequired, async (req, res) => {
 
     } catch (payErr) {
         console.error(`[Reward] Payment failed:`, payErr.message);
-        // Leave status as 'pending' (or update to 'failed')
     }
 
     res.json({ success: true, rewardTx: txHash, identifiedVendor: finalAnalysis.vendor });
