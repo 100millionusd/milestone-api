@@ -11763,10 +11763,10 @@ app.post('/api/reports', authRequired, async (req, res) => {
 
     const wallet = String(req.user?.sub || "").toLowerCase();
     
-    console.log(`[Report] Received for: "${schoolName}"`);
+    console.log(`[Report] Processing report for school: "${schoolName}"`);
 
-    // --- 1. FETCH ALL ACTIVE CONTRACTS ---
-    // We get EVERYTHING approved so we can match in JS
+    // --- SMART VENDOR MATCHING (JS-SIDE) ---
+    // 1. Fetch ALL active contracts
     const { rows: candidates } = await pool.query(`
       SELECT p.proposal_id, p.org_name, p.title, p.location, b.vendor_name
       FROM proposals p
@@ -11776,55 +11776,64 @@ app.post('/api/reports', authRequired, async (req, res) => {
 
     console.log(`[Report] Found ${candidates.length} active contracts in DB to check against.`);
 
-    // --- 2. ROBUST MATCHING LOGIC ---
+    // 2. Normalization Helper
     const normalize = (str) => 
-        (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, ' ').trim();
+        (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
 
-    const target = normalize(schoolName);
-    const stopWords = new Set(['school', 'colegio', 'unidad', 'educativa', 'escuela', 'de', 'la', 'el', 'los', 'las', 'del', 'bolivia']);
-    const targetTokens = target.split(' ').filter(w => w.length > 2 && !stopWords.has(w));
+    // 3. Prepare Search Keywords
+    const stopWords = new Set(['school', 'colegio', 'unidad', 'educativa', 'escuela', 'de', 'la', 'el', 'los', 'las', 'del']);
+    const targetName = normalize(schoolName);
+    
+    const keywords = targetName.split(/[^a-z0-9]+/).filter(w => w.length > 2 && !stopWords.has(w));
+    const finalKeywords = keywords.length > 0 ? keywords : targetName.split(/\s+/);
 
+    console.log(`[Report] Keywords:`, finalKeywords);
+
+    // 4. Find Best Match
     let bestMatch = null;
-    let bestScore = 0;
+    let maxScore = 0;
 
-    candidates.forEach(c => {
-        const dbName = normalize(c.org_name);
-        const dbTitle = normalize(c.title);
-        const fullDbText = `${dbName} ${dbTitle}`;
+    candidates.forEach(cand => {
+        const dbText = normalize(cand.org_name + " " + cand.title);
+        
+        let hits = 0;
+        finalKeywords.forEach(k => {
+            if (dbText.includes(k)) hits++;
+        });
 
-        let score = 0;
+        const score = hits / finalKeywords.length;
 
-        // A) Exact Substring Match (Strongest)
-        // If "incos de potosi" is inside "unidad educativa incos de potosi" -> Match
-        if (fullDbText.includes(target) || target.includes(dbName)) {
-            score = 1.0; 
-        } 
-        // B) Token Overlap (Fuzzy)
-        else {
-            let hits = 0;
-            targetTokens.forEach(token => {
-                if (fullDbText.includes(token)) hits++;
-            });
-            // If we match significant words (e.g. "incos" and "potosi"), valid.
-            score = targetTokens.length > 0 ? (hits / targetTokens.length) : 0;
+        // DEBUG LOG: Only show partial matches to reduce noise
+        if (score > 0) {
+            console.log(`   -> Candidate: "${cand.org_name}" | Score: ${score.toFixed(2)}`);
         }
 
-        if (score > bestScore) {
-            bestScore = score;
-            bestMatch = c;
+        // Lowered threshold to >= 0.4 to catch partial matches (e.g. 1 out of 2 words)
+        if (score >= 0.4 && score > maxScore) {
+            maxScore = score;
+            bestMatch = cand;
         }
     });
 
-    console.log(`[Report] Best Match: "${bestMatch?.org_name}" (Vendor: ${bestMatch?.vendor_name}) - Score: ${bestScore}`);
+    // 5. Fallback: Simple Substring Match (if smart match failed)
+    if (!bestMatch) {
+        console.log(`[Report] No smart match found. Trying simple substring fallback...`);
+        bestMatch = candidates.find(c => {
+            const rawDb = normalize(c.org_name + " " + c.title);
+            return rawDb.includes(targetName) || targetName.includes(rawDb);
+        });
+    }
 
-    // Lower threshold to 0.4 (matches "Incos" out of "Incos de Potosi" if "Potosi" is missing/typo'd)
-    const matchedVendor = (bestScore >= 0.4 && bestMatch) 
-        ? bestMatch.vendor_name 
-        : "Unknown (No Active Contract)";
-
-    let finalAnalysis = { ...aiAnalysis, vendor: matchedVendor }; 
+    let finalAnalysis = { ...aiAnalysis }; 
+    if (bestMatch) {
+        console.log(`[Report] MATCH FOUND! Vendor: ${bestMatch.vendor_name}`);
+        finalAnalysis.vendor = bestMatch.vendor_name;
+    } else {
+        console.warn(`[Report] NO MATCH found for "${schoolName}"`);
+        finalAnalysis.vendor = "Unknown (No Active Contract)";
+    }
     
-    // --- B) Verify Location ---
+    // --- Verify Location ---
     const schoolLoc = bestMatch ? bestMatch.location : null;
 
     if (schoolLoc && schoolLoc.lat && schoolLoc.lon) { 
