@@ -11763,9 +11763,10 @@ app.post('/api/reports', authRequired, async (req, res) => {
 
     const wallet = String(req.user?.sub || "").toLowerCase();
     
-    // --- SMART VENDOR MATCHING (JS-SIDE) ---
-    // 1. Fetch ALL active contracts (Proposals + Approved Bids)
-    //    We fetch all because strict SQL matching is failing on accents/typos.
+    console.log(`[Report] Received for: "${schoolName}"`);
+
+    // --- 1. FETCH ALL ACTIVE CONTRACTS ---
+    // We get EVERYTHING approved so we can match in JS
     const { rows: candidates } = await pool.query(`
       SELECT p.proposal_id, p.org_name, p.title, p.location, b.vendor_name
       FROM proposals p
@@ -11773,46 +11774,57 @@ app.post('/api/reports', authRequired, async (req, res) => {
       WHERE LOWER(b.status) IN ('approved', 'completed', 'paid', 'funded')
     `);
 
-    // 2. Normalization Helper (Removes accents, lowercase, trims)
+    console.log(`[Report] Found ${candidates.length} active contracts in DB to check against.`);
+
+    // --- 2. ROBUST MATCHING LOGIC ---
     const normalize = (str) => 
-        (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+        (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, ' ').trim();
 
-    // 3. Prepare Search Keywords (from the Report's School Name)
-    //    Filter out common noise words to focus on unique names (e.g. "Incos", "Potosi")
-    const stopWords = new Set(['school', 'colegio', 'unidad', 'educativa', 'escuela', 'de', 'la', 'el', 'los', 'las', 'del']);
-    const targetName = normalize(schoolName);
-    
-    const keywords = targetName.split(/[^a-z0-9]+/).filter(w => w.length > 2 && !stopWords.has(w));
-    // Fallback: if name was very short (e.g. "U.E. 1"), keep original tokens
-    const finalKeywords = keywords.length > 0 ? keywords : targetName.split(/\s+/);
+    const target = normalize(schoolName);
+    const stopWords = new Set(['school', 'colegio', 'unidad', 'educativa', 'escuela', 'de', 'la', 'el', 'los', 'las', 'del', 'bolivia']);
+    const targetTokens = target.split(' ').filter(w => w.length > 2 && !stopWords.has(w));
 
-    // 4. Find Best Match
     let bestMatch = null;
-    let maxScore = 0;
+    let bestScore = 0;
 
-    candidates.forEach(cand => {
-        // Combine Org Name + Title for search text
-        const dbText = normalize(cand.org_name + " " + cand.title);
-        
-        // Count how many keywords appear in the DB text
-        let hits = 0;
-        finalKeywords.forEach(k => {
-            if (dbText.includes(k)) hits++;
-        });
+    candidates.forEach(c => {
+        const dbName = normalize(c.org_name);
+        const dbTitle = normalize(c.title);
+        const fullDbText = `${dbName} ${dbTitle}`;
 
-        const score = hits / finalKeywords.length; // e.g. 2/2 = 1.0 (Perfect)
+        let score = 0;
 
-        // We accept a match if > 50% of significant words are found
-        if (score > 0.5 && score > maxScore) {
-            maxScore = score;
-            bestMatch = cand;
+        // A) Exact Substring Match (Strongest)
+        // If "incos de potosi" is inside "unidad educativa incos de potosi" -> Match
+        if (fullDbText.includes(target) || target.includes(dbName)) {
+            score = 1.0; 
+        } 
+        // B) Token Overlap (Fuzzy)
+        else {
+            let hits = 0;
+            targetTokens.forEach(token => {
+                if (fullDbText.includes(token)) hits++;
+            });
+            // If we match significant words (e.g. "incos" and "potosi"), valid.
+            score = targetTokens.length > 0 ? (hits / targetTokens.length) : 0;
+        }
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestMatch = c;
         }
     });
 
-    let finalAnalysis = { ...aiAnalysis }; 
-    finalAnalysis.vendor = bestMatch ? bestMatch.vendor_name : "Unknown (No Active Contract)";
+    console.log(`[Report] Best Match: "${bestMatch?.org_name}" (Vendor: ${bestMatch?.vendor_name}) - Score: ${bestScore}`);
+
+    // Lower threshold to 0.4 (matches "Incos" out of "Incos de Potosi" if "Potosi" is missing/typo'd)
+    const matchedVendor = (bestScore >= 0.4 && bestMatch) 
+        ? bestMatch.vendor_name 
+        : "Unknown (No Active Contract)";
+
+    let finalAnalysis = { ...aiAnalysis, vendor: matchedVendor }; 
     
-    // --- Verify Location (using the matched proposal's location) ---
+    // --- B) Verify Location ---
     const schoolLoc = bestMatch ? bestMatch.location : null;
 
     if (schoolLoc && schoolLoc.lat && schoolLoc.lon) { 
@@ -11821,7 +11833,6 @@ app.post('/api/reports', authRequired, async (req, res) => {
                 location.lat, location.lon, schoolLoc.lat, schoolLoc.lon
             );
 
-            // 0.5km radius tolerance
             if (distance <= 0.5) {
                 finalAnalysis.verification = "verified";
                 finalAnalysis.location_status = "match";
