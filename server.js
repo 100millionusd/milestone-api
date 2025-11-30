@@ -11952,6 +11952,74 @@ app.post('/api/reports', authRequired, async (req, res) => {
   }
 });
 
+// --- 4. DELETE ROUTE: Permanently remove a report ---
+app.delete('/api/reports/:id', authRequired, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const wallet = String(req.user?.sub || "").toLowerCase();
+    
+    // Check if Admin
+    const isAdmin = (req.user?.role === 'admin') || isAdminAddress(wallet);
+
+    let query;
+    let params;
+
+    if (isAdmin) {
+      // Admin can delete ANY report
+      query = 'DELETE FROM school_reports WHERE report_id = $1';
+      params = [id];
+    } else {
+      // Users can only delete THEIR OWN reports
+      query = 'DELETE FROM school_reports WHERE report_id = $1 AND lower(wallet_address) = lower($2)';
+      params = [id, wallet];
+    }
+
+    const { rowCount } = await pool.query(query, params);
+
+    if (rowCount === 0) {
+      return res.status(404).json({ error: "Report not found or unauthorized" });
+    }
+
+    res.json({ success: true, deletedId: id });
+
+  } catch (err) {
+    console.error("DELETE /api/reports error:", err);
+    res.status(500).json({ error: "Failed to delete report" });
+  }
+});
+
+// --- 5. ARCHIVE ROUTE: Mark as archived (Soft Delete) ---
+app.put('/api/reports/:id/archive', authRequired, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const wallet = String(req.user?.sub || "").toLowerCase();
+    const isAdmin = (req.user?.role === 'admin') || isAdminAddress(wallet);
+
+    let query;
+    let params;
+
+    if (isAdmin) {
+      query = "UPDATE school_reports SET status = 'archived' WHERE report_id = $1";
+      params = [id];
+    } else {
+      query = "UPDATE school_reports SET status = 'archived' WHERE report_id = $1 AND lower(wallet_address) = lower($2)";
+      params = [id, wallet];
+    }
+
+    const { rowCount } = await pool.query(query, params);
+
+    if (rowCount === 0) {
+      return res.status(404).json({ error: "Report not found or unauthorized" });
+    }
+
+    res.json({ success: true, id, status: 'archived' });
+
+  } catch (err) {
+    console.error("ARCHIVE /api/reports error:", err);
+    res.status(500).json({ error: "Failed to archive report" });
+  }
+});
+
 // ==============================
 // Start server
 // ==============================
