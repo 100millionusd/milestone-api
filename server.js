@@ -11745,24 +11745,24 @@ app.get('/api/reports', async (req, res) => {
   }
 });
 
-// --- 3. ROUTE: Submit Report & Pay Reward (FIXED) ---
+// --- 3. ROUTE: Submit Report & Pay Reward (STRICT GPS) ---
 app.post('/api/reports', authRequired, async (req, res) => {
   try {
     const {
       id,
-      category, // <--- IMPORTANT: We must extract category
+      category, 
       schoolName,
       description,
       rating,
       imageCid,
       imageUrl,
       aiAnalysis = {}, 
-      location 
+      location // Device location
     } = req.body;
 
     const wallet = String(req.user?.sub || "").toLowerCase();
     
-    // --- 1. SMART VENDOR MATCHING ---
+    // --- 1. FIND PROPOSAL IN DB (Smart Match) ---
     const { rows: candidates } = await pool.query(`
       SELECT p.proposal_id, p.org_name, p.title, p.location, b.vendor_name
       FROM proposals p
@@ -11774,21 +11774,20 @@ app.post('/api/reports', authRequired, async (req, res) => {
     const normalizeCoords = (loc) => {
         if (!loc) return null;
         let obj = loc;
-        if (typeof loc === 'string') {
-            try { obj = JSON.parse(loc); } catch { return null; }
-        }
+        if (typeof loc === 'string') { try { obj = JSON.parse(loc); } catch { return null; } }
         if (typeof obj !== 'object') return null;
+        // Handle {lat, lng}, {latitude, longitude}, [lon, lat]
         const lat = obj.lat ?? obj.latitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[1] : null);
-        const lon = obj.lon ?? obj.longitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[0] : null);
+        const lon = obj.lng ?? obj.lon ?? obj.longitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[0] : null);
+        
         if (lat != null && lon != null && !isNaN(Number(lat)) && Number(lat) !== 0) {
             return { lat: Number(lat), lon: Number(lon) };
         }
         return null;
     };
 
-    const normalizeStr = (str) => 
-        (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
-
+    // ... (Keyword matching logic remains the same) ...
+    const normalizeStr = (str) => (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
     const stopWords = new Set(['school', 'colegio', 'unidad', 'educativa', 'escuela', 'de', 'la', 'el', 'los', 'las', 'del', 'the']);
     const targetName = normalizeStr(schoolName);
     const keywords = targetName.split(/[^a-z0-9]+/).filter(w => w.length > 2 && !stopWords.has(w));
@@ -11808,6 +11807,7 @@ app.post('/api/reports', authRequired, async (req, res) => {
         }
     });
 
+    // Fallback simple search
     if (!bestMatch) {
         bestMatch = candidates.find(c => {
             const rawDb = normalizeStr(c.org_name + " " + c.title);
@@ -11817,24 +11817,24 @@ app.post('/api/reports', authRequired, async (req, res) => {
 
     let finalAnalysis = { ...aiAnalysis }; 
     
+    // --- 2. DETERMINE LOCATIONS ---
+    
+    // A. School Location (From Proposal DB)
+    const proposalLoc = bestMatch ? normalizeCoords(bestMatch.location) : null;
+
     if (bestMatch) {
         finalAnalysis.vendor = bestMatch.vendor_name;
-        finalAnalysis.debug_target = {
-            id: bestMatch.proposal_id,
-            name: bestMatch.org_name,
-            raw_location: bestMatch.location 
-        };
+        finalAnalysis.proposal_id = bestMatch.proposal_id; // Store ID for reference
     } else {
-        finalAnalysis.vendor = "Unknown (No Active Contract)";
-        finalAnalysis.debug_target = "No Match Found";
+        finalAnalysis.vendor = "Unknown";
     }
-    
-    // --- 2. FORCE EXIF EXTRACTION ---
+
+    // B. Report Location (From Image EXIF or Device GPS)
     let reportLoc = normalizeCoords(location);
 
-    if (!reportLoc && imageUrl) {
+    // Try to overwrite with EXIF if available (More secure)
+    if (imageUrl) {
         try {
-            // Assuming extractFileMetaFromUrl is defined elsewhere in your file
             const meta = await extractFileMetaFromUrl({ url: imageUrl });
             if (meta?.exif?.gpsLatitude) {
                 finalAnalysis.geo = { 
@@ -11844,39 +11844,33 @@ app.post('/api/reports', authRequired, async (req, res) => {
                 };
                 reportLoc = { lat: meta.exif.gpsLatitude, lon: meta.exif.gpsLongitude };
             }
-        } catch (exifErr) { console.warn("EXIF failed", exifErr.message); }
+        } catch (exifErr) { console.warn("EXIF extraction failed:", exifErr.message); }
     }
 
-    // --- 3. VERIFY LOCATION ---
-    const schoolLoc = bestMatch ? normalizeCoords(bestMatch.location) : null;
+    // --- 3. CALCULATE DISTANCE & VERIFY ---
+    if (proposalLoc && reportLoc) {
+        const distance = getDistanceFromLatLonInKm(
+            reportLoc.lat, reportLoc.lon, proposalLoc.lat, proposalLoc.lon
+        );
+        finalAnalysis.distance_km = distance.toFixed(3);
 
-    if (schoolLoc) {
-        if (reportLoc) {
-            const distance = getDistanceFromLatLonInKm(
-                reportLoc.lat, reportLoc.lon, schoolLoc.lat, schoolLoc.lon
-            );
-            finalAnalysis.distance_km = distance.toFixed(3);
-
-            if (distance <= 0.5) { // 500m tolerance
-                finalAnalysis.verification = "verified";
-                finalAnalysis.location_status = "match";
-                finalAnalysis.confidence = 0.98;
-                finalAnalysis.highlights = [...(finalAnalysis.highlights || []), "GPS Verified"];
-            } else {
-                finalAnalysis.verification = "flagged";
-                finalAnalysis.location_status = "mismatch";
-                finalAnalysis.confidence = 0.45; 
-                finalAnalysis.issues = [...(finalAnalysis.issues || []), `Location Mismatch (${distance.toFixed(1)}km off)`];
-            }
+        // 🚨 CRITICAL THRESHOLD: 0.5 KM (500 Meters)
+        if (distance <= 0.5) { 
+            finalAnalysis.verification = "verified";
+            finalAnalysis.location_status = "match";
+            finalAnalysis.highlights = [...(finalAnalysis.highlights || []), "GPS Matches Proposal"];
         } else {
-            finalAnalysis.verification = "unknown";
-            finalAnalysis.location_status = "missing_report_gps";
+            finalAnalysis.verification = "flagged"; // Too far
+            finalAnalysis.location_status = "mismatch";
+            finalAnalysis.issues = [...(finalAnalysis.issues || []), `GPS Mismatch (${distance.toFixed(2)}km)`];
         }
     } else {
-        finalAnalysis.verification = "unknown_school_coords";
+        // If we can't compare (missing DB loc or missing Image loc), we cannot verify.
+        finalAnalysis.verification = "unknown"; 
+        finalAnalysis.location_status = proposalLoc ? "missing_image_gps" : "school_not_found_in_db";
     }
 
-    // 4. Save Initial Report
+    // 4. Save to Database
     await pool.query(
       `INSERT INTO school_reports 
        (report_id, school_name, description, rating, image_cid, image_url, ai_analysis, location, wallet_address, status, created_at)
@@ -11888,48 +11882,44 @@ app.post('/api/reports', authRequired, async (req, res) => {
       ]
     );
 
-    // --- 5. CONDITIONAL PAYMENT LOGIC (FIXED FOR BOTH TYPES) ---
+    // --- 5. STRICT PAYMENT LOGIC ---
     let txHash = null;
     let finalStatus = 'pending';
     let rejectReason = '';
-    let isRewardable = false;
+    
+    // GATE 1: PROPOSAL & LOCATION CHECK
+    // If verification is ANYTHING other than 'verified', we stop.
+    // This handles: Unknown Schools, Missing GPS, and Distance > 500m
+    const isLocationValid = finalAnalysis.verification === 'verified';
 
-    // A. Check Logic Based on Category
+    // GATE 2: CONTENT VALIDATION (Damage or Food)
+    let isContentValid = false;
+
     if (category === 'infrastructure') {
-        // REPAIR Logic: Needs severity > 0
-        const hasDamage = (finalAnalysis.severity > 0);
-        if (hasDamage) {
-            isRewardable = true;
-        } else {
-            rejectReason = 'no_damage_detected';
-        }
+        // Infrastructure: Must have severity > 0
+        if (finalAnalysis.severity > 0) isContentValid = true;
+        else rejectReason = 'no_damage_detected';
     } else {
-        // FOOD Logic (Default): Needs score > 0 or isFood=true
-        const isFood = (finalAnalysis.score > 0) || (finalAnalysis.isFood === true);
-        if (isFood) {
-            isRewardable = true;
+        // Food: Must be food + score > 0
+        if ((finalAnalysis.score > 0) || (finalAnalysis.isFood === true)) isContentValid = true;
+        else rejectReason = 'no_food_detected';
+    }
+
+    if (!isLocationValid) {
+        // Override reason if location failed
+        if (finalAnalysis.location_status === 'school_not_found_in_db') {
+            rejectReason = 'school_proposal_not_found';
+        } else if (finalAnalysis.location_status === 'mismatch') {
+            rejectReason = `gps_mismatch_${finalAnalysis.distance_km}km`;
         } else {
-            rejectReason = 'no_food_detected';
+            rejectReason = 'gps_data_missing';
         }
     }
 
-    // B. Global Checks (GPS & Location Consistency)
-    const hasGPS = !!reportLoc;
-    const isFlagged = finalAnalysis.verification === 'flagged';
-
-    if (!hasGPS) {
-        isRewardable = false;
-        rejectReason = 'no_gps_data';
-    } else if (isFlagged) {
-        isRewardable = false;
-        rejectReason = 'location_mismatch';
-    }
-
-    // C. Execute Payment
-    if (isRewardable) {
+    // FINAL DECISION
+    if (isLocationValid && isContentValid) {
         try {
-            console.log(`[Reward] Sending 0.05 USDT to ${wallet}`);
-            // Ensure blockchainService is imported and available
+            console.log(`[Reward] Verification Passed. Sending 0.05 USDT to ${wallet}`);
             const receipt = await blockchainService.sendToken("USDT", wallet, 0.05);
             txHash = receipt.hash;
             finalStatus = 'paid';
@@ -11938,11 +11928,11 @@ app.post('/api/reports', authRequired, async (req, res) => {
             finalStatus = 'payment_failed';
         }
     } else {
-        console.log(`[Reward] Skipped. Category: ${category}, Reason: ${rejectReason}`);
-        finalStatus = rejectReason; 
+        console.log(`[Reward] Skipped. Reason: ${rejectReason}`);
+        finalStatus = rejectReason;
     }
 
-    // Update DB with final status
+    // Update Status
     await pool.query(
         `UPDATE school_reports SET status = $1, tx_hash = $2 WHERE report_id = $3`,
         [finalStatus, txHash, id]
@@ -11952,7 +11942,8 @@ app.post('/api/reports', authRequired, async (req, res) => {
         success: true, 
         rewardTx: txHash, 
         status: finalStatus,
-        identifiedVendor: finalAnalysis.vendor 
+        identifiedVendor: finalAnalysis.vendor,
+        verification: finalAnalysis.verification // Return this so UI knows why
     });
 
   } catch (err) {
