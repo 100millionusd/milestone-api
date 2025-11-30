@@ -11745,18 +11745,19 @@ app.get('/api/reports', async (req, res) => {
   }
 });
 
-// --- 3. ROUTE: Submit Report & Pay Reward ---
+// --- 3. ROUTE: Submit Report & Pay Reward (FIXED) ---
 app.post('/api/reports', authRequired, async (req, res) => {
   try {
     const {
       id,
+      category, // <--- IMPORTANT: We must extract category
       schoolName,
       description,
       rating,
       imageCid,
       imageUrl,
       aiAnalysis = {}, 
-      location // Device location from App
+      location 
     } = req.body;
 
     const wallet = String(req.user?.sub || "").toLowerCase();
@@ -11833,6 +11834,7 @@ app.post('/api/reports', authRequired, async (req, res) => {
 
     if (!reportLoc && imageUrl) {
         try {
+            // Assuming extractFileMetaFromUrl is defined elsewhere in your file
             const meta = await extractFileMetaFromUrl({ url: imageUrl });
             if (meta?.exif?.gpsLatitude) {
                 finalAnalysis.geo = { 
@@ -11886,20 +11888,48 @@ app.post('/api/reports', authRequired, async (req, res) => {
       ]
     );
 
-    // --- 5. CONDITIONAL PAYMENT LOGIC (FIXED) ---
+    // --- 5. CONDITIONAL PAYMENT LOGIC (FIXED FOR BOTH TYPES) ---
     let txHash = null;
     let finalStatus = 'pending';
+    let rejectReason = '';
+    let isRewardable = false;
 
-    // Criteria 1: Must have detected food (score > 0)
-    // Criteria 2: Must have valid GPS (reportLoc is not null)
-    // Criteria 3: Must NOT be flagged for location mismatch (optional, but recommended)
-    const isFood = (finalAnalysis.score > 0) || (finalAnalysis.isFood === true);
+    // A. Check Logic Based on Category
+    if (category === 'infrastructure') {
+        // REPAIR Logic: Needs severity > 0
+        const hasDamage = (finalAnalysis.severity > 0);
+        if (hasDamage) {
+            isRewardable = true;
+        } else {
+            rejectReason = 'no_damage_detected';
+        }
+    } else {
+        // FOOD Logic (Default): Needs score > 0 or isFood=true
+        const isFood = (finalAnalysis.score > 0) || (finalAnalysis.isFood === true);
+        if (isFood) {
+            isRewardable = true;
+        } else {
+            rejectReason = 'no_food_detected';
+        }
+    }
+
+    // B. Global Checks (GPS & Location Consistency)
     const hasGPS = !!reportLoc;
     const isFlagged = finalAnalysis.verification === 'flagged';
 
-    if (isFood && hasGPS && !isFlagged) {
+    if (!hasGPS) {
+        isRewardable = false;
+        rejectReason = 'no_gps_data';
+    } else if (isFlagged) {
+        isRewardable = false;
+        rejectReason = 'location_mismatch';
+    }
+
+    // C. Execute Payment
+    if (isRewardable) {
         try {
             console.log(`[Reward] Sending 0.05 USDT to ${wallet}`);
+            // Ensure blockchainService is imported and available
             const receipt = await blockchainService.sendToken("USDT", wallet, 0.05);
             txHash = receipt.hash;
             finalStatus = 'paid';
@@ -11908,10 +11938,8 @@ app.post('/api/reports', authRequired, async (req, res) => {
             finalStatus = 'payment_failed';
         }
     } else {
-        // Log why we skipped payment
-        const reason = !isFood ? 'no_food_detected' : (!hasGPS ? 'no_gps_data' : 'location_mismatch');
-        console.log(`[Reward] Skipped. Reason: ${reason}`);
-        finalStatus = reason; // e.g. 'no_food_detected'
+        console.log(`[Reward] Skipped. Category: ${category}, Reason: ${rejectReason}`);
+        finalStatus = rejectReason; 
     }
 
     // Update DB with final status
