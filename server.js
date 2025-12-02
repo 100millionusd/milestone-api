@@ -3894,9 +3894,10 @@ app.get('/auth/role', async (req, res) => {
     // If payload had a role claim (from choose-role), prefer it when consistent
     const claimed = String(payload?.role || '').toLowerCase();
     if (claimed && (claimed === 'admin' || claimed === 'vendor' || claimed === 'proposer')) {
-      // Keep admin if durable says admin
-      if (claimed === 'admin' && roles.includes('admin')) role = 'admin';
-      else role = claimed; // otherwise trust the token's role
+      // 🛑 FIX: Only respect the token's role if the user ACTUALLY HAS that role in this tenant
+      if (roles.includes(claimed)) {
+        role = claimed;
+      }
     }
 
     return res.json({ address: address || null, role, roles, vendorStatus, tenantId: req.tenantId });
