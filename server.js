@@ -532,10 +532,10 @@ async function _findExecutedByNonce(nonce) {
 }
 
 // Finalize DB (fire-and-forget)
-async function _finalizePaidInDb({ bidId, milestoneIndex, txHash, safeTxHash }) {
+async function _finalizePaidInDb({ bidId, milestoneIndex, txHash, safeTxHash, tenantId }) {
   try {
     // Update milestone JSON
-    const { rows: b } = await pool.query('SELECT milestones FROM bids WHERE bid_id=$1', [bidId]);
+    const { rows: b } = await pool.query('SELECT milestones FROM bids WHERE bid_id=$1 AND tenant_id=$2', [bidId, tenantId]);
     if (!b[0]) return;
     const arr = Array.isArray(b[0].milestones) ? b[0].milestones : JSON.parse(b[0].milestones || '[]');
     const ms = { ...(arr[milestoneIndex] || {}) };
@@ -549,7 +549,7 @@ async function _finalizePaidInDb({ bidId, milestoneIndex, txHash, safeTxHash }) 
     ms.status = 'paid';
 
     arr[milestoneIndex] = ms;
-    await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2', [JSON.stringify(arr), bidId]);
+    await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2 AND tenant_id=$3', [JSON.stringify(arr), bidId, tenantId]);
 
     // Update milestone_payments (also switch to the new safe_tx_hash if the hash changed)
     await pool.query(
@@ -558,8 +558,8 @@ async function _finalizePaidInDb({ bidId, milestoneIndex, txHash, safeTxHash }) 
              safe_tx_hash = COALESCE($4, safe_tx_hash),
              tx_hash=COALESCE($3, tx_hash),
              released_at=COALESCE(released_at, NOW())
-       WHERE bid_id=$1 AND milestone_index=$2`,
-      [bidId, milestoneIndex, txHash || null, safeTxHash || null]
+       WHERE bid_id=$1 AND milestone_index=$2 AND tenant_id=$5`,
+      [bidId, milestoneIndex, txHash || null, safeTxHash || null, tenantId]
     );
   } catch (e) {
     console.warn('[overlay finalize] DB finalize failed', e?.message || e);
@@ -582,9 +582,9 @@ async function overlayPaidFromMp(bid, pool) {
     `SELECT DISTINCT ON (milestone_index)
            milestone_index, status, tx_hash, safe_tx_hash, released_at, safe_nonce, created_at, id
        FROM milestone_payments
-      WHERE bid_id = $1
+      WHERE bid_id = $1 AND tenant_id = $2
       ORDER BY milestone_index, created_at DESC, id DESC`,
-    [bidId]
+    [bidId, bid.tenant_id]
   );
 
   // Create a map for O(1) lookup
@@ -653,6 +653,7 @@ async function overlayPaidFromMp(bid, pool) {
 
     const safeHash = r.safe_tx_hash;
     const nonce = r.safe_nonce ?? null;
+    const tenantId = bid.tenant_id; // Extract tenantId from bid
 
     tasks.push((async () => {
       const st = await _getSafeTxStatus(safeHash);
@@ -667,7 +668,7 @@ async function overlayPaidFromMp(bid, pool) {
           paymentPending: false,
           status: 'paid',
         };
-        await _finalizePaidInDb({ bidId, milestoneIndex: idx, txHash: st.txHash, safeTxHash: safeHash });
+        await _finalizePaidInDb({ bidId, milestoneIndex: idx, txHash: st.txHash, safeTxHash: safeHash, tenantId });
         return;
       }
 
@@ -683,7 +684,7 @@ async function overlayPaidFromMp(bid, pool) {
           paymentPending: false,
           status: 'paid',
         };
-        await _finalizePaidInDb({ bidId, milestoneIndex: idx, txHash: alt.txHash, safeTxHash: alt.safeTxHash });
+        await _finalizePaidInDb({ bidId, milestoneIndex: idx, txHash: alt.txHash, safeTxHash: alt.safeTxHash, tenantId });
         return;
       }
 
@@ -718,8 +719,8 @@ async function attachPaymentState(bids) {
   const { rows: payRows } = await pool.query(
     `SELECT bid_id, milestone_index, status, tx_hash
        FROM milestone_payments
-      WHERE bid_id = ANY($1::bigint[])`,
-    [bidIds]
+      WHERE bid_id = ANY($1::bigint[]) AND tenant_id = $2`,
+    [bidIds, bids[0].tenant_id]
   );
 
   const byKey = new Map();
@@ -1114,7 +1115,7 @@ async function attachPaymentState(bids) {
     `);
 
     // 4. Add tenant_id to existing tables
-    const tables = ['proposals', 'bids', 'proofs', 'vendor_profiles', 'proposer_profiles', 'school_reports', 'user_dashboard_state'];
+    const tables = ['proposals', 'bids', 'proofs', 'vendor_profiles', 'proposer_profiles', 'school_reports', 'user_dashboard_state', 'milestone_payments'];
     for (const table of tables) {
       await pool.query(`
         ALTER TABLE ${table}
@@ -3999,6 +4000,25 @@ app.put("/api/tenants/:id/config", requireAuth, async (req, res) => {
 });
 
 // Get Current Tenant Info
+// Public lookup by slug (for frontend middleware)
+app.get("/api/tenants/lookup", async (req, res) => {
+  try {
+    const slug = String(req.query.slug || "").trim();
+    if (!slug) return res.status(400).json({ error: "Missing slug" });
+
+    const { rows } = await pool.query(
+      "SELECT id, name, slug FROM tenants WHERE slug = $1",
+      [slug]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Tenant not found" });
+
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("GET /api/tenants/lookup failed", e);
+    res.status(500).json({ error: "Lookup failed" });
+  }
+});
+
 app.get("/api/tenants/current", async (req, res) => {
   try {
     const { rows } = await pool.query(`SELECT id, name, slug FROM tenants WHERE id = $1`, [req.tenantId]);
@@ -4718,6 +4738,7 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
       WITH vendor_wallets AS (
         SELECT DISTINCT LOWER(wallet_address) AS w
         FROM vendor_profiles
+        WHERE tenant_id = $1
       ),
       props AS (
         SELECT
@@ -4762,6 +4783,7 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           COUNT(*) FILTER (WHERE p.status <> 'archived')::int     AS active_count
         FROM proposals p
         WHERE NOT EXISTS (SELECT 1 FROM vendor_wallets vw WHERE vw.w = LOWER(p.owner_wallet))
+          AND tenant_id = $1
         GROUP BY LOWER(COALESCE(p.owner_wallet,''))
       ),
       ents AS (
@@ -4781,6 +4803,7 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           pp.updated_at                       AS updated_at
         FROM proposer_profiles pp
         WHERE NOT EXISTS (SELECT 1 FROM vendor_wallets vw WHERE vw.w = LOWER(pp.wallet_address))
+          AND tenant_id = $1
       ),
       combined AS (
         SELECT
@@ -4837,7 +4860,7 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
       ORDER BY last_activity_at DESC NULLS LAST, entity_name ASC
     `;
 
-    const { rows } = await pool.query(sql);
+    const { rows } = await pool.query(sql, [req.tenantId]);
     const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
     const items = rows.map((r) => {
@@ -5920,7 +5943,8 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
           COUNT(*) FILTER (WHERE status='pending') AS open_pending,
           COUNT(*) FILTER (WHERE status='pending' AND submitted_at < NOW() - INTERVAL '48 hours') AS breaching
         FROM proofs
-      `);
+        WHERE tenant_id = $1
+      `, [req.tenantId]);
       out.tiles.openProofs = Number(rows[0].open_pending || 0);
       out.tiles.breachingSla = Number(rows[0].breaching || 0);
     }
@@ -5932,9 +5956,8 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
       COUNT(*)::int                            AS count,
       COALESCE(SUM(mp.amount_usd), 0)::numeric AS total_usd
     FROM milestone_payments mp
-    WHERE mp.status = 'pending'
-      AND EXISTS (SELECT 1 FROM bids b WHERE b.bid_id = mp.bid_id)
-  `).catch(() => ({ rows: [{ count: 0, total_usd: 0 }] }));
+    WHERE mp.status = 'pending' AND mp.tenant_id = $1
+  `, [req.tenantId]).catch(() => ({ rows: [{ count: 0, total_usd: 0 }] }));
 
       out.tiles.pendingPayouts = {
         count: Number(rows[0].count || 0),
@@ -5949,8 +5972,8 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
                  ORDER BY EXTRACT(EPOCH FROM (COALESCE(approved_at, updated_at) - submitted_at))/3600.0
                ) AS p50h
         FROM proofs
-        WHERE status='approved' AND submitted_at IS NOT NULL
-      `).catch(() => ({ rows: [{ p50h: 0 }] }));
+        WHERE status='approved' AND submitted_at IS NOT NULL AND tenant_id = $1
+      `, [req.tenantId]).catch(() => ({ rows: [{ p50h: 0 }] }));
       out.tiles.p50CycleHours = Number(rows[0].p50h || 0);
     }
 
@@ -5961,7 +5984,8 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
           COUNT(*) FILTER (WHERE status IN ('approved','rejected')) AS decided,
           COUNT(*) FILTER (WHERE status='rejected') AS rej
         FROM proofs
-      `).catch(() => ({ rows: [{ decided: 0, rej: 0 }] }));
+        WHERE tenant_id = $1
+      `, [req.tenantId]).catch(() => ({ rows: [{ decided: 0, rej: 0 }] }));
       const decided = Number(rows[0].decided || 0);
       const rej = Number(rows[0].rej || 0);
       out.tiles.revisionRatePct = decided ? Math.round(100 * rej / decided) : 0;
@@ -5975,10 +5999,10 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
           FROM proofs p
           JOIN bids b       ON b.bid_id=p.bid_id
           JOIN proposals pr ON pr.proposal_id=b.proposal_id
-         WHERE p.status='pending'
+         WHERE p.status='pending' AND p.tenant_id = $1
          ORDER BY p.submitted_at NULLS LAST, p.updated_at NULLS LAST
          LIMIT 50
-      `);
+      `, [req.tenantId]);
       out.queue = rows.map(r => ({
         id: r.proof_id,
         vendor: r.vendor_name || r.wallet_address,
@@ -6003,10 +6027,11 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
           MAX(p.updated_at)                                   AS last_activity
         FROM bids b
         LEFT JOIN proofs p ON p.bid_id=b.bid_id
+        WHERE b.tenant_id = $1
         GROUP BY b.vendor_name, b.wallet_address
         ORDER BY proofs DESC NULLS LAST, vendor_name ASC
         LIMIT 200
-      `);
+      `, [req.tenantId]);
       out.vendors = rows.map(r => ({
         vendor: r.vendor_name || '(unnamed)',
         wallet: r.wallet_address,
@@ -6022,12 +6047,13 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
     // alerts: ipfs_missing from bid_audits
     {
       const { rows } = await pool.query(`
-        SELECT created_at, bid_id, changes
-          FROM bid_audits
-         WHERE changes ? 'ipfs_missing'
-         ORDER BY created_at DESC
+        SELECT ba.created_at, ba.bid_id, ba.changes
+          FROM bid_audits ba
+          JOIN bids b ON b.bid_id = ba.bid_id
+         WHERE ba.changes ? 'ipfs_missing' AND b.tenant_id = $1
+         ORDER BY ba.created_at DESC
          LIMIT 20
-      `);
+      `, [req.tenantId]);
       out.alerts = rows.map(r => ({
         type: 'ipfs_missing',
         createdAt: r.created_at,
@@ -6041,17 +6067,17 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
       const { rows: pend } = await pool.query(`
         SELECT id, bid_id, milestone_index, amount_usd, created_at
           FROM milestone_payments
-         WHERE status='pending'
+         WHERE status='pending' AND tenant_id = $1
          ORDER BY created_at DESC
          LIMIT 20
-      `).catch(() => ({ rows: [] }));
+      `, [req.tenantId]).catch(() => ({ rows: [] }));
       const { rows: rec } = await pool.query(`
         SELECT id, bid_id, milestone_index, amount_usd, released_at
           FROM milestone_payments
-         WHERE status='released'
+         WHERE status='released' AND tenant_id = $1
          ORDER BY released_at DESC
          LIMIT 20
-      `).catch(() => ({ rows: [] }));
+      `, [req.tenantId]).catch(() => ({ rows: [] }));
       out.payouts.pending = pend || [];
       out.payouts.recent = rec || [];
     }
@@ -6068,7 +6094,10 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
         actor_wallet,
         changes,
         bid_id
-      FROM bid_audits
+
+      FROM bid_audits ba
+      JOIN bids b ON b.bid_id = ba.bid_id
+      WHERE b.tenant_id = $1
 
       UNION ALL
 
@@ -6090,7 +6119,7 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
         )                                  AS changes,
         bid_id
       FROM milestone_payments
-      WHERE status = 'released' AND safe_tx_hash IS NOT NULL
+      WHERE status = 'released' AND safe_tx_hash IS NOT NULL AND tenant_id = $1
     ) x
     ORDER BY created_at DESC
     LIMIT 200
@@ -6114,8 +6143,8 @@ app.post('/admin/oversight/reconcile-payouts', adminGuard, async (req, res) => {
     const { rows: pendingRows } = await pool.query(`
       SELECT id, bid_id, milestone_index, tx_hash 
       FROM milestone_payments 
-      WHERE status = 'pending' AND tx_hash IS NOT NULL
-    `);
+      WHERE status = 'pending' AND tx_hash IS NOT NULL AND tenant_id = $1
+    `, [req.tenantId]);
 
     if (pendingRows.length === 0) {
       return res.json({ ok: true, message: "No pending payouts to reconcile.", updated: 0 });
@@ -6137,8 +6166,8 @@ app.post('/admin/oversight/reconcile-payouts', adminGuard, async (req, res) => {
      SET status='released',
          released_at=NOW(),
          tx_hash = COALESCE(tx_hash, $2)
-   WHERE id=$1
-`, [row.id, receipt.transactionHash]);
+   WHERE id=$1 AND tenant_id=$3
+`, [row.id, receipt.transactionHash, req.tenantId]);
 
           // (Optional: also update the related bid's milestone JSON to reflect released status)
           // You could load the bid and update its milestones[payload.milestone_index].paymentPending = false, etc.
@@ -6162,8 +6191,8 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
     const { rows: pending } = await pool.query(`
       SELECT id, bid_id, milestone_index, amount_usd, safe_tx_hash
       FROM milestone_payments
-      WHERE status='pending' AND safe_tx_hash IS NOT NULL
-    `);
+      WHERE status='pending' AND safe_tx_hash IS NOT NULL AND tenant_id = $1
+    `, [req.tenantId]);
     if (!pending.length) return res.json({ ok: true, updated: 0 });
 
     const { default: SafeApiKit } = await import('@safe-global/api-kit');
@@ -6198,7 +6227,7 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
       if (!executed) continue;
 
       // --- Update bids.milestones (UI reads this) ---
-      const { rows: bids } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [row.bid_id]);
+      const { rows: bids } = await pool.query('SELECT * FROM bids WHERE bid_id=$1 AND tenant_id=$2', [row.bid_id, req.tenantId]);
       const bid = bids[0];
       if (!bid) continue;
 
@@ -6221,8 +6250,8 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
       milestones[idx] = ms;
 
       await pool.query(
-        'UPDATE bids SET milestones=$1 WHERE bid_id=$2',
-        [JSON.stringify(milestones), row.bid_id]
+        'UPDATE bids SET milestones=$1 WHERE bid_id=$2 AND tenant_id=$3',
+        [JSON.stringify(milestones), row.bid_id, req.tenantId]
       );
 
       // --- milestone_payments → released ---
@@ -6232,8 +6261,8 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
                tx_hash=$2,
                released_at=NOW(),
                amount_usd=COALESCE(amount_usd,$3)
-         WHERE id=$1
-      `, [row.id, txResp.transactionHash, row.amount_usd]);
+         WHERE id=$1 AND tenant_id=$4
+      `, [row.id, txResp.transactionHash, row.amount_usd, req.tenantId]);
 
       // (optional) notify
       try {
@@ -6298,7 +6327,7 @@ app.post('/admin/oversight/finalize-chain-tx', adminGuard, async (req, res) => {
     }
 
     // 2) Load bid + milestones JSON
-    const { rows: bids } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [bidId]);
+    const { rows: bids } = await pool.query('SELECT * FROM bids WHERE bid_id=$1 AND tenant_id=$2', [bidId, req.tenantId]);
     const bid = bids[0];
     if (!bid) return res.status(404).json({ error: 'Bid not found' });
 
@@ -6322,22 +6351,22 @@ app.post('/admin/oversight/finalize-chain-tx', adminGuard, async (req, res) => {
 
     milestones[milestoneIndex] = ms;
 
-    await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2', [JSON.stringify(milestones), bidId]);
+    await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2 AND tenant_id=$3', [JSON.stringify(milestones), bidId, req.tenantId]);
 
     // 4) Update or insert milestone_payments row as released
     const { rowCount } = await pool.query(
       `UPDATE milestone_payments
           SET status='released', tx_hash=$3, released_at=NOW()
-        WHERE bid_id=$1 AND milestone_index=$2`,
-      [bidId, milestoneIndex, txHash]
+        WHERE bid_id=$1 AND milestone_index=$2 AND tenant_id=$4`,
+      [bidId, milestoneIndex, txHash, req.tenantId]
     );
 
     if (rowCount === 0) {
       await pool.query(
         `INSERT INTO milestone_payments
-          (bid_id, milestone_index, created_at, tx_hash, status, released_at)
-         VALUES ($1,$2,NOW(),$3,'released',NOW())`,
-        [bidId, milestoneIndex, txHash]
+          (bid_id, milestone_index, created_at, tx_hash, status, released_at, tenant_id)
+         VALUES ($1,$2,NOW(),$3,'released',NOW(),$4)`,
+        [bidId, milestoneIndex, txHash, req.tenantId]
       );
     }
 
@@ -6434,8 +6463,9 @@ app.post('/admin/oversight/payouts/prune-orphans', adminGuard, async (req, res) 
       SELECT mp.id, mp.bid_id, mp.milestone_index, mp.amount_usd, mp.status, mp.created_at
       FROM milestone_payments mp
       WHERE NOT EXISTS (SELECT 1 FROM bids b WHERE b.bid_id = mp.bid_id)
+        AND mp.tenant_id = $1
       ORDER BY mp.created_at DESC
-    `);
+    `, [req.tenantId]);
 
     if (orphans.length === 0) {
       return res.json({ ok: true, deleted: 0, orphans: [] });
@@ -6445,8 +6475,9 @@ app.post('/admin/oversight/payouts/prune-orphans', adminGuard, async (req, res) 
     const { rows: deleted } = await pool.query(`
       DELETE FROM milestone_payments mp
       WHERE NOT EXISTS (SELECT 1 FROM bids b WHERE b.bid_id = mp.bid_id)
+        AND mp.tenant_id = $1
       RETURNING mp.id, mp.bid_id, mp.milestone_index, mp.amount_usd, mp.status, mp.created_at
-    `);
+    `, [req.tenantId]);
 
     return res.json({ ok: true, deleted: deleted.length, orphans: deleted });
   } catch (e) {
@@ -6633,7 +6664,7 @@ async function autoReconcileSafeTransactionsOnce() {
   try {
     // small batch each tick to avoid hammering
     const { rows: pendingTxs } = await pool.query(`
-      SELECT id, bid_id, milestone_index, amount_usd, safe_tx_hash
+      SELECT id, bid_id, milestone_index, amount_usd, safe_tx_hash, tenant_id
       FROM milestone_payments
       WHERE status='pending' AND safe_tx_hash IS NOT NULL
       ORDER BY id DESC
@@ -6674,12 +6705,12 @@ async function autoReconcileSafeTransactionsOnce() {
         await pool.query(
           `UPDATE milestone_payments
              SET status='released', tx_hash=$2, released_at=NOW()
-           WHERE id=$1`,
-          [row.id, txResp.transactionHash]
+           WHERE id=$1 AND tenant_id=$3`,
+          [row.id, txResp.transactionHash, row.tenant_id]
         );
 
         // 2) mark PAID on bids.milestones (the UI reads these)
-        const { rows: bids } = await pool.query('SELECT milestones FROM bids WHERE bid_id=$1', [row.bid_id]);
+        const { rows: bids } = await pool.query('SELECT milestones FROM bids WHERE bid_id=$1 AND tenant_id=$2', [row.bid_id, row.tenant_id]);
         if (!bids[0]) continue;
 
         const arr = Array.isArray(bids[0].milestones)
@@ -6700,7 +6731,7 @@ async function autoReconcileSafeTransactionsOnce() {
 
         arr[idx] = ms;
 
-        await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2', [JSON.stringify(arr), row.bid_id]);
+        await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2 AND tenant_id=$3', [JSON.stringify(arr), row.bid_id, row.tenant_id]);
 
         // 3) (best-effort) notify
         try {
@@ -7513,6 +7544,7 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
         tx_hash         TEXT,
         safe_tx_hash    TEXT,
         safe_nonce      BIGINT,
+        tenant_id       UUID REFERENCES tenants(id),
         created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
         released_at     TIMESTAMPTZ
       );
@@ -7522,6 +7554,7 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
         ADD COLUMN IF NOT EXISTS tx_hash TEXT,
         ADD COLUMN IF NOT EXISTS safe_tx_hash TEXT,
         ADD COLUMN IF NOT EXISTS safe_nonce BIGINT,
+        ADD COLUMN IF NOT EXISTS tenant_id UUID REFERENCES tenants(id),
         ADD COLUMN IF NOT EXISTS released_at TIMESTAMPTZ;
       DO $$
       BEGIN
@@ -7561,11 +7594,11 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
     // 2) Idempotency gate (create PENDING row once)
     const msAmountUSD = Number(ms?.amount ?? 0);
     const ins = await pool.query(
-      `INSERT INTO milestone_payments (bid_id, milestone_index, amount_usd, status, created_at)
-       VALUES ($1, $2, $3, 'pending', NOW())
+      `INSERT INTO milestone_payments (bid_id, milestone_index, amount_usd, status, created_at, tenant_id)
+       VALUES ($1, $2, $3, 'pending', NOW(), $4)
        ON CONFLICT (bid_id, milestone_index) DO NOTHING
        RETURNING id`,
-      [bidId, milestoneIndex, msAmountUSD]
+      [bidId, milestoneIndex, msAmountUSD, req.tenantId]
     );
 
     if (ins.rowCount === 0) {
