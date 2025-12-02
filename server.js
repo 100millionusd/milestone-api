@@ -3886,7 +3886,7 @@ app.get('/auth/role', async (req, res) => {
       else role = claimed; // otherwise trust the token's role
     }
 
-    return res.json({ address: address || null, role, roles, vendorStatus });
+    return res.json({ address: address || null, role, roles, vendorStatus, tenantId: req.tenantId });
   } catch (e) {
     console.error('GET /auth/role error', e);
     return res.json({ address: null, role: 'guest', roles: [], vendorStatus: 'none' });
