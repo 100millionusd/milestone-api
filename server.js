@@ -226,6 +226,17 @@ async function durableRolesForAddress(address, tenantId) {
     if (r.rowCount > 0) roles.push('proposer');
   } catch { }
 
+  // ✅ NEW: Check tenant_members (for tenant admins)
+  try {
+    const m = await pool.query(
+      `SELECT role FROM tenant_members WHERE lower(wallet_address)=lower($1) AND tenant_id=$2`,
+      [addr, tenantId]
+    );
+    for (const row of m.rows) {
+      if (row.role) roles.push(row.role);
+    }
+  } catch { }
+
   return roles;
 }
 
