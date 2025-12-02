@@ -8831,12 +8831,11 @@ app.get('/bids/:bidId/proofs/latest-status', adminGuard, async (req, res) => {
                      proof_id    DESC
           ) AS rn
         FROM proofs
-        WHERE bid_id = $1
+        WHERE bid_id = $1 AND tenant_id = $2
       )
       SELECT milestone_index, status
       FROM ranked
-      FROM ranked
-      WHERE rn = 1 AND tenant_id = $2
+      WHERE rn = 1
     `, [bidId, req.tenantId]);
 
     const byIndex = {};
