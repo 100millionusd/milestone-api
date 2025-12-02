@@ -3952,7 +3952,7 @@ app.post("/auth/logout", (req, res) => {
 // ==============================
 
 // Create a new tenant (Open for now, or restrict to super-admin)
-app.post("/api/tenants", async (req, res) => {
+app.post("/api/tenants", requireAuth, async (req, res) => {
   try {
     const { name, slug } = req.body;
     if (!name || !slug) return res.status(400).json({ error: "name and slug required" });
