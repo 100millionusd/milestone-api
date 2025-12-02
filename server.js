@@ -3421,10 +3421,7 @@ function isAdminAddress(addr) { return ADMIN_SET.has(norm(addr)); }
 function signJwt(payload, expiresIn = "7d") {
   return jwt.sign(payload, JWT_SECRET, { expiresIn });
 }
-function verifyJwt(token) {
-  try { return jwt.verify(token, JWT_SECRET); }
-  catch { return null; }
-}
+
 
 // ==== AUTH GUARD (drop-in) ===============================================
 // Place this block **right after** your verifyJwt() definition.
@@ -3960,10 +3957,11 @@ app.post("/api/tenants", requireAuth, async (req, res) => {
     const tenant = await tenantService.createTenant(name, slug);
 
     // Add creator as the first admin member
-    if (req.user?.sub) {
+    const creatorAddress = req.user?.address || req.user?.sub;
+    if (creatorAddress) {
       await pool.query(
         `INSERT INTO tenant_members (tenant_id, wallet_address, role) VALUES ($1, $2, 'admin')`,
-        [tenant.id, req.user.sub]
+        [tenant.id, creatorAddress]
       );
     }
 
