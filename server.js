@@ -70,10 +70,10 @@ async function extractTxHash(sendRes) {
 
   // functional getters
   if (typeof sendRes.hash === 'function') {
-    try { v = take(await sendRes.hash()); if (v) return v; } catch {}
+    try { v = take(await sendRes.hash()); if (v) return v; } catch { }
   }
   if (typeof sendRes.getHash === 'function') {
-    try { v = take(await sendRes.getHash()); if (v) return v; } catch {}
+    try { v = take(await sendRes.getHash()); if (v) return v; } catch { }
   }
 
   // nested common containers
@@ -92,14 +92,17 @@ async function extractTxHash(sendRes) {
       const rcpt = await sendRes.wait(1);
       v = take(rcpt?.transactionHash) || take(rcpt?.hash);
       if (v) return v;
-    } catch {}
+    } catch { }
   }
 
   return null;
 }
 
 // ==== SAFE CONFIG (define once, near the top) ====
-const SAFE_ADDRESS       = (process.env.SAFE_ADDRESS || process.env.SAFE_WALLET || '0xedd1F37FD3eaACb596CDF00102187DA0cc884D93').trim();
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || crypto.createHash('sha256').update(String(process.env.JWT_SECRET || 'dev_secret')).digest().slice(0, 32);
+const IV_LENGTH = 16;
+
+const SAFE_ADDRESS = (process.env.SAFE_ADDRESS || process.env.SAFE_WALLET || '0xedd1F37FD3eaACb596CDF00102187DA0cc884D93').trim();
 const SAFE_TXSERVICE_URL = (process.env.SAFE_TXSERVICE_URL || 'https://api.safe.global/tx-service/sep').trim().replace(/\/+$/, '');
 const SAFE_THRESHOLD_USD = Number(process.env.SAFE_THRESHOLD_USD || 0);
 
@@ -191,37 +194,37 @@ function roleFromDurableOrIntent(roles, intent) {
 }
 
 /** durable roles = what the wallet actually has in DB (plus admin) */
-async function durableRolesForAddress(address) {
+async function durableRolesForAddress(address, tenantId) {
   const addr = String(address || '').toLowerCase();
   const roles = [];
 
   try {
     if (isAdminAddress(addr)) roles.push('admin');
-  } catch {}
+  } catch { }
 
   try {
     const v = await pool.query(
-      `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-      [addr]
+      `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 LIMIT 1`,
+      [addr, tenantId]
     );
     if (v.rowCount > 0) roles.push('vendor');
-  } catch {}
+  } catch { }
 
   try {
     const p = await pool.query(
-      `SELECT 1 FROM proposals WHERE lower(owner_wallet)=lower($1) LIMIT 1`,
-      [addr]
+      `SELECT 1 FROM proposals WHERE lower(owner_wallet)=lower($1) AND tenant_id=$2 LIMIT 1`,
+      [addr, tenantId]
     );
     if (p.rowCount > 0) roles.push('proposer');
-  } catch {}
+  } catch { }
 
   try {
-  const r = await pool.query(
-    `SELECT 1 FROM proposer_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-    [addr]
-  );
-  if (r.rowCount > 0) roles.push('proposer');
-} catch {}
+    const r = await pool.query(
+      `SELECT 1 FROM proposer_profiles WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 LIMIT 1`,
+      [addr, tenantId]
+    );
+    if (r.rowCount > 0) roles.push('proposer');
+  } catch { }
 
   return roles;
 }
@@ -231,14 +234,14 @@ function _addrText(a, city, country) {
   if (!a) return null;
   if (typeof a === 'string') return a;
   const line = a.line1 || a.address1 || '';
-  const cty  = a.city ?? city ?? '';
+  const cty = a.city ?? city ?? '';
   const ctry = a.country ?? country ?? '';
   const out = [line, cty, ctry].filter(Boolean).join(', ');
   return out || null;
 }
 
 // Canonical vendor seeder: copy fields from user_profiles → vendor_profiles
-async function seedVendorFromUserProfile(pool, wallet) {
+async function seedVendorFromUserProfile(pool, wallet, tenantId) {
   const w = String(wallet || '').toLowerCase();
   if (!w) return false;
 
@@ -246,12 +249,13 @@ async function seedVendorFromUserProfile(pool, wallet) {
   try {
     const { rowCount } = await pool.query(
       `INSERT INTO vendor_profiles
-         (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at, telegram_chat_id, whatsapp)
+         (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at, telegram_chat_id, whatsapp, tenant_id)
        SELECT $1,
               COALESCE(display_name,''),
               email, phone, website, address,
               'pending', NOW(), NOW(),
-              telegram_chat_id, whatsapp
+              telegram_chat_id, whatsapp,
+              $2
          FROM user_profiles
         WHERE lower(wallet_address)=lower($1)
        ON CONFLICT (wallet_address) DO UPDATE SET
@@ -263,7 +267,7 @@ async function seedVendorFromUserProfile(pool, wallet) {
          telegram_chat_id  = COALESCE(EXCLUDED.telegram_chat_id, vendor_profiles.telegram_chat_id),
          whatsapp          = COALESCE(EXCLUDED.whatsapp, vendor_profiles.whatsapp),
          updated_at        = NOW()`,
-      [w]
+      [w, tenantId]
     );
     return rowCount > 0;
   } finally {
@@ -273,7 +277,7 @@ async function seedVendorFromUserProfile(pool, wallet) {
 
 // Back-compat alias for old call sites
 async function maybeSeedVendor(address) {
-  return seedVendorFromUserProfile(pool, address);
+  return seedVendorFromUserProfile(pool, address, null);
 }
 
 function requireAdmin(req, res, next) {
@@ -373,7 +377,7 @@ async function salvageTxHashViaLogs(rpcUrl, tokenOrSymbol, toAddress, amountRaw)
     const amountUnits = ethers.utils.parseUnits(String(amountRaw), dec);
 
     const head = await provider.getBlockNumber();
-    const win  = Math.max(1, Number(process.env.SALVAGE_BLOCK_WINDOW || 6000)); // ~20–30min window
+    const win = Math.max(1, Number(process.env.SALVAGE_BLOCK_WINDOW || 6000)); // ~20–30min window
     const fromBlock = Math.max(0, head - win);
 
     const topicTo = ethers.utils.hexZeroPad(ethers.utils.getAddress(toAddress), 32);
@@ -538,11 +542,11 @@ async function _finalizePaidInDb({ bidId, milestoneIndex, txHash, safeTxHash }) 
     const iso = new Date().toISOString();
 
     if (safeTxHash && !ms.safePaymentTxHash) ms.safePaymentTxHash = safeTxHash;
-    ms.paymentTxHash  = ms.paymentTxHash || txHash || null;
-    ms.paymentDate    = ms.paymentDate   || iso;
-    ms.paidAt         = ms.paidAt        || ms.paymentDate;
+    ms.paymentTxHash = ms.paymentTxHash || txHash || null;
+    ms.paymentDate = ms.paymentDate || iso;
+    ms.paidAt = ms.paidAt || ms.paymentDate;
     ms.paymentPending = false;
-    ms.status         = 'paid';
+    ms.status = 'paid';
 
     arr[milestoneIndex] = ms;
     await pool.query('UPDATE bids SET milestones=$1 WHERE bid_id=$2', [JSON.stringify(arr), bidId]);
@@ -589,7 +593,7 @@ async function overlayPaidFromMp(bid, pool) {
   // Pass 1: Rebuild status based strictly on milestone_payments table
   for (let i = 0; i < msArr.length; i++) {
     const r = byIdx.get(i);
-    
+
     // If no payment row exists in DB, clear any stuck "Pending" flag from the JSON
     if (!r) {
       if (msArr[i].paymentPending) {
@@ -600,7 +604,7 @@ async function overlayPaidFromMp(bid, pool) {
 
     const s = String(r.status || '').toLowerCase();
     // FIX: Use tx_hash existence as the source of truth
-    const hasTx = !!r.tx_hash && r.tx_hash.length > 10; 
+    const hasTx = !!r.tx_hash && r.tx_hash.length > 10;
     const alreadyReleased = s === 'released' || hasTx || !!r.released_at;
 
     if (alreadyReleased) {
@@ -618,8 +622,8 @@ async function overlayPaidFromMp(bid, pool) {
         status: 'paid',
       };
     } else if (s === 'pending') {
-       // It is genuinely pending in the DB (no tx hash yet)
-       msArr[i].paymentPending = true;
+      // It is genuinely pending in the DB (no tx hash yet)
+      msArr[i].paymentPending = true;
     }
   }
 
@@ -682,7 +686,7 @@ async function overlayPaidFromMp(bid, pool) {
         await _finalizePaidInDb({ bidId, milestoneIndex: idx, txHash: alt.txHash, safeTxHash: alt.safeTxHash });
         return;
       }
-      
+
       // Still pending
       msArr[idx] = {
         ...(msArr[idx] || {}),
@@ -694,7 +698,7 @@ async function overlayPaidFromMp(bid, pool) {
       };
     })());
   }
-  
+
   if (tasks.length) await Promise.all(tasks);
 
   return { ...bid, milestones: msArr };
@@ -729,7 +733,7 @@ async function attachPaymentState(bids) {
       ? b.milestones
       : JSON.parse(b.milestones || '[]');
 
- milestones = milestones.map((m, i) => {
+    milestones = milestones.map((m, i) => {
       const hit = byKey.get(`${bidId}:${i}`);
       if (!hit) return m;
 
@@ -738,7 +742,7 @@ async function attachPaymentState(bids) {
         // show the amber "Payment Pending" pill and hide the green button
         return { ...m, paymentPending: true };
       }
-      
+
       // If released OR if we have a tx_hash (even if status is pending)
       if (hit.status === 'released' || hit.tx_hash) {
         // make sure the UI sees it as paid
@@ -797,8 +801,8 @@ async function attachPaymentState(bids) {
 (async function initDb() {
   try {
 
-// Generic user profile (shared fields before picking a role)
-await pool.query(`
+    // Generic user profile (shared fields before picking a role)
+    await pool.query(`
   CREATE TABLE IF NOT EXISTS user_profiles (
     wallet_address TEXT PRIMARY KEY,
     display_name   TEXT,
@@ -813,9 +817,9 @@ await pool.query(`
     updated_at     TIMESTAMP DEFAULT NOW()
   );
 `);
-console.log('[db] user_profiles ready');
+    console.log('[db] user_profiles ready');
 
-await pool.query(`
+    await pool.query(`
   CREATE TABLE IF NOT EXISTS proposer_profiles (
     wallet_address   TEXT PRIMARY KEY,
     org_name         TEXT,
@@ -833,8 +837,8 @@ await pool.query(`
   );
 `);
 
-await pool.query(`ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS vendor_name TEXT`);
-// --- INSERT START: Sally Uyuni App Tables ---
+    await pool.query(`ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS vendor_name TEXT`);
+    // --- INSERT START: Sally Uyuni App Tables ---
     await pool.query(`
       CREATE TABLE IF NOT EXISTS school_reports (
         report_id      TEXT PRIMARY KEY,
@@ -851,10 +855,10 @@ await pool.query(`ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS vendor_name
     `);
     console.log('[db] school_reports ready');
     // --- INSERT END ---
-await pool.query(`ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS telegram_username TEXT`);
-await pool.query(`ALTER TABLE proposer_profiles ADD COLUMN IF NOT EXISTS telegram_username TEXT`);
+    await pool.query(`ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS telegram_username TEXT`);
+    await pool.query(`ALTER TABLE proposer_profiles ADD COLUMN IF NOT EXISTS telegram_username TEXT`);
 
-console.log('[db] proposer_profiles ready');
+    console.log('[db] proposer_profiles ready');
   } catch (e) {
     console.error('[initDb] error', e);
   }
@@ -897,6 +901,42 @@ console.log('[db] proposer_profiles ready');
     console.log('[db] Successfully added "location" column to proposals table');
   } catch (e) {
     console.error('[db] Failed to add location column:', e);
+  }
+})();
+
+// --- DB MIGRATION: Add tenant_id to school_reports ---
+(async () => {
+  try {
+    await pool.query(`
+      ALTER TABLE school_reports
+      ADD COLUMN IF NOT EXISTS tenant_id UUID REFERENCES tenants(id);
+    `);
+    console.log('[db] Successfully added "tenant_id" column to school_reports table');
+  } catch (e) {
+    console.error('[db] Failed to add tenant_id column to school_reports:', e);
+  }
+})();
+
+// --- DB MIGRATION: Add tenant_id to user_dashboard_state and update PK ---
+(async () => {
+  try {
+    await pool.query(`
+      ALTER TABLE user_dashboard_state
+      ADD COLUMN IF NOT EXISTS tenant_id UUID REFERENCES tenants(id);
+    `);
+    // Truncate to avoid PK violation on null tenant_id during migration
+    await pool.query(`TRUNCATE TABLE user_dashboard_state`);
+
+    await pool.query(`
+      ALTER TABLE user_dashboard_state DROP CONSTRAINT IF EXISTS user_dashboard_state_pkey;
+    `);
+
+    await pool.query(`
+      ALTER TABLE user_dashboard_state ADD PRIMARY KEY (wallet_address, tenant_id);
+    `);
+    console.log('[db] Successfully updated user_dashboard_state PK to (wallet_address, tenant_id)');
+  } catch (e) {
+    console.error('[db] Failed to migrate user_dashboard_state:', e);
   }
 })();
 
@@ -1066,6 +1106,83 @@ console.log('[db] proposer_profiles ready');
 })();
 
 // ==============================
+// DB bootstrap — Multi-Tenancy (Tenants, Configs, Members)
+// ==============================
+(async () => {
+  try {
+    // 1. Tenants Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS tenants (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name TEXT NOT NULL,
+        slug TEXT UNIQUE NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    // 2. Tenant Configs (Encrypted Credentials)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS tenant_configs (
+        id SERIAL PRIMARY KEY,
+        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        is_encrypted BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(tenant_id, key)
+      );
+    `);
+
+    // 3. Tenant Members (User Roles within a Tenant)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS tenant_members (
+        id SERIAL PRIMARY KEY,
+        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        wallet_address TEXT NOT NULL,
+        role TEXT NOT NULL, -- 'admin', 'vendor', 'proposer'
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(tenant_id, wallet_address)
+      );
+    `);
+
+    // 4. Add tenant_id to existing tables
+    const tables = ['proposals', 'bids', 'proofs', 'vendor_profiles', 'proposer_profiles'];
+    for (const table of tables) {
+      await pool.query(`
+        ALTER TABLE ${table}
+        ADD COLUMN IF NOT EXISTS tenant_id UUID REFERENCES tenants(id);
+      `);
+    }
+
+    // 5. Create Default Tenant (if none exists) & Migrate Data
+    // We use a specific UUID for the default tenant to make migration idempotent
+    const defaultTenantId = '00000000-0000-0000-0000-000000000000';
+
+    // Insert default tenant if not exists
+    await pool.query(`
+      INSERT INTO tenants (id, name, slug)
+      VALUES ($1, 'Global', 'default')
+      ON CONFLICT (id) DO NOTHING;
+    `, [defaultTenantId]);
+
+    // Backfill NULL tenant_ids with default tenant
+    for (const table of tables) {
+      await pool.query(`
+        UPDATE ${table}
+        SET tenant_id = $1
+        WHERE tenant_id IS NULL;
+      `, [defaultTenantId]);
+    }
+
+    console.log('[db] multi-tenancy schema ready & migrated');
+  } catch (e) {
+    console.error('multi-tenancy init failed:', e?.message || e);
+  }
+})();
+
+// ==============================
 // Utilities
 // ==============================
 function toCamel(row) {
@@ -1113,7 +1230,7 @@ const ADMIN_WHATSAPP = (process.env.ADMIN_WHATSAPP || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
-  const TWILIO_WA_CONTENT_SID = process.env.TWILIO_WA_CONTENT_SID || "";
+const TWILIO_WA_CONTENT_SID = process.env.TWILIO_WA_CONTENT_SID || "";
 
 const APP_BASE_URL = process.env.APP_BASE_URL || process.env.NEXT_PUBLIC_APP_BASE_URL || "";
 const NOTIFY_ENABLED = String(process.env.NOTIFY_ENABLED || "true").toLowerCase() !== "false";
@@ -1202,7 +1319,7 @@ async function sendWhatsApp(to, body) {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_WHATSAPP_FROM) return;
 
   const fromAddr = ensureWaAddr(TWILIO_WHATSAPP_FROM); // e.g. whatsapp:+1415XXXXXXX
-  const toAddr   = ensureWaAddr(to);                   // e.g. whatsapp:+49XXXXXXXXX
+  const toAddr = ensureWaAddr(to);                   // e.g. whatsapp:+49XXXXXXXXX
 
   const creds = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
   const form = new URLSearchParams({ From: fromAddr, To: toAddr, Body: body }).toString();
@@ -1223,7 +1340,7 @@ async function sendWhatsAppTemplate(to, contentSid, vars) {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_WHATSAPP_FROM || !contentSid) return;
 
   const fromAddr = ensureWaAddr(TWILIO_WHATSAPP_FROM);
-  const toAddr   = ensureWaAddr(to);
+  const toAddr = ensureWaAddr(to);
 
   const creds = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
   const form = new URLSearchParams({
@@ -1283,7 +1400,7 @@ async function notifyVendorSignup({
 
   await Promise.allSettled([
     TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, adminText) : null,
-    MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, 'Vendor signup — approval needed', adminHtml) : null,
+    MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, 'Vendor signup — approval needed', adminHtml) : null,
     ...(ADMIN_WHATSAPP || []).map(n =>
       TWILIO_WA_CONTENT_SID
         ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": vendorName || "", "2": "vendor signup" })
@@ -1323,9 +1440,9 @@ async function notifyVendorSignup({
     // WhatsApp to vendor (uses template if available, else plain text)
     waE164
       ? (TWILIO_WA_CONTENT_SID
-          ? sendWhatsAppTemplate(waE164, TWILIO_WA_CONTENT_SID, { "1": vendorName || "", "2": "signup pending" })
-          : sendWhatsApp(waE164, vendorText)
-        )
+        ? sendWhatsAppTemplate(waE164, TWILIO_WA_CONTENT_SID, { "1": vendorName || "", "2": "signup pending" })
+        : sendWhatsApp(waE164, vendorText)
+      )
       : null,
   ].filter(Boolean));
 }
@@ -1350,14 +1467,14 @@ async function notifyProposalSubmitted(p) {
     const html = lines.join("<br>");
 
     // proposer contacts
-    const proposerEmails = [p.contact, p.owner_email].map(s => (s||"").trim()).filter(Boolean);
-    const proposerPhone  = toE164(p.owner_phone || "");
-    const proposerTg     = (p.owner_telegram_chat_id || "").trim();
+    const proposerEmails = [p.contact, p.owner_email].map(s => (s || "").trim()).filter(Boolean);
+    const proposerPhone = toE164(p.owner_phone || "");
+    const proposerTg = (p.owner_telegram_chat_id || "").trim();
 
     await Promise.all([
       // Admins
       TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
-      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
       ...(ADMIN_WHATSAPP || []).map(n =>
         TWILIO_WA_CONTENT_SID
           ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": p.title || "", "2": p.org_name || "" })
@@ -1395,14 +1512,14 @@ async function notifyProposalRejected(p, reason) {
     const html = lines.join("<br>");
 
     // Proposer contacts
-    const proposerEmails = [p.contact, p.owner_email].map(s => (s||"").trim()).filter(Boolean);
-    const proposerPhone  = toE164(p.owner_phone || "");
-    const proposerTg     = (p.owner_telegram_chat_id || "").trim();
+    const proposerEmails = [p.contact, p.owner_email].map(s => (s || "").trim()).filter(Boolean);
+    const proposerPhone = toE164(p.owner_phone || "");
+    const proposerTg = (p.owner_telegram_chat_id || "").trim();
 
     await Promise.all([
       // Admins
       TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
-      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
       ...(ADMIN_WHATSAPP || []).map(n =>
         TWILIO_WA_CONTENT_SID
           ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": p.title || "", "2": "rejected" })
@@ -1424,9 +1541,9 @@ async function notifyProposalRejected(p, reason) {
 // ==============================
 async function notifyBidApproved(bid, proposal, vendor) {
   try {
-    const subject   = `✅ Bid awarded`;
-    const title     = proposal?.title || "(untitled)";
-    const org       = proposal?.org_name || "";
+    const subject = `✅ Bid awarded`;
+    const title = proposal?.title || "(untitled)";
+    const org = proposal?.org_name || "";
     const vendorStr = bid?.vendor_name || vendor?.vendor_name || "";
     const amountStr = `$${bid?.price_usd ?? 0}`;
     const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/bids` : "";
@@ -1451,14 +1568,14 @@ async function notifyBidApproved(bid, proposal, vendor) {
     const { text, html } = bi(en, es); // uses your existing helper
 
     // Vendor contacts
-    const vendorEmails = [vendor?.email].map(s => (s||"").trim()).filter(Boolean);
-    const vendorPhone  = toE164(vendor?.phone || "");
-    const vendorTg     = (vendor?.telegram_chat_id || "").trim();
+    const vendorEmails = [vendor?.email].map(s => (s || "").trim()).filter(Boolean);
+    const vendorPhone = toE164(vendor?.phone || "");
+    const vendorTg = (vendor?.telegram_chat_id || "").trim();
 
     await Promise.all([
       // Admins
       TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
-      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
       ...(ADMIN_WHATSAPP || []).map(n =>
         TWILIO_WA_CONTENT_SID
           ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": title, "2": "awarded" })
@@ -1489,14 +1606,14 @@ async function notifyBidRejected(bid, proposal, vendor, reason) {
     const text = lines.join("\n");
     const html = lines.join("<br>");
 
-    const vendorEmails = [vendor?.email].map(s => (s||"").trim()).filter(Boolean);
-    const vendorPhone  = toE164(vendor?.phone || "");
-    const vendorTg     = (vendor?.telegram_chat_id || "").trim();
+    const vendorEmails = [vendor?.email].map(s => (s || "").trim()).filter(Boolean);
+    const vendorPhone = toE164(vendor?.phone || "");
+    const vendorTg = (vendor?.telegram_chat_id || "").trim();
 
     await Promise.all([
       // Admins
       TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
-      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
       ...(ADMIN_WHATSAPP || []).map(n =>
         TWILIO_WA_CONTENT_SID
           ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": proposal?.title || "", "2": "rejected" })
@@ -1534,9 +1651,9 @@ function shouldNotify(analysis) {
 function bi(en, es) {
   const text = `${en.trim()}\n\n${es.trim()}`;
   const html = [
-    `<div>${en.trim().replace(/\n/g,'<br>')}</div>`,
+    `<div>${en.trim().replace(/\n/g, '<br>')}</div>`,
     '<hr>',
-    `<div>${es.trim().replace(/\n/g,'<br>')}</div>`
+    `<div>${es.trim().replace(/\n/g, '<br>')}</div>`
   ].join('\n');
   return { text, html };
 }
@@ -1546,11 +1663,11 @@ function bi(en, es) {
 // ==============================
 async function notifyPaymentPending({ bid, proposal, msIndex, amount, method = 'safe', txRef = null }) {
   try {
-    const title     = proposal?.title || 'Project';
+    const title = proposal?.title || 'Project';
     const vendorStr = `${bid.vendor_name || ''} (${bid.wallet_address || ''})`.trim();
     const amountStr = `$${Number(amount || 0).toFixed(2)} USD`;
     const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/bids/${bid.bid_id}` : null;
-    const subject   = method === 'safe'
+    const subject = method === 'safe'
       ? '🔐 Payment pending approval'
       : '🟨 Payment processing';
 
@@ -1578,7 +1695,7 @@ async function notifyPaymentPending({ bid, proposal, msIndex, amount, method = '
 
     await Promise.all([
       TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
-      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
       ...(ADMIN_WHATSAPP || []).map(n =>
         TWILIO_WA_CONTENT_SID
           ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": title, "2": "payment pending" })
@@ -1616,14 +1733,14 @@ async function notifyBidSubmitted(bid, proposal, vendor) {
     const { text, html } = bi(en, es);
 
     // Vendor contacts (confirmation back to submitter)
-    const vendorEmails = [vendor?.email].map(s => (s||"").trim()).filter(Boolean);
-    const vendorPhone  = toE164(vendor?.phone || "");
-    const vendorTg     = (vendor?.telegram_chat_id || "").trim();
+    const vendorEmails = [vendor?.email].map(s => (s || "").trim()).filter(Boolean);
+    const vendorPhone = toE164(vendor?.phone || "");
+    const vendorTg = (vendor?.telegram_chat_id || "").trim();
 
     await Promise.all([
       // Admins
       TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
-      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
       ...(ADMIN_WHATSAPP || []).map(n =>
         TWILIO_WA_CONTENT_SID
           ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": proposal?.title || "", "2": "new bid" })
@@ -1644,8 +1761,8 @@ async function notifyBidSubmitted(bid, proposal, vendor) {
 // Notifications — Proof needs review
 // ==================================
 async function notifyProofFlag({ proof, bid, proposal, analysis }) {
-  const msIndex   = Number(proof.milestone_index) + 1;
-  const subject   = `⚠️ Proof needs review — ${proposal?.title || "Project"} (Milestone ${msIndex})`;
+  const msIndex = Number(proof.milestone_index) + 1;
+  const subject = `⚠️ Proof needs review — ${proposal?.title || "Project"} (Milestone ${msIndex})`;
   const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/bids/${bid.bid_id}?tab=proofs` : "";
   const short = (s, n = 300) => (s || "").slice(0, n);
 
@@ -1675,7 +1792,7 @@ async function notifyProofFlag({ proof, bid, proposal, analysis }) {
   try {
     await Promise.all([
       TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
-      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
       ...(ADMIN_WHATSAPP || []).map(n =>
         TWILIO_WA_CONTENT_SID
           ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": proposal?.title || "", "2": "proof needs review" })
@@ -1692,7 +1809,7 @@ async function notifyProofFlag({ proof, bid, proposal, analysis }) {
 // ==============================
 async function notifyProofApproved({ proof, bid, proposal, msIndex }) {
   try {
-    const subject   = `✅ Proof approved — ${proposal?.title || "Project"} (Milestone ${msIndex})`;
+    const subject = `✅ Proof approved — ${proposal?.title || "Project"} (Milestone ${msIndex})`;
     const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/bids/${bid.bid_id}?tab=proofs` : "";
 
     // Bilingual text
@@ -1717,7 +1834,7 @@ async function notifyProofApproved({ proof, bid, proposal, msIndex }) {
     // ---- Admin broadcast (Telegram / Email / WhatsApp) ----
     await Promise.all([
       TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
-      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
       ...(ADMIN_WHATSAPP || []).map(n =>
         TWILIO_WA_CONTENT_SID
           ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": proposal?.title || "", "2": "proof approved" })
@@ -1731,15 +1848,15 @@ async function notifyProofApproved({ proof, bid, proposal, msIndex }) {
          FROM vendor_profiles
         WHERE lower(wallet_address)=lower($1)
         LIMIT 1`,
-      [ (bid.wallet_address || "").toLowerCase() ]
+      [(bid.wallet_address || "").toLowerCase()]
     );
     const vp = vprows[0] || {};
     const vendorEmail = (vp.email || "").trim();
     const vendorPhone = toE164(vp.phone || "");
-    const vendorTg    = (vp.telegram_chat_id || "").trim();
+    const vendorTg = (vp.telegram_chat_id || "").trim();
 
     await Promise.all([
-      vendorTg    ? sendTelegram([vendorTg], text)          : null,
+      vendorTg ? sendTelegram([vendorTg], text) : null,
       vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
       vendorPhone ? (
         TWILIO_WA_CONTENT_SID
@@ -1758,7 +1875,7 @@ async function notifyProofApproved({ proof, bid, proposal, msIndex }) {
 // Notifications — Payment released (EN/ES)
 // ========================================
 async function notifyPaymentReleased({ bid, proposal, msIndex, amount, txHash }) {
-  const subject   = `💸 Payment released — ${proposal?.title || "Project"} (Milestone ${msIndex})`;
+  const subject = `💸 Payment released — ${proposal?.title || "Project"} (Milestone ${msIndex})`;
   const adminLink = APP_BASE_URL ? `${APP_BASE_URL}/admin/bids/${bid.bid_id}` : "";
   const amountStr = typeof amount === 'number' ? `$${Number(amount).toLocaleString()}` : String(amount || '');
 
@@ -1785,7 +1902,7 @@ async function notifyPaymentReleased({ bid, proposal, msIndex, amount, txHash })
   // Admins
   await Promise.all([
     TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
-    MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+    MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
     ...(ADMIN_WHATSAPP || []).map(n =>
       TWILIO_WA_CONTENT_SID
         ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": proposal?.title || "", "2": "payment released" })
@@ -1795,17 +1912,17 @@ async function notifyPaymentReleased({ bid, proposal, msIndex, amount, txHash })
 
   // Vendor
   const { rows: vprows } = await pool.query(
-    `SELECT email, phone, telegram_chat_id FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-    [ (bid.wallet_address || "").toLowerCase() ]
+    `SELECT email, phone, telegram_chat_id FROM vendor_profiles WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 LIMIT 1`,
+    [(bid.wallet_address || "").toLowerCase(), bid.tenant_id]
   );
   const vp = vprows[0] || {};
   const vendorEmail = (vp.email || "").trim();
   const vendorPhone = toE164(vp.phone || "");
-  const vendorTg    = (vp.telegram_chat_id || "").trim();
+  const vendorTg = (vp.telegram_chat_id || "").trim();
 
   await Promise.all([
-    vendorTg    ? sendTelegram([vendorTg], text)             : null,
-    vendorEmail ? sendEmail([vendorEmail], subject, html)    : null,
+    vendorTg ? sendTelegram([vendorTg], text) : null,
+    vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
     vendorPhone ? (
       TWILIO_WA_CONTENT_SID
         ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, { "1": proposal?.title || "", "2": "payment released" })
@@ -1817,8 +1934,8 @@ async function notifyPaymentReleased({ bid, proposal, msIndex, amount, txHash })
 async function notifyIpfsMissing({ bid, proposal, cid, where, proofId = null, url = null }) {
   try {
     const subject = `🟥 IPFS content missing`;
-    const title   = proposal?.title || 'Project';
-    const bidStr  = `Bid ${bid?.bid_id ?? ''}`.trim();
+    const title = proposal?.title || 'Project';
+    const bidStr = `Bid ${bid?.bid_id ?? ''}`.trim();
     const whereStr = where || 'unknown';
 
     const en = [
@@ -1843,7 +1960,7 @@ async function notifyIpfsMissing({ bid, proposal, cid, where, proofId = null, ur
 
     await Promise.all([
       TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, text) : null,
-      MAIL_ADMIN_TO?.length           ? sendEmail(MAIL_ADMIN_TO, subject, html)      : null,
+      MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
       ...(ADMIN_WHATSAPP || []).map(n =>
         TWILIO_WA_CONTENT_SID
           ? sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, { "1": title, "2": "ipfs missing" })
@@ -1851,7 +1968,7 @@ async function notifyIpfsMissing({ bid, proposal, cid, where, proofId = null, ur
       ),
     ].filter(Boolean));
   } catch (e) {
-    console.warn('notifyIpfsMissing failed:', String(e).slice(0,200));
+    console.warn('notifyIpfsMissing failed:', String(e).slice(0, 200));
   }
 }
 
@@ -1905,7 +2022,7 @@ function extractConfidenceFromText(fullText) {
 
   // 1) JSON-like key
   let m = fullText.match(/"confidence"\s*:\s*([0-9]*\.?[0-9]+)/i)
-       || fullText.match(/'confidence'\s*:\s*([0-9]*\.?[0-9]+)/i);
+    || fullText.match(/'confidence'\s*:\s*([0-9]*\.?[0-9]+)/i);
   if (m) {
     const v = clamp01(parseFloat(m[1]));
     if (v !== null) return v;
@@ -2039,68 +2156,68 @@ function normalizeProfile(profileRaw) {
   // -------- EMAIL (broad + deep) ----------
   const emailRe = /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i;
   let email = pick(
-    'email','email_address','emailaddress','primary_email',
-    'contact.email','contact.email_address','contactEmail',
-    'business_email','work_email','owner_email'
+    'email', 'email_address', 'emailaddress', 'primary_email',
+    'contact.email', 'contact.email_address', 'contactEmail',
+    'business_email', 'work_email', 'owner_email'
   );
   if (!email) {
-    const arr = pick('emails','contact.emails');
+    const arr = pick('emails', 'contact.emails');
     if (Array.isArray(arr)) {
       for (const e of arr) {
         let s = typeof e === 'string' ? e : (e && typeof e.value === 'string' ? e.value : null);
-        if (s) { s = s.replace(/^mailto:/i,'').trim(); if (emailRe.test(s)) { email = s; break; } }
+        if (s) { s = s.replace(/^mailto:/i, '').trim(); if (emailRe.test(s)) { email = s; break; } }
       }
     }
   }
   if (!email) {
     for (const v of flatMap.values()) {
       if (typeof v === 'string') {
-        const s = v.replace(/^mailto:/i,'').trim();
+        const s = v.replace(/^mailto:/i, '').trim();
         if (emailRe.test(s)) { email = s; break; }
       }
     }
   }
 
   // -------- PHONE / WEBSITE ----------
-  const phone   = pick('phone','phone_number','contact.phone','contact.phone_number','mobile','contact.mobile');
-  const website = pick('website','url','site','homepage','contact.website','contact.url');
+  const phone = pick('phone', 'phone_number', 'contact.phone', 'contact.phone_number', 'mobile', 'contact.mobile');
+  const website = pick('website', 'url', 'site', 'homepage', 'contact.website', 'contact.url');
 
   // -------- ADDRESS PARTS (now with many more synonyms) ----------
   // direct line1
   let line1 = pick(
-    'address1','addr1','line1','line_1','address_line1','address_line_1','addressline1','addr_line1',
-    'address.address1','address.addr1','address.line1','address.line_1','address.address_line1','address.addressline1','address.addr_line1'
+    'address1', 'addr1', 'line1', 'line_1', 'address_line1', 'address_line_1', 'addressline1', 'addr_line1',
+    'address.address1', 'address.addr1', 'address.line1', 'address.line_1', 'address.address_line1', 'address.addressline1', 'address.addr_line1'
   );
 
   // street name variants
   const street = pick(
-    'street','street1','streetname','street_name','streetName',
-    'road','road_name','roadname','strasse','straße','str',
-    'address.street','address.street1','address.streetname','address.street_name','address.streetName',
-    'address.road','address.road_name','address.roadname','address.strasse','address.straße','address.str'
+    'street', 'street1', 'streetname', 'street_name', 'streetName',
+    'road', 'road_name', 'roadname', 'strasse', 'straße', 'str',
+    'address.street', 'address.street1', 'address.streetname', 'address.street_name', 'address.streetName',
+    'address.road', 'address.road_name', 'address.roadname', 'address.strasse', 'address.straße', 'address.str'
   );
 
   // house/number variants
   const houseNo = pick(
-    'house_number','housenumber','houseNo','house_no','houseNumber','house_num','houseno',
-    'nr','no','numero','num','hausnummer','hausnr','hnr',
-    'address.house_number','address.housenumber','address.houseNo','address.house_no','address.houseNumber','address.house_num','address.houseno',
-    'address.nr','address.no','address.numero','address.num','address.hausnummer','address.hausnr','address.hnr'
+    'house_number', 'housenumber', 'houseNo', 'house_no', 'houseNumber', 'house_num', 'houseno',
+    'nr', 'no', 'numero', 'num', 'hausnummer', 'hausnr', 'hnr',
+    'address.house_number', 'address.housenumber', 'address.houseNo', 'address.house_no', 'address.houseNumber', 'address.house_num', 'address.houseno',
+    'address.nr', 'address.no', 'address.numero', 'address.num', 'address.hausnummer', 'address.hausnr', 'address.hnr'
   );
 
   if (!line1 && (street || houseNo)) {
-    line1 = [street, houseNo].filter(Boolean).join(' ').replace(/\s+/g,' ').trim() || null;
+    line1 = [street, houseNo].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim() || null;
   }
 
   // city / state / postal / country (synonyms)
-  const city       = pick('city','town','locality','address.city','address.town','address.locality');
-  const state      = pick('state','region','province','county','address.state','address.region','address.province','address.county');
-  const postalCode = pick('postalcode','postal_code','postcode','zip','zip_code','address.postalcode','address.postal_code','address.postcode','address.zip','address.zip_code');
-  const country    = pick('country','country_code','address.country','address.country_code');
+  const city = pick('city', 'town', 'locality', 'address.city', 'address.town', 'address.locality');
+  const state = pick('state', 'region', 'province', 'county', 'address.state', 'address.region', 'address.province', 'address.county');
+  const postalCode = pick('postalcode', 'postal_code', 'postcode', 'zip', 'zip_code', 'address.postalcode', 'address.postal_code', 'address.postcode', 'address.zip', 'address.zip_code');
+  const country = pick('country', 'country_code', 'address.country', 'address.country_code');
 
   // explicit free-text variants we keep as-is
   const explicitText =
-    pick('address_text','addresstext','address.freeform','address.text') ||
+    pick('address_text', 'addresstext', 'address.freeform', 'address.text') ||
     (typeof profileRaw.address === 'string' ? profileRaw.address.trim() : null);
 
   // --- Fallback: derive line1 from free-text if it *looks* like a street (contains a number) ---
@@ -2196,10 +2313,24 @@ const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECR
 // Helper: Wait with jitter (randomness) to prevent synchronized retries
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function pinataUploadFile(file) {
-  if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
+async function pinataUploadFile(file, tenantId = null) {
+  let pKey = process.env.PINATA_API_KEY;
+  let pSecret = process.env.PINATA_SECRET_API_KEY;
+
+  if (tenantId) {
+    const tKey = await tenantService.getTenantConfig(tenantId, 'PINATA_API_KEY');
+    const tSecret = await tenantService.getTenantConfig(tenantId, 'PINATA_SECRET_API_KEY');
+    if (tKey && tSecret) {
+      pKey = tKey;
+      pSecret = tSecret;
+    }
+  }
+
+  if (!pKey || !pSecret) {
     throw new Error("Pinata not configured");
   }
+
+  const localPinata = new pinataSDK(pKey, pSecret);
 
   // Increase max retries to 5 to be very safe
   const maxRetries = 5;
@@ -2217,7 +2348,7 @@ async function pinataUploadFile(file) {
       };
 
       // 2. Try Upload
-      const result = await pinata.pinFileToIPFS(stream, options);
+      const result = await localPinata.pinFileToIPFS(stream, options);
 
       return {
         cid: result.IpfsHash,
@@ -2229,16 +2360,16 @@ async function pinataUploadFile(file) {
 
     } catch (err) {
       // 3. Check for Rate Limit errors
-      const isRateLimit = err?.reason === 'RATE_LIMITED' || 
-                          (err?.details && String(err.details).includes('slow down'));
+      const isRateLimit = err?.reason === 'RATE_LIMITED' ||
+        (err?.details && String(err.details).includes('slow down'));
 
       if (isRateLimit && attempt < maxRetries - 1) {
         // EXPONENTIAL BACKOFF: 2s -> 4s -> 8s -> 16s
         // We add Math.random() * 1000 to prevent two uploads from retrying at the exact same millisecond
         const waitTime = Math.pow(2, attempt + 1) * 1000 + (Math.random() * 1000);
-        
+
         console.warn(`[Pinata] Rate limited. Pausing for ${Math.round(waitTime)}ms... (Attempt ${attempt + 1}/${maxRetries})`);
-        
+
         await delay(waitTime);
         attempt++;
       } else {
@@ -2254,10 +2385,24 @@ async function pinataUploadFile(file) {
 // MISSING FUNCTION: pinataUploadJson
 // Paste this immediately after the 'pinataUploadFile' function
 // =====================================================================
-async function pinataUploadJson(jsonData) {
-  if (!process.env.PINATA_API_KEY || !process.env.PINATA_SECRET_API_KEY) {
+async function pinataUploadJson(jsonData, tenantId = null) {
+  let pKey = process.env.PINATA_API_KEY;
+  let pSecret = process.env.PINATA_SECRET_API_KEY;
+
+  if (tenantId) {
+    const tKey = await tenantService.getTenantConfig(tenantId, 'PINATA_API_KEY');
+    const tSecret = await tenantService.getTenantConfig(tenantId, 'PINATA_SECRET_API_KEY');
+    if (tKey && tSecret) {
+      pKey = tKey;
+      pSecret = tSecret;
+    }
+  }
+
+  if (!pKey || !pSecret) {
     throw new Error("Pinata not configured");
   }
+
+  const localPinata = new pinataSDK(pKey, pSecret);
 
   // Safety: Ensure we have an object
   const body = (typeof jsonData === 'string') ? JSON.parse(jsonData) : jsonData;
@@ -2278,7 +2423,7 @@ async function pinataUploadJson(jsonData) {
       };
 
       // Perform the upload
-      const result = await pinata.pinJSONToIPFS(body, options);
+      const result = await localPinata.pinJSONToIPFS(body, options);
 
       return {
         cid: result.IpfsHash,
@@ -2288,15 +2433,15 @@ async function pinataUploadJson(jsonData) {
 
     } catch (err) {
       // Check for Rate Limit errors (same logic as your file uploader)
-      const isRateLimit = err?.reason === 'RATE_LIMITED' || 
-                          (err?.details && String(err.details).includes('slow down'));
+      const isRateLimit = err?.reason === 'RATE_LIMITED' ||
+        (err?.details && String(err.details).includes('slow down'));
 
       if (isRateLimit && attempt < maxRetries - 1) {
         // Exponential Backoff with Jitter
         const waitTime = Math.pow(2, attempt + 1) * 1000 + (Math.random() * 1000);
-        
+
         console.warn(`[Pinata JSON] Rate limited. Pausing for ${Math.round(waitTime)}ms... (Attempt ${attempt + 1}/${maxRetries})`);
-        
+
         await delay(waitTime); // Uses your existing delay() helper
         attempt++;
       } else {
@@ -2342,9 +2487,9 @@ function rewriteToGateway(u, base) {
   try {
     const m = String(u).match(/\/ipfs\/([^/]+)(\/.*)?$/i);
     if (!m) return u;
-    const cid  = m[1];
+    const cid = m[1];
     const rest = m[2] || "";
-    const b    = base.replace(/\/+$/, "/");
+    const b = base.replace(/\/+$/, "/");
     return b.startsWith("http")
       ? b + cid + rest
       : (new URL(u)).toString().replace((new URL(u)).hostname, b);
@@ -2378,7 +2523,7 @@ async function headOk(u, headers = {}) {
     };
     return await new Promise((resolve) => {
       const req = lib.request(opts, (res) => resolve((res.statusCode || 0) < 400));
-      req.on('timeout', () => { try { req.destroy(); } catch {} resolve(false); });
+      req.on('timeout', () => { try { req.destroy(); } catch { } resolve(false); });
       req.on('error', () => resolve(false));
       req.end();
     });
@@ -2459,7 +2604,7 @@ async function fetchAsBuffer(urlStr) {
   const isDedicated = /\.mypinata\.cloud$/i.test(new URL(orig).hostname);
   const headers = {};
   if (isDedicated) {
-    if (PINATA_JWT)           headers["Authorization"] = `Bearer ${PINATA_JWT}`;
+    if (PINATA_JWT) headers["Authorization"] = `Bearer ${PINATA_JWT}`;
     if (PINATA_GATEWAY_TOKEN) headers["x-pinata-gateway-token"] = PINATA_GATEWAY_TOKEN;
   }
 
@@ -2502,7 +2647,7 @@ function withTimeout(p, ms, onTimeout) {
 async function writeAudit(bidId, req, changes) {
   try {
     const actorWallet = req.user?.sub || req.user?.address || null;
-    const actorRole   = req.user?.role || 'vendor';
+    const actorRole = req.user?.role || 'vendor';
     const { rows } = await pool.query(
       `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
        VALUES ($1,$2,$3,$4)
@@ -2513,7 +2658,7 @@ async function writeAudit(bidId, req, changes) {
       enrichAuditRow(pool, rows[0].audit_id).catch(() => null); // adds ipfs_cid & leaf_hash
     }
   } catch (e) {
-    console.warn('writeAudit failed (non-fatal):', String(e).slice(0,200));
+    console.warn('writeAudit failed (non-fatal):', String(e).slice(0, 200));
   }
 }
 
@@ -2549,7 +2694,7 @@ async function extractFileMetaFromUrl(file) {
       tags = await withTimeout(exiftool.read(tmp), 4000, () => null);
     } catch { tags = null; }
 
-    try { await fs.unlink(tmp); } catch {}
+    try { await fs.unlink(tmp); } catch { }
 
     const size = buf.length;
     const exif = tags ? {
@@ -2648,7 +2793,7 @@ async function reverseGeocode(lat, lon) {
           postcode,
         };
       }
-    } catch (_) {}
+    } catch (_) { }
   }
 
   // 2) Nominatim fallback (requires a UA; be a good citizen)
@@ -2686,7 +2831,7 @@ async function reverseGeocode(lat, lon) {
         postcode,
       };
     }
-  } catch (_) {}
+  } catch (_) { }
 
   return null;
 }
@@ -2713,10 +2858,10 @@ async function buildSafeGeoForProof(proofRow) {
     _geoCache.set(cacheKey, rg);
   }
 
-  const city    = rg?.city    || null;
-  const state   = rg?.state   || null;
+  const city = rg?.city || null;
+  const state = rg?.state || null;
   const country = rg?.country || null;
-  const label   = rg?.label || [city, state, country].filter(Boolean).join(", ") || null;
+  const label = rg?.label || [city, state, country].filter(Boolean).join(", ") || null;
 
   return {
     label,
@@ -2739,39 +2884,175 @@ class BlockchainService {
     }
   }
 
- async sendToken(tokenSymbol, toAddress, amount) {
-    if (!this.signer) throw new Error("Blockchain not configured");
+  async sendToken(tokenSymbol, toAddress, amount, tenantId) {
+    let signer = this.signer;
+
+    // Try to load tenant-specific key
+    if (tenantId) {
+      const tenantKey = await tenantService.getTenantConfig(tenantId, 'ETH_PRIVATE_KEY');
+      if (tenantKey) {
+        const pk = tenantKey.startsWith("0x") ? tenantKey : `0x${tenantKey}`;
+        signer = new ethers.Wallet(pk, this.provider);
+      }
+    }
+
+    if (!signer) throw new Error("Blockchain not configured");
     const token = TOKENS[tokenSymbol];
-    const contract = new ethers.Contract(token.address, ERC20_ABI, this.signer);
+    const contract = new ethers.Contract(token.address, ERC20_ABI, signer);
     const decimals = await contract.decimals();
     const amt = ethers.utils.parseUnits(amount.toString(), decimals);
 
-    const balance = await contract.balanceOf(this.signer.address);
+    const balance = await contract.balanceOf(signer.address);
     if (balance.lt(amt)) throw new Error("Insufficient balance");
 
     // --- CHANGED SECTION START ---
     // Send the transaction
     const tx = await contract.transfer(toAddress, amt);
-    
+
     // CRITICAL FIX: Do NOT await tx.wait() here. 
     // Return the hash immediately so the database gets updated instantly.
     console.log(`[Blockchain] Sent ${amount} ${tokenSymbol} -> ${toAddress}. Hash: ${tx.hash}`);
-    
+
     return { hash: tx.hash, amount, token: tokenSymbol };
     // --- CHANGED SECTION END ---
   }
 
-  async getBalance(tokenSymbol) {
-    if (!this.signer) return 0;
+  async getBalance(tokenSymbol, tenantId) {
+    let signer = this.signer;
+
+    // Try to load tenant-specific key
+    if (tenantId) {
+      const tenantKey = await tenantService.getTenantConfig(tenantId, 'ETH_PRIVATE_KEY');
+      if (tenantKey) {
+        const pk = tenantKey.startsWith("0x") ? tenantKey : `0x${tenantKey}`;
+        signer = new ethers.Wallet(pk, this.provider);
+      }
+    }
+
+    if (!signer) return 0;
     const token = TOKENS[tokenSymbol];
-    const contract = new ethers.Contract(token.address, ERC20_ABI, this.signer);
-    const balance = await contract.balanceOf(this.signer.address);
+    const contract = new ethers.Contract(token.address, ERC20_ABI, signer);
+    const balance = await contract.balanceOf(signer.address);
     const decimals = await contract.decimals();
     return parseFloat(ethers.utils.formatUnits(balance, decimals));
   }
 }
 
 const blockchainService = new BlockchainService();
+
+// ==============================
+// Tenant Service (Multi-Tenancy)
+// ==============================
+
+function encrypt(text) {
+  if (!text) return text;
+  try {
+    const iv = crypto.randomBytes(IV_LENGTH);
+    const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY), iv);
+    let encrypted = cipher.update(text);
+    encrypted = Buffer.concat([encrypted, cipher.final()]);
+    return iv.toString('hex') + ':' + encrypted.toString('hex');
+  } catch (e) {
+    console.error('[Encryption] Failed to encrypt:', e);
+    return text; // Fallback to plain text (or throw)
+  }
+}
+
+function decrypt(text) {
+  if (!text) return text;
+  try {
+    const textParts = text.split(':');
+    if (textParts.length < 2) return text; // Not encrypted or invalid format
+    const iv = Buffer.from(textParts.shift(), 'hex');
+    const encryptedText = Buffer.from(textParts.join(':'), 'hex');
+    const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY), iv);
+    let decrypted = decipher.update(encryptedText);
+    decrypted = Buffer.concat([decrypted, decipher.final()]);
+    return decrypted.toString();
+  } catch (e) {
+    console.error('[Encryption] Failed to decrypt:', e);
+    return text; // Return original if decryption fails
+  }
+}
+
+class TenantService {
+  constructor(pool) {
+    this.pool = pool;
+    this.configCache = new Map(); // tenantId:key -> value
+    this.cacheTTL = 60 * 1000; // 1 minute
+  }
+
+  async getTenantConfig(tenantId, key) {
+    if (!tenantId) return null;
+    const cacheKey = `${tenantId}:${key}`;
+    const cached = this.configCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < this.cacheTTL) return cached.value;
+
+    try {
+      const { rows } = await this.pool.query(
+        `SELECT value, is_encrypted FROM tenant_configs WHERE tenant_id = $1 AND key = $2`,
+        [tenantId, key]
+      );
+      if (rows[0]) {
+        let val = rows[0].value;
+        if (rows[0].is_encrypted) {
+          val = decrypt(val);
+        }
+        this.configCache.set(cacheKey, { value: val, at: Date.now() });
+        return val;
+      }
+    } catch (e) {
+      console.warn(`[TenantService] Failed to fetch config ${key} for ${tenantId}`, e);
+    }
+    return null;
+  }
+
+  async setTenantConfig(tenantId, key, value, isEncrypted = false) {
+    const finalValue = isEncrypted ? encrypt(value) : value;
+    await this.pool.query(
+      `INSERT INTO tenant_configs (tenant_id, key, value, is_encrypted, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (tenant_id, key) DO UPDATE SET
+         value = EXCLUDED.value,
+         is_encrypted = EXCLUDED.is_encrypted,
+         updated_at = NOW()`,
+      [tenantId, key, finalValue, isEncrypted]
+    );
+    this.configCache.delete(`${tenantId}:${key}`);
+  }
+
+  async createTenant(name, slug) {
+    const { rows } = await this.pool.query(
+      `INSERT INTO tenants (name, slug) VALUES ($1, $2) RETURNING id, name, slug`,
+      [name, slug]
+    );
+    return rows[0];
+  }
+}
+
+const tenantService = new TenantService(pool);
+
+// ==============================
+// Tenant Middleware
+// ==============================
+async function resolveTenant(req, res, next) {
+  const tenantIdHeader = req.get('X-Tenant-ID');
+
+  // 1. Try Header
+  if (tenantIdHeader) {
+    // Basic UUID validation
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tenantIdHeader)) {
+      req.tenantId = tenantIdHeader;
+    }
+  }
+
+  // 2. Default to Global Tenant if not found
+  if (!req.tenantId) {
+    req.tenantId = '00000000-0000-0000-0000-000000000000';
+  }
+
+  next();
+}
 
 // ==============================
 // Validation Schemas
@@ -2788,8 +3069,8 @@ const proposalSchema = Joi.object({
   docs: Joi.array().default([]),
   cid: Joi.string().allow(""),
   ownerEmail: Joi.string().email().allow(""), // ✅ NEW (optional)
-  ownerPhone: Joi.string().allow("").optional(), 
-  }).unknown(true);
+  ownerPhone: Joi.string().allow("").optional(),
+}).unknown(true);
 
 const proposalUpdateSchema = Joi.object({
   orgName: Joi.string().min(2).max(160),
@@ -2947,8 +3228,22 @@ function normalizeAnalysisShape(core) {
   return safe;
 }
 
-async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
-  if (!openai) {
+async function runAgent2OnBid(bidRow, proposalRow, { promptOverride, tenantId } = {}) {
+  // 1. Resolve OpenAI Client (Tenant > Global)
+  let localOpenai = openai; // Default global
+
+  if (tenantId) {
+    const tenantKey = await tenantService.getTenantConfig(tenantId, 'OPENAI_API_KEY');
+    if (tenantKey) {
+      localOpenai = new OpenAI({
+        apiKey: tenantKey,
+        project: process.env.OPENAI_PROJECT || undefined,
+        organization: process.env.OPENAI_ORG || undefined,
+      });
+    }
+  }
+
+  if (!localOpenai) {
     return {
       status: "error",
       summary: "OpenAI is not configured.",
@@ -2986,7 +3281,7 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride } = {}) {
   });
 
   try {
-    const resp = await openai.chat.completions.create({
+    const resp = await localOpenai.chat.completions.create({
       model: "gpt-4o-mini",
       temperature: 0.2,
       messages: [{ role: "user", content: prompt }],
@@ -3053,6 +3348,7 @@ app.use(
 app.use(helmet());
 app.use(express.json({ limit: "20mb" }));
 app.use(cookieParser()); // 🔐 parse JWT cookie
+app.use(resolveTenant);    // 🏢 Multi-tenancy context
 
 // Ensure JSON parsing is registered before admin routes
 app.use(express.json({ limit: '2mb' }));
@@ -3063,12 +3359,12 @@ function normalizeEntitySelector(body = {}) {
 
   return {
     // explicit triple
-    entity:       norm(body.entity ?? body.orgName ?? body.org_name),
+    entity: norm(body.entity ?? body.orgName ?? body.org_name),
     contactEmail: norm(body.contactEmail ?? body.ownerEmail ?? body.owner_email ?? body.contact ?? body.contact_email),
-    wallet:       norm(body.wallet ?? body.ownerWallet ?? body.owner_wallet ?? body.wallet_address),
+    wallet: norm(body.wallet ?? body.ownerWallet ?? body.owner_wallet ?? body.wallet_address),
 
     // fallback key used by /admin/proposers -> AdminEntitiesTable
-    entityKey:    norm(body.id ?? body.entityKey ?? body.entity_key),
+    entityKey: norm(body.id ?? body.entityKey ?? body.entity_key),
   };
 }
 
@@ -3089,9 +3385,9 @@ async function buildEntityWhereAsync(pool, sel) {
   };
 
   // 1) explicit fields (any that are present)
-  addEq(sel.wallet,       cols.walletCols);
+  addEq(sel.wallet, cols.walletCols);
   addEq(sel.contactEmail, cols.emailCols);
-  addEq(sel.entity,       cols.orgCols);
+  addEq(sel.entity, cols.orgCols);
 
   // 2) fallback: id/entityKey from /admin/proposers (match across any col)
   if (!clauses.length && sel.entityKey) {
@@ -3301,8 +3597,8 @@ async function requireApprovedVendorOrAdmin(req, res, next) {
     if (!addr) return res.status(401).json({ error: 'unauthorized' });
 
     const { rows } = await pool.query(
-      `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-      [addr]
+      `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 LIMIT 1`,
+      [addr, req.tenantId]
     );
     const status = (rows[0]?.status || 'pending').toLowerCase();
     if (status !== 'approved') {
@@ -3372,7 +3668,7 @@ app.post("/auth/verify", async (req, res) => {
   }
 
   // Determine durable roles and effective role (from intent)
-  let roles = await durableRolesForAddress(address);
+  let roles = await durableRolesForAddress(address, req.tenantId);
   let role = roleFromDurableOrIntent(roles, roleIntent);
   if (!role) {
     return res.status(400).json({
@@ -3414,14 +3710,14 @@ app.post("/auth/verify", async (req, res) => {
               whatsapp: rows[0].whatsapp || null
             })
           ]);
-        } catch {}
+        } catch { }
       }
     } finally {
       if (typeof __vendorSeedGuard === "number") __vendorSeedGuard--;
     }
 
     // Refresh roles after possible insert
-    roles = await durableRolesForAddress(address);
+    roles = await durableRolesForAddress(address, req.tenantId);
   }
 
   // Admin override: admin wallets always act as admin
@@ -3481,7 +3777,7 @@ app.post("/auth/login", async (req, res) => {
   }
 
   // Decide role from durable roles + button intent
-  let roles = await durableRolesForAddress(address);
+  let roles = await durableRolesForAddress(address, req.tenantId);
   let role = roleFromDurableOrIntent(roles, roleIntent);
   if (!role) {
     return res.status(400).json({
@@ -3513,7 +3809,7 @@ app.post("/auth/login", async (req, res) => {
             email: rows[0].email || "",
             phone: rows[0].phone || ""
           });
-        } catch {}
+        } catch { }
         try {
           await notifyVendorSignupVendor({
             vendorName: rows[0].vendor_name || "",
@@ -3522,7 +3818,7 @@ app.post("/auth/login", async (req, res) => {
             telegramChatId: rows[0].telegram_chat_id || null,
             whatsapp: rows[0].whatsapp || null
           });
-        } catch {}
+        } catch { }
 
         // reflect vendor in role set
         roles = Array.from(new Set([...(roles || []), "vendor"]));
@@ -3569,7 +3865,7 @@ app.get('/auth/role', async (req, res) => {
     // Compute durable roles even if only address is known
     let roles = [];
     if (address) {
-      roles = await durableRolesForAddress(address); // your existing function
+      roles = await durableRolesForAddress(address, req.tenantId); // your existing function
       // ensure unique
       roles = Array.from(new Set(roles));
     }
@@ -3633,22 +3929,22 @@ app.post("/auth/switch-role", async (req, res) => {
 
     // vendor role if vendor_profiles row exists
     const v = await pool.query(
-      `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-      [lower]
+      `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 LIMIT 1`,
+      [lower, req.tenantId]
     );
     if (v.rowCount > 0) roles.push('vendor');
 
     // ✅ proposer role if proposer_profiles row exists
     const pp = await pool.query(
-      `SELECT 1 FROM proposer_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-      [lower]
+      `SELECT 1 FROM proposer_profiles WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 LIMIT 1`,
+      [lower, req.tenantId]
     );
     if (pp.rowCount > 0) roles.push('proposer');
 
     // also proposer if they already own any proposals
     const p = await pool.query(
-      `SELECT 1 FROM proposals WHERE lower(owner_wallet)=lower($1) LIMIT 1`,
-      [lower]
+      `SELECT 1 FROM proposals WHERE lower(owner_wallet)=lower($1) AND tenant_id=$2 LIMIT 1`,
+      [lower, req.tenantId]
     );
     if (p.rowCount > 0 && !roles.includes('proposer')) roles.push('proposer');
 
@@ -3673,7 +3969,69 @@ app.post("/auth/switch-role", async (req, res) => {
 app.post("/auth/logout", (req, res) => {
   res.clearCookie("auth_token");
   res.json({ ok: true });
-}); 
+});
+
+// ==============================
+// Routes — Tenant Management
+// ==============================
+
+// Create a new tenant (Open for now, or restrict to super-admin)
+app.post("/api/tenants", async (req, res) => {
+  try {
+    const { name, slug } = req.body;
+    if (!name || !slug) return res.status(400).json({ error: "name and slug required" });
+
+    const tenant = await tenantService.createTenant(name, slug);
+
+    // Add creator as the first admin member
+    if (req.user?.sub) {
+      await pool.query(
+        `INSERT INTO tenant_members (tenant_id, wallet_address, role) VALUES ($1, $2, 'admin')`,
+        [tenant.id, req.user.sub]
+      );
+    }
+
+    res.json(tenant);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Update Tenant Config (Admin only)
+app.put("/api/tenants/:id/config", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { key, value, isEncrypted } = req.body;
+
+    // Authorization check: User must be an admin of this tenant
+    const { rows: member } = await pool.query(
+      `SELECT role FROM tenant_members WHERE tenant_id = $1 AND wallet_address = $2`,
+      [id, req.user.sub]
+    );
+
+    if (!member[0] || member[0].role !== 'admin') {
+      // Allow global admins to override
+      if (!isAdminAddress(req.user.sub)) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+    }
+
+    await tenantService.setTenantConfig(id, key, value, isEncrypted);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get Current Tenant Info
+app.get("/api/tenants/current", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT id, name, slug FROM tenants WHERE id = $1`, [req.tenantId]);
+    res.json(rows[0] || null);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ==============================
 // Routes — Health & Test
@@ -3710,8 +4068,8 @@ app.get("/proposals", async (req, res) => {
     const includeArchived = String(req.query.includeArchived || "").toLowerCase();
 
     let q = "SELECT * FROM proposals";
-    const params = [];
-    const conditions = [];
+    const params = [req.tenantId];
+    const conditions = ["tenant_id = $1"];
 
     // 3. Apply Filtering Logic
     if (!isAdmin) {
@@ -3762,15 +4120,15 @@ async function detectProposalCols(pool) {
     WHERE table_name = 'proposals' AND table_schema = current_schema()
   `);
 
-  const have    = new Set(rows.map(r => r.name));
-  const first   = (cands) => cands.find(c => have.has(c)) || null;
+  const have = new Set(rows.map(r => r.name));
+  const first = (cands) => cands.find(c => have.has(c)) || null;
   const present = (cands) => cands.filter(c => have.has(c));
 
-  const orgCols    = present(['org_name','org','organization','entity','orgname']);
-  const emailCols  = present(['contact','contact_email','owner_email','email','primary_email']);
-  const walletCols = present(['owner_wallet','wallet','wallet_address','owner_wallet_address']);
-  const statusCol  = first(['status','proposal_status']);
-  const updatedCol = first(['updated_at','updatedat','modified_at','modifiedat']);
+  const orgCols = present(['org_name', 'org', 'organization', 'entity', 'orgname']);
+  const emailCols = present(['contact', 'contact_email', 'owner_email', 'email', 'primary_email']);
+  const walletCols = present(['owner_wallet', 'wallet', 'wallet_address', 'owner_wallet_address']);
+  const statusCol = first(['status', 'proposal_status']);
+  const updatedCol = first(['updated_at', 'updatedat', 'modified_at', 'modifiedat']);
 
   globalThis.__lxProposalColsCache = { orgCols, emailCols, walletCols, statusCol, updatedCol };
   return globalThis.__lxProposalColsCache;
@@ -3781,12 +4139,12 @@ function normalizeEntitySelector(body = {}) {
   const norm = (v) => (v == null ? null : String(v).trim());
   return {
     // explicit triple
-    entity:       norm(body.entity ?? body.orgName ?? body.org_name),
+    entity: norm(body.entity ?? body.orgName ?? body.org_name),
     contactEmail: norm(body.contactEmail ?? body.ownerEmail ?? body.owner_email ?? body.contact ?? body.contact_email),
-    wallet:       norm(body.wallet ?? body.ownerWallet ?? body.owner_wallet ?? body.wallet_address),
+    wallet: norm(body.wallet ?? body.ownerWallet ?? body.owner_wallet ?? body.wallet_address),
 
     // fallback key used by some older UIs
-    entityKey:    norm(body.id ?? body.entityKey ?? body.entity_key),
+    entityKey: norm(body.id ?? body.entityKey ?? body.entity_key),
   };
 }
 
@@ -3807,9 +4165,9 @@ async function buildEntityWhereAsync(pool, sel) {
   };
 
   // 1) explicit fields (any that are present)
-  addEq(sel.wallet,       cols.walletCols);
+  addEq(sel.wallet, cols.walletCols);
   addEq(sel.contactEmail, cols.emailCols);
-  addEq(sel.entity,       cols.orgCols);
+  addEq(sel.entity, cols.orgCols);
 
   // 2) fallback: id/entityKey from /admin/proposers (match across any col)
   if (!clauses.length && sel.entityKey) {
@@ -3862,21 +4220,22 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
 
     // --- Identify the target profiles ---
     const { whereClause, params } = buildWhereClauseForProfiles(sel);
-    
+
     if (!whereClause) {
       return res.status(400).json({ error: 'Provide entity or contactEmail or wallet' });
     }
 
     // Find the wallet addresses (using the dedicated client)
+    // Use client.query, NOT pool.query
+    params.push(req.tenantId);
     const profileQuery = `
       SELECT wallet_address 
       FROM proposer_profiles 
-      WHERE ${whereClause} AND status <> 'archived'
+      WHERE ${whereClause} AND status <> 'archived' AND tenant_id = $${params.length}
     `;
-    
-    // Use client.query, NOT pool.query
+
     const { rows } = await client.query(profileQuery, params);
-    
+
     if (rows.length === 0) {
       return res.json({ ok: true, affected: 0 });
     }
@@ -3884,8 +4243,8 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
     const walletAddresses = rows.map(row => row.wallet_address).filter(Boolean);
 
     if (walletAddresses.length === 0) {
-       console.warn("Matching profiles found, but no wallet addresses associated.", sel);
-       return res.json({ ok: true, affected: 0 });
+      console.warn("Matching profiles found, but no wallet addresses associated.", sel);
+      return res.json({ ok: true, affected: 0 });
     }
 
     // 2. START THE TRANSACTION
@@ -3895,18 +4254,18 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
     const { rowCount: rc1 } = await client.query(
       `UPDATE proposer_profiles 
        SET status='archived', updated_at=NOW() 
-       WHERE wallet_address = ANY($1) AND status <> 'archived'`,
-      [walletAddresses]
+       WHERE wallet_address = ANY($1) AND status <> 'archived' AND tenant_id = $2`,
+      [walletAddresses, req.tenantId]
     );
 
     // 4. Archive associated 'proposals' (using the client)
-    const cols = await detectProposalCols(pool); 
+    const cols = await detectProposalCols(pool);
     if (!cols.statusCol) {
       // We MUST roll back before throwing or returning
       await client.query('ROLLBACK');
       return res.status(500).json({ error: 'proposals.status column not found' });
     }
-    
+
     const setSql = cols.updatedCol
       ? `${cols.statusCol}='archived', ${cols.updatedCol}=NOW()`
       : `${cols.statusCol}='archived'`;
@@ -3914,8 +4273,8 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
     const { rowCount: rc2 } = await client.query(
       `UPDATE proposals 
        SET ${setSql} 
-       WHERE owner_wallet = ANY($1) AND ${cols.statusCol} <> 'archived'`,
-      [walletAddresses]
+       WHERE owner_wallet = ANY($1) AND ${cols.statusCol} <> 'archived' AND tenant_id = $2`,
+      [walletAddresses, req.tenantId]
     );
 
     // 5. COMMIT THE TRANSACTION
@@ -3928,10 +4287,10 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
     // 6. ROLL BACK ON ANY ERROR
     // If anything failed, undo all changes from this transaction
     await client.query('ROLLBACK');
-    
+
     console.error('archive entity error', e);
     return res.status(500).json({ error: 'Failed to archive entity' });
-    
+
   } finally {
     // 7. ALWAYS RELEASE THE CLIENT
     // This returns the client to the pool, whether we committed or rolled back.
@@ -3954,13 +4313,14 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
     }
 
     // Find the wallet addresses (using the dedicated client)
+    // Use client.query, NOT pool.query
+    params.push(req.tenantId);
     const profileQuery = `
       SELECT wallet_address 
       FROM proposer_profiles 
-      WHERE ${whereClause} AND status = 'archived'
+      WHERE ${whereClause} AND status = 'archived' AND tenant_id = $${params.length}
     `;
-    
-    // Use client.query, NOT pool.query
+
     const { rows } = await client.query(profileQuery, params);
 
     if (rows.length === 0) {
@@ -3970,8 +4330,8 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
     const walletAddresses = rows.map(row => row.wallet_address).filter(Boolean);
 
     if (walletAddresses.length === 0) {
-       console.warn("Matching archived profiles found, but no wallet addresses associated.", sel);
-       return res.json({ ok: true, affected: 0 });
+      console.warn("Matching archived profiles found, but no wallet addresses associated.", sel);
+      return res.json({ ok: true, affected: 0 });
     }
 
     // 2. START THE TRANSACTION
@@ -3981,13 +4341,13 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
     const { rowCount: rc1 } = await client.query(
       `UPDATE proposer_profiles 
        SET status='active', updated_at=NOW() 
-       WHERE wallet_address = ANY($1) AND status = 'archived'`,
-      [walletAddresses]
+       WHERE wallet_address = ANY($1) AND status = 'archived' AND tenant_id = $2`,
+      [walletAddresses, req.tenantId]
     );
 
     // 4. Unarchive associated 'proposals'
     const toStatusRaw = String(req.body?.toStatus || 'pending').toLowerCase();
-    const toStatus = ['pending','approved','rejected'].includes(toStatusRaw) ? toStatusRaw : 'pending';
+    const toStatus = ['pending', 'approved', 'rejected'].includes(toStatusRaw) ? toStatusRaw : 'pending';
 
     const cols = await detectProposalCols(pool);
     if (!cols.statusCol) {
@@ -4003,8 +4363,8 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
     const { rowCount: rc2 } = await client.query(
       `UPDATE proposals 
        SET ${setSql} 
-       WHERE owner_wallet = ANY($1) AND ${cols.statusCol}='archived'`,
-      [walletAddresses, toStatus] // Pass both parameters
+       WHERE owner_wallet = ANY($1) AND ${cols.statusCol}='archived' AND tenant_id = $3`,
+      [walletAddresses, toStatus, req.tenantId] // Pass both parameters
     );
 
     // 5. COMMIT THE TRANSACTION
@@ -4015,7 +4375,7 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
   } catch (e) {
     // 6. ROLL BACK ON ANY ERROR
     await client.query('ROLLBACK');
-    
+
     console.error('unarchive entity error', e);
     return res.status(500).json({ error: 'Failed to unarchive entity' });
   } finally {
@@ -4028,7 +4388,7 @@ app.delete('/admin/entities', adminGuard, async (req, res) => {
   try {
     // This normalizeSelector function is correct and robust
     const sel = normalizeEntitySelector(req.body || {});
-    
+
     // We must build WHERE clauses for BOTH tables, as their columns differ.
     const clauses_proposals = [];
     const clauses_proposer_profiles = [];
@@ -4038,7 +4398,7 @@ app.delete('/admin/entities', adminGuard, async (req, res) => {
     if (sel.wallet) {
       params.push(sel.wallet);
       // proposals table has owner_wallet
-      clauses_proposals.push(`(LOWER(TRIM(owner_wallet)) = LOWER(TRIM($${params.length})))`); 
+      clauses_proposals.push(`(LOWER(TRIM(owner_wallet)) = LOWER(TRIM($${params.length})))`);
       // proposer_profiles table has wallet_address
       clauses_proposer_profiles.push(`(LOWER(TRIM(wallet_address)) = LOWER(TRIM($${params.length})))`);
     }
@@ -4070,30 +4430,35 @@ app.delete('/admin/entities', adminGuard, async (req, res) => {
 
     if (mode === 'hard') {
       // ✅ SOLUTION: DELETE FROM BOTH TABLES
-      const { rowCount: rc1 } = await pool.query(`DELETE FROM proposals WHERE ${where_proposals}`, params);
-      const { rowCount: rc2 } = await pool.query(`DELETE FROM proposer_profiles WHERE ${where_proposer_profiles}`, params);
-      
+      params.push(req.tenantId);
+      const tenantIdIdx = params.length;
+      const { rowCount: rc1 } = await pool.query(`DELETE FROM proposals WHERE ${where_proposals} AND tenant_id=$${tenantIdIdx}`, params);
+      const { rowCount: rc2 } = await pool.query(`DELETE FROM proposer_profiles WHERE ${where_proposer_profiles} AND tenant_id=$${tenantIdIdx}`, params);
+
       return res.json({ success: true, deleted: (rc1 + rc2), mode: 'hard' });
     }
 
     // --- SOFT DELETE (Archive) ---
-    
+
     // 1. Soft delete on 'proposals'
     const { cols } = await detectProposalCols(pool); //
     if (!cols.statusCol) return res.status(500).json({ error: 'proposals.status column not found' });
-    
+
     const setSql_proposals = cols.updatedCol
       ? `${cols.statusCol}='archived', ${cols.updatedCol}=NOW()`
       : `${cols.statusCol}='archived'`;
 
+    params.push(req.tenantId);
+    const tenantIdIdx = params.length;
+
     const { rowCount: rc1 } = await pool.query(
-      `UPDATE proposals SET ${setSql_proposals} WHERE ${where_proposals} AND ${cols.statusCol} <> 'archived'`,
+      `UPDATE proposals SET ${setSql_proposals} WHERE ${where_proposals} AND ${cols.statusCol} <> 'archived' AND tenant_id=$${tenantIdIdx}`,
       params
     );
 
     // 2. ✅ SOLUTION: Soft delete on 'proposer_profiles'
     const { rowCount: rc2 } = await pool.query(
-      `UPDATE proposer_profiles SET status='archived', updated_at=NOW() WHERE ${where_proposer_profiles} AND status <> 'archived'`,
+      `UPDATE proposer_profiles SET status='archived', updated_at=NOW() WHERE ${where_proposer_profiles} AND status <> 'archived' AND tenant_id=$${tenantIdIdx}`,
       params
     );
 
@@ -4114,9 +4479,9 @@ app.get("/proposals/mine", authRequired, async (req, res) => {
 
     let q = `
       SELECT * FROM proposals
-      WHERE lower(owner_wallet) = lower($1)
+      WHERE lower(owner_wallet) = lower($1) AND tenant_id = $2
     `;
-    const params = [wallet];
+    const params = [wallet, req.tenantId];
 
     if (!["true", "1", "yes"].includes(includeArchived)) {
       q += ` AND status != 'archived'`;
@@ -4135,7 +4500,7 @@ app.get("/proposals/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-    const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ id ]);
+    const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1 AND tenant_id=$2", [id, req.tenantId]);
     if (!rows[0]) return res.status(404).json({ error: "not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
@@ -4143,7 +4508,7 @@ app.get("/proposals/:id", async (req, res) => {
   }
 });
 
-const _nonEmpty = (s) => typeof s === 'string' && s.trim() !== ''; 
+const _nonEmpty = (s) => typeof s === 'string' && s.trim() !== '';
 
 app.post("/proposals", authGuard /* or requireAuth */, async (req, res) => {
   try {
@@ -4151,8 +4516,8 @@ app.post("/proposals", authGuard /* or requireAuth */, async (req, res) => {
     if (error) return res.status(400).json({ error: error.message });
 
     const ownerWallet = String(req.user?.address || req.user?.sub || "").toLowerCase();
-    const ownerEmail  = value.ownerEmail || null;
-    const ownerPhone  = toE164(value.ownerPhone || "");
+    const ownerEmail = value.ownerEmail || null;
+    const ownerPhone = toE164(value.ownerPhone || "");
 
     if (!ownerWallet) return res.status(401).json({ error: "Login required" });
 
@@ -4162,6 +4527,7 @@ app.post("/proposals", authGuard /* or requireAuth */, async (req, res) => {
       SELECT 1
         FROM proposer_profiles
        WHERE lower(wallet_address) = lower($1)
+         AND tenant_id = $2
          AND (
            COALESCE(contact_email,'') <> ''
         OR COALESCE(phone,'') <> ''
@@ -4170,7 +4536,7 @@ app.post("/proposals", authGuard /* or requireAuth */, async (req, res) => {
          )
        LIMIT 1
       `,
-      [ownerWallet]
+      [ownerWallet, req.tenantId]
     );
 
     if (!ok[0]) {
@@ -4183,13 +4549,13 @@ app.post("/proposals", authGuard /* or requireAuth */, async (req, res) => {
     const q = `
       INSERT INTO proposals (
         org_name, title, summary, contact, address, city, country, amount_usd, docs, cid, status,
-        owner_wallet, owner_email, owner_phone, location, updated_at
+        owner_wallet, owner_email, owner_phone, location, tenant_id, updated_at
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',
-        $11,$12,$13, $14, NOW()
+        $11,$12,$13, $14, $15, NOW()
       )
       RETURNING proposal_id, org_name, title, summary, contact, address, city, country,
-                amount_usd, docs, cid, status, created_at, owner_wallet, owner_email, owner_phone, location, updated_at
+                amount_usd, docs, cid, status, created_at, owner_wallet, owner_email, owner_phone, location, tenant_id, updated_at
     `;
 
     // [FIXED] Added value.location to vals array (index 13 -> $14)
@@ -4207,7 +4573,8 @@ app.post("/proposals", authGuard /* or requireAuth */, async (req, res) => {
       ownerWallet,
       ownerEmail,
       ownerPhone || null,
-      value.location ? JSON.stringify(value.location) : null // <--- THIS IS CRITICAL
+      value.location ? JSON.stringify(value.location) : null,
+      req.tenantId
     ];
 
     const { rows } = await pool.query(q, vals);
@@ -4269,8 +4636,9 @@ app.patch("/proposals/:id", adminOrProposalOwnerGuard, async (req, res) => {
     // Always bump updated_at
     sets.push(`updated_at=NOW()`);
 
-    const sql = `UPDATE proposals SET ${sets.join(', ')} WHERE proposal_id=$${i} RETURNING *`;
+    const sql = `UPDATE proposals SET ${sets.join(', ')} WHERE proposal_id=$${i} AND tenant_id=$${i + 1} RETURNING *`;
     vals.push(id);
+    vals.push(req.tenantId);
 
     const { rows } = await pool.query(sql, vals);
     if (!rows[0]) return res.status(404).json({ error: "Proposal not found" });
@@ -4288,8 +4656,8 @@ app.post("/proposals/:id/approve", adminGuard, async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
     const { rows } = await pool.query(
-      `UPDATE proposals SET status='approved' WHERE proposal_id=$1 RETURNING *`,
-      [id]
+      `UPDATE proposals SET status='approved' WHERE proposal_id=$1 AND tenant_id=$2 RETURNING *`,
+      [id, req.tenantId]
     );
     if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
@@ -4310,9 +4678,9 @@ app.post("/proposals/:id/reject", adminGuard, async (req, res) => {
 
     const { rows } = await pool.query(
       `UPDATE proposals SET status='rejected', updated_at = NOW()
-         WHERE proposal_id=$1
+         WHERE proposal_id=$1 AND tenant_id=$2
        RETURNING *`,
-      [id]
+      [id, req.tenantId]
     );
     if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
 
@@ -4336,8 +4704,8 @@ app.post("/proposals/:id/archive", adminGuard, async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
     const { rows } = await pool.query(
-      `UPDATE proposals SET status='archived' WHERE proposal_id=$1 RETURNING *`,
-      [id]
+      `UPDATE proposals SET status='archived' WHERE proposal_id=$1 AND tenant_id=$2 RETURNING *`,
+      [id, req.tenantId]
     );
     if (rows.length === 0) return res.status(404).json({ error: "Proposal not found" });
     res.json(toCamel(rows[0]));
@@ -4353,8 +4721,8 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
     const { rowCount } = await pool.query(
-      `DELETE FROM proposals WHERE proposal_id=$1`,
-      [id]
+      `DELETE FROM proposals WHERE proposal_id=$1 AND tenant_id=$2`,
+      [id, req.tenantId]
     );
     if (rowCount === 0) return res.status(404).json({ error: "Proposal not found" });
     res.json({ success: true });
@@ -4367,7 +4735,7 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
 /// /admin/entities — REPLACE ENTIRE ROUTE (excludes wallets in vendor_profiles; includes proposer_profiles even with 0 proposals)
 app.get('/admin/entities', adminGuard, async (req, res) => {
   try {
-    const includeArchived = ['true','1','yes'].includes(
+    const includeArchived = ['true', '1', 'yes'].includes(
       String(req.query.includeArchived || '').toLowerCase()
     );
 
@@ -4498,14 +4866,14 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
     const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
     const items = rows.map((r) => {
-      const email            = norm(r.email);
-      const phone            = norm(r.phone);
-      const line1            = norm(r.address_raw);
-      const city             = norm(r.city);
-      const country          = norm(r.country);
-      const flat             = [line1, city, country].filter(Boolean).join(', ') || null;
-      const telegramChatId   = norm(r.telegram_chat_id);   
-      const telegramUsername = norm(r.telegram_username); 
+      const email = norm(r.email);
+      const phone = norm(r.phone);
+      const line1 = norm(r.address_raw);
+      const city = norm(r.city);
+      const country = norm(r.country);
+      const flat = [line1, city, country].filter(Boolean).join(', ') || null;
+      const telegramChatId = norm(r.telegram_chat_id);
+      const telegramUsername = norm(r.telegram_username);
 
       return {
         entityName: r.entity_name || '',
@@ -4562,7 +4930,7 @@ app.get("/proposer-profile", authGuard, async (req, res) => {
       `SELECT * FROM proposer_profiles WHERE lower(wallet_address)=lower($1)`,
       [wallet]
     );
-    
+
     if (rows[0]) {
       return res.json(toCamel(rows[0]));
     } else {
@@ -4723,9 +5091,9 @@ app.get("/bids", async (req, res) => {
       const { rows } = await pool.query(
         `SELECT bid_id, proposal_id, vendor_name, price_usd, days, status, created_at, updated_at, milestones
            FROM bids
-          WHERE proposal_id = $1 AND status <> 'archived'
+          WHERE proposal_id = $1 AND status <> 'archived' AND tenant_id = $2
           ORDER BY bid_id DESC`,
-        [pid]
+        [pid, req.tenantId]
       );
 
       // keep the public sanitized payload (no payment metadata here)
@@ -4760,15 +5128,15 @@ app.get("/bids", async (req, res) => {
 
       if (Number.isFinite(pid)) {
         const { rows } = await pool.query(
-          "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) AND proposal_id=$2 ORDER BY bid_id DESC",
-          [caller, pid]
+          "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) AND proposal_id=$2 AND tenant_id=$3 ORDER BY bid_id DESC",
+          [caller, pid, req.tenantId]
         );
         const hydrated = await Promise.all(rows.map(r => overlayPaidFromMp(r, pool)));
         return res.json(mapRows(hydrated));
       } else {
         const { rows } = await pool.query(
-          "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) ORDER BY bid_id DESC",
-          [caller]
+          "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 ORDER BY bid_id DESC",
+          [caller, req.tenantId]
         );
         const hydrated = await Promise.all(rows.map(r => overlayPaidFromMp(r, pool)));
         return res.json(mapRows(hydrated));
@@ -4778,13 +5146,13 @@ app.get("/bids", async (req, res) => {
     // --- ADMIN (or flag OFF): return all bids, hydrated ---
     if (Number.isFinite(pid)) {
       const { rows } = await pool.query(
-        "SELECT * FROM bids WHERE proposal_id=$1 ORDER BY bid_id DESC",
-        [pid]
+        "SELECT * FROM bids WHERE proposal_id=$1 AND tenant_id=$2 ORDER BY bid_id DESC",
+        [pid, req.tenantId]
       );
       const hydrated = await Promise.all(rows.map(r => overlayPaidFromMp(r, pool)));
       return res.json(mapRows(hydrated));
     } else {
-      const { rows } = await pool.query("SELECT * FROM bids ORDER BY bid_id DESC");
+      const { rows } = await pool.query("SELECT * FROM bids WHERE tenant_id=$1 ORDER BY bid_id DESC", [req.tenantId]);
       const hydrated = await Promise.all(rows.map(r => overlayPaidFromMp(r, pool)));
       return res.json(mapRows(hydrated));
     }
@@ -4798,7 +5166,7 @@ app.get("/bids/:id", async (req, res) => {
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
 
   try {
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [id]);
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1 AND tenant_id=$2", [id, req.tenantId]);
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
 
     const bid = rows[0];
@@ -4852,9 +5220,10 @@ app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
         doc,
         files,
         status,
-        created_at
+        created_at,
+        tenant_id
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending', NOW())
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending', NOW(), $11)
       RETURNING *`;
 
     const insertVals = [
@@ -4868,6 +5237,7 @@ app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
       JSON.stringify(value.milestones || []),
       docCompat ? JSON.stringify(docCompat) : null, // back-compat single doc
       JSON.stringify(value.files || []),            // multi-file column
+      req.tenantId
     ];
 
     const { rows } = await pool.query(insertQ, insertVals);
@@ -4876,7 +5246,7 @@ app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
     // fetch proposal
     const { rows: pr } = await pool.query(
       "SELECT * FROM proposals WHERE proposal_id=$1",
-      [ inserted.proposal_id ]
+      [inserted.proposal_id]
     );
     const prop = pr[0] || null;
 
@@ -4885,19 +5255,19 @@ app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
 
     const analysis = await withTimeout(
       prop
-        ? runAgent2OnBid(inserted, prop)
+        ? runAgent2OnBid(inserted, prop, { tenantId: req.tenantId })
         : Promise.resolve({
-            status: "error",
-            summary: "Proposal not found for analysis.",
-            risks: [],
-            fit: "low",
-            milestoneNotes: [],
-            confidence: 0,
-            pdfUsed: false,
-            pdfChars: 0,
-            pdfSnippet: null,
-            pdfDebug: { reason: "proposal_missing" },
-          }),
+          status: "error",
+          summary: "Proposal not found for analysis.",
+          risks: [],
+          fit: "low",
+          milestoneNotes: [],
+          confidence: 0,
+          pdfUsed: false,
+          pdfChars: 0,
+          pdfSnippet: null,
+          pdfDebug: { reason: "proposal_missing" },
+        }),
       INLINE_ANALYSIS_DEADLINE_MS,
       () => ({
         status: "error",
@@ -4915,7 +5285,7 @@ app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
 
     await pool.query(
       "UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2",
-      [ JSON.stringify(analysis), inserted.bid_id ]
+      [JSON.stringify(analysis), inserted.bid_id]
     );
     inserted.ai_analysis = analysis;
 
@@ -4923,11 +5293,11 @@ app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
     const [{ rows: vp }, { rows: prj }] = await Promise.all([
       pool.query(
         "SELECT * FROM vendor_profiles WHERE lower(wallet_address)=lower($1)",
-        [ inserted.wallet_address ]
+        [inserted.wallet_address]
       ),
-      pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ inserted.proposal_id ]),
+      pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [inserted.proposal_id]),
     ]);
-    const vendor   = vp[0]  || null;
+    const vendor = vp[0] || null;
     const proposal = prj[0] || null;
 
     if (typeof notifyBidSubmitted === "function") {
@@ -4937,18 +5307,18 @@ app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
     // audit
     try {
       const actorWallet = (req.user && (req.user.address || req.user.sub)) || null;
-      const actorRole   = (req.user && req.user.role) || "vendor";
+      const actorRole = (req.user && req.user.role) || "vendor";
 
       const ins = await pool.query(
         `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
          VALUES ($1,$2,$3,$4)
          RETURNING audit_id`,
-        [ Number(inserted.bid_id ?? inserted.id), actorWallet, actorRole, { created: true } ]
+        [Number(inserted.bid_id ?? inserted.id), actorWallet, actorRole, { created: true }]
       );
       if (typeof enrichAuditRow === "function") {
         enrichAuditRow(pool, ins.rows[0].audit_id).catch(() => null);
       }
-    } catch {}
+    } catch { }
 
     return res.status(201).json(toCamel(inserted));
   } catch (err) {
@@ -4965,8 +5335,8 @@ app.post("/bids/:id/approve", adminGuard, async (req, res) => {
   try {
     // 1) Update status -> approved
     const { rows } = await pool.query(
-      `UPDATE bids SET status='approved', updated_at=NOW() WHERE bid_id=$1 RETURNING *`,
-      [ id ]
+      `UPDATE bids SET status='approved', updated_at=NOW() WHERE bid_id=$1 AND tenant_id=$2 RETURNING *`,
+      [id, req.tenantId]
     );
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
     const bid = rows[0];
@@ -4974,11 +5344,11 @@ app.post("/bids/:id/approve", adminGuard, async (req, res) => {
 
     // 2) Pull proposal + vendor profile for contacts
     const [{ rows: prjRows }, { rows: vpRows }] = await Promise.all([
-      pool.query(`SELECT * FROM proposals WHERE proposal_id=$1`, [ bid.proposal_id ]),
-      pool.query(`SELECT * FROM vendor_profiles WHERE LOWER(wallet_address)=LOWER($1)`, [ bid.wallet_address ])
+      pool.query(`SELECT * FROM proposals WHERE proposal_id=$1`, [bid.proposal_id]),
+      pool.query(`SELECT * FROM vendor_profiles WHERE LOWER(wallet_address)=LOWER($1)`, [bid.wallet_address])
     ]);
     const proposal = prjRows[0] || null;
-    const vendor   = vpRows[0] || null;
+    const vendor = vpRows[0] || null;
 
     // 3) Fire-and-forget notifications
     if (typeof notifyBidApproved === "function") {
@@ -5003,8 +5373,8 @@ app.post("/bids/:id/reject", adminGuard, async (req, res) => {
 
     // 1) Update status -> rejected
     const { rows } = await pool.query(
-      `UPDATE bids SET status='rejected', updated_at=NOW() WHERE bid_id=$1 RETURNING *`,
-      [ id ]
+      `UPDATE bids SET status='rejected', updated_at=NOW() WHERE bid_id=$1 AND tenant_id=$2 RETURNING *`,
+      [id, req.tenantId]
     );
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
     const bid = rows[0];
@@ -5012,11 +5382,11 @@ app.post("/bids/:id/reject", adminGuard, async (req, res) => {
 
     // 2) Pull proposal + vendor profile for contacts
     const [{ rows: prjRows }, { rows: vpRows }] = await Promise.all([
-      pool.query(`SELECT * FROM proposals WHERE proposal_id=$1`, [ bid.proposal_id ]),
-      pool.query(`SELECT * FROM vendor_profiles WHERE LOWER(wallet_address)=LOWER($1)`, [ bid.wallet_address ])
+      pool.query(`SELECT * FROM proposals WHERE proposal_id=$1`, [bid.proposal_id]),
+      pool.query(`SELECT * FROM vendor_profiles WHERE LOWER(wallet_address)=LOWER($1)`, [bid.wallet_address])
     ]);
     const proposal = prjRows[0] || null;
-    const vendor   = vpRows[0] || null;
+    const vendor = vpRows[0] || null;
 
     // 3) Fire-and-forget notifications
     if (typeof notifyBidRejected === "function") {
@@ -5035,9 +5405,9 @@ app.post("/bids/:id/archive", adminGuard, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE bids SET status = 'archived'
-       WHERE bid_id = $1
+       WHERE bid_id = $1 AND tenant_id = $2
        RETURNING *`,
-      [id]
+      [id, req.tenantId]
     );
     if (!rows.length) return res.status(404).json({ error: "Bid not found" });
     res.json(toCamel(rows[0]));
@@ -5051,7 +5421,7 @@ app.delete("/bids/:id", adminGuard, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
   try {
-    const { rowCount } = await pool.query(`DELETE FROM bids WHERE bid_id=$1`, [id]);
+    const { rowCount } = await pool.query(`DELETE FROM bids WHERE bid_id=$1 AND tenant_id=$2`, [id, req.tenantId]);
     if (rowCount === 0) return res.status(404).json({ error: "Bid not found" });
     return res.json({ success: true });
   } catch (err) {
@@ -5074,8 +5444,8 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
     const { rows: currentRows } = await pool.query(
       `SELECT bid_id, status, preferred_stablecoin, price_usd, days, notes
          FROM bids
-        WHERE bid_id = $1`,
-      [bidId]
+        WHERE bid_id = $1 AND tenant_id = $2`,
+      [bidId, req.tenantId]
     );
     const current = currentRows[0];
     if (!current) return res.status(404).json({ error: "Bid not found" });
@@ -5131,8 +5501,9 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
     const sqlUpdate = `
       UPDATE bids
          SET ${set.join(", ")}, updated_at = NOW()  -- keep if you added updated_at; otherwise remove
-       WHERE bid_id = $1
+       WHERE bid_id = $1 AND tenant_id = $${i + 1}
    RETURNING *`;
+    vals.push(req.tenantId);
     const { rows: updatedRows } = await pool.query(sqlUpdate, vals);
     const updated = updatedRows[0];
 
@@ -5169,13 +5540,13 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
     if (Object.keys(changes).length > 0) {
       const actorWallet = req.user?.sub || null;  // your JWT puts wallet in sub
       const actorRole = req.user?.role || "admin";
-// AFTER (correct)
-const ins = await pool.query(
-  'INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes) VALUES ($1,$2,$3,$4) RETURNING audit_id',
-  [bidId, actorWallet, actorRole, changes]
-);
-enrichAuditRow(pool, ins.rows[0].audit_id).catch(/* ... */);
-}
+      // AFTER (correct)
+      const ins = await pool.query(
+        'INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes) VALUES ($1,$2,$3,$4) RETURNING audit_id',
+        [bidId, actorWallet, actorRole, changes]
+      );
+      enrichAuditRow(pool, ins.rows[0].audit_id).catch(/* ... */);
+    }
 
     // Return normalized bid
     return res.json(toCamel(updated));
@@ -5195,12 +5566,12 @@ app.patch('/bids/:id/notes', requireApprovedVendorOrAdmin, async (req, res) => {
   try {
     const bidId = Number(req.params.id);
     const { notes } = req.body;
-    
+
     await pool.query(
-      `UPDATE bids SET notes = $1 WHERE bid_id = $2`,
-      [notes, bidId]
+      `UPDATE bids SET notes = $1 WHERE bid_id = $2 AND tenant_id = $3`,
+      [notes, bidId, req.tenantId]
     );
-    
+
     res.json({ ok: true });
   } catch (e) {
     console.error('Error updating bid notes:', e);
@@ -5237,8 +5608,8 @@ app.patch("/bids/:id/milestones", adminGuard, async (req, res) => {
   try {
     // Load current for audit
     const { rows: curRows } = await pool.query(
-      `SELECT bid_id, milestones, price_usd FROM bids WHERE bid_id=$1`,
-      [bidId]
+      `SELECT bid_id, milestones, price_usd FROM bids WHERE bid_id=$1 AND tenant_id=$2`,
+      [bidId, req.tenantId]
     );
     const current = curRows[0];
     if (!current) return res.status(404).json({ error: "Bid not found" });
@@ -5252,32 +5623,32 @@ app.patch("/bids/:id/milestones", adminGuard, async (req, res) => {
     const { rows: upd } = await pool.query(
       `UPDATE bids
          SET milestones = $2::jsonb
-       WHERE bid_id = $1
+       WHERE bid_id = $1 AND tenant_id = $3
        RETURNING *`,
-      [bidId, JSON.stringify(norm)]
+      [bidId, JSON.stringify(norm), req.tenantId]
     );
 
- // Audit row
-const actorWallet = req.user?.sub || req.user?.address || null;
-const actorRole   = req.user?.role || "admin";
+    // Audit row
+    const actorWallet = req.user?.sub || req.user?.address || null;
+    const actorRole = req.user?.role || "admin";
 
-const ins = await pool.query(
-  `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
+    const ins = await pool.query(
+      `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
    VALUES ($1, $2, $3, $4)
    RETURNING audit_id`,
-  [bidId, actorWallet, actorRole, { milestones: { from: current.milestones, to: norm } }]
-);
+      [bidId, actorWallet, actorRole, { milestones: { from: current.milestones, to: norm } }]
+    );
 
-// fire-and-forget enrichment (IPFS + hash)
-enrichAuditRow(pool, ins.rows[0].audit_id).catch(err =>
-  console.error('audit enrich failed:', err)
-);
+    // fire-and-forget enrichment (IPFS + hash)
+    enrichAuditRow(pool, ins.rows[0].audit_id).catch(err =>
+      console.error('audit enrich failed:', err)
+    );
 
-return res.json(toCamel(upd[0]));
-} catch (err) {
-  console.error("PATCH /bids/:id/milestones failed", { bidId, err });
-  return res.status(500).json({ error: "Internal error updating milestones" });
-}
+    return res.json(toCamel(upd[0]));
+  } catch (err) {
+    console.error("PATCH /bids/:id/milestones failed", { bidId, err });
+    return res.status(500).json({ error: "Internal error updating milestones" });
+  }
 });
 
 // GET /audit?itemType=proposal&itemId=123  OR  /audit?itemType=bid&itemId=456
@@ -5289,54 +5660,7 @@ app.get('/audit', async (req, res) => {
 
   if (itemType === 'bid') {
     const { rows } = await pool.query(
-  `SELECT
-     ba.created_at,
-     ba.actor_role,
-     ba.actor_wallet,
-     ba.changes,
-     ba.ipfs_cid,
-     ba.merkle_index,
-     ba.merkle_proof,
-     ba.batch_id,
-     ab.period_id,
-     ab.tx_hash,
-     ab.contract_addr,
-     ab.chain_id
-   FROM bid_audits ba
-   LEFT JOIN audit_batches ab ON ab.id = ba.batch_id
-   WHERE ba.bid_id = $1
-   ORDER BY ba.created_at DESC`,
-  [itemId]
-);
-return res.json(rows.map(r => ({
-  created_at: r.created_at,
-  action: 'update',
-  actor_role: r.actor_role,
-  actor_address: r.actor_wallet,
-  changed_fields: Object.keys(r.changes || {}),
-  changes: r.changes || {},                 // ← add this line
-  ipfs_cid: r.ipfs_cid,
-  merkle_index: r.merkle_index ?? null,
-  proof: Array.isArray(r.merkle_proof)
-    ? r.merkle_proof.map(buf =>
-        typeof buf === 'string'
-          ? (buf.startsWith('0x') ? buf : '0x' + buf)
-          : '0x' + Buffer.from(buf).toString('hex')
-      )
-    : [],
-  batch: r.period_id ? {
-    period_id: r.period_id,
-    tx_hash: r.tx_hash,
-    contract_addr: r.contract_addr,
-    chain_id: r.chain_id
-  } : null
-})));
-  }
-
-  if (itemType === 'proposal') {
-    // join through bids to show all bid audits for this proposal
-    const { rows } = await pool.query(
-  `SELECT
+      `SELECT
      ba.created_at,
      ba.actor_role,
      ba.actor_wallet,
@@ -5352,33 +5676,81 @@ return res.json(rows.map(r => ({
    FROM bid_audits ba
    JOIN bids b ON b.bid_id = ba.bid_id
    LEFT JOIN audit_batches ab ON ab.id = ba.batch_id
-   WHERE b.proposal_id = $1
+   WHERE ba.bid_id = $1 AND b.tenant_id = $2
    ORDER BY ba.created_at DESC`,
-  [itemId]
-);
-return res.json(rows.map(r => ({
-  created_at: r.created_at,
-  action: 'update',
-  actor_role: r.actor_role,
-  actor_address: r.actor_wallet,
-  changed_fields: Object.keys(r.changes || {}),
-  changes: r.changes || {},                 // ← add this line
-  ipfs_cid: r.ipfs_cid,
-  merkle_index: r.merkle_index ?? null,
-  proof: Array.isArray(r.merkle_proof)
-    ? r.merkle_proof.map(buf =>
-        typeof buf === 'string'
-          ? (buf.startsWith('0x') ? buf : '0x' + buf)
-          : '0x' + Buffer.from(buf).toString('hex')
-      )
-    : [],
-  batch: r.period_id ? {
-    period_id: r.period_id,
-    tx_hash: r.tx_hash,
-    contract_addr: r.contract_addr,
-    chain_id: r.chain_id
-  } : null
-})));
+      [itemId, req.tenantId]
+    );
+    return res.json(rows.map(r => ({
+      created_at: r.created_at,
+      action: 'update',
+      actor_role: r.actor_role,
+      actor_address: r.actor_wallet,
+      changed_fields: Object.keys(r.changes || {}),
+      changes: r.changes || {},                 // ← add this line
+      ipfs_cid: r.ipfs_cid,
+      merkle_index: r.merkle_index ?? null,
+      proof: Array.isArray(r.merkle_proof)
+        ? r.merkle_proof.map(buf =>
+          typeof buf === 'string'
+            ? (buf.startsWith('0x') ? buf : '0x' + buf)
+            : '0x' + Buffer.from(buf).toString('hex')
+        )
+        : [],
+      batch: r.period_id ? {
+        period_id: r.period_id,
+        tx_hash: r.tx_hash,
+        contract_addr: r.contract_addr,
+        chain_id: r.chain_id
+      } : null
+    })));
+  }
+
+  if (itemType === 'proposal') {
+    // join through bids to show all bid audits for this proposal
+    const { rows } = await pool.query(
+      `SELECT
+     ba.created_at,
+     ba.actor_role,
+     ba.actor_wallet,
+     ba.changes,
+     ba.ipfs_cid,
+     ba.merkle_index,
+     ba.merkle_proof,
+     ba.batch_id,
+     ab.period_id,
+     ab.tx_hash,
+     ab.contract_addr,
+     ab.chain_id
+   FROM bid_audits ba
+   JOIN bids b ON b.bid_id = ba.bid_id
+   LEFT JOIN audit_batches ab ON ab.id = ba.batch_id
+   WHERE b.proposal_id = $1 AND b.tenant_id = $2
+   ORDER BY ba.created_at DESC`,
+      [itemId, req.tenantId]
+    );
+    return res.json(rows.map(r => ({
+      created_at: r.created_at,
+      action: 'update',
+      actor_role: r.actor_role,
+      actor_address: r.actor_wallet,
+      changed_fields: Object.keys(r.changes || {}),
+      changes: r.changes || {},                 // ← add this line
+      ipfs_cid: r.ipfs_cid,
+      merkle_index: r.merkle_index ?? null,
+      proof: Array.isArray(r.merkle_proof)
+        ? r.merkle_proof.map(buf =>
+          typeof buf === 'string'
+            ? (buf.startsWith('0x') ? buf : '0x' + buf)
+            : '0x' + Buffer.from(buf).toString('hex')
+        )
+        : [],
+      batch: r.period_id ? {
+        period_id: r.period_id,
+        tx_hash: r.tx_hash,
+        contract_addr: r.contract_addr,
+        chain_id: r.chain_id
+      } : null
+    })));
   }
 
   res.json([]);
@@ -5420,15 +5792,17 @@ app.get('/admin/anchor/candidates', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'period must be YYYY-MM-DDTHH' });
     }
     const { rows } = await pool.query(
-      `SELECT audit_id, bid_id, created_at,
-              (ipfs_cid IS NOT NULL) AS has_ipfs,
-              (leaf_hash IS NOT NULL) AS has_leaf
-         FROM bid_audits
-        WHERE batch_id IS NULL
-          AND leaf_hash IS NOT NULL
-          AND to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') = $1
-        ORDER BY audit_id ASC`,
-      [period]
+      `SELECT ba.audit_id, ba.bid_id, ba.created_at,
+              (ba.ipfs_cid IS NOT NULL) AS has_ipfs,
+              (ba.leaf_hash IS NOT NULL) AS has_leaf
+         FROM bid_audits ba
+         JOIN bids b ON b.bid_id = ba.bid_id
+        WHERE ba.batch_id IS NULL
+          AND ba.leaf_hash IS NOT NULL
+          AND to_char(ba.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') = $1
+          AND b.tenant_id = $2
+        ORDER BY ba.audit_id ASC`,
+      [period, req.tenantId]
     );
     res.type('application/json').json({ ok: true, period, count: rows.length, rows });
   } catch (e) {
@@ -5440,14 +5814,16 @@ app.get('/admin/anchor/candidates', async (req, res) => {
 app.get('/admin/anchor/periods', async (req, res) => {
   try {
     const q = `
-      SELECT to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') AS period,
+      SELECT to_char(ba.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24') AS period,
              COUNT(*) AS cnt
-      FROM bid_audits
-      WHERE leaf_hash IS NOT NULL
-        AND batch_id IS NULL
+      FROM bid_audits ba
+      JOIN bids b ON b.bid_id = ba.bid_id
+      WHERE ba.leaf_hash IS NOT NULL
+        AND ba.batch_id IS NULL
+        AND b.tenant_id = $1
       GROUP BY 1
       ORDER BY 1`;
-    const { rows } = await pool.query(q);
+    const { rows } = await pool.query(q, [req.tenantId]);
     res.json({ ok: true, rows });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
@@ -5458,14 +5834,16 @@ app.get('/admin/anchor/periods', async (req, res) => {
 app.get('/admin/anchor/last', async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT audit_id, bid_id,
-             to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS') AS created_utc,
-             (ipfs_cid IS NOT NULL) AS has_ipfs,
-             (leaf_hash IS NOT NULL) AS has_leaf,
-             batch_id
-      FROM bid_audits
-      ORDER BY audit_id DESC
-      LIMIT 10`);
+      SELECT ba.audit_id, ba.bid_id,
+             to_char(ba.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS') AS created_utc,
+             (ba.ipfs_cid IS NOT NULL) AS has_ipfs,
+             (ba.leaf_hash IS NOT NULL) AS has_leaf,
+             ba.batch_id
+      FROM bid_audits ba
+      JOIN bids b ON b.bid_id = ba.bid_id
+      WHERE b.tenant_id = $1
+      ORDER BY ba.audit_id DESC
+      LIMIT 10`, [req.tenantId]);
     res.json({ ok: true, rows });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
@@ -5479,10 +5857,12 @@ app.get('/admin/audit/recent', adminGuard, async (req, res) => {
       SELECT ba.created_at, ba.actor_role, ba.actor_wallet, ba.changes, ba.bid_id,
              ab.period_id, ab.tx_hash, ab.contract_addr, ab.chain_id
         FROM bid_audits ba
+        JOIN bids b ON b.bid_id = ba.bid_id
         LEFT JOIN audit_batches ab ON ab.id = ba.batch_id
+       WHERE b.tenant_id = $2
        ORDER BY ba.created_at DESC
-       LIMIT $1`, [take]);
-    res.set('Cache-Control','no-store');
+       LIMIT $1`, [take, req.tenantId]);
+    res.set('Cache-Control', 'no-store');
     res.json(rows);
   } catch (e) {
     res.status(500).json({ error: 'Failed to load recent audit' });
@@ -5492,11 +5872,12 @@ app.get('/admin/audit/recent', adminGuard, async (req, res) => {
 app.get('/admin/alerts', adminGuard, async (_req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT created_at, bid_id, changes
-        FROM bid_audits
-       WHERE changes ? 'ipfs_missing'
-       ORDER BY created_at DESC
-       LIMIT 100`);
+      SELECT ba.created_at, ba.bid_id, ba.changes
+        FROM bid_audits ba
+        JOIN bids b ON b.bid_id = ba.bid_id
+       WHERE ba.changes ? 'ipfs_missing' AND b.tenant_id = $1
+       ORDER BY ba.created_at DESC
+       LIMIT 100`, [req.tenantId]);
     res.json(rows.map(r => ({
       type: 'ipfs_missing',
       createdAt: r.created_at,
@@ -5553,7 +5934,7 @@ app.get('/templates/:idOrSlug', async (req, res) => {
 app.get('/admin/oversight', adminGuard, async (req, res) => {
   try {
     const out = {
-      tiles: { openProofs:0, breachingSla:0, pendingPayouts:{count:0,totalUSD:0}, escrowsLocked:0, p50CycleHours:0, revisionRatePct:0 },
+      tiles: { openProofs: 0, breachingSla: 0, pendingPayouts: { count: 0, totalUSD: 0 }, escrowsLocked: 0, p50CycleHours: 0, revisionRatePct: 0 },
       queue: [], vendors: [], alerts: [], recent: [], payouts: { pending: [], recent: [] }
     };
 
@@ -5565,13 +5946,13 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
           COUNT(*) FILTER (WHERE status='pending' AND submitted_at < NOW() - INTERVAL '48 hours') AS breaching
         FROM proofs
       `);
-      out.tiles.openProofs   = Number(rows[0].open_pending || 0);
+      out.tiles.openProofs = Number(rows[0].open_pending || 0);
       out.tiles.breachingSla = Number(rows[0].breaching || 0);
     }
 
     // tiles: pending payouts (ignore orphans)
-{
-  const { rows } = await pool.query(`
+    {
+      const { rows } = await pool.query(`
     SELECT
       COUNT(*)::int                            AS count,
       COALESCE(SUM(mp.amount_usd), 0)::numeric AS total_usd
@@ -5580,11 +5961,11 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
       AND EXISTS (SELECT 1 FROM bids b WHERE b.bid_id = mp.bid_id)
   `).catch(() => ({ rows: [{ count: 0, total_usd: 0 }] }));
 
-  out.tiles.pendingPayouts = {
-    count: Number(rows[0].count || 0),
-    totalUSD: Number(rows[0].total_usd || 0),
-  };
-}
+      out.tiles.pendingPayouts = {
+        count: Number(rows[0].count || 0),
+        totalUSD: Number(rows[0].total_usd || 0),
+      };
+    }
 
     // tiles: p50 approval cycle
     {
@@ -5594,7 +5975,7 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
                ) AS p50h
         FROM proofs
         WHERE status='approved' AND submitted_at IS NOT NULL
-      `).catch(() => ({ rows:[{ p50h:0 }] }));
+      `).catch(() => ({ rows: [{ p50h: 0 }] }));
       out.tiles.p50CycleHours = Number(rows[0].p50h || 0);
     }
 
@@ -5605,10 +5986,10 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
           COUNT(*) FILTER (WHERE status IN ('approved','rejected')) AS decided,
           COUNT(*) FILTER (WHERE status='rejected') AS rej
         FROM proofs
-      `).catch(() => ({ rows:[{ decided:0, rej:0 }] }));
-      const decided = Number(rows[0].decided||0);
-      const rej = Number(rows[0].rej||0);
-      out.tiles.revisionRatePct = decided ? Math.round(100*rej/decided) : 0;
+      `).catch(() => ({ rows: [{ decided: 0, rej: 0 }] }));
+      const decided = Number(rows[0].decided || 0);
+      const rej = Number(rows[0].rej || 0);
+      out.tiles.revisionRatePct = decided ? Math.round(100 * rej / decided) : 0;
     }
 
     // queue: oldest pending proofs
@@ -5627,10 +6008,10 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
         id: r.proof_id,
         vendor: r.vendor_name || r.wallet_address,
         project: r.project,
-        milestone: Number(r.milestone_index)+1,
-        ageHours: r.submitted_at ? Math.max(0,(Date.now()-new Date(r.submitted_at).getTime())/3600000) : null,
+        milestone: Number(r.milestone_index) + 1,
+        ageHours: r.submitted_at ? Math.max(0, (Date.now() - new Date(r.submitted_at).getTime()) / 3600000) : null,
         status: r.status,
-        risk: (r.submitted_at && (Date.now()-new Date(r.submitted_at).getTime()) > 48*3600000) ? 'sla' : null,
+        risk: (r.submitted_at && (Date.now() - new Date(r.submitted_at).getTime()) > 48 * 3600000) ? 'sla' : null,
         actions: { bidId: r.bid_id, proposalId: r.proposal_id }
       }));
     }
@@ -5654,11 +6035,11 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
       out.vendors = rows.map(r => ({
         vendor: r.vendor_name || '(unnamed)',
         wallet: r.wallet_address,
-        proofs: Number(r.proofs||0),
-        approved: Number(r.approved||0),
-        cr: Number(r.cr||0),
-        approvalPct: Number(r.proofs||0) ? Math.round(100*Number(r.approved||0)/Number(r.proofs||0)) : 0,
-        bids: Number(r.bids||0),
+        proofs: Number(r.proofs || 0),
+        approved: Number(r.approved || 0),
+        cr: Number(r.cr || 0),
+        approvalPct: Number(r.proofs || 0) ? Math.round(100 * Number(r.approved || 0) / Number(r.proofs || 0)) : 0,
+        bids: Number(r.bids || 0),
         lastActivity: r.last_activity
       }));
     }
@@ -5697,12 +6078,12 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
          LIMIT 20
       `).catch(() => ({ rows: [] }));
       out.payouts.pending = pend || [];
-      out.payouts.recent  = rec  || [];
+      out.payouts.recent = rec || [];
     }
 
- // recent activity = audits UNION released Safe payouts (so Safe shows up in Activity)
-{
-  const { rows } = await pool.query(`
+    // recent activity = audits UNION released Safe payouts (so Safe shows up in Activity)
+    {
+      const { rows } = await pool.query(`
     SELECT *
     FROM (
       -- A) existing audit entries
@@ -5739,10 +6120,10 @@ app.get('/admin/oversight', adminGuard, async (req, res) => {
     ORDER BY created_at DESC
     LIMIT 200
   `).catch(() => ({ rows: [] }));
-  out.recent = rows;
-}
+      out.recent = rows;
+    }
 
-    res.set('Cache-Control','no-store');
+    res.set('Cache-Control', 'no-store');
     res.json(out);
   } catch (e) {
     console.error('oversight error', e);
@@ -5776,7 +6157,7 @@ app.post('/admin/oversight/reconcile-payouts', adminGuard, async (req, res) => {
           // Transaction is confirmed and successful
           updatedCount++;
           // Mark this payout as released in the database
-   await pool.query(`
+          await pool.query(`
   UPDATE milestone_payments
      SET status='released',
          released_at=NOW(),
@@ -5855,12 +6236,12 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
       const iso = new Date().toISOString();
 
       // ✅ set ALL paid markers the UI checks
-      ms.paymentTxHash     = ms.paymentTxHash     || txResp.transactionHash;
+      ms.paymentTxHash = ms.paymentTxHash || txResp.transactionHash;
       ms.safePaymentTxHash = ms.safePaymentTxHash || row.safe_tx_hash; // keep Safe ref
-      ms.paymentDate       = ms.paymentDate       || iso;
-      ms.paidAt            = ms.paidAt            || ms.paymentDate;
-      ms.paymentPending    = false;
-      ms.status            = 'paid';
+      ms.paymentDate = ms.paymentDate || iso;
+      ms.paidAt = ms.paidAt || ms.paymentDate;
+      ms.paymentPending = false;
+      ms.status = 'paid';
 
       milestones[idx] = ms;
 
@@ -5899,19 +6280,19 @@ app.post('/admin/oversight/reconcile-safe', adminGuard, async (req, res) => {
       }
 
       // write an audit row so it appears under ACTIVITY
-try {
-  await writeAudit(row.bid_id, req, {
-    payment_released: {
-      milestone_index: idx,
-      amount_usd: row.amount_usd,
-      tx: txResp.transactionHash,
-      via: 'safe',
-      safe_tx_hash: row.safe_tx_hash
-    }
-  });
-} catch (e) {
-  console.warn('[reconcile-safe] audit failed', e?.message || e);
-}
+      try {
+        await writeAudit(row.bid_id, req, {
+          payment_released: {
+            milestone_index: idx,
+            amount_usd: row.amount_usd,
+            tx: txResp.transactionHash,
+            via: 'safe',
+            safe_tx_hash: row.safe_tx_hash
+          }
+        });
+      } catch (e) {
+        console.warn('[reconcile-safe] audit failed', e?.message || e);
+      }
 
       updated++;
     }
@@ -5958,11 +6339,11 @@ app.post('/admin/oversight/finalize-chain-tx', adminGuard, async (req, res) => {
     const ms = { ...(milestones[milestoneIndex] || {}) };
     const iso = new Date().toISOString();
 
-    ms.paymentTxHash  = ms.paymentTxHash || txHash;
-    ms.paymentDate    = ms.paymentDate || iso;
-    ms.paidAt         = ms.paidAt || ms.paymentDate;
+    ms.paymentTxHash = ms.paymentTxHash || txHash;
+    ms.paymentDate = ms.paymentDate || iso;
+    ms.paidAt = ms.paidAt || ms.paymentDate;
     ms.paymentPending = false;
-    ms.status         = 'paid';
+    ms.status = 'paid';
 
     milestones[milestoneIndex] = ms;
 
@@ -5985,7 +6366,7 @@ app.post('/admin/oversight/finalize-chain-tx', adminGuard, async (req, res) => {
       );
     }
 
-       // 5) Optional: notify
+    // 5) Optional: notify
     try {
       const { rows: [proposal] } = await pool.query(
         'SELECT * FROM proposals WHERE proposal_id=$1',
@@ -6100,7 +6481,7 @@ app.post('/admin/oversight/payouts/prune-orphans', adminGuard, async (req, res) 
 });
 
 // --- IPFS monitor: scans recent CIDs and records "ipfs_missing" once ----------
-const MONITOR_MINUTES       = Number(process.env.IPFS_MONITOR_INTERVAL_MIN || 15);  // 0 = disabled
+const MONITOR_MINUTES = Number(process.env.IPFS_MONITOR_INTERVAL_MIN || 15);  // 0 = disabled
 const MONITOR_LOOKBACK_DAYS = Number(process.env.IPFS_MONITOR_LOOKBACK_DAYS || 14);
 
 async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
@@ -6135,7 +6516,7 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
           AND changes ? 'ipfs_missing'
           AND changes->'ipfs_missing'->>'cid' = $2
         LIMIT 1`,
-      [ r.bid_id, cid ]
+      [r.bid_id, cid]
     );
     if (exists.length) continue;
 
@@ -6156,14 +6537,14 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
       `INSERT INTO bid_audits (bid_id, actor_role, actor_wallet, changes)
        VALUES ($1, 'system', NULL, $2)
        RETURNING audit_id`,
-      [ r.bid_id, payload ]
+      [r.bid_id, payload]
     );
-    if (typeof enrichAuditRow === 'function') enrichAuditRow(pool, ins.rows[0].audit_id).catch(()=>{});
+    if (typeof enrichAuditRow === 'function') enrichAuditRow(pool, ins.rows[0].audit_id).catch(() => { });
 
     // Notify admins (best-effort)
     const [{ rows: bRows }, { rows: pRows }] = await Promise.all([
-      pool.query('SELECT * FROM bids WHERE bid_id=$1', [ r.bid_id ]),
-      pool.query('SELECT p.* FROM bids b JOIN proposals p ON p.proposal_id=b.proposal_id WHERE b.bid_id=$1', [ r.bid_id ])
+      pool.query('SELECT * FROM bids WHERE bid_id=$1', [r.bid_id]),
+      pool.query('SELECT p.* FROM bids b JOIN proposals p ON p.proposal_id=b.proposal_id WHERE b.bid_id=$1', [r.bid_id])
     ]);
     await notifyIpfsMissing({ bid: bRows[0], proposal: pRows[0], cid, where: source });
 
@@ -6179,7 +6560,7 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
 
   for (const pr of proofRows) {
     const files = Array.isArray(pr.files) ? pr.files :
-                  (typeof pr.files === 'string' ? JSON.parse(pr.files || '[]') : []);
+      (typeof pr.files === 'string' ? JSON.parse(pr.files || '[]') : []);
     for (const f of files) {
       const cid = extractCidFromUrl(f?.url);
       if (!cid) continue;
@@ -6197,7 +6578,7 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
             AND changes ? 'ipfs_missing'
             AND changes->'ipfs_missing'->>'cid' = $2
           LIMIT 1`,
-        [ pr.bid_id, cid ]
+        [pr.bid_id, cid]
       );
       if (exists.length) continue;
 
@@ -6219,13 +6600,13 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
         `INSERT INTO bid_audits (bid_id, actor_role, actor_wallet, changes)
          VALUES ($1, 'system', NULL, $2)
          RETURNING audit_id`,
-        [ pr.bid_id, payload ]
+        [pr.bid_id, payload]
       );
-      if (typeof enrichAuditRow === 'function') enrichAuditRow(pool, ins.rows[0].audit_id).catch(()=>{});
+      if (typeof enrichAuditRow === 'function') enrichAuditRow(pool, ins.rows[0].audit_id).catch(() => { });
 
       const [{ rows: bRows }, { rows: pRows }] = await Promise.all([
-        pool.query('SELECT * FROM bids WHERE bid_id=$1', [ pr.bid_id ]),
-        pool.query('SELECT p.* FROM bids b JOIN proposals p ON p.proposal_id=b.proposal_id WHERE b.bid_id=$1', [ pr.bid_id ])
+        pool.query('SELECT * FROM bids WHERE bid_id=$1', [pr.bid_id]),
+        pool.query('SELECT p.* FROM bids b JOIN proposals p ON p.proposal_id=b.proposal_id WHERE b.bid_id=$1', [pr.bid_id])
       ]);
       await notifyIpfsMissing({
         bid: bRows[0],
@@ -6240,7 +6621,7 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
     }
   }
 
-  console.log(`[ipfs-monitor] lookback=${days}d checked=${checked} flagged=${flagged} in ${Date.now()-started}ms`);
+  console.log(`[ipfs-monitor] lookback=${days}d checked=${checked} flagged=${flagged} in ${Date.now() - started}ms`);
   return { checked, flagged, days };
 }
 
@@ -6257,8 +6638,8 @@ app.get('/admin/ipfs/monitor-run', allowCron, async (req, res) => {
 
 // Optional: auto-run every MONITOR_MINUTES (single global timer; no per-project cron)
 if (MONITOR_MINUTES > 0) {
-  setTimeout(() => runIpfsMonitor().catch(()=>{}), 10_000); // first run ~10s after boot
-  setInterval(() => runIpfsMonitor().catch(()=>{}), MONITOR_MINUTES * 60 * 1000);
+  setTimeout(() => runIpfsMonitor().catch(() => { }), 10_000); // first run ~10s after boot
+  setInterval(() => runIpfsMonitor().catch(() => { }), MONITOR_MINUTES * 60 * 1000);
   console.log(`[ipfs-monitor] enabled: every ${MONITOR_MINUTES} min, lookback ${MONITOR_LOOKBACK_DAYS} days`);
 } else {
   console.log('[ipfs-monitor] disabled (IPFS_MONITOR_INTERVAL_MIN=0)');
@@ -6331,16 +6712,16 @@ async function autoReconcileSafeTransactionsOnce() {
           : JSON.parse(bids[0].milestones || '[]');
 
         const idx = row.milestone_index;
-        const ms  = { ...(arr[idx] || {}) };
+        const ms = { ...(arr[idx] || {}) };
         const iso = new Date().toISOString();
 
         // set ALL paid markers your UI checks
-        ms.paymentTxHash     = ms.paymentTxHash     || txResp.transactionHash;
+        ms.paymentTxHash = ms.paymentTxHash || txResp.transactionHash;
         ms.safePaymentTxHash = ms.safePaymentTxHash || row.safe_tx_hash;
-        ms.paymentDate       = ms.paymentDate       || iso;
-        ms.paidAt            = ms.paidAt            || iso;
-        ms.paymentPending    = false;
-        ms.status            = 'paid';
+        ms.paymentDate = ms.paymentDate || iso;
+        ms.paidAt = ms.paidAt || iso;
+        ms.paymentPending = false;
+        ms.status = 'paid';
 
         arr[idx] = ms;
 
@@ -6385,9 +6766,9 @@ async function autoReconcileSafeTransactionsOnce() {
 if (SAFE_RECONCILE_MINUTES > 0) {
   if (!global.__SAFE_RECONCILER_STARTED__) {
     global.__SAFE_RECONCILER_STARTED__ = true;
-    setTimeout(() => autoReconcileSafeTransactionsOnce().catch(() => {}), 30_000); // first run after 30s
+    setTimeout(() => autoReconcileSafeTransactionsOnce().catch(() => { }), 30_000); // first run after 30s
     setInterval(
-      () => autoReconcileSafeTransactionsOnce().catch(() => {}),
+      () => autoReconcileSafeTransactionsOnce().catch(() => { }),
       SAFE_RECONCILE_MINUTES * 60 * 1000
     );
     console.log(`[safe-reconcile] enabled: every ${SAFE_RECONCILE_MINUTES} minutes`);
@@ -6441,7 +6822,7 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
     // 1. Extract Text from the BID PDF (The Vendor's Offer)
     // ==================================================================
     let bidPdfText = "No bid PDF attached.";
-    
+
     let bidRawFiles = Array.isArray(bid.files) ? bid.files : (bid.files ? JSON.parse(bid.files) : []);
     if (bid.doc) {
       const d = typeof bid.doc === 'string' ? JSON.parse(bid.doc) : bid.doc;
@@ -6455,7 +6836,7 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
 
     if (bidPdfFile && bidPdfFile.url) {
       try {
-        const cleanUrl = bidPdfFile.url.trim().replace(/[.,;]+$/, ""); 
+        const cleanUrl = bidPdfFile.url.trim().replace(/[.,;]+$/, "");
         const info = await withTimeout(
           waitForPdfInfoFromDoc({ ...bidPdfFile, url: cleanUrl }), 8000, () => ({ used: false, reason: 'timeout' })
         );
@@ -6471,7 +6852,7 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
     let proposalPdfText = "No proposal PDF attached.";
 
     let propRawFiles = Array.isArray(proposal.docs) ? proposal.docs : (proposal.docs ? JSON.parse(proposal.docs) : []);
-    
+
     const propPdfFile = propRawFiles.find(f => {
       const n = (f.name || f.url || '').toLowerCase();
       return n.endsWith('.pdf') || n.includes('.pdf?') || (f.mimetype || '').includes('pdf');
@@ -6479,7 +6860,7 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
 
     if (propPdfFile && propPdfFile.url) {
       try {
-        const cleanUrl = propPdfFile.url.trim().replace(/[.,;]+$/, ""); 
+        const cleanUrl = propPdfFile.url.trim().replace(/[.,;]+$/, "");
         const info = await withTimeout(
           waitForPdfInfoFromDoc({ ...propPdfFile, url: cleanUrl }), 8000, () => ({ used: false, reason: 'timeout' })
         );
@@ -6508,16 +6889,16 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
 
       if (pdfFile && pdfFile.url) {
         try {
-const info = await withTimeout(
-  waitForPdfInfoFromDoc({ 
-    // 🛡️ FIX: Remove trailing dot/punctuation before downloading
-    url: (pdfFile.url || "").trim().replace(/[.,;]+$/, ""), 
-    name: pdfFile.name || 'attachment.pdf', 
-    mimetype: 'application/pdf' 
-  }),
-  8000,
-  () => ({ used: false, reason: 'timeout' })
-);
+          const info = await withTimeout(
+            waitForPdfInfoFromDoc({
+              // 🛡️ FIX: Remove trailing dot/punctuation before downloading
+              url: (pdfFile.url || "").trim().replace(/[.,;]+$/, ""),
+              name: pdfFile.name || 'attachment.pdf',
+              mimetype: 'application/pdf'
+            }),
+            8000,
+            () => ({ used: false, reason: 'timeout' })
+          );
           if (info.used) {
             const txt = (info.text || '').slice(0, 6000);
             pdfNote = `PDF EXTRACT (truncated): """${txt}"""`;
@@ -6525,7 +6906,7 @@ const info = await withTimeout(
             pdfNote = `No PDF text available (reason: ${info.reason || 'unknown'})`;
           }
         } catch (e) {
-          pdfNote = `PDF extraction failed (${String(e).slice(0,120)})`;
+          pdfNote = `PDF extraction failed (${String(e).slice(0, 120)})`;
         }
       }
 
@@ -6557,9 +6938,9 @@ const info = await withTimeout(
     // Build chat context with **bid + proofs**
     const ai = coerceJson(bid.ai_analysis);
     const proofsBlock = proofsCtx.length
-  ? proofsCtx.map((p, i) => {
-      const filesList = (p.files || []).map(f => `- ${f.name || 'file'}: ${f.url}`).join('\n') || '(none)';
-      return `
+      ? proofsCtx.map((p, i) => {
+        const filesList = (p.files || []).map(f => `- ${f.name || 'file'}: ${f.url}`).join('\n') || '(none)';
+        return `
 Proof #${i + 1} — Milestone ${Number(p.milestoneIndex) + 1}: ${p.title}
 Description (truncated):
 """${p.description}"""
@@ -6570,11 +6951,11 @@ IMAGE/VIDEO METADATA:
 ${p.metaNote}
 
 ${p.pdfNote}`.trim();
-    }).join('\n\n')
-  : '(no proofs submitted for this bid)';
+      }).join('\n\n')
+      : '(no proofs submitted for this bid)';
 
- const systemContext =
-`You are Agent2 for LithiumX.
+    const systemContext =
+      `You are Agent2 for LithiumX.
 
 --- PROPOSAL DETAILS ---
 Org: ${proposal.org_name || ""}
@@ -6605,14 +6986,14 @@ Instruction:
 - Be concise.`;
 
     // One last user line to steer the answer
-const lastUserText =
-  String(userMessages.at(-1)?.content || '').trim() ||
-  'Analyze all provided materials, especially the images.';
+    const lastUserText =
+      String(userMessages.at(-1)?.content || '').trim() ||
+      'Analyze all provided materials, especially the images.';
 
-// BEFORE images from the proposal docs
-const proposalImages = collectProposalImages(proposal);
+    // BEFORE images from the proposal docs
+    const proposalImages = collectProposalImages(proposal);
 
-// Decide vision vs. text (compare BEFORE vs AFTER when any images exist)
+    // Decide vision vs. text (compare BEFORE vs AFTER when any images exist)
     let stream;
     if ((imageFiles.length > 0) || (proposalImages.length > 0)) {
       const systemMsg = `
@@ -6639,15 +7020,15 @@ Rules: Be concrete and cite visible cues.
         try {
           // 2. Clean URL
           const url = (f.url || "").trim().replace(/[.,;]+$/, "");
-          
+
           // 3. Download on YOUR server (Reliable)
           // We use your existing 'fetchAsBuffer' which handles retries/timeouts
           const buf = await fetchAsBuffer(url);
-          
+
           // 4. Convert to Base64
           const b64 = buf.toString('base64');
           let finalMime = mime.startsWith("image/") ? mime : "image/jpeg"; // Fallback
-          
+
           return { type: 'image_url', image_url: { url: `data:${finalMime};base64,${b64}` } };
         } catch (e) {
           console.warn(`[Vision] Skipped unreadable image ${f.url}:`, e.message);
@@ -6659,7 +7040,7 @@ Rules: Be concrete and cite visible cues.
       // Process BEFORE Images (Limit to 3 to keep payload size manageable)
       const beforeProcessed = await Promise.all(proposalImages.slice(0, 3).map(urlToContent));
       const validBefore = beforeProcessed.filter(Boolean);
-      
+
       if (validBefore.length > 0) {
         userVisionContent.push({ type: 'text', text: 'BEFORE (from proposal):' });
         userVisionContent.push(...validBefore);
@@ -6706,44 +7087,44 @@ Rules: Be concrete and cite visible cues.
       });
     }
 
-// === SSE streaming loop (buffer + footer) ===
-let fullText = '';
-for await (const part of stream) {
-  const token = part?.choices?.[0]?.delta?.content || '';
-  if (token) {
-    fullText += token;
-    res.write(`data: ${token}\n\n`);
-  }
-}
+    // === SSE streaming loop (buffer + footer) ===
+    let fullText = '';
+    for await (const part of stream) {
+      const token = part?.choices?.[0]?.delta?.content || '';
+      if (token) {
+        fullText += token;
+        res.write(`data: ${token}\n\n`);
+      }
+    }
 
-// ---- Post-stream footer: confidence floor + Next checks ----
-const conf = extractConfidenceFromText(fullText);
-const hasAnyPdfText = proofsCtx.some(p => /^PDF EXTRACT/i.test(p.pdfNote || ''));
-const nextChecks = buildNextChecks({ hasAnyPdfText, imageCount: imageFiles.length });
+    // ---- Post-stream footer: confidence floor + Next checks ----
+    const conf = extractConfidenceFromText(fullText);
+    const hasAnyPdfText = proofsCtx.some(p => /^PDF EXTRACT/i.test(p.pdfNote || ''));
+    const nextChecks = buildNextChecks({ hasAnyPdfText, imageCount: imageFiles.length });
 
-if (conf !== null && conf < 0.35) {
-  res.write(`data: \n\n`);
-  res.write(`data: 🔎 Needs human review (low confidence: ${conf.toFixed(2)})\n\n`);
-}
+    if (conf !== null && conf < 0.35) {
+      res.write(`data: \n\n`);
+      res.write(`data: 🔎 Needs human review (low confidence: ${conf.toFixed(2)})\n\n`);
+    }
 
-if (nextChecks.length) {
-  res.write(`data: \n\n`);
-  res.write(`data: Next checks:\n\n`);
-  for (const item of nextChecks) {
-    res.write(`data: • ${item}\n\n`);
-  }
-}
+    if (nextChecks.length) {
+      res.write(`data: \n\n`);
+      res.write(`data: Next checks:\n\n`);
+      for (const item of nextChecks) {
+        res.write(`data: • ${item}\n\n`);
+      }
+    }
 
-res.write(`data: [DONE]\n\n`);
-res.end();
-} catch (err) {
-  console.error('Bid chat SSE error:', err);
-  try {
-    res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`);
     res.write(`data: [DONE]\n\n`);
     res.end();
-  } catch {}
-}
+  } catch (err) {
+    console.error('Bid chat SSE error:', err);
+    try {
+      res.write(`data: ERROR ${String(err).slice(0, 200)}\n\n`);
+      res.write(`data: [DONE]\n\n`);
+      res.end();
+    } catch { }
+  }
 });
 
 // --- Agent2 Chat about a PROOF (uses bid + proof + extracted PDF text) -----
@@ -6753,19 +7134,19 @@ app.post('/agent2/chat', adminGuard, async (req, res) => {
     if (!message) return res.status(400).json({ error: 'Missing message' });
 
     // Load proof if provided (and derive bidId if needed)
-const proofId = Number(rawProofId);
-let proof = null;
-if (Number.isFinite(proofId)) {
-  const { rows } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
-  proof = rows[0] || null;
-}
+    const proofId = Number(rawProofId);
+    let proof = null;
+    if (Number.isFinite(proofId)) {
+      const { rows } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
+      proof = rows[0] || null;
+    }
 
-let bidId = Number(rawBidId);
-if (!Number.isFinite(bidId) && proof) bidId = Number(proof.bid_id);
+    let bidId = Number(rawBidId);
+    if (!Number.isFinite(bidId) && proof) bidId = Number(proof.bid_id);
 
-if (!Number.isFinite(bidId)) {
-  return res.status(400).json({ error: 'Provide bidId or a proofId that belongs to a bid' });
-}
+    if (!Number.isFinite(bidId)) {
+      return res.status(400).json({ error: 'Provide bidId or a proofId that belongs to a bid' });
+    }
 
     // Load bid + proposal for context
     const { rows: br } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [bidId]);
@@ -6776,10 +7157,10 @@ if (!Number.isFinite(bidId)) {
     const proposal = pr[0] || null;
 
     // Collect proof text (description + any PDF text) — you likely already have this above; keep it once.
-const proofDesc = String(proof?.description || '').trim();
-let files = Array.isArray(proof?.files)
-  ? proof.files
-  : (typeof proof?.files === 'string' ? JSON.parse(proof.files || '[]') : []);
+    const proofDesc = String(proof?.description || '').trim();
+    let files = Array.isArray(proof?.files)
+      ? proof.files
+      : (typeof proof?.files === 'string' ? JSON.parse(proof.files || '[]') : []);
 
     // Build strict context
     const context = [
@@ -6810,16 +7191,16 @@ let files = Array.isArray(proof?.files)
         description: proofDesc.slice(0, 4000),
         files: files.map(f => ({ name: f.name, url: f.url })),
       }, null, 2),
-            '',
+      '',
       '--- IMAGE/VIDEO METADATA ---',
-metaBlock,
-'',
-'--- KNOWN LOCATION ---',
-locationBlock,
-'',
-pdfText
-  ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText.slice(0, 15000)}`
-  : `--- NO PDF TEXT AVAILABLE ---`,
+      metaBlock,
+      '',
+      '--- KNOWN LOCATION ---',
+      locationBlock,
+      '',
+      pdfText
+        ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText.slice(0, 15000)}`
+        : `--- NO PDF TEXT AVAILABLE ---`,
     ].join('\n');
 
     if (!openai) return res.status(503).json({ error: 'OpenAI not configured' });
@@ -6871,11 +7252,12 @@ app.post('/bids/:id/analyze', adminOrBidOwnerGuard, async (req, res) => {
     if (!proposal) return res.status(404).json({ error: 'Proposal not found' });
 
     const promptOverride = typeof req.body?.prompt === 'string' ? req.body.prompt : '';
-    const analysis = await runAgent2OnBid(bid, proposal, { promptOverride });
+    const analysis = await runAgent2OnBid(bid, proposal, { promptOverride, tenantId: req.tenantId });
 
-    await pool.query('UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2', [
+    await pool.query('UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2 AND tenant_id=$3', [
       JSON.stringify(analysis),
       bidId,
+      req.tenantId
     ]);
 
     const { rows: updated } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [bidId]);
@@ -6917,26 +7299,26 @@ app.get("/proofs", async (req, res) => {
     let rows;
     if (Number.isFinite(bidId)) {
       ({ rows } = await pool.query(
-        `${selectSql} WHERE p.bid_id = $1 ORDER BY p.proof_id ASC`,
-        [bidId]
+        `${selectSql} WHERE p.bid_id = $1 AND p.tenant_id = $2 ORDER BY p.proof_id ASC`,
+        [bidId, req.tenantId]
       ));
     } else {
       ({ rows } = await pool.query(
         `${selectSql}
          JOIN bids b ON b.bid_id = p.bid_id
-         WHERE b.proposal_id = $1
+         WHERE b.proposal_id = $1 AND b.tenant_id = $2
          ORDER BY p.proof_id ASC`,
-        [proposalId]
+        [proposalId, req.tenantId]
       ));
     }
 
     // normalize for the frontend
     const out = await Promise.all(rows.map(async r => {
       const o = toCamel(r);
-      o.files      = coerceJson(o.files)      || [];
-      o.fileMeta   = coerceJson(o.fileMeta)   || [];
+      o.files = coerceJson(o.files) || [];
+      o.fileMeta = coerceJson(o.fileMeta) || [];
       o.aiAnalysis = coerceJson(o.aiAnalysis) || null;
-      o.geo        = await buildSafeGeoForProof(o);
+      o.geo = await buildSafeGeoForProof(o);
 
       // FIX: Explicitly set 'paid' flag if we found a hash or 'released' status
       if (o.paymentTxHash || o.paymentStatus === 'released') {
@@ -6960,16 +7342,16 @@ app.post("/proofs/:id/approve", adminGuard, async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid proof id" });
 
-    const { rows: cur } = await pool.query(`SELECT * FROM proofs WHERE proof_id=$1`, [id]);
+    const { rows: cur } = await pool.query(`SELECT * FROM proofs WHERE proof_id=$1 AND tenant_id=$2`, [id, req.tenantId]);
     const proof = cur[0];
     if (!proof) return res.status(404).json({ error: "Proof not found" });
 
     const { rows: upd } = await pool.query(
       `UPDATE proofs
           SET status='approved', approved_at=NOW(), updated_at=NOW()
-        WHERE proof_id=$1
+        WHERE proof_id=$1 AND tenant_id=$2
       RETURNING *`,
-      [id]
+      [id, req.tenantId]
     );
     const updated = upd[0];
 
@@ -6979,13 +7361,13 @@ app.post("/proofs/:id/approve", adminGuard, async (req, res) => {
 
     // notify
     const [{ rows: bRows }, { rows: pRows }] = await Promise.all([
-      pool.query(`SELECT * FROM bids WHERE bid_id=$1`, [ proof.bid_id ]),
-      pool.query(`SELECT * FROM proposals WHERE proposal_id=(SELECT proposal_id FROM bids WHERE bid_id=$1)`, [ proof.bid_id ])
+      pool.query(`SELECT * FROM bids WHERE bid_id=$1`, [proof.bid_id]),
+      pool.query(`SELECT * FROM proposals WHERE proposal_id=(SELECT proposal_id FROM bids WHERE bid_id=$1)`, [proof.bid_id])
     ]);
     if (typeof notifyProofApproved === "function") {
       const bid = bRows[0]; const proposal = pRows[0];
       const msIndex = Number(updated.milestone_index) + 1;
-      notifyProofApproved({ proof: updated, bid, proposal, msIndex }).catch(() => {});
+      notifyProofApproved({ proof: updated, bid, proposal, msIndex }).catch(() => { });
     }
 
     res.json(toCamel(updated));
@@ -7001,16 +7383,16 @@ app.post("/proofs/:id/reject", adminGuard, async (req, res) => {
     const reason = String(req.body?.reason || "").trim() || null;
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid proof id" });
 
-    const { rows: cur } = await pool.query(`SELECT * FROM proofs WHERE proof_id=$1`, [id]);
+    const { rows: cur } = await pool.query(`SELECT * FROM proofs WHERE proof_id=$1 AND tenant_id=$2`, [id, req.tenantId]);
     const proof = cur[0];
     if (!proof) return res.status(404).json({ error: "Proof not found" });
 
     const { rows: upd } = await pool.query(
       `UPDATE proofs
           SET status='rejected', updated_at=NOW()
-        WHERE proof_id=$1
+        WHERE proof_id=$1 AND tenant_id=$2
       RETURNING *`,
-      [id]
+      [id, req.tenantId]
     );
 
     await writeAudit(Number(proof.bid_id), req, {
@@ -7029,7 +7411,7 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
   try {
     const bidId = req.params.bidId;
     const idx = parseInt(req.params.index, 10);
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
 
     const bid = rows[0];
@@ -7037,7 +7419,7 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
     if (!milestones[idx]) return res.status(400).json({ error: "Invalid index" });
 
     milestones[idx].completed = true;
-    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [ JSON.stringify(milestones), bidId ]);
+    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
     res.json({ success: true, milestones });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -7047,7 +7429,7 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
 // ==============================
 // Routes — Complete/Pay milestone (frontend-compatible)
 // ==============================
-  app.post("/bids/:id/complete-milestone", adminOrBidOwnerGuard, async (req, res) => {
+app.post("/bids/:id/complete-milestone", adminOrBidOwnerGuard, async (req, res) => {
   const bidId = Number(req.params.id);
   const { milestoneIndex, proof } = req.body || {};
   if (!Number.isFinite(bidId)) return res.status(400).json({ error: "Invalid bid id" });
@@ -7055,7 +7437,7 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
     return res.status(400).json({ error: "Invalid milestoneIndex" });
   }
   try {
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
 
     const bid = rows[0];
@@ -7067,10 +7449,10 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
     ms.completionDate = new Date().toISOString();
     if (typeof proof === "string" && proof.trim()) ms.proof = proof.trim();
 
-    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [ JSON.stringify(milestones), bidId ]);
+    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
     await writeAudit(bidId, req, {
-  milestone_completed: { index: milestoneIndex, completionDate: ms.completionDate, proof: !!proof }
-});
+      milestone_completed: { index: milestoneIndex, completionDate: ms.completionDate, proof: !!proof }
+    });
 
     // --- BEGIN: approve latest proof for this milestone + notify ---
     if (NOTIFY_ENABLED) {
@@ -7082,7 +7464,7 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
             WHERE bid_id = $1 AND milestone_index = $2
             ORDER BY proof_id DESC
             LIMIT 1`,
-          [ bidId, milestoneIndex ]
+          [bidId, milestoneIndex]
         );
         const latest = proofs[0];
 
@@ -7093,14 +7475,14 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
                SET status = 'approved', updated_at = NOW()
              WHERE proof_id = $1
              RETURNING *`,
-            [ latest.proof_id ]
+            [latest.proof_id]
           );
           const updatedProof = upd[0];
           await writeAudit(bidId, req, { proof_approved: { index: milestoneIndex, proofId: updatedProof.proof_id } });
 
           // 3) Load proposal and fire the existing "proof approved" notifier
           const { rows: [proposal] } =
-            await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [ bid.proposal_id ]);
+            await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [bid.proposal_id]);
 
           if (proposal && typeof notifyProofApproved === "function") {
             console.log("[notify] approve about to send", {
@@ -7117,12 +7499,12 @@ app.put("/milestones/:bidId/:index/complete", async (req, res) => {
           }
         }
       } catch (e) {
-        console.warn("notifyProofApproved via /complete-milestone failed:", String(e).slice(0,200));
+        console.warn("notifyProofApproved via /complete-milestone failed:", String(e).slice(0, 200));
       }
     }
     // --- END: approve latest proof for this milestone + notify ---
 
-    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
+    const { rows: updated } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
     return res.json(toCamel(updated[0]));
   } catch (err) {
     console.error("complete-milestone error", err);
@@ -7179,7 +7561,7 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
     `);
 
     // 1) Load bid + milestone; bail if not ready
-    const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1 AND tenant_id=$2", [bidId, req.tenantId]);
     const bid = bids[0];
     if (!bid) return res.status(404).json({ error: "Bid not found" });
 
@@ -7266,416 +7648,416 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
         // Preferred stablecoin symbol (e.g. USDT/USDC)
         const token = String(bid.preferred_stablecoin || "USDT").toUpperCase();
 
-// ---------- SAFE PATH (EIP-712; direct POST; sep base; checksummed addr; hard self-verify) ----------
-if (willUseSafe) {
-  try {
-    const RPC_URL = process.env.SEPOLIA_RPC_URL;
-    const SAFE_API_KEY = process.env.SAFE_API_KEY;
-    const SAFE_ADDRESS_CS = ethers.utils.getAddress(String(process.env.SAFE_ADDRESS || "").trim()); // checksummed
-    const TX_SERVICE_BASE = (process.env.SAFE_TXSERVICE_URL || "https://api.safe.global/tx-service/sep")
-      .trim()
-      .replace(/\/+$/, "");
+        // ---------- SAFE PATH (EIP-712; direct POST; sep base; checksummed addr; hard self-verify) ----------
+        if (willUseSafe) {
+          try {
+            const RPC_URL = process.env.SEPOLIA_RPC_URL;
+            const SAFE_API_KEY = process.env.SAFE_API_KEY;
+            const SAFE_ADDRESS_CS = ethers.utils.getAddress(String(process.env.SAFE_ADDRESS || "").trim()); // checksummed
+            const TX_SERVICE_BASE = (process.env.SAFE_TXSERVICE_URL || "https://api.safe.global/tx-service/sep")
+              .trim()
+              .replace(/\/+$/, "");
 
-    if (!RPC_URL) throw new Error("SEPOLIA_RPC_URL not configured");
-    if (!SAFE_API_KEY) throw new Error("SAFE_API_KEY not configured");
-    if (!SAFE_ADDRESS_CS) throw new Error("SAFE_ADDRESS not configured");
+            if (!RPC_URL) throw new Error("SEPOLIA_RPC_URL not configured");
+            if (!SAFE_API_KEY) throw new Error("SAFE_API_KEY not configured");
+            if (!SAFE_ADDRESS_CS) throw new Error("SAFE_ADDRESS not configured");
 
-    const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
+            const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
 
-    // Minimal Safe ABI to read owners/nonce
-    const SAFE_ABI = [
-      "function getOwners() view returns (address[])",
-      "function nonce() view returns (uint256)"
-    ];
-    const ZERO = "0x0000000000000000000000000000000000000000";
-    const safeContract = new ethers.Contract(SAFE_ADDRESS_CS, SAFE_ABI, provider);
+            // Minimal Safe ABI to read owners/nonce
+            const SAFE_ABI = [
+              "function getOwners() view returns (address[])",
+              "function nonce() view returns (uint256)"
+            ];
+            const ZERO = "0x0000000000000000000000000000000000000000";
+            const safeContract = new ethers.Contract(SAFE_ADDRESS_CS, SAFE_ABI, provider);
 
-    // 1) pick a Safe owner key from env
-    const rawKeys = (process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
-      .split(",").map(s => s.trim()).filter(Boolean)
-      .map(k => (k.startsWith("0x") ? k : `0x${k}`));
-    if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured");
+            // 1) pick a Safe owner key from env
+            const rawKeys = (process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
+              .split(",").map(s => s.trim()).filter(Boolean)
+              .map(k => (k.startsWith("0x") ? k : `0x${k}`));
+            if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured");
 
-    // 2) verify signer is an owner
-    const ownersLc = (await safeContract.getOwners()).map(a => a.toLowerCase());
-    console.log("[SAFE] owners (lc):", ownersLc);
+            // 2) verify signer is an owner
+            const ownersLc = (await safeContract.getOwners()).map(a => a.toLowerCase());
+            console.log("[SAFE] owners (lc):", ownersLc);
 
-    let signerWallet = null;
-    for (const k of rawKeys) {
-      const w = new ethers.Wallet(k, provider);
-      if (ownersLc.includes(w.address.toLowerCase())) { signerWallet = w; break; }
-    }
-    if (!signerWallet) throw new Error(`None of the provided keys is a Safe owner. Owners: ${ownersLc.join(", ")}`);
-    const senderAddr = await signerWallet.getAddress();
-    console.log("[SAFE] using signer (owner):", senderAddr);
+            let signerWallet = null;
+            for (const k of rawKeys) {
+              const w = new ethers.Wallet(k, provider);
+              if (ownersLc.includes(w.address.toLowerCase())) { signerWallet = w; break; }
+            }
+            if (!signerWallet) throw new Error(`None of the provided keys is a Safe owner. Owners: ${ownersLc.join(", ")}`);
+            const senderAddr = await signerWallet.getAddress();
+            console.log("[SAFE] using signer (owner):", senderAddr);
 
-    // 3) resolve token + amount
-    const tokenMeta = (TOKENS && TOKENS[token]) || {};
-    const tokenAddr = tokenMeta.address;
-    const tokenDec  = Number.isInteger(tokenMeta.decimals) ? tokenMeta.decimals : 6;
-    if (!tokenAddr) throw new Error(`Unknown token ${token} (no address in TOKENS)`);
+            // 3) resolve token + amount
+            const tokenMeta = (TOKENS && TOKENS[token]) || {};
+            const tokenAddr = tokenMeta.address;
+            const tokenDec = Number.isInteger(tokenMeta.decimals) ? tokenMeta.decimals : 6;
+            if (!tokenAddr) throw new Error(`Unknown token ${token} (no address in TOKENS)`);
 
-    const amountUnits = typeof toTokenUnits === "function"
-      ? await toTokenUnits(token, msAmountUSD)
-      : ethers.utils.parseUnits(String(msAmountUSD), tokenDec);
+            const amountUnits = typeof toTokenUnits === "function"
+              ? await toTokenUnits(token, msAmountUSD)
+              : ethers.utils.parseUnits(String(msAmountUSD), tokenDec);
 
-    // 4) encode ERC20.transfer(to, amount)
-    const erc20Iface = new ethers.utils.Interface(ERC20_ABI);
-    const data = erc20Iface.encodeFunctionData("transfer", [ bid.wallet_address, amountUnits ]);
-    if (typeof data !== "string" || !data.startsWith("0x")) throw new Error("[SAFE] invalid ERC20.transfer data");
+            // 4) encode ERC20.transfer(to, amount)
+            const erc20Iface = new ethers.utils.Interface(ERC20_ABI);
+            const data = erc20Iface.encodeFunctionData("transfer", [bid.wallet_address, amountUnits]);
+            if (typeof data !== "string" || !data.startsWith("0x")) throw new Error("[SAFE] invalid ERC20.transfer data");
 
-    // 5) EIP-712 typed data (SafeTx)
-    const chainId = 11155111; // Sepolia
-    const op = 0; // CALL
-    const nonceBn = await safeContract.nonce();
-    const nonce = ethers.BigNumber.isBigNumber(nonceBn) ? nonceBn.toNumber() : Number(nonceBn);
-    if (!Number.isFinite(nonce)) throw new Error("[SAFE] invalid Safe nonce");
+            // 5) EIP-712 typed data (SafeTx)
+            const chainId = 11155111; // Sepolia
+            const op = 0; // CALL
+            const nonceBn = await safeContract.nonce();
+            const nonce = ethers.BigNumber.isBigNumber(nonceBn) ? nonceBn.toNumber() : Number(nonceBn);
+            if (!Number.isFinite(nonce)) throw new Error("[SAFE] invalid Safe nonce");
 
-    const domain = { chainId, verifyingContract: SAFE_ADDRESS_CS };
-    const types = {
-      SafeTx: [
-        { name: "to",              type: "address" },
-        { name: "value",           type: "uint256" },
-        { name: "data",            type: "bytes" },
-        { name: "operation",       type: "uint8" },
-        { name: "safeTxGas",       type: "uint256" },
-        { name: "baseGas",         type: "uint256" },
-        { name: "gasPrice",        type: "uint256" },
-        { name: "gasToken",        type: "address" },
-        { name: "refundReceiver",  type: "address" },
-        { name: "nonce",           type: "uint256" }
-      ]
-    };
-    const value = {
-      to: tokenAddr,
-      value: "0",
-      data,
-      operation: op,
-      safeTxGas: "0",
-      baseGas: "0",
-      gasPrice: "0",
-      gasToken: ZERO,
-      refundReceiver: ZERO,
-      nonce: String(nonce)
-    };
+            const domain = { chainId, verifyingContract: SAFE_ADDRESS_CS };
+            const types = {
+              SafeTx: [
+                { name: "to", type: "address" },
+                { name: "value", type: "uint256" },
+                { name: "data", type: "bytes" },
+                { name: "operation", type: "uint8" },
+                { name: "safeTxGas", type: "uint256" },
+                { name: "baseGas", type: "uint256" },
+                { name: "gasPrice", type: "uint256" },
+                { name: "gasToken", type: "address" },
+                { name: "refundReceiver", type: "address" },
+                { name: "nonce", type: "uint256" }
+              ]
+            };
+            const value = {
+              to: tokenAddr,
+              value: "0",
+              data,
+              operation: op,
+              safeTxGas: "0",
+              baseGas: "0",
+              gasPrice: "0",
+              gasToken: ZERO,
+              refundReceiver: ZERO,
+              nonce: String(nonce)
+            };
 
-    // 6) sign typed data and SELF-VERIFY (EIP-712)
-    const signatureRaw = await signerWallet._signTypedData(domain, types, value); // 65-byte sig
-    const recovered = ethers.utils.verifyTypedData(domain, types, value, signatureRaw);
-    if (recovered.toLowerCase() !== senderAddr.toLowerCase()) {
-      throw new Error(`[SAFE] EIP-712 signature mismatch BEFORE POST: recovered ${recovered}, expected ${senderAddr}`);
-    }
+            // 6) sign typed data and SELF-VERIFY (EIP-712)
+            const signatureRaw = await signerWallet._signTypedData(domain, types, value); // 65-byte sig
+            const recovered = ethers.utils.verifyTypedData(domain, types, value, signatureRaw);
+            if (recovered.toLowerCase() !== senderAddr.toLowerCase()) {
+              throw new Error(`[SAFE] EIP-712 signature mismatch BEFORE POST: recovered ${recovered}, expected ${senderAddr}`);
+            }
 
-    // 7) compute the contractTransactionHash (REQUIRED by Tx-Service)
-    const contractTransactionHash = ethers.utils._TypedDataEncoder.hash(domain, types, value);
+            // 7) compute the contractTransactionHash (REQUIRED by Tx-Service)
+            const contractTransactionHash = ethers.utils._TypedDataEncoder.hash(domain, types, value);
 
-    // Tx-Service expects EIP-712 signatures with type suffix "02"
-    const hexNoPrefix = signatureRaw.slice(2);
-    if (hexNoPrefix.length !== 130) {
-      throw new Error(`[SAFE] unexpected EIP-712 signature length=${hexNoPrefix.length} (expected 130)`);
-    }
-    const senderSignature = signatureRaw + "02";
+            // Tx-Service expects EIP-712 signatures with type suffix "02"
+            const hexNoPrefix = signatureRaw.slice(2);
+            if (hexNoPrefix.length !== 130) {
+              throw new Error(`[SAFE] unexpected EIP-712 signature length=${hexNoPrefix.length} (expected 130)`);
+            }
+            const senderSignature = signatureRaw + "02";
 
-    // 8) DIRECT POST to Safe Tx-Service (checksummed address; 'sep' base)
-    console.log("[SAFE] using DIRECT POST path");
-    console.log("[SAFE] POST", `${TX_SERVICE_BASE}/api/v2/safes/${SAFE_ADDRESS_CS}/multisig-transactions/`);
+            // 8) DIRECT POST to Safe Tx-Service (checksummed address; 'sep' base)
+            console.log("[SAFE] using DIRECT POST path");
+            console.log("[SAFE] POST", `${TX_SERVICE_BASE}/api/v2/safes/${SAFE_ADDRESS_CS}/multisig-transactions/`);
 
-    // optional: early info check for clearer error
-    {
-      const info = await fetch(`${TX_SERVICE_BASE}/api/v1/safes/${SAFE_ADDRESS_CS}/`, {
-        headers: { "Authorization": `Bearer ${SAFE_API_KEY}` }
-      });
-      if (!info.ok) {
-        const msg = await info.text().catch(() => "");
-        throw new Error(`[SAFE info] ${info.status} ${msg || info.statusText}`);
-      }
-    }
+            // optional: early info check for clearer error
+            {
+              const info = await fetch(`${TX_SERVICE_BASE}/api/v1/safes/${SAFE_ADDRESS_CS}/`, {
+                headers: { "Authorization": `Bearer ${SAFE_API_KEY}` }
+              });
+              if (!info.ok) {
+                const msg = await info.text().catch(() => "");
+                throw new Error(`[SAFE info] ${info.status} ${msg || info.statusText}`);
+              }
+            }
 
-    const body = {
-      to: tokenAddr,
-      value: "0",
-      data,
-      operation: 0,
-      gasToken: ZERO,
-      safeTxGas: 0,
-      baseGas: 0,
-      gasPrice: "0",
-      refundReceiver: ZERO,
-      nonce,
-      contractTransactionHash,          // <-- REQUIRED (this fixes the 422)
-      sender: senderAddr,
-      signature: senderSignature,       // EIP-712 + "02"
-      origin: "milestone-pay"
-    };
+            const body = {
+              to: tokenAddr,
+              value: "0",
+              data,
+              operation: 0,
+              gasToken: ZERO,
+              safeTxGas: 0,
+              baseGas: 0,
+              gasPrice: "0",
+              refundReceiver: ZERO,
+              nonce,
+              contractTransactionHash,          // <-- REQUIRED (this fixes the 422)
+              sender: senderAddr,
+              signature: senderSignature,       // EIP-712 + "02"
+              origin: "milestone-pay"
+            };
 
-    const resp = await fetch(`${TX_SERVICE_BASE}/api/v2/safes/${SAFE_ADDRESS_CS}/multisig-transactions/`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "Authorization": `Bearer ${SAFE_API_KEY}`
-      },
-      body: JSON.stringify(body)
-    });
+            const resp = await fetch(`${TX_SERVICE_BASE}/api/v2/safes/${SAFE_ADDRESS_CS}/multisig-transactions/`, {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "Authorization": `Bearer ${SAFE_API_KEY}`
+              },
+              body: JSON.stringify(body)
+            });
 
-    if (!resp.ok) {
-      const txt = await resp.text().catch(() => "");
-      throw new Error(`TxService propose failed [${resp.status}] ${txt || resp.statusText}`);
-    }
+            if (!resp.ok) {
+              const txt = await resp.text().catch(() => "");
+              throw new Error(`TxService propose failed [${resp.status}] ${txt || resp.statusText}`);
+            }
 
-   // 9) store the tx hash + nonce (use the typed-data hash)
-await pool.query(
-  `UPDATE milestone_payments
+            // 9) store the tx hash + nonce (use the typed-data hash)
+            await pool.query(
+              `UPDATE milestone_payments
      SET safe_tx_hash=$3, safe_nonce=$4
    WHERE bid_id=$1 AND milestone_index=$2`,
-  [bidId, milestoneIndex, contractTransactionHash, nonce]
-);
+              [bidId, milestoneIndex, contractTransactionHash, nonce]
+            );
 
-// === A) Write in-flight markers into bids.milestones so UI hides buttons & can poll ===
-try {
-  const { rows } = await pool.query(
-    'SELECT milestones FROM bids WHERE bid_id=$1 LIMIT 1',
-    [bidId]
-  );
-  const milestonesJson = rows?.[0]?.milestones;
-  const milestonesArr = Array.isArray(milestonesJson)
-    ? milestonesJson
-    : JSON.parse(milestonesJson || '[]');
+            // === A) Write in-flight markers into bids.milestones so UI hides buttons & can poll ===
+            try {
+              const { rows } = await pool.query(
+                'SELECT milestones FROM bids WHERE bid_id=$1 LIMIT 1',
+                [bidId]
+              );
+              const milestonesJson = rows?.[0]?.milestones;
+              const milestonesArr = Array.isArray(milestonesJson)
+                ? milestonesJson
+                : JSON.parse(milestonesJson || '[]');
 
-  const ms = { ...(milestonesArr[milestoneIndex] || {}) };
+              const ms = { ...(milestonesArr[milestoneIndex] || {}) };
 
-  // Markers the UI looks for to treat as "in-flight"
-  ms.safePaymentTxHash = contractTransactionHash;      // Client polls /safe/tx/:hash with this
-  ms.safeTxHash = ms.safeTxHash || contractTransactionHash;
-  ms.safeNonce = nonce;
-  ms.safeStatus = 'submitted';
-  ms.paymentPending = true;
-  if (!ms.status || ms.status === 'approved') ms.status = 'pending';
+              // Markers the UI looks for to treat as "in-flight"
+              ms.safePaymentTxHash = contractTransactionHash;      // Client polls /safe/tx/:hash with this
+              ms.safeTxHash = ms.safeTxHash || contractTransactionHash;
+              ms.safeNonce = nonce;
+              ms.safeStatus = 'submitted';
+              ms.paymentPending = true;
+              if (!ms.status || ms.status === 'approved') ms.status = 'pending';
 
-  milestonesArr[milestoneIndex] = ms;
+              milestonesArr[milestoneIndex] = ms;
 
-  await pool.query(
-    'UPDATE bids SET milestones=$1 WHERE bid_id=$2',
-    [JSON.stringify(milestonesArr), bidId]
-  );
-} catch (e) {
-  console.warn('Failed to persist in-flight markers to milestones JSON', e?.message || e);
-}
+              await pool.query(
+                'UPDATE bids SET milestones=$1 WHERE bid_id=$2',
+                [JSON.stringify(milestonesArr), bidId]
+              );
+            } catch (e) {
+              console.warn('Failed to persist in-flight markers to milestones JSON', e?.message || e);
+            }
 
-// === B) Immediate executed check: if already executed -> mark as PAID now ===
-{
-  // Use rate-limited fetch if available; otherwise fall back to fetch
-  const _safeFetch = (typeof safeFetchRL === 'function') ? safeFetchRL : fetch;
+            // === B) Immediate executed check: if already executed -> mark as PAID now ===
+            {
+              // Use rate-limited fetch if available; otherwise fall back to fetch
+              const _safeFetch = (typeof safeFetchRL === 'function') ? safeFetchRL : fetch;
 
-  try {
-    const url = `${TX_SERVICE_BASE}/api/v1/multisig-transactions/${contractTransactionHash}`;
-    const r = await _safeFetch(url);
+              try {
+                const url = `${TX_SERVICE_BASE}/api/v1/multisig-transactions/${contractTransactionHash}`;
+                const r = await _safeFetch(url);
 
-    if (r.ok) {
-      const t = await r.json().catch(() => null);
+                if (r.ok) {
+                  const t = await r.json().catch(() => null);
 
-      // Robust execution detection across Safe API variants
-      const statusStr = String(t?.tx_status || t?.status || "").toLowerCase();
-      const executed =
-        !!t?.is_executed ||
-        !!t?.isExecuted ||
-        !!t?.execution_date ||
-        !!t?.executionDate ||
-        !!t?.transaction_hash ||
-        !!t?.transactionHash ||
-        statusStr === "success" ||
-        statusStr === "executed" ||
-        statusStr === "successful";
+                  // Robust execution detection across Safe API variants
+                  const statusStr = String(t?.tx_status || t?.status || "").toLowerCase();
+                  const executed =
+                    !!t?.is_executed ||
+                    !!t?.isExecuted ||
+                    !!t?.execution_date ||
+                    !!t?.executionDate ||
+                    !!t?.transaction_hash ||
+                    !!t?.transactionHash ||
+                    statusStr === "success" ||
+                    statusStr === "executed" ||
+                    statusStr === "successful";
 
-      if (executed) {
-        const finalTxHash =
-          t?.transaction_hash || t?.transactionHash || t?.tx_hash || t?.txHash || contractTransactionHash;
+                  if (executed) {
+                    const finalTxHash =
+                      t?.transaction_hash || t?.transactionHash || t?.tx_hash || t?.txHash || contractTransactionHash;
 
-        // milestone_payments → mark released now
-        await pool.query(
-          `UPDATE milestone_payments
+                    // milestone_payments → mark released now
+                    await pool.query(
+                      `UPDATE milestone_payments
              SET status='released', tx_hash=$3, released_at=NOW()
            WHERE bid_id=$1 AND milestone_index=$2`,
-          [bidId, milestoneIndex, finalTxHash]
-        );
+                      [bidId, milestoneIndex, finalTxHash]
+                    );
 
-        // bids.milestones → fields the FE's isPaid() relies on
-        const iso = new Date().toISOString();
-        await upsertMilestoneFields(bidId, milestoneIndex, {
-          paymentTxHash: finalTxHash,
-          paymentDate: iso,
-          paidAt: iso,
-          paid: true,
-          status: 'paid',
-          paymentPending: false,
-        });
+                    // bids.milestones → fields the FE's isPaid() relies on
+                    const iso = new Date().toISOString();
+                    await upsertMilestoneFields(bidId, milestoneIndex, {
+                      paymentTxHash: finalTxHash,
+                      paymentDate: iso,
+                      paidAt: iso,
+                      paid: true,
+                      status: 'paid',
+                      paymentPending: false,
+                    });
 
-        // best-effort notify (ignore failures)
-        if (proposal && typeof notifyPaymentReleased === 'function') {
-          try {
-            await notifyPaymentReleased({
-              bid,
-              proposal,
-              msIndex: milestoneIndex + 1,
-              amount: msAmountUSD,
-              txHash: finalTxHash,
-            });
-          } catch {}
+                    // best-effort notify (ignore failures)
+                    if (proposal && typeof notifyPaymentReleased === 'function') {
+                      try {
+                        await notifyPaymentReleased({
+                          bid,
+                          proposal,
+                          msIndex: milestoneIndex + 1,
+                          amount: msAmountUSD,
+                          txHash: finalTxHash,
+                        });
+                      } catch { }
+                    }
+
+                    return res.json({ ok: true, status: 'released', txHash: finalTxHash });
+                  }
+                  // Not executed yet → fall through to pending below
+                } else {
+                  const txt = await r.text().catch(() => '');
+                  console.warn('Immediate Safe check HTTP failed', r.status, txt || r.statusText);
+                  // fall through to pending
+                }
+              } catch (e) {
+                console.warn('Immediate Safe execution check failed, proceeding with pending', e?.message || e);
+                // fall through to pending
+              }
+            }
+
+            // 10) notify
+            try {
+              const { rows: [proposal] } = await pool.query(
+                "SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1",
+                [bid.proposal_id]
+              );
+              if (proposal && typeof notifyPaymentPending === "function") {
+                await notifyPaymentPending({
+                  bid,
+                  proposal,
+                  msIndex: milestoneIndex + 1,
+                  amount: msAmountUSD,
+                  method: "safe",
+                  txRef: contractTransactionHash
+                });
+              }
+            } catch (e) {
+              console.warn("notifyPaymentPending (post-safe-hash) failed", e?.message || e);
+            }
+
+            return;
+          } catch (safeErr) {
+            console.error("SAFE propose failed; leaving pending", safeErr?.message || safeErr);
+            return;
+          }
         }
 
-        return res.json({ ok: true, status: 'released', txHash: finalTxHash });
-      }
-      // Not executed yet → fall through to pending below
-    } else {
-      const txt = await r.text().catch(() => '');
-      console.warn('Immediate Safe check HTTP failed', r.status, txt || r.statusText);
-      // fall through to pending
-    }
-  } catch (e) {
-    console.warn('Immediate Safe execution check failed, proceeding with pending', e?.message || e);
-    // fall through to pending
-  }
-}
+        // ---------- MANUAL/EOA PATH ----------
+        let txHash;
+        if (blockchainService?.transferSubmit) {
+          const r = await blockchainService.transferSubmit(token, bid.wallet_address, msAmountUSD);
+          txHash = r?.hash;
+        } else if (blockchainService?.sendToken) {
+          const r = await blockchainService.sendToken(token, bid.wallet_address, msAmountUSD, bid.tenant_id);
+          txHash = r?.hash;
+        } else {
+          txHash = "dev_" + crypto.randomBytes(8).toString("hex");
+        }
 
-    // 10) notify
-    try {
-      const { rows: [proposal] } = await pool.query(
-        "SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1",
-        [bid.proposal_id]
-      );
-      if (proposal && typeof notifyPaymentPending === "function") {
-        await notifyPaymentPending({
-          bid,
-          proposal,
-          msIndex: milestoneIndex + 1,
-          amount: msAmountUSD,
-          method: "safe",
-          txRef: contractTransactionHash
-        });
-      }
-    } catch (e) {
-      console.warn("notifyPaymentPending (post-safe-hash) failed", e?.message || e);
-    }
+        // --- FALLBACK: recover tx hash from chain logs if wrapper returned none ---
+        if (!txHash) {
+          const rpcUrl =
+            process.env.PAYOUT_RPC_URL ||
+            process.env.ANCHOR_RPC_URL ||
+            process.env.SEPOLIA_RPC_URL; // make sure this matches the CHAIN you paid on
+          const tokenKeyOrAddr = (TOKENS[token]?.address) ? TOKENS[token].address : token; // "USDT" -> TOKENS.USDT.address, or 0x...
+          try {
+            const recovered = await salvageTxHashViaLogs(
+              rpcUrl,
+              tokenKeyOrAddr,
+              bid.wallet_address,
+              msAmountUSD
+            );
+            if (recovered) {
+              txHash = recovered;
+              console.log('[SALVAGE] recovered txHash:', txHash);
+            }
+          } catch (e) {
+            console.warn('[SALVAGE] error:', e?.message || e);
+          }
+        }
 
-    return;
-  } catch (safeErr) {
-    console.error("SAFE propose failed; leaving pending", safeErr?.message || safeErr);
-    return;
-  }
-}
+        if (txHash) {
+          await pool.query(
+            `UPDATE milestone_payments SET tx_hash=$3 WHERE bid_id=$1 AND milestone_index=$2`,
+            [bidId, milestoneIndex, txHash]
+          );
+        }
 
-// ---------- MANUAL/EOA PATH ----------
-let txHash;
-if (blockchainService?.transferSubmit) {
-  const r = await blockchainService.transferSubmit(token, bid.wallet_address, msAmountUSD);
-  txHash = r?.hash;
-} else if (blockchainService?.sendToken) {
-  const r = await blockchainService.sendToken(token, bid.wallet_address, msAmountUSD);
-  txHash = r?.hash;
-} else {
-  txHash = "dev_" + crypto.randomBytes(8).toString("hex");
-}
+        // Optional confirm (1 conf). MUST NOT block the HTTP response.
+        try {
+          if (blockchainService?.waitForConfirm && txHash && !txHash.startsWith("dev_")) {
+            await blockchainService.waitForConfirm(txHash, 1);
+          }
+        } catch (e) {
+          console.warn("waitForConfirm failed (left as pending)", e?.message || e);
+          return;
+        }
 
-// --- FALLBACK: recover tx hash from chain logs if wrapper returned none ---
-if (!txHash) {
-  const rpcUrl =
-    process.env.PAYOUT_RPC_URL ||
-    process.env.ANCHOR_RPC_URL ||
-    process.env.SEPOLIA_RPC_URL; // make sure this matches the CHAIN you paid on
-  const tokenKeyOrAddr = (TOKENS[token]?.address) ? TOKENS[token].address : token; // "USDT" -> TOKENS.USDT.address, or 0x...
-  try {
-    const recovered = await salvageTxHashViaLogs(
-      rpcUrl,
-      tokenKeyOrAddr,
-      bid.wallet_address,
-      msAmountUSD
-    );
-    if (recovered) {
-      txHash = recovered;
-      console.log('[SALVAGE] recovered txHash:', txHash);
-    }
-  } catch (e) {
-    console.warn('[SALVAGE] error:', e?.message || e);
-  }
-}
+        // 4) Mark released + legacy JSON fields
+        ms.paymentTxHash = txHash || ms.paymentTxHash || null;
+        ms.paymentDate = new Date().toISOString();
+        ms.paymentPending = false;
+        ms.status = "paid";
+        milestones[milestoneIndex] = ms;
 
-if (txHash) {
-  await pool.query(
-    `UPDATE milestone_payments SET tx_hash=$3 WHERE bid_id=$1 AND milestone_index=$2`,
-    [bidId, milestoneIndex, txHash]
-  );
-}
-
-// Optional confirm (1 conf). MUST NOT block the HTTP response.
-try {
-  if (blockchainService?.waitForConfirm && txHash && !txHash.startsWith("dev_")) {
-    await blockchainService.waitForConfirm(txHash, 1);
-  }
-} catch (e) {
-  console.warn("waitForConfirm failed (left as pending)", e?.message || e);
-  return;
-}
-
-// 4) Mark released + legacy JSON fields
-ms.paymentTxHash = txHash || ms.paymentTxHash || null;
-ms.paymentDate = new Date().toISOString();
-ms.paymentPending = false;
-ms.status = "paid";
-milestones[milestoneIndex] = ms;
-
-await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
-await pool.query(
-  `UPDATE milestone_payments
+        await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
+        await pool.query(
+          `UPDATE milestone_payments
      SET status='released', tx_hash=COALESCE(tx_hash,$3), released_at=NOW(), amount_usd=COALESCE(amount_usd,$4)
    WHERE bid_id=$1 AND milestone_index=$2`,
-  [bidId, milestoneIndex, txHash || null, msAmountUSD]
-);
+          [bidId, milestoneIndex, txHash || null, msAmountUSD]
+        );
 
-// 5) Notify best-effort
-try {
-  const { rows: [proposal] } = await pool.query(
-    "SELECT * FROM proposals WHERE proposal_id=$1",
-    [bid.proposal_id]
-  );
-  if (proposal && typeof notifyPaymentReleased === "function") {
-    await notifyPaymentReleased({
-      bid, proposal,
-      msIndex: milestoneIndex + 1,
-      amount: msAmountUSD,
-      txHash: txHash || null
+        // 5) Notify best-effort
+        try {
+          const { rows: [proposal] } = await pool.query(
+            "SELECT * FROM proposals WHERE proposal_id=$1",
+            [bid.proposal_id]
+          );
+          if (proposal && typeof notifyPaymentReleased === "function") {
+            await notifyPaymentReleased({
+              bid, proposal,
+              msIndex: milestoneIndex + 1,
+              amount: msAmountUSD,
+              txHash: txHash || null
+            });
+          }
+        } catch (e) {
+          console.warn("notifyPaymentReleased failed", e?.message || e);
+        }
+
+        // Optional: audit
+        try {
+          await writeAudit(bidId, req, {
+            payment_released: {
+              milestone_index: milestoneIndex,
+              amount_usd: msAmountUSD,
+              tx: txHash || null
+            }
+          });
+        } catch { }
+      } catch (e) {
+        console.error("Background pay-milestone failed (left pending)", e);
+      }
     });
+
+    // 5) Return immediately to avoid proxy 502s on slow confirmations
+    return res.status(202).json({
+      ok: true,
+      status: "pending",
+      bidId,
+      milestoneIndex,
+    });
+
+  } catch (err) {
+    console.error("pay-milestone error", err);
+    const msg = err?.shortMessage || err?.reason || err?.message || "Internal error paying milestone";
+    return res.status(500).json({ ok: false, error: msg });
   }
-} catch (e) {
-  console.warn("notifyPaymentReleased failed", e?.message || e);
-}
-
-// Optional: audit
-try {
-  await writeAudit(bidId, req, {
-    payment_released: {
-      milestone_index: milestoneIndex,
-      amount_usd: msAmountUSD,
-      tx: txHash || null
-    }
-  });
-} catch {}
-} catch (e) {
-  console.error("Background pay-milestone failed (left pending)", e);
-}
-});
-
-// 5) Return immediately to avoid proxy 502s on slow confirmations
-return res.status(202).json({
-  ok: true,
-  status: "pending",
-  bidId,
-  milestoneIndex,
-});
-
-} catch (err) {
-console.error("pay-milestone error", err);
-const msg = err?.shortMessage || err?.reason || err?.message || "Internal error paying milestone";
-return res.status(500).json({ ok: false, error: msg });
-}
 });
 
 // ==============================
@@ -7708,11 +8090,11 @@ app.post("/proofs", authRequired, async (req, res) => {
 
   try {
     // 1) Ensure bid exists & caller allowed
-    const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+    const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1 AND tenant_id=$2", [bidId, req.tenantId]);
     if (!bids[0]) return res.status(404).json({ error: "Bid not found" });
     const bid = bids[0];
 
-    const caller  = String(req.user?.sub || "").toLowerCase();
+    const caller = String(req.user?.sub || "").toLowerCase();
     const isAdmin = String(req.user?.role || "").toLowerCase() === "admin";
     if (!isAdmin && caller !== String(bid.wallet_address || "").toLowerCase()) {
       return res.status(403).json({ error: "Forbidden" });
@@ -7728,8 +8110,8 @@ app.post("/proofs", authRequired, async (req, res) => {
 
     // 3) Duplicate guards
     const { rows: pend } = await pool.query(
-      `SELECT 1 FROM proofs WHERE bid_id=$1 AND milestone_index=$2 AND status='pending' LIMIT 1`,
-      [bidId, milestoneIndex]
+      `SELECT 1 FROM proofs WHERE bid_id=$1 AND milestone_index=$2 AND status='pending' AND tenant_id=$3 LIMIT 1`,
+      [bidId, milestoneIndex, req.tenantId]
     );
     if (pend.length) {
       return res.status(409).json({ error: "A proof is already pending review for this milestone." });
@@ -7737,12 +8119,12 @@ app.post("/proofs", authRequired, async (req, res) => {
     const { rows: lastRows } = await pool.query(
       `SELECT status
          FROM proofs
-        WHERE bid_id=$1 AND milestone_index=$2
+        WHERE bid_id=$1 AND milestone_index=$2 AND tenant_id=$3
         ORDER BY submitted_at DESC NULLS LAST,
                  updated_at  DESC NULLS LAST,
                  proof_id    DESC
         LIMIT 1`,
-      [bidId, milestoneIndex]
+      [bidId, milestoneIndex, req.tenantId]
     );
     if (lastRows[0] && String(lastRows[0].status || "").toLowerCase() === "approved") {
       return res.status(409).json({ error: "This milestone has already been approved." });
@@ -7778,15 +8160,15 @@ app.post("/proofs", authRequired, async (req, res) => {
 
     const { lat: gpsLat, lon: gpsLon, alt: gpsAlt } = findFirstGps(fileMeta);
     const captureIso = findFirstCaptureIso(fileMeta);
-   // Reverse geocode once if we have GPS
-let rgeo = null;
-if (Number.isFinite(gpsLat) && Number.isFinite(gpsLon)) {
-  try { rgeo = await reverseGeocode(gpsLat, gpsLon); } catch {}
-}
+    // Reverse geocode once if we have GPS
+    let rgeo = null;
+    if (Number.isFinite(gpsLat) && Number.isFinite(gpsLon)) {
+      try { rgeo = await reverseGeocode(gpsLat, gpsLon); } catch { }
+    }
 
-    const legacyText   = (value.proof || "").trim();
-    const description  = (value.description || legacyText || "").trim();
-    const title        = (value.title || `Proof for Milestone ${milestoneIndex + 1}`).trim();
+    const legacyText = (value.proof || "").trim();
+    const description = (value.description || legacyText || "").trim();
+    const title = (value.title || `Proof for Milestone ${milestoneIndex + 1}`).trim();
     const vendorPrompt = (value.vendorPrompt || value.prompt || "").trim();
 
     // 5) Insert proof row
@@ -7794,12 +8176,12 @@ if (Number.isFinite(gpsLat) && Number.isFinite(gpsLon)) {
       INSERT INTO proofs
         (bid_id, milestone_index, vendor_name, wallet_address, title, description,
          files, file_meta, gps_lat, gps_lon, gps_alt, capture_time,
-         status, submitted_at, vendor_prompt, updated_at)
-      VALUES
-        ($1,$2,$3,$4,$5,$6,
-         $7,$8,$9,$10,$11,$12,
-         'pending', NOW(), $13, NOW())
-      RETURNING *`;
+         status, submitted_at, vendor_prompt, updated_at, tenant_id)
+       VALUES
+         ($1,$2,$3,$4,$5,$6,
+          $7,$8,$9,$10,$11,$12,
+          'pending', NOW(), $13, NOW(), $14)
+       RETURNING *`;
     const insertVals = [
       bidId,
       milestoneIndex,
@@ -7811,17 +8193,18 @@ if (Number.isFinite(gpsLat) && Number.isFinite(gpsLon)) {
       JSON.stringify(fileMeta || []),
       gpsLat, gpsLon, gpsAlt, captureIso,
       vendorPrompt || "",
+      req.tenantId
     ];
     const { rows: pr } = await pool.query(insertQ, insertVals);
     let proofRow = pr[0];
-await writeAudit(bidId, req, {
-  proof_submitted: {
-    index: milestoneIndex,
-    proofId: proofRow.proof_id,
-    files: files, 
-    hasGps: Number.isFinite(gpsLat) && Number.isFinite(gpsLon)
-  }
-});
+    await writeAudit(bidId, req, {
+      proof_submitted: {
+        index: milestoneIndex,
+        proofId: proofRow.proof_id,
+        files: files,
+        hasGps: Number.isFinite(gpsLat) && Number.isFinite(gpsLon)
+      }
+    });
 
 
     // 6) (Best-effort) Agent2 analysis + notify
@@ -7841,12 +8224,12 @@ await writeAudit(bidId, req, {
         );
         const firstGps = firstFix
           ? {
-              lat: Number(firstFix.exif.gpsLatitude),
-              lon: Number(firstFix.exif.gpsLongitude),
-              alt: Number.isFinite(Number(firstFix?.exif?.gpsAltitude))
-                ? Number(firstFix.exif.gpsAltitude)
-                : null,
-            }
+            lat: Number(firstFix.exif.gpsLatitude),
+            lon: Number(firstFix.exif.gpsLongitude),
+            alt: Number.isFinite(Number(firstFix?.exif?.gpsAltitude))
+              ? Number(firstFix.exif.gpsAltitude)
+              : null,
+          }
           : { lat: null, lon: null, alt: null };
 
         const capNote = captureIso ? `First capture time (EXIF, ISO8601): ${captureIso}` : "No capture time in EXIF.";
@@ -7917,13 +8300,13 @@ Hints:
         );
         proofRow.ai_analysis = analysis;
         await writeAudit(bidId, req, {
-  proof_analyzed: {
-    index: milestoneIndex,
-    proofId: proofRow.proof_id,
-    fit: analysis?.fit,
-    confidence: analysis?.confidence
-  }
-});
+          proof_analyzed: {
+            index: milestoneIndex,
+            proofId: proofRow.proof_id,
+            fit: analysis?.fit,
+            confidence: analysis?.confidence
+          }
+        });
 
         // notify if suspicious
         if (shouldNotify(analysis)) {
@@ -7980,9 +8363,9 @@ app.get("/proofs", async (req, res) => {
          p.gps_lon
        FROM proofs p
        JOIN bids b ON b.bid_id = p.bid_id
-      WHERE b.proposal_id = $1
+      WHERE b.proposal_id = $1 AND b.tenant_id = $2
       ORDER BY p.submitted_at ASC NULLS LAST, p.proof_id ASC`,
-      [proposalId]
+      [proposalId, req.tenantId]
     );
 
     const out = await Promise.all(
@@ -8023,8 +8406,8 @@ app.get("/proofs", adminGuard, async (req, res) => {
     // Fallback: resolve bidId from proposalId (so /projects/136 works even if it passes proposalId)
     if (!Number.isFinite(bidId) && Number.isFinite(proposalId)) {
       const { rows: [b] } = await pool.query(
-        `SELECT bid_id FROM bids WHERE proposal_id=$1 ORDER BY created_at DESC LIMIT 1`,
-        [proposalId]
+        `SELECT bid_id FROM bids WHERE proposal_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 1`,
+        [proposalId, req.tenantId]
       );
       if (b) bidId = Number(b.bid_id);
     }
@@ -8044,27 +8427,28 @@ app.get("/proofs", adminGuard, async (req, res) => {
       FROM proofs
     `;
     const params = [];
-    const where  = Number.isFinite(bidId) ? "WHERE bid_id = $1" : "";
+    const where = Number.isFinite(bidId) ? "WHERE bid_id = $1 AND tenant_id = $2" : "WHERE tenant_id = $1";
     if (Number.isFinite(bidId)) params.push(bidId);
+    params.push(req.tenantId);
 
-    const order  = "ORDER BY proof_id DESC";
-    const sql    = [baseSql, where, order].filter(Boolean).join("\n");
+    const order = "ORDER BY proof_id DESC";
+    const sql = [baseSql, where, order].filter(Boolean).join("\n");
 
     const { rows } = await pool.query(sql, params);
 
-const out = await Promise.all(rows.map(async (r) => ({
-  proofId: Number(r.proof_id),
-  bidId: Number(r.bid_id),
-  milestoneIndex: Number(r.milestone_index),
-  status: String(r.status || "pending"),
-  title: r.title || "",
-  description: r.description || "",
-  files: Array.isArray(r.files) ? r.files : (r.files ? r.files : []),
-  aiAnalysis: r.ai_analysis ?? null,
-  submittedAt: r.submitted_at,
-  updatedAt: r.updated_at,
-  geoApprox: await buildSafeGeoForProof(r),
-})));
+    const out = await Promise.all(rows.map(async (r) => ({
+      proofId: Number(r.proof_id),
+      bidId: Number(r.bid_id),
+      milestoneIndex: Number(r.milestone_index),
+      status: String(r.status || "pending"),
+      title: r.title || "",
+      description: r.description || "",
+      files: Array.isArray(r.files) ? r.files : (r.files ? r.files : []),
+      aiAnalysis: r.ai_analysis ?? null,
+      submittedAt: r.submitted_at,
+      updatedAt: r.updated_at,
+      geoApprox: await buildSafeGeoForProof(r),
+    })));
 
     console.log(`[GET /proofs] bidId=${Number.isInteger(bidId) ? bidId : 'ALL'} -> ${out.length}`);
     return res.json(out);
@@ -8078,15 +8462,15 @@ const out = await Promise.all(rows.map(async (r) => ({
 app.get("/proofs/:bidId", adminOrBidOwnerGuard, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      "SELECT * FROM proofs WHERE bid_id=$1 AND status != 'rejected' ORDER BY submitted_at DESC NULLS LAST",
-      [ req.params.bidId ]
+      "SELECT * FROM proofs WHERE bid_id=$1 AND status != 'rejected' AND tenant_id=$2 ORDER BY submitted_at DESC NULLS LAST",
+      [req.params.bidId, req.tenantId]
     );
     const out = await Promise.all(rows.map(async (r) => {
-  const camel = toCamel(r);
-  camel.geoApprox = await buildSafeGeoForProof(r); // uses gps_lat/lon if present
-  return camel;
-}));
-res.json(out);
+      const camel = toCamel(r);
+      camel.geoApprox = await buildSafeGeoForProof(r); // uses gps_lat/lon if present
+      return camel;
+    }));
+    res.json(out);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -8096,7 +8480,7 @@ res.json(out);
 app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) => {
   try {
     const bidId = Number(req.params.bidId);
-    const idx   = Number(req.params.milestoneIndex);
+    const idx = Number(req.params.milestoneIndex);
 
     if (!Number.isInteger(bidId) || !Number.isInteger(idx)) {
       return res.status(400).json({ error: "Invalid bidId or milestoneIndex" });
@@ -8106,10 +8490,10 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
     const { rows: proofs } = await pool.query(
       `SELECT *
          FROM proofs
-        WHERE bid_id = $1 AND milestone_index = $2
+        WHERE bid_id = $1 AND milestone_index = $2 AND tenant_id = $3
         ORDER BY proof_id DESC
         LIMIT 1`,
-      [bidId, idx]
+      [bidId, idx, req.tenantId]
     );
     if (!proofs.length) {
       return res.status(404).json({ error: "No proof found for this milestone" });
@@ -8126,9 +8510,9 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
     const { rows } = await pool.query(
       `UPDATE proofs
           SET status = 'approved', updated_at = NOW()
-        WHERE proof_id = $1
+        WHERE proof_id = $1 AND tenant_id = $2
         RETURNING *`,
-      [latest.proof_id]
+      [latest.proof_id, req.tenantId]
     );
     const updated = rows[0];
     await writeAudit(bidId, req, { proof_approved: { index: idx, proofId: updated.proof_id } });
@@ -8136,11 +8520,11 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
     // Notify (admins + vendor) if enabled
     if (NOTIFY_ENABLED) {
       try {
-        const { rows: [bid] } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
+        const { rows: [bid] } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
         if (bid) {
           const { rows: [proposal] } = await pool.query(
             "SELECT * FROM proposals WHERE proposal_id=$1",
-            [ bid.proposal_id ]
+            [bid.proposal_id]
           );
           if (proposal && typeof notifyProofApproved === "function") {
             console.log("[notify] approve about to send", { bidId, ms: idx + 1, proofId: updated.proof_id });
@@ -8153,7 +8537,7 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
           }
         }
       } catch (e) {
-        console.warn("notifyProofApproved failed (non-fatal):", String(e).slice(0,200));
+        console.warn("notifyProofApproved failed (non-fatal):", String(e).slice(0, 200));
       }
     }
 
@@ -8168,7 +8552,7 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
 app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) => {
   try {
     const bidId = Number(req.params.bidId);
-    const idx   = Number(req.params.milestoneIndex);
+    const idx = Number(req.params.milestoneIndex);
     const reason = String(req.body?.reason || req.body?.message || req.body?.note || '').trim() || null;
 
     if (!Number.isInteger(bidId) || !Number.isInteger(idx)) {
@@ -8180,7 +8564,7 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) =
       WITH latest AS (
         SELECT proof_id
           FROM proofs
-         WHERE bid_id = $1 AND milestone_index = $2
+         WHERE bid_id = $1 AND milestone_index = $2 AND tenant_id = $3
          ORDER BY submitted_at DESC NULLS LAST,
                   updated_at  DESC NULLS LAST,
                   proof_id    DESC
@@ -8194,7 +8578,7 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) =
          RETURNING p.*
       )
       SELECT * FROM upd;
-    `, [bidId, idx]);
+    `, [bidId, idx, req.tenantId]);
 
     const updated = rows[0];
     await writeAudit(bidId, req, { proof_rejected: { index: idx, proofId: updated.proof_id, reason } });
@@ -8209,39 +8593,39 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) =
         const bid = bids[0];
         const { rows: prj } = await pool.query(
           "SELECT * FROM proposals WHERE proposal_id=$1",
-          [ bid.proposal_id || bid.proposalId ]
+          [bid.proposal_id || bid.proposalId]
         );
         const proposal = prj[0] || null;
 
         const subject = "❌ Proof rejected";
 
-const en = [
-  '❌ Proof rejected',
-  `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
-  `Bid: ${bidId} • Milestone: ${idx}`,
-  reason ? `Reason: ${reason}` : ''
-].filter(Boolean).join('\n');
+        const en = [
+          '❌ Proof rejected',
+          `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
+          `Bid: ${bidId} • Milestone: ${idx}`,
+          reason ? `Reason: ${reason}` : ''
+        ].filter(Boolean).join('\n');
 
-const es = [
-  '❌ Prueba rechazada',
-  `Proyecto: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
-  `Oferta: ${bidId} • Hito: ${idx}`,
-  reason ? `Motivo: ${reason}` : ''
-].filter(Boolean).join('\n');
+        const es = [
+          '❌ Prueba rechazada',
+          `Proyecto: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
+          `Oferta: ${bidId} • Hito: ${idx}`,
+          reason ? `Motivo: ${reason}` : ''
+        ].filter(Boolean).join('\n');
 
-const { text: msg, html } = bi(en, es);
+        const { text: msg, html } = bi(en, es);
 
         const { rows: vprows } = await pool.query(
           `SELECT email, phone, telegram_chat_id
              FROM vendor_profiles
             WHERE lower(wallet_address)=lower($1)
             LIMIT 1`,
-          [ (bid.wallet_address || "").toLowerCase() ]
+          [(bid.wallet_address || "").toLowerCase()]
         );
         const vp = vprows[0] || {};
         const vendorEmail = (vp.email || "").trim();
         const vendorPhone = (vp.phone || "").trim();
-        const vendorTg    = (vp.telegram_chat_id || "").trim();
+        const vendorTg = (vp.telegram_chat_id || "").trim();
 
         const waVars = {
           "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
@@ -8263,14 +8647,14 @@ const { text: msg, html } = bi(en, es);
             vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
             vendorPhone
               ? (TWILIO_WA_CONTENT_SID
-                  ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
-                  : sendWhatsApp(vendorPhone, msg))
+                ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
+                : sendWhatsApp(vendorPhone, msg))
               : null,
           ].filter(Boolean)
         );
       }
     } catch (e) {
-      console.warn("notify-on-reject (proofs route) failed:", String(e).slice(0,200));
+      console.warn("notify-on-reject (proofs route) failed:", String(e).slice(0, 200));
     }
     // -------------------------------------------------------
 
@@ -8312,10 +8696,10 @@ function extractAnyDateFromExif(exif) {
   // Common fields (both cases)
   const direct =
     pick(exif,
-      'createDate','CreateDate',
-      'dateTimeOriginal','DateTimeOriginal',
-      'modifyDate','ModifyDate',
-      'dateTime','DateTime'
+      'createDate', 'CreateDate',
+      'dateTimeOriginal', 'DateTimeOriginal',
+      'modifyDate', 'ModifyDate',
+      'dateTime', 'DateTime'
     ) ||
     // sometimes nested
     pick(exif?.Photo || {}, 'DateTimeOriginal') ||
@@ -8476,8 +8860,9 @@ app.get('/bids/:bidId/proofs/latest-status', adminGuard, async (req, res) => {
       )
       SELECT milestone_index, status
       FROM ranked
-      WHERE rn = 1
-    `, [bidId]);
+      FROM ranked
+      WHERE rn = 1 AND tenant_id = $2
+    `, [bidId, req.tenantId]);
 
     const byIndex = {};
     for (const r of rows) {
@@ -8509,7 +8894,7 @@ app.post('/proofs/:id/analyze', adminGuard, async (req, res) => {
 
   try {
     // 1) Load proof
-    const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
+    const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1 AND tenant_id=$2', [proofId, req.tenantId]);
     const proof = pr[0];
     if (!proof) return res.status(404).json({ error: 'Proof not found' });
     const proofDesc = String(proof.description || '').trim();
@@ -8540,22 +8925,22 @@ app.post('/proofs/:id/analyze', adminGuard, async (req, res) => {
     const gpsCount = gpsItems.length;
     const firstGps = gpsItems[0]
       ? {
-          lat: Number(gpsItems[0].exif.gpsLatitude),
-          lon: Number(gpsItems[0].exif.gpsLongitude),
-          alt: Number.isFinite(Number(gpsItems[0].exif?.gpsAltitude))
-            ? Number(gpsItems[0].exif.gpsAltitude)
-            : null,
-        }
+        lat: Number(gpsItems[0].exif.gpsLatitude),
+        lon: Number(gpsItems[0].exif.gpsLongitude),
+        alt: Number.isFinite(Number(gpsItems[0].exif?.gpsAltitude))
+          ? Number(gpsItems[0].exif.gpsAltitude)
+          : null,
+      }
       : { lat: null, lon: null, alt: null };
 
     const captureIso = proof.capture_time || null; // we saved this on submit
     const lat = Number.isFinite(firstGps?.lat) ? firstGps.lat : (Number.isFinite(proof.gps_lat) ? Number(proof.gps_lat) : null);
-const lon = Number.isFinite(firstGps?.lon) ? firstGps.lon : (Number.isFinite(proof.gps_lon) ? Number(proof.gps_lon) : null);
+    const lon = Number.isFinite(firstGps?.lon) ? firstGps.lon : (Number.isFinite(proof.gps_lon) ? Number(proof.gps_lon) : null);
 
-let rgeo = null;
-if (Number.isFinite(lat) && Number.isFinite(lon)) {
-  try { rgeo = await reverseGeocode(lat, lon); } catch {}
-}
+    let rgeo = null;
+    if (Number.isFinite(lat) && Number.isFinite(lon)) {
+      try { rgeo = await reverseGeocode(lat, lon); } catch { }
+    }
     const metaBlock = summarizeMeta(meta);
     const capNote = captureIso
       ? `First capture time (EXIF, ISO8601): ${captureIso}`
@@ -8608,67 +8993,67 @@ Hints:
 
     const fullPrompt = vendorPrompt ? `${vendorPrompt}\n\n---\n${basePrompt}` : basePrompt;
 
-// 5) Run OpenAI (or fallback)
-let analysis;
-if (!openai) {
-  analysis = {
-    summary: "OpenAI not configured; no automatic proof analysis.",
-    evidence: [],
-    gaps: [],
-    fit: "low",
-    confidence: 0,
-    geo: { gpsCount, firstFix: firstGps, captureTime: captureIso || null },
-  };
-} else {
-  const resp = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    temperature: 0.2,
-    messages: [{ role: "user", content: fullPrompt }],
-    response_format: { type: "json_object" },
-  });
+    // 5) Run OpenAI (or fallback)
+    let analysis;
+    if (!openai) {
+      analysis = {
+        summary: "OpenAI not configured; no automatic proof analysis.",
+        evidence: [],
+        gaps: [],
+        fit: "low",
+        confidence: 0,
+        geo: { gpsCount, firstFix: firstGps, captureTime: captureIso || null },
+      };
+    } else {
+      const resp = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        temperature: 0.2,
+        messages: [{ role: "user", content: fullPrompt }],
+        response_format: { type: "json_object" },
+      });
 
-  try {
-    const raw = resp.choices?.[0]?.message?.content || "{}";
-    analysis = JSON.parse(raw);
-  } catch {
-    analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
-  }
-} // ← end else
+      try {
+        const raw = resp.choices?.[0]?.message?.content || "{}";
+        analysis = JSON.parse(raw);
+      } catch {
+        analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
+      }
+    } // ← end else
 
-// ↓↓↓ THIS BLOCK GOES OUTSIDE the else, before the DB UPDATE ↓↓↓
+    // ↓↓↓ THIS BLOCK GOES OUTSIDE the else, before the DB UPDATE ↓↓↓
 
-// Ensure geo always present
-if (!analysis.geo) {
-  analysis.geo = { gpsCount, firstFix: firstGps, captureTime: captureIso || null };
-}
+    // Ensure geo always present
+    if (!analysis.geo) {
+      analysis.geo = { gpsCount, firstFix: firstGps, captureTime: captureIso || null };
+    }
 
-// Attach GPS + human-readable location (uses the `lat`/`lon` you computed above)
-analysis.geo.lat = Number.isFinite(lat) ? lat : (analysis.geo.lat ?? null);
-analysis.geo.lon = Number.isFinite(lon) ? lon : (analysis.geo.lon ?? null);
-if (captureIso && !analysis.geo.captureTime) analysis.geo.captureTime = captureIso;
+    // Attach GPS + human-readable location (uses the `lat`/`lon` you computed above)
+    analysis.geo.lat = Number.isFinite(lat) ? lat : (analysis.geo.lat ?? null);
+    analysis.geo.lon = Number.isFinite(lon) ? lon : (analysis.geo.lon ?? null);
+    if (captureIso && !analysis.geo.captureTime) analysis.geo.captureTime = captureIso;
 
-if (rgeo) {
-  Object.assign(analysis.geo, {
-    // handle either new {provider,label} or older {source,displayName}
-    provider: rgeo.provider || rgeo.source || null,
-    address:  rgeo.label || rgeo.displayName || null,
-    country:  rgeo.country ?? null,
-    state:    rgeo.state || rgeo.region || null,
-    county:   rgeo.county || rgeo.province || null,
-    city:     rgeo.city || rgeo.municipality || null,
-    suburb:   rgeo.suburb ?? null,
-    postcode: rgeo.postcode ?? null,
-  });
-}
+    if (rgeo) {
+      Object.assign(analysis.geo, {
+        // handle either new {provider,label} or older {source,displayName}
+        provider: rgeo.provider || rgeo.source || null,
+        address: rgeo.label || rgeo.displayName || null,
+        country: rgeo.country ?? null,
+        state: rgeo.state || rgeo.region || null,
+        county: rgeo.county || rgeo.province || null,
+        city: rgeo.city || rgeo.municipality || null,
+        suburb: rgeo.suburb ?? null,
+        postcode: rgeo.postcode ?? null,
+      });
+    }
 
-// (optional) add a readable line to the summary
-const locBits = [analysis.geo.city, analysis.geo.state, analysis.geo.country].filter(Boolean);
-if (locBits.length) {
-  const locLine = `Location: ${locBits.join(", ")} (${analysis.geo.lat?.toFixed?.(6)}, ${analysis.geo.lon?.toFixed?.(6)})`;
-  if (!String(analysis.summary || "").includes(locLine)) {
-    analysis.summary = `${analysis.summary ? analysis.summary.trim() + "\n\n" : ""}${locLine}`;
-  }
-}
+    // (optional) add a readable line to the summary
+    const locBits = [analysis.geo.city, analysis.geo.state, analysis.geo.country].filter(Boolean);
+    if (locBits.length) {
+      const locLine = `Location: ${locBits.join(", ")} (${analysis.geo.lat?.toFixed?.(6)}, ${analysis.geo.lon?.toFixed?.(6)})`;
+      if (!String(analysis.summary || "").includes(locLine)) {
+        analysis.summary = `${analysis.summary ? analysis.summary.trim() + "\n\n" : ""}${locLine}`;
+      }
+    }
 
     // 6) Save & return
     const { rows: upd } = await pool.query(
@@ -8697,10 +9082,10 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
     // Find the most recent proof for this milestone
     const { rows: proofs } = await pool.query(
       `SELECT proof_id FROM proofs
-         WHERE bid_id = $1 AND milestone_index = $2
+         WHERE bid_id = $1 AND milestone_index = $2 AND tenant_id = $3
          ORDER BY submitted_at DESC NULLS LAST, updated_at DESC NULLS LAST
          LIMIT 1`,
-      [bidId, idx]
+      [bidId, idx, req.tenantId]
     );
     if (!proofs.length) return res.status(404).json({ error: "No proof found for this milestone" });
 
@@ -8710,77 +9095,77 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
     const { rows } = await pool.query(
       `UPDATE proofs
          SET status = 'rejected', updated_at = NOW()
-       WHERE proof_id = $1
+       WHERE proof_id = $1 AND tenant_id = $2
        RETURNING proof_id, bid_id, milestone_index, status, updated_at`,
-      [proofId]
+      [proofId, req.tenantId]
     );
 
     // Notify
-try {
-  if (process.env.NOTIFY_ENABLED === "true") {
-    const { rows: pr } = await pool.query("SELECT * FROM proofs WHERE proof_id=$1", [proofId]);
-    const proof = pr[0];
-    const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
-    const bid = bids[0];
-    const { rows: prj } = await pool.query(
-      "SELECT * FROM proposals WHERE proposal_id=$1",
-      [ bid.proposal_id || bid.proposalId ]
-    );
-    const proposal = prj[0] || null;
+    try {
+      if (process.env.NOTIFY_ENABLED === "true") {
+        const { rows: pr } = await pool.query("SELECT * FROM proofs WHERE proof_id=$1", [proofId]);
+        const proof = pr[0];
+        const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+        const bid = bids[0];
+        const { rows: prj } = await pool.query(
+          "SELECT * FROM proposals WHERE proposal_id=$1",
+          [bid.proposal_id || bid.proposalId]
+        );
+        const proposal = prj[0] || null;
 
-    const subject = "❌ Proof rejected";
-    const msg = [
-      "❌ Proof rejected",
-      `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
-      `Bid: ${bidId} • Milestone: ${idx}`,
-      reason ? `Reason: ${reason}` : ""
-    ].filter(Boolean).join("\n");
-    const html = msg.replace(/\n/g, "<br>");
+        const subject = "❌ Proof rejected";
+        const msg = [
+          "❌ Proof rejected",
+          `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
+          `Bid: ${bidId} • Milestone: ${idx}`,
+          reason ? `Reason: ${reason}` : ""
+        ].filter(Boolean).join("\n");
+        const html = msg.replace(/\n/g, "<br>");
 
-    // Load vendor contacts (email/phone/telegram) from vendor_profiles
-    const { rows: vprows } = await pool.query(
-      `SELECT email, phone, telegram_chat_id
+        // Load vendor contacts (email/phone/telegram) from vendor_profiles
+        const { rows: vprows } = await pool.query(
+          `SELECT email, phone, telegram_chat_id
          FROM vendor_profiles
         WHERE lower(wallet_address)=lower($1)
         LIMIT 1`,
-      [ (bid.wallet_address || "").toLowerCase() ]
-    );
-    const vp = vprows[0] || {};
-    const vendorEmail = (vp.email || "").trim();
-    const vendorPhone = (vp.phone || "").trim();
-    const vendorTg    = (vp.telegram_chat_id || "").trim();
+          [(bid.wallet_address || "").toLowerCase()]
+        );
+        const vp = vprows[0] || {};
+        const vendorEmail = (vp.email || "").trim();
+        const vendorPhone = (vp.phone || "").trim();
+        const vendorTg = (vp.telegram_chat_id || "").trim();
 
-    // WhatsApp template variables (if TWILIO_WA_CONTENT_SID is set)
-    const waVars = {
-      "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
-      "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
-      "3": `#${idx}`,
-      "4": reason ? reason : "No reason provided"
-    };
+        // WhatsApp template variables (if TWILIO_WA_CONTENT_SID is set)
+        const waVars = {
+          "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
+          "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
+          "3": `#${idx}`,
+          "4": reason ? reason : "No reason provided"
+        };
 
-    await Promise.all(
-      [
-        // Admins
-        TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, msg) : null,
-        ...(TWILIO_WA_CONTENT_SID
-          ? (ADMIN_WHATSAPP || []).map(n => sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars))
-          : (ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, msg))),
-        MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
+        await Promise.all(
+          [
+            // Admins
+            TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, msg) : null,
+            ...(TWILIO_WA_CONTENT_SID
+              ? (ADMIN_WHATSAPP || []).map(n => sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars))
+              : (ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, msg))),
+            MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
 
-        // Vendor (email + optional TG/WA)
-        vendorTg ? sendTelegram([vendorTg], msg) : null,
-        vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
-        vendorPhone
-          ? (TWILIO_WA_CONTENT_SID
-              ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
-              : sendWhatsApp(vendorPhone, msg))
-          : null,
-      ].filter(Boolean)
-    );
-  }
-} catch (e) {
-  console.warn("notify-on-reject failed (non-fatal):", String(e).slice(0,200));
-}
+            // Vendor (email + optional TG/WA)
+            vendorTg ? sendTelegram([vendorTg], msg) : null,
+            vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
+            vendorPhone
+              ? (TWILIO_WA_CONTENT_SID
+                ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
+                : sendWhatsApp(vendorPhone, msg))
+              : null,
+          ].filter(Boolean)
+        );
+      }
+    } catch (e) {
+      console.warn("notify-on-reject failed (non-fatal):", String(e).slice(0, 200));
+    }
 
     return res.json({ ok: true, proof: rows[0] });
   } catch (e) {
@@ -8805,15 +9190,15 @@ app.post('/proofs/:id/archive', authRequired, async (req, res) => {
               b.wallet_address AS bid_wallet
          FROM proofs p
          JOIN bids b ON b.bid_id = p.bid_id
-        WHERE p.proof_id = $1`,
-      [proofId]
+        WHERE p.proof_id = $1 AND p.tenant_id = $2`,
+      [proofId, req.tenantId]
     );
     const pr = rows[0];
     if (!pr) return res.status(404).json({ error: 'Proof not found' });
 
-    const caller  = String(req.user?.sub || '').toLowerCase();
+    const caller = String(req.user?.sub || '').toLowerCase();
     const isAdmin = String(req.user?.role || '').toLowerCase() === 'admin';
-    const owner   = String(pr.bid_wallet || '').toLowerCase();
+    const owner = String(pr.bid_wallet || '').toLowerCase();
 
     if (!isAdmin && !caller) return res.status(401).json({ error: 'Unauthorized' });
     if (!isAdmin && caller !== owner) return res.status(403).json({ error: 'Forbidden' });
@@ -8825,9 +9210,9 @@ app.post('/proofs/:id/archive', authRequired, async (req, res) => {
     const { rows: upd } = await pool.query(
       `UPDATE proofs
           SET status = 'archived', updated_at = NOW()
-        WHERE proof_id = $1
+        WHERE proof_id = $1 AND tenant_id = $2
         RETURNING *`,
-      [proofId]
+      [proofId, req.tenantId]
     );
 
     return res.json({ ok: true, proof: toCamel(upd[0]) });
@@ -8865,7 +9250,7 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
 
   try {
     // 1) Load proof
-    const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1', [proofId]);
+    const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1 AND tenant_id=$2', [proofId, req.tenantId]);
     const proof = pr[0];
     if (!proof) {
       res.write(`data: ERROR Proof not found\n\n`);
@@ -8885,68 +9270,68 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
     const { rows: por } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
     const proposal = por[0] || null;
 
-// 3) Normalize proof payload (single source of truth)
-const files = Array.isArray(proof?.files)
-  ? proof.files
-  : (typeof proof?.files === 'string' ? JSON.parse(proof.files || '[]') : []);
+    // 3) Normalize proof payload (single source of truth)
+    const files = Array.isArray(proof?.files)
+      ? proof.files
+      : (typeof proof?.files === 'string' ? JSON.parse(proof.files || '[]') : []);
 
-const meta = Array.isArray(proof?.file_meta)
-  ? proof.file_meta
-  : (typeof proof?.file_meta === 'string' ? JSON.parse(proof.file_meta || '[]') : []);
+    const meta = Array.isArray(proof?.file_meta)
+      ? proof.file_meta
+      : (typeof proof?.file_meta === 'string' ? JSON.parse(proof.file_meta || '[]') : []);
 
-const metaBlock = summarizeMeta(meta);
+    const metaBlock = summarizeMeta(meta);
 
-// === A) Proof description string ===
-const proofDesc = String(proof?.description || '').trim();
+    // === A) Proof description string ===
+    const proofDesc = String(proof?.description || '').trim();
 
-// === B) Extract PDF text from any proof files ===
-let pdfText = '';
-for (const f of files) {
-  if (!f?.url) continue;
-  const info = await waitForPdfInfoFromDoc({ url: f.url, name: f.name || '' });
-  if (info.used && info.text) {
-    pdfText += `\n\n[${f.name || 'file'}]\n${info.text}`;
-  }
-}
-pdfText = pdfText.trim();
+    // === B) Extract PDF text from any proof files ===
+    let pdfText = '';
+    for (const f of files) {
+      if (!f?.url) continue;
+      const info = await waitForPdfInfoFromDoc({ url: f.url, name: f.name || '' });
+      if (info.used && info.text) {
+        pdfText += `\n\n[${f.name || 'file'}]\n${info.text}`;
+      }
+    }
+    pdfText = pdfText.trim();
 
-// === C) Build location block from AI geo or GPS (+ reverse geocode) ===
-let aiGeo = null;
-try { aiGeo = JSON.parse(proof?.ai_analysis || '{}')?.geo || null; } catch {}
+    // === C) Build location block from AI geo or GPS (+ reverse geocode) ===
+    let aiGeo = null;
+    try { aiGeo = JSON.parse(proof?.ai_analysis || '{}')?.geo || null; } catch { }
 
-const lat = Number.isFinite(aiGeo?.lat) ? Number(aiGeo.lat)
-          : (Number.isFinite(proof?.gps_lat) ? Number(proof.gps_lat) : null);
-const lon = Number.isFinite(aiGeo?.lon) ? Number(aiGeo.lon)
-          : (Number.isFinite(proof?.gps_lon) ? Number(proof.gps_lon) : null);
+    const lat = Number.isFinite(aiGeo?.lat) ? Number(aiGeo.lat)
+      : (Number.isFinite(proof?.gps_lat) ? Number(proof.gps_lat) : null);
+    const lon = Number.isFinite(aiGeo?.lon) ? Number(aiGeo.lon)
+      : (Number.isFinite(proof?.gps_lon) ? Number(proof.gps_lon) : null);
 
-let rgeo = null;
-if (Number.isFinite(lat) && Number.isFinite(lon)) {
-  try { rgeo = await reverseGeocode(lat, lon); } catch {}
-}
+    let rgeo = null;
+    if (Number.isFinite(lat) && Number.isFinite(lon)) {
+      try { rgeo = await reverseGeocode(lat, lon); } catch { }
+    }
 
-const loc = {
-  lat, lon,
-  country:  aiGeo?.country  ?? rgeo?.country  ?? null,
-  state:    aiGeo?.state    ?? rgeo?.state    ?? null,
-  county:   aiGeo?.county   ?? rgeo?.county   ?? null,
-  city:     aiGeo?.city     ?? rgeo?.city     ?? null,
-  suburb:   aiGeo?.suburb   ?? rgeo?.suburb   ?? null,
-  postcode: aiGeo?.postcode ?? rgeo?.postcode ?? null,
-  address:  aiGeo?.address  ?? rgeo?.displayName ?? rgeo?.label ?? null,
-  provider: aiGeo?.provider ?? rgeo?.provider ?? rgeo?.source ?? null,
-};
+    const loc = {
+      lat, lon,
+      country: aiGeo?.country ?? rgeo?.country ?? null,
+      state: aiGeo?.state ?? rgeo?.state ?? null,
+      county: aiGeo?.county ?? rgeo?.county ?? null,
+      city: aiGeo?.city ?? rgeo?.city ?? null,
+      suburb: aiGeo?.suburb ?? rgeo?.suburb ?? null,
+      postcode: aiGeo?.postcode ?? rgeo?.postcode ?? null,
+      address: aiGeo?.address ?? rgeo?.displayName ?? rgeo?.label ?? null,
+      provider: aiGeo?.provider ?? rgeo?.provider ?? rgeo?.source ?? null,
+    };
 
-const locationBlock = loc ? [
-  'Known location:',
-  (Number.isFinite(loc.lat) && Number.isFinite(loc.lon))
-    ? `- Coords: ${loc.lat.toFixed(6)}, ${loc.lon.toFixed(6)}`
-    : '- Coords: n/a',
-  loc.address ? `- Address: ${loc.address}` : '',
-  loc.city ? `- City: ${loc.city}` : '',
-  loc.state ? `- State/Region: ${loc.state}` : '',
-  loc.country ? `- Country: ${loc.country}` : '',
-  loc.provider ? `- Source: ${loc.provider}` : '',
-].filter(Boolean).join('\n') : 'Known location: (none)';
+    const locationBlock = loc ? [
+      'Known location:',
+      (Number.isFinite(loc.lat) && Number.isFinite(loc.lon))
+        ? `- Coords: ${loc.lat.toFixed(6)}, ${loc.lon.toFixed(6)}`
+        : '- Coords: n/a',
+      loc.address ? `- Address: ${loc.address}` : '',
+      loc.city ? `- City: ${loc.city}` : '',
+      loc.state ? `- State/Region: ${loc.state}` : '',
+      loc.country ? `- Country: ${loc.country}` : '',
+      loc.provider ? `- Source: ${loc.provider}` : '',
+    ].filter(Boolean).join('\n') : 'Known location: (none)';
 
     const userText = String(req.body?.message || 'Analyze this proof for completeness and risks.').slice(0, 2000);
 
@@ -8957,50 +9342,50 @@ const locationBlock = loc ? [
 
     // 4) Create context block
     const context = [
-  'You are Agent 2 for LithiumX.',
-  'Answer ONLY using the provided bid/proposal fields and the submitted proof (description + extracted PDF text).',
-  'If something is not present in that material, say it is not stated in the submitted proof.',
-  '',
-  '--- PROPOSAL ---',
-  JSON.stringify({
-    org: proposal?.org_name || '',
-    title: proposal?.title || '',
-    summary: proposal?.summary || '',
-    budgetUSD: proposal?.amount_usd ?? 0,
-  }, null, 2),
-  '',
-  '--- BID ---',
-  JSON.stringify({
-    vendor: bid.vendor_name || '',
-    priceUSD: bid.price_usd ?? 0,
-    days: bid.days ?? 0,
-    notes: bid.notes || '',
-    milestones: (Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || '[]')),
-  }, null, 2),
-  '',
-  '--- PROOF ---',
-  JSON.stringify({
-    title: proof?.title || '',
-    description: proofDesc.slice(0, 4000),
-    files: files.map(f => ({ name: f.name, url: f.url })),
-  }, null, 2),
-  '',
-  '--- IMAGE/VIDEO METADATA ---',
-  metaBlock,
-  '',
+      'You are Agent 2 for LithiumX.',
+      'Answer ONLY using the provided bid/proposal fields and the submitted proof (description + extracted PDF text).',
+      'If something is not present in that material, say it is not stated in the submitted proof.',
+      '',
+      '--- PROPOSAL ---',
+      JSON.stringify({
+        org: proposal?.org_name || '',
+        title: proposal?.title || '',
+        summary: proposal?.summary || '',
+        budgetUSD: proposal?.amount_usd ?? 0,
+      }, null, 2),
+      '',
+      '--- BID ---',
+      JSON.stringify({
+        vendor: bid.vendor_name || '',
+        priceUSD: bid.price_usd ?? 0,
+        days: bid.days ?? 0,
+        notes: bid.notes || '',
+        milestones: (Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || '[]')),
+      }, null, 2),
+      '',
+      '--- PROOF ---',
+      JSON.stringify({
+        title: proof?.title || '',
+        description: proofDesc.slice(0, 4000),
+        files: files.map(f => ({ name: f.name, url: f.url })),
+      }, null, 2),
+      '',
+      '--- IMAGE/VIDEO METADATA ---',
+      metaBlock,
+      '',
 
-  // >>> INSERTED LINES <<<
-  '--- KNOWN LOCATION ---',
-  locationBlock,
-  '',
-  // <<< END INSERTION <<<
+      // >>> INSERTED LINES <<<
+      '--- KNOWN LOCATION ---',
+      locationBlock,
+      '',
+      // <<< END INSERTION <<<
 
-  pdfText
-    ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText.slice(0, 15000)}`
-    : `--- NO PDF TEXT AVAILABLE ---`,
-].join('\n');
+      pdfText
+        ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText.slice(0, 15000)}`
+        : `--- NO PDF TEXT AVAILABLE ---`,
+    ].join('\n');
 
-// ——— FIX: Base64 Proxy for Proof Chat (Prevents Timeouts) ———
+    // ——— FIX: Base64 Proxy for Proof Chat (Prevents Timeouts) ———
     const urlToContent = async (f) => {
       const name = (f.name || f.url || "").toLowerCase();
       const mime = (f.mimetype || "").toLowerCase();
@@ -9010,12 +9395,12 @@ const locationBlock = loc ? [
         // Clean URL & Force Cloudflare (Fastest Download)
         let url = (f.url || "").trim().replace(/[.,;]+$/, "");
         url = url.replace("gateway.pinata.cloud", "cf-ipfs.com");
-        
+
         // Download buffer using your robust fetcher
         const buf = await fetchAsBuffer(url);
         const b64 = buf.toString('base64');
-        let finalMime = mime.startsWith("image/") ? mime : "image/jpeg"; 
-        
+        let finalMime = mime.startsWith("image/") ? mime : "image/jpeg";
+
         return { type: 'image_url', image_url: { url: `data:${finalMime};base64,${b64}` } };
       } catch (e) {
         console.warn(`[ProofChat] Skipped image ${f.url}:`, e.message);
@@ -9026,7 +9411,7 @@ const locationBlock = loc ? [
     // 5) Choose vision vs text model
     let stream;
     if (hasAnyImages) {
-const systemMsg = `
+      const systemMsg = `
 You are Agent2 for LithiumX.
 You CAN analyze the attached images.
 Task: Compare "BEFORE" (proposal) vs "AFTER" (proof) images to assess progress.
@@ -9133,12 +9518,12 @@ ALWAYS provide:
   } catch (err) {
     console.error('/proofs/:id/chat SSE error:', err);
     try {
-      res.write(`data: ERROR ${String(err).slice(0,200)}\n\n`);
+      res.write(`data: ERROR ${String(err).slice(0, 200)}\n\n`);
       res.write(`data: [DONE]\n\n`);
       res.end();
-    } catch {}
+    } catch { }
   }
-}); 
+});
 
 // ==============================
 // Routes — Vendor profile (fill once, used in Admin Vendors)
@@ -9174,7 +9559,7 @@ function _addrText(a, city, country) {
   }
   if (typeof a === 'object') {
     const line = a.line1 || a.address1 || '';
-    const cty  = a.city || city || '';
+    const cty = a.city || city || '';
     const ctry = a.country || country || '';
     return [line, cty, ctry].filter(Boolean).join(', ') || null;
   }
@@ -9333,7 +9718,7 @@ app.post('/proposer/profile', requireAuth, async (req, res) => {
 
     // 🔒 HARD SEPARATION:
     // If this wallet is (now) a proposer, nuke any vendor profile for the same wallet.
-    await pool.query('DELETE FROM vendor_profiles WHERE wallet_address = $1', [wallet]);
+    await pool.query('DELETE FROM vendor_profiles WHERE wallet_address = $1 AND tenant_id = $2', [wallet, req.tenantId]);
 
     const {
       vendorName,            // → org_name
@@ -9355,14 +9740,14 @@ app.post('/proposer/profile', requireAuth, async (req, res) => {
     // Store address: keep JSON when object; keep as text when string
     const addressVal =
       typeof address === 'string' ? (address || null)
-      : (address ? JSON.stringify(address) : null);
+        : (address ? JSON.stringify(address) : null);
 
     await pool.query(`
       INSERT INTO proposer_profiles
         (wallet_address, org_name, contact_email, phone, website, address, city, country,
-         whatsapp, telegram_chat_id, telegram_username, updated_at)
+         whatsapp, telegram_chat_id, telegram_username, updated_at, tenant_id)
       VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW())
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, NOW(), $12)
       ON CONFLICT (wallet_address) DO UPDATE SET
         org_name          = COALESCE(NULLIF(EXCLUDED.org_name, ''),         proposer_profiles.org_name),
         contact_email     = COALESCE(NULLIF(EXCLUDED.contact_email, ''),     proposer_profiles.contact_email),
@@ -9390,6 +9775,7 @@ app.post('/proposer/profile', requireAuth, async (req, res) => {
       whatsapp ?? null,
       telegram_chat_id ?? null,
       telegram_username ?? null,
+      req.tenantId
     ]);
 
     // Minimal, consistent response (don’t leak vendor shape)
@@ -9407,9 +9793,9 @@ app.get('/proposer/profile', requireAuth, async (req, res) => {
     const r = await pool.query(`
       SELECT org_name, contact_email, phone, website, address, city, country, telegram_username, telegram_chat_id, whatsapp
       FROM proposer_profiles
-      WHERE lower(wallet_address)=lower($1)
+      WHERE lower(wallet_address)=lower($1) AND tenant_id=$2
       LIMIT 1
-    `, [addr]);
+    `, [addr, req.tenantId]);
 
     if (!r.rows.length) return res.json({}); // empty profile
 
@@ -9420,13 +9806,13 @@ app.get('/proposer/profile', requireAuth, async (req, res) => {
     let addrObj = null, addressText = null;
     if (row.address) {
       if (typeof row.address === 'string' && row.address.trim().startsWith('{')) {
-        try { addrObj = JSON.parse(row.address); } catch {}
+        try { addrObj = JSON.parse(row.address); } catch { }
       }
       if (addrObj && typeof addrObj === 'object') {
         const line1 = norm(addrObj.line1);
-        const city  = norm(addrObj.city);
-        const pc    = norm(addrObj.postalCode) || norm(addrObj.postal_code);
-        const ctry  = norm(addrObj.country);
+        const city = norm(addrObj.city);
+        const pc = norm(addrObj.postalCode) || norm(addrObj.postal_code);
+        const ctry = norm(addrObj.country);
         addressText = [line1, city, pc, ctry].filter(Boolean).join(', ') || null;
       } else {
         addressText = norm(row.address);
@@ -9478,25 +9864,24 @@ app.post("/profile/choose-role", authGuard, async (req, res) => {
     if (roleIntent === "vendor") {
       // ---- UPSERT vendor (safe, don't wipe address JSON) ----
       await client.query(
-        `
-        INSERT INTO vendor_profiles
-          (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at, telegram_chat_id, whatsapp)
+        `INSERT INTO vendor_profiles
+        (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at, telegram_chat_id, whatsapp, tenant_id)
         VALUES
-          ($1, COALESCE($2,''), $3, $4, $5, $6, 'pending', NOW(), NOW(), $7, $8)
-   ON CONFLICT (wallet_address) DO UPDATE SET
-    vendor_name       = COALESCE(NULLIF(EXCLUDED.vendor_name,''), vendor_profiles.vendor_name),
-    email             = COALESCE(EXCLUDED.email,    vendor_profiles.email),
-    phone             = COALESCE(EXCLUDED.phone,    vendor_profiles.phone),
-    website           = COALESCE(EXCLUDED.website,  vendor_profiles.website),
-    address           = CASE
+          ($1, COALESCE($2, ''), $3, $4, $5, $6, 'pending', NOW(), NOW(), $7, $8, $9)
+   ON CONFLICT(wallet_address) DO UPDATE SET
+    vendor_name = COALESCE(NULLIF(EXCLUDED.vendor_name, ''), vendor_profiles.vendor_name),
+        email = COALESCE(EXCLUDED.email, vendor_profiles.email),
+        phone = COALESCE(EXCLUDED.phone, vendor_profiles.phone),
+        website = COALESCE(EXCLUDED.website, vendor_profiles.website),
+        address = CASE
                           WHEN EXCLUDED.address IS NULL OR EXCLUDED.address = '' THEN vendor_profiles.address
                           ELSE EXCLUDED.address
                         END,
-    telegram_chat_id  = COALESCE(EXCLUDED.telegram_chat_id, vendor_profiles.telegram_chat_id),
-    whatsapp          = COALESCE(EXCLUDED.whatsapp, vendor_profiles.whatsapp),
-    status            = COALESCE(NULLIF(vendor_profiles.status,''), 'pending'),
-    updated_at        = NOW()
-        `,
+        telegram_chat_id = COALESCE(EXCLUDED.telegram_chat_id, vendor_profiles.telegram_chat_id),
+        whatsapp = COALESCE(EXCLUDED.whatsapp, vendor_profiles.whatsapp),
+        status = COALESCE(NULLIF(vendor_profiles.status, ''), 'pending'),
+        updated_at = NOW()
+          `,
         [
           wallet,
           (b.vendorName ?? p.display_name ?? "").trim(),
@@ -9506,41 +9891,41 @@ app.post("/profile/choose-role", authGuard, async (req, res) => {
           typeof b.address === "string" ? b.address : (b.address ? JSON.stringify(b.address) : (p.address ?? null)),
           b.telegram_chat_id ?? p.telegram_chat_id ?? null,
           b.whatsapp ?? p.whatsapp ?? null,
+          req.tenantId
         ]
       );
 
       // ---- EXCLUSIVITY: make proposer side inactive for this wallet ----
       await client.query(
         `UPDATE proposer_profiles
-            SET status='inactive', updated_at=NOW()
-          WHERE lower(wallet_address)=lower($1)`,
-        [wallet]
+            SET status = 'inactive', updated_at = NOW()
+          WHERE lower(wallet_address) = lower($1) AND tenant_id = $2`,
+        [wallet, req.tenantId]
       );
     }
 
     if (roleIntent === "proposer") {
       // Prepare proposer fields (includes telegram_username)
-      const orgName  = (b.vendorName ?? b.orgName ?? p.display_name ?? "").trim();
-      const email    = b.email   ?? p.email   ?? null;
-      const phone    = b.phone   ?? p.phone   ?? null;
-      const website  = b.website ?? p.website ?? null;
-      const city     = b.city    ?? p.city    ?? null;
-      const country  = b.country ?? p.country ?? null;
+      const orgName = (b.vendorName ?? b.orgName ?? p.display_name ?? "").trim();
+      const email = b.email ?? p.email ?? null;
+      const phone = b.phone ?? p.phone ?? null;
+      const website = b.website ?? p.website ?? null;
+      const city = b.city ?? p.city ?? null;
+      const country = b.country ?? p.country ?? null;
       const tgChatId = b.telegram_chat_id ?? p.telegram_chat_id ?? null;
-      const tgUser   = b.telegram_username ?? null; // <- include username
+      const tgUser = b.telegram_username ?? null; // <- include username
       const whatsapp = b.whatsapp ?? p.whatsapp ?? null;
       const addressVal =
         typeof b.address === "string" ? b.address :
-        (b.address ? JSON.stringify(b.address) : (p.address ?? null));
+          (b.address ? JSON.stringify(b.address) : (p.address ?? null));
 
       // ---- UPSERT proposer (safe, don't wipe address JSON) ----
       await client.query(
-        `
-        INSERT INTO proposer_profiles
+        `INSERT INTO proposer_profiles
           (wallet_address, org_name, contact_email, phone, website, address, city, country,
-           telegram_chat_id, telegram_username, whatsapp, status, created_at, updated_at)
+           telegram_chat_id, telegram_username, whatsapp, status, created_at, updated_at, tenant_id)
         VALUES
-          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',NOW(),NOW())
+          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',NOW(),NOW(), $12)
    ON CONFLICT (wallet_address) DO UPDATE SET
     org_name          = COALESCE(NULLIF(EXCLUDED.org_name, ''),         proposer_profiles.org_name),
     contact_email     = COALESCE(NULLIF(EXCLUDED.contact_email, ''),    proposer_profiles.contact_email),
@@ -9558,22 +9943,22 @@ app.post("/profile/choose-role", authGuard, async (req, res) => {
     status            = 'active',
     updated_at        = NOW()
         `,
-        [wallet, orgName, email, phone, website, addressVal, city, country, tgChatId, tgUser, whatsapp]
+        [wallet, orgName, email, phone, website, addressVal, city, country, tgChatId, tgUser, whatsapp, req.tenantId]
       );
 
       // ---- EXCLUSIVITY: make vendor side inactive for this wallet ----
       await client.query(
         `UPDATE vendor_profiles
             SET status='inactive', updated_at=NOW()
-          WHERE lower(wallet_address)=lower($1)`,
-        [wallet]
+          WHERE lower(wallet_address)=lower($1) AND tenant_id=$2`,
+        [wallet, req.tenantId]
       );
     }
 
     await client.query('COMMIT');
 
     // Recompute durable roles, choose final role, issue token (unchanged)
-    let roles = await durableRolesForAddress(wallet);
+    let roles = await durableRolesForAddress(wallet, req.tenantId);
     let role = roleFromDurableOrIntent(roles, roleIntent);
     if (isAdminAddress(wallet)) {
       roles = Array.from(new Set([...(roles || []), "admin"]));
@@ -9585,7 +9970,7 @@ app.post("/profile/choose-role", authGuard, async (req, res) => {
     });
     return res.json({ ok: true, role, roles, token });
   } catch (e) {
-    try { await client.query('ROLLBACK'); } catch {}
+    try { await client.query('ROLLBACK'); } catch { }
     console.error("POST /profile/choose-role error", e);
     return res.status(500).json({ error: "choose_role_failed" });
   } finally {
@@ -9623,13 +10008,13 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
 
   try {
     // 🔒 HARD EXCLUSIVITY: a wallet cannot be an entity (proposer) at the same time
-    await pool.query(`DELETE FROM proposer_profiles WHERE wallet_address = $1`, [wallet]);
+    await pool.query(`DELETE FROM proposer_profiles WHERE wallet_address = $1 AND tenant_id = $2`, [wallet, req.tenantId]);
 
     const { rows } = await pool.query(
       `INSERT INTO vendor_profiles
-         (wallet_address, vendor_name, email, phone, address, website, created_at, updated_at)
+         (wallet_address, vendor_name, email, phone, address, website, created_at, updated_at, tenant_id)
        VALUES
-         ($1,$2,$3,$4,$5,$6, now(), now())
+         ($1,$2,$3,$4,$5,$6, now(), now(), $7)
        ON CONFLICT (wallet_address) DO UPDATE SET
          vendor_name = EXCLUDED.vendor_name,
          email       = EXCLUDED.email,
@@ -9638,12 +10023,12 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
          website     = EXCLUDED.website,
          updated_at  = now()
        RETURNING wallet_address, vendor_name, email, phone, address, website`,
-      [wallet, value.vendorName || null, value.email || null, value.phone || null, addressToStore, website || null]
+      [wallet, value.vendorName || null, value.email || null, value.phone || null, addressToStore, website || null, req.tenantId]
     );
 
     const r = rows[0];
     let parsed = null;
-    try { parsed = JSON.parse(r.address || ''); } catch {}
+    try { parsed = JSON.parse(r.address || ''); } catch { }
     const address =
       parsed && typeof parsed === 'object'
         ? { line1: parsed.line1 || '', city: parsed.city || '', country: parsed.country || '', postalCode: parsed.postalCode || parsed.postal_code || '' }
@@ -9666,9 +10051,9 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
 app.post('/tg/webhook', async (req, res) => {
   try {
     const update = req.body || {};
-    const from    = update?.message?.from || update?.callback_query?.from || {};
+    const from = update?.message?.from || update?.callback_query?.from || {};
     const chatObj = update?.message?.chat || update?.callback_query?.message?.chat || {};
-    const chatId  = chatObj?.id ?? from?.id;
+    const chatId = chatObj?.id ?? from?.id;
     const username = from?.username || chatObj?.username || null;
     const textRaw =
       update?.message?.text ??
@@ -9700,8 +10085,8 @@ app.post('/tg/webhook', async (req, res) => {
                updated_at = NOW()
          WHERE owner_telegram_chat_id = $2`,
         [username, chatIdStr]
-      ).catch(() => null); 
-      
+      ).catch(() => null);
+
       // Update proposer_profiles
       await pool.query(
         `UPDATE proposer_profiles
@@ -9735,7 +10120,7 @@ app.post('/tg/webhook', async (req, res) => {
     const walletLower = wallet.toLowerCase();
 
     // --- Unlink this chat ID from any OTHER profiles ---
-    
+
     // Clear from other vendors
     await pool.query(
       `UPDATE vendor_profiles
@@ -9746,7 +10131,7 @@ app.post('/tg/webhook', async (req, res) => {
           AND LOWER(wallet_address) <> LOWER($2)`,
       [chatIdStr, walletLower]
     ).catch(() => null);
-    
+
     // Clear from other proposer_profiles
     await pool.query(
       `UPDATE proposer_profiles
@@ -9791,8 +10176,8 @@ app.post('/tg/webhook', async (req, res) => {
              updated_at = NOW()
        WHERE LOWER(owner_wallet) = LOWER($3)`,
       [chatIdStr, username, walletLower]
-    ).catch(() => null); 
-    
+    ).catch(() => null);
+
     // ====================================================================
     // 2. [THE FIX] UPSERT (INSERT OR UPDATE) 'proposer_profiles'
     // ====================================================================
@@ -9838,7 +10223,7 @@ app.get("/vendor/bids", async (req, res) => {
     const caller = (req.user?.sub || "").toLowerCase();
 
     if (role === "admin") {
-      const { rows } = await pool.query("SELECT * FROM bids ORDER BY created_at DESC NULLS LAST, bid_id DESC");
+      const { rows } = await pool.query("SELECT * FROM bids WHERE tenant_id=$1 ORDER BY created_at DESC NULLS LAST, bid_id DESC", [req.tenantId]);
       return res.json(mapRows(rows));
     }
 
@@ -9846,8 +10231,8 @@ app.get("/vendor/bids", async (req, res) => {
     if (SCOPE_BIDS_FOR_VENDOR) {
       if (!caller) return res.status(401).json({ error: "Unauthorized" });
       const { rows } = await pool.query(
-        "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) ORDER BY created_at DESC NULLS LAST, bid_id DESC",
-        [caller]
+        "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 ORDER BY created_at DESC NULLS LAST, bid_id DESC",
+        [caller, req.tenantId]
       );
       return res.json(mapRows(rows));
     }
@@ -9855,14 +10240,14 @@ app.get("/vendor/bids", async (req, res) => {
     // Flag OFF: safest default is still to scope to caller if present
     if (caller) {
       const { rows } = await pool.query(
-        "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) ORDER BY created_at DESC NULLS LAST, bid_id DESC",
-        [caller]
+        "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 ORDER BY created_at DESC NULLS LAST, bid_id DESC",
+        [caller, req.tenantId]
       );
       return res.json(mapRows(rows));
     }
 
     // If completely unauthenticated and flag OFF, preserve legacy behavior
-    const { rows } = await pool.query("SELECT * FROM bids ORDER BY created_at DESC NULLS LAST, bid_id DESC");
+    const { rows } = await pool.query("SELECT * FROM bids WHERE tenant_id=$1 ORDER BY created_at DESC NULLS LAST, bid_id DESC", [req.tenantId]);
     return res.json(mapRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -9903,7 +10288,7 @@ app.get("/vendor/payments", async (_req, res) => {
 app.get('/admin/bids', adminGuard, async (req, res) => {
   try {
     const vendorWallet = (String(req.query.vendorWallet || '').toLowerCase()) || null;
-    const page  = Math.max(1, parseInt(String(req.query.page ?? '1'), 10));
+    const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10));
     const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? '100'), 10)));
     const offset = (page - 1) * limit;
 
@@ -9921,28 +10306,28 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
     COALESCE(p.title, 'Untitled Project') AS project_title
   FROM bids b
   LEFT JOIN proposals p ON p.proposal_id = b.proposal_id
-  WHERE ($1::text IS NULL OR LOWER(b.wallet_address) = $1)
+  WHERE ($1::text IS NULL OR LOWER(b.wallet_address) = $1) AND b.tenant_id = $2
   ORDER BY b.created_at DESC NULLS LAST, b.bid_id DESC
-  LIMIT $2 OFFSET $3
+  LIMIT $3 OFFSET $4
 `;
     const countSql = `
       SELECT COUNT(*)::int AS cnt
       FROM bids b
-      WHERE ($1::text IS NULL OR LOWER(b.wallet_address) = $1)
+      WHERE ($1::text IS NULL OR LOWER(b.wallet_address) = $1) AND b.tenant_id = $2
     `;
 
     const [list, count] = await Promise.all([
-      pool.query(listSql, [vendorWallet, limit, offset]),
-      pool.query(countSql, [vendorWallet]),
+      pool.query(listSql, [vendorWallet, req.tenantId, limit, offset]),
+      pool.query(countSql, [vendorWallet, req.tenantId]),
     ]);
 
     // Robust JSON coercion (handles jsonb, json text, null)
     const items = list.rows.map(r => {
       let doc = r.doc;
-      if (typeof doc === 'string') { try { doc = JSON.parse(doc); } catch {} }
+      if (typeof doc === 'string') { try { doc = JSON.parse(doc); } catch { } }
 
       let files = r.files;
-      if (typeof files === 'string') { try { files = JSON.parse(files); } catch {} }
+      if (typeof files === 'string') { try { files = JSON.parse(files); } catch { } }
       if (!Array.isArray(files)) files = files ? [files] : [];
 
       return {
@@ -9983,7 +10368,9 @@ app.get('/admin/proofs-bids', adminGuard, async (req, res) => {
          status,
          created_at
        FROM bids
-       ORDER BY created_at DESC NULLS LAST, bid_id DESC`
+       WHERE tenant_id = $1
+       ORDER BY created_at DESC NULLS LAST, bid_id DESC`,
+      [req.tenantId]
     );
 
     // Hydrate with Safe overlay so executed txs flip to PAID immediately
@@ -10003,9 +10390,9 @@ app.get('/admin/proofs-bids', adminGuard, async (req, res) => {
       milestones: Array.isArray(r.milestones)
         ? r.milestones
         : (typeof r.milestones === 'string'
-            ? (() => { try { return JSON.parse(r.milestones || '[]'); } catch { return []; } })()
-            : []
-          ),
+          ? (() => { try { return JSON.parse(r.milestones || '[]'); } catch { return []; } })()
+          : []
+        ),
     }));
 
     // Make sure Netlify / browsers don’t cache this list
@@ -10023,11 +10410,11 @@ app.get('/admin/proofs-bids', adminGuard, async (req, res) => {
 // ADMIN: list proposers/entities (from proposals + fallback to proposer_profiles)
 app.get('/admin/proposers', adminGuard, async (req, res) => {
   try {
-    const includeArchived = ['true','1','yes'].includes(String(req.query.includeArchived || '').toLowerCase());
+    const includeArchived = ['true', '1', 'yes'].includes(String(req.query.includeArchived || '').toLowerCase());
     const qRaw = String(req.query.q || '').trim();
     const q = qRaw ? `%${qRaw}%` : null;
 
-    const page  = Math.max(1, parseInt(String(req.query.page ?? '1'), 10));
+    const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10));
     const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? '100'), 10)));
     const offset = (page - 1) * limit;
 
@@ -10216,7 +10603,7 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
       lastProposalAt: r.last_proposal_at ? new Date(r.last_proposal_at).toISOString() : null,
       statusCounts: {
         approved: Number(r.approved_count) || 0,
-        pending:  Number(r.pending_count)  || 0,
+        pending: Number(r.pending_count) || 0,
         rejected: Number(r.rejected_count) || 0,
         archived: Number(r.archived_count) || 0,
       },
@@ -10236,13 +10623,13 @@ app.post('/admin/vendors/:wallet/archive', adminGuard, async (req, res) => {
 
     // Ensure a row exists, then set archived=true
     const { rows } = await pool.query(
-      `INSERT INTO vendor_profiles (wallet_address, vendor_name, archived, created_at, updated_at)
-         VALUES ($1, '', true, now(), now())
+      `INSERT INTO vendor_profiles (wallet_address, vendor_name, archived, created_at, updated_at, tenant_id)
+         VALUES ($1, '', true, now(), now(), $2)
        ON CONFLICT (wallet_address) DO UPDATE SET
          archived = true,
          updated_at = now()
        RETURNING wallet_address, vendor_name, archived, updated_at`,
-      [wallet]
+      [wallet, req.tenantId]
     );
 
     res.json({ ok: true, walletAddress: rows[0].wallet_address, archived: rows[0].archived });
@@ -10260,9 +10647,9 @@ app.post('/admin/vendors/:wallet/unarchive', adminGuard, async (req, res) => {
     const { rows } = await pool.query(
       `UPDATE vendor_profiles
          SET archived=false, updated_at=now()
-       WHERE lower(wallet_address)=lower($1)
+       WHERE lower(wallet_address)=lower($1) AND tenant_id=$2
        RETURNING wallet_address, archived`,
-      [wallet]
+      [wallet, req.tenantId]
     );
     if (!rows.length) return res.status(404).json({ error: 'Vendor profile not found' });
     res.json({ ok: true, walletAddress: rows[0].wallet_address, archived: rows[0].archived });
@@ -10280,13 +10667,13 @@ app.post('/admin/vendors/:wallet/approve', adminGuard, async (req, res) => {
 
     // ✅ UPSERT so a profile row is created if it doesn't exist
     const { rows } = await pool.query(
-      `INSERT INTO vendor_profiles (wallet_address, status, updated_at)
-         VALUES ($1, 'approved', now())
+      `INSERT INTO vendor_profiles (wallet_address, status, updated_at, tenant_id)
+         VALUES ($1, 'approved', now(), $2)
        ON CONFLICT (wallet_address) DO UPDATE SET
          status='approved',
          updated_at=now()
        RETURNING wallet_address, vendor_name, email, phone, telegram_chat_id, status`,
-      [wallet]
+      [wallet, req.tenantId]
     );
 
     const v = rows[0];
@@ -10301,10 +10688,10 @@ Wallet / Cartera: ${walletStr}`;
       v.telegram_chat_id ? sendTelegram([String(v.telegram_chat_id)], msg) : null,
       v.email
         ? (async () => {
-            const subject = 'Vendor account approved · Cuenta de proveedor aprobada';
-            const { text, html } = bi(msg, msg);
-            await sendEmail([v.email], subject, text, html);
-          })()
+          const subject = 'Vendor account approved · Cuenta de proveedor aprobada';
+          const { text, html } = bi(msg, msg);
+          await sendEmail([v.email], subject, text, html);
+        })()
         : null,
     ]).catch(() => null);
 
@@ -10325,13 +10712,13 @@ app.post('/admin/vendors/:wallet/reject', adminGuard, async (req, res) => {
 
     // ✅ UPSERT so a profile row is created if it doesn't exist
     const { rows } = await pool.query(
-      `INSERT INTO vendor_profiles (wallet_address, status, updated_at)
-         VALUES ($1, 'rejected', now())
+      `INSERT INTO vendor_profiles (wallet_address, status, updated_at, tenant_id)
+         VALUES ($1, 'rejected', now(), $2)
        ON CONFLICT (wallet_address) DO UPDATE SET
          status='rejected',
          updated_at=now()
        RETURNING wallet_address, vendor_name, email, phone, telegram_chat_id, status`,
-      [wallet]
+      [wallet, req.tenantId]
     );
 
     const v = rows[0];
@@ -10344,7 +10731,7 @@ app.post('/admin/vendors/:wallet/reject', adminGuard, async (req, res) => {
         const { text, html } = bi(msg, msg);
         await sendEmail([v.email], 'Vendor account not approved', text, html);
       })() : null,
-    ]).catch(()=>null);
+    ]).catch(() => null);
 
     res.json({ ok: true, walletAddress: v.wallet_address, status: v.status });
   } catch (e) {
@@ -10360,8 +10747,8 @@ app.delete('/admin/vendors/:wallet', adminGuard, async (req, res) => {
     if (!wallet) return res.status(400).json({ error: 'wallet required' });
 
     const { rowCount } = await pool.query(
-      `DELETE FROM vendor_profiles WHERE lower(wallet_address) = $1`,
-      [wallet]
+      `DELETE FROM vendor_profiles WHERE lower(wallet_address) = $1 AND tenant_id = $2`,
+      [wallet, req.tenantId]
     );
     if (rowCount === 0) return res.status(404).json({ error: 'Vendor profile not found' });
 
@@ -10375,7 +10762,7 @@ app.delete('/admin/vendors/:wallet', adminGuard, async (req, res) => {
 // /admin/vendors — normalized vendor list (profiles + bids)
 app.get('/admin/vendors', adminGuard, async (req, res) => {
   try {
-    const includeArchived = ['true','1','yes'].includes(String(req.query.includeArchived || '').toLowerCase());
+    const includeArchived = ['true', '1', 'yes'].includes(String(req.query.includeArchived || '').toLowerCase());
 
     const sqlCore = `
       WITH a AS (
@@ -10387,6 +10774,7 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
                             THEN b.price_usd ELSE 0 END),0)::numeric         AS total_awarded_usd,
           MAX(NULLIF(b.vendor_name, ''))                                     AS bid_vendor_name
         FROM bids b
+        WHERE b.tenant_id = $1
         GROUP BY LOWER(b.wallet_address)
       ),
       vp AS (
@@ -10404,6 +10792,7 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
                COALESCE(status,'pending')      AS status,
                COALESCE(kyc_status,'none')     AS kyc_status
         FROM vendor_profiles
+        WHERE tenant_id = $1
         ORDER BY
           LOWER(wallet_address),
           (NULLIF(vendor_name, '') IS NULL),                  -- prefer non-empty vendor_name
@@ -10436,7 +10825,7 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
     }
     sql += ` ORDER BY s.last_bid_at DESC NULLS LAST, s.vendor_name ASC`;
 
-    const { rows } = await pool.query(sql);
+    const { rows } = await pool.query(sql, [req.tenantId]);
 
     const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
@@ -10447,34 +10836,34 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       if (raw && typeof raw === 'object') {
         addrObj = raw;
       } else if (typeof raw === 'string' && raw.trim().startsWith('{')) {
-        try { addrObj = JSON.parse(raw.trim()); } catch {}
+        try { addrObj = JSON.parse(raw.trim()); } catch { }
       }
 
       // Build normalized address object + string
       const parts = addrObj && typeof addrObj === 'object'
         ? {
-            line1: norm(addrObj.line1),
-            city: norm(addrObj.city),
-            state: norm(addrObj.state),
-            postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code),
-            country: norm(addrObj.country),
-          }
+          line1: norm(addrObj.line1),
+          city: norm(addrObj.city),
+          state: norm(addrObj.state),
+          postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code),
+          country: norm(addrObj.country),
+        }
         : {
-            line1: norm(raw),
-            city: null,
-            state: null,
-            postalCode: null,
-            country: null,
-          };
+          line1: norm(raw),
+          city: null,
+          state: null,
+          postalCode: null,
+          country: null,
+        };
 
       const addressText = [parts.line1, parts.city, parts.postalCode, parts.country]
         .filter(Boolean).join(', ') || null;
 
-      const email    = norm(r.email);
-      const phone    = norm(r.phone);
-      const website  = norm(r.website);
-      const tgId     = norm(r.telegram_chat_id);
-      const tgUser   = norm(r.telegram_username);
+      const email = norm(r.email);
+      const phone = norm(r.phone);
+      const website = norm(r.website);
+      const tgId = norm(r.telegram_chat_id);
+      const tgUser = norm(r.telegram_username);
       const whatsapp = norm(r.whatsapp);
 
       return {
@@ -10553,7 +10942,7 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
           notes: null,
         },
 
-    archived: !!r.archived,
+        archived: !!r.archived,
       };
     });
 
@@ -10589,37 +10978,40 @@ app.get('/admin/oversight/summary', adminGuard, async (req, res) => {
           COUNT(*) FILTER (WHERE status='pending'
             AND submitted_at < NOW() - INTERVAL '48 hours') AS breaching
         FROM proofs
-      `).catch(() => ({ rows:[{ open_pending:0, breaching:0 }] })),
+        WHERE tenant_id = $1
+      `, [req.tenantId]).catch(() => ({ rows: [{ open_pending: 0, breaching: 0 }] })),
       pool.query(`
         SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_usd),0) AS usd
-        FROM milestone_payments
-        WHERE status='pending'
-      `).catch(() => ({ rows:[{ cnt:0, usd:0 }] })),
+        FROM milestone_payments mp
+        JOIN bids b ON b.bid_id = mp.bid_id
+        WHERE mp.status='pending' AND b.tenant_id = $1
+      `, [req.tenantId]).catch(() => ({ rows: [{ cnt: 0, usd: 0 }] })),
       pool.query(`
         SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (
           ORDER BY EXTRACT(EPOCH FROM (updated_at - submitted_at))/3600.0
         ) AS p50h
         FROM proofs
-        WHERE status='approved' AND submitted_at IS NOT NULL AND updated_at IS NOT NULL
-      `).catch(() => ({ rows:[{ p50h:0 }] })),
+        WHERE status='approved' AND submitted_at IS NOT NULL AND updated_at IS NOT NULL AND tenant_id = $1
+      `, [req.tenantId]).catch(() => ({ rows: [{ p50h: 0 }] })),
       pool.query(`
         SELECT 
           COUNT(*) FILTER (WHERE status IN ('approved','rejected')) AS decided,
           COUNT(*) FILTER (WHERE status='rejected') AS rej
         FROM proofs
-      `).catch(() => ({ rows:[{ decided:0, rej:0 }] })),
+        WHERE tenant_id = $1
+      `, [req.tenantId]).catch(() => ({ rows: [{ decided: 0, rej: 0 }] })),
     ]);
 
     res.json({
-      openProofs: Number(proofs.rows[0].open_pending||0),
-      breachingSla: Number(proofs.rows[0].breaching||0),
+      openProofs: Number(proofs.rows[0].open_pending || 0),
+      breachingSla: Number(proofs.rows[0].breaching || 0),
       pendingPayouts: {
-        count: Number(payouts.rows[0].cnt||0),
-        totalUSD: Number(payouts.rows[0].usd||0),
+        count: Number(payouts.rows[0].cnt || 0),
+        totalUSD: Number(payouts.rows[0].usd || 0),
       },
-      p50CycleHours: Number(p50.rows[0].p50h||0),
-      revisionRatePct: (Number(rev.rows[0].decided||0)
-        ? Math.round(100*Number(rev.rows[0].rej)/Number(rev.rows[0].decided))
+      p50CycleHours: Number(p50.rows[0].p50h || 0),
+      revisionRatePct: (Number(rev.rows[0].decided || 0)
+        ? Math.round(100 * Number(rev.rows[0].rej) / Number(rev.rows[0].decided))
         : 0),
     });
   } catch (e) {
@@ -10639,20 +11031,20 @@ app.get('/admin/oversight/queue', adminGuard, async (req, res) => {
         FROM proofs p
         JOIN bids b       ON b.bid_id = p.bid_id
         JOIN proposals pr ON pr.proposal_id = b.proposal_id
-       WHERE p.status='pending'
+       WHERE p.status='pending' AND b.tenant_id = $1
        ORDER BY p.submitted_at NULLS LAST, p.updated_at NULLS LAST
        LIMIT 100
-    `);
+    `, [req.tenantId]);
     res.json(rows.map(r => ({
       id: r.proof_id,                       // ← no “id” column, use proof_id
       vendor: r.vendor_name || r.wallet_address,
       project: r.project,
-      milestone: Number(r.milestone_index)+1,
+      milestone: Number(r.milestone_index) + 1,
       ageHours: r.submitted_at
-        ? Math.max(0, (Date.now()-new Date(r.submitted_at).getTime())/3600000)
+        ? Math.max(0, (Date.now() - new Date(r.submitted_at).getTime()) / 3600000)
         : null,
       status: r.status,
-      risk: (r.submitted_at && (Date.now()-new Date(r.submitted_at).getTime()) > 48*3600000) ? 'sla' : null,
+      risk: (r.submitted_at && (Date.now() - new Date(r.submitted_at).getTime()) > 48 * 3600000) ? 'sla' : null,
       actions: { bidId: r.bid_id, proposalId: r.proposal_id },
     })));
   } catch (e) {
@@ -10675,20 +11067,21 @@ app.get('/admin/oversight/vendors', adminGuard, async (req, res) => {
         MAX(p.updated_at)                                 AS last_activity
       FROM bids b
       LEFT JOIN proofs p ON p.bid_id = b.bid_id
+      WHERE b.tenant_id = $1
       GROUP BY b.vendor_name, b.wallet_address
       ORDER BY proofs DESC NULLS LAST, vendor_name ASC
       LIMIT 200
-    `);
+    `, [req.tenantId]);
     res.json(rows.map(r => ({
       vendor: r.vendor_name || '(unnamed)',
       wallet: r.wallet_address,
-      proofs: Number(r.proofs||0),
-      approved: Number(r.approved||0),
-      cr: Number(r.cr||0),
-      approvalPct: Number(r.proofs||0)
-        ? Math.round(100*Number(r.approved||0)/Number(r.proofs||0))
+      proofs: Number(r.proofs || 0),
+      approved: Number(r.approved || 0),
+      cr: Number(r.cr || 0),
+      approvalPct: Number(r.proofs || 0)
+        ? Math.round(100 * Number(r.approved || 0) / Number(r.proofs || 0))
         : 0,
-      bids: Number(r.bids||0),
+      bids: Number(r.bids || 0),
       lastActivity: r.last_activity
     })));
   } catch (e) {
@@ -10702,19 +11095,21 @@ app.get('/admin/oversight/payouts', adminGuard, async (req, res) => {
   try {
     const [pend, rec] = await Promise.all([
       pool.query(`
-        SELECT id, bid_id, milestone_index, amount_usd, created_at
-          FROM milestone_payments
-         WHERE status='pending'
-         ORDER BY created_at DESC
+        SELECT mp.id, mp.bid_id, mp.milestone_index, mp.amount_usd, mp.created_at
+          FROM milestone_payments mp
+          JOIN bids b ON b.bid_id = mp.bid_id
+         WHERE mp.status='pending' AND b.tenant_id = $1
+         ORDER BY mp.created_at DESC
          LIMIT 50
-      `).catch(() => ({ rows: [] })),
+      `, [req.tenantId]).catch(() => ({ rows: [] })),
       pool.query(`
-        SELECT id, bid_id, milestone_index, amount_usd, released_at, tx_hash
-          FROM milestone_payments
-         WHERE status='released'
-         ORDER BY released_at DESC
+        SELECT mp.id, mp.bid_id, mp.milestone_index, mp.amount_usd, mp.released_at, mp.tx_hash
+          FROM milestone_payments mp
+          JOIN bids b ON b.bid_id = mp.bid_id
+         WHERE mp.status='released' AND b.tenant_id = $1
+         ORDER BY mp.released_at DESC
          LIMIT 50
-      `).catch(() => ({ rows: [] })),
+      `, [req.tenantId]).catch(() => ({ rows: [] })),
     ]);
     res.json({ pending: pend.rows, recent: rec.rows });
   } catch (e) {
@@ -10732,12 +11127,12 @@ app.get('/admin/whats-new', adminGuard, async (req, res) => {
     const hasSince = since && !Number.isNaN(since.getTime());
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || '50'), 10), 1), 200);
 
-    const params = [];
+    const params = [req.tenantId];
     if (hasSince) params.push(since.toISOString());
     params.push(limit);
 
-    const where = hasSince ? 'WHERE ts > $1' : '';
-    const limPos = hasSince ? 2 : 1;
+    const where = hasSince ? 'WHERE ts > $2' : '';
+    const limPos = hasSince ? 3 : 2;
 
     const sql = `
       WITH events AS (
@@ -10774,7 +11169,7 @@ app.get('/admin/whats-new', adminGuard, async (req, res) => {
                NULL::numeric, NULL::numeric, pr.status
           FROM proofs pr
           JOIN bids b ON b.bid_id = pr.bid_id
-         WHERE pr.status IN ('approved','rejected')
+         WHERE pr.status IN ('approved','rejected') AND b.tenant_id = $1
 
         UNION ALL
         -- Payments released
@@ -10784,7 +11179,7 @@ app.get('/admin/whats-new', adminGuard, async (req, res) => {
                mp.amount_usd, NULL::numeric, 'released'
           FROM milestone_payments mp
           JOIN bids b ON b.bid_id = mp.bid_id
-         WHERE mp.released_at IS NOT NULL
+         WHERE mp.released_at IS NOT NULL AND b.tenant_id = $1
       )
       SELECT *
         FROM events
@@ -10813,12 +11208,12 @@ app.get('/me/whats-new', authRequired, async (req, res) => {
     const hasSince = since && !Number.isNaN(since.getTime());
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || '50'), 10), 1), 200);
 
-    const params = [me];
+    const params = [me, req.tenantId];
     if (hasSince) params.push(since.toISOString());
     params.push(limit);
 
-    const where = hasSince ? 'WHERE ts > $2' : '';
-    const limPos = hasSince ? 3 : 2;
+    const where = hasSince ? 'WHERE ts > $3' : '';
+    const limPos = hasSince ? 4 : 3;
 
     const sql = `
       WITH events AS (
@@ -10830,7 +11225,7 @@ app.get('/me/whats-new', authRequired, async (req, res) => {
                p.amount_usd AS amount_usd, NULL::numeric AS price_usd, p.status AS status
           FROM proposals p
           JOIN bids b ON b.proposal_id = p.proposal_id
-         WHERE lower(b.wallet_address) = lower($1)
+         WHERE lower(b.wallet_address) = lower($1) AND b.tenant_id = $2
 
         UNION ALL
         -- Proposals I own (if any)
@@ -10840,7 +11235,7 @@ app.get('/me/whats-new', authRequired, async (req, res) => {
                p.title AS title, NULL::text AS vendor_name,
                p.amount_usd AS amount_usd, NULL::numeric AS price_usd, p.status AS status
           FROM proposals p
-         WHERE lower(p.owner_wallet) = lower($1)
+         WHERE lower(p.owner_wallet) = lower($1) AND p.tenant_id = $2
 
         UNION ALL
         -- My bids
@@ -10849,7 +11244,7 @@ app.get('/me/whats-new', authRequired, async (req, res) => {
                b.wallet_address, NULL::text,
                b.vendor_name, NULL::numeric, b.price_usd, b.status
           FROM bids b
-         WHERE lower(b.wallet_address) = lower($1)
+         WHERE lower(b.wallet_address) = lower($1) AND b.tenant_id = $2
 
         UNION ALL
         -- My proofs
@@ -10859,7 +11254,7 @@ app.get('/me/whats-new', authRequired, async (req, res) => {
                NULL::numeric, NULL::numeric, pr.status
           FROM proofs pr
           JOIN bids b ON b.bid_id = pr.bid_id
-         WHERE lower(b.wallet_address) = lower($1)
+         WHERE lower(b.wallet_address) = lower($1) AND b.tenant_id = $2
 
         UNION ALL
         -- Decisions on my proofs
@@ -10869,7 +11264,7 @@ app.get('/me/whats-new', authRequired, async (req, res) => {
                NULL::numeric, NULL::numeric, pr.status
           FROM proofs pr
           JOIN bids b ON b.bid_id = pr.bid_id
-         WHERE lower(b.wallet_address) = lower($1)
+         WHERE lower(b.wallet_address) = lower($1) AND b.tenant_id = $2
            AND pr.status IN ('approved','rejected')
 
         UNION ALL
@@ -10880,7 +11275,7 @@ app.get('/me/whats-new', authRequired, async (req, res) => {
                mp.amount_usd, NULL::numeric, 'released'
           FROM milestone_payments mp
           JOIN bids b ON b.bid_id = mp.bid_id
-         WHERE lower(b.wallet_address) = lower($1)
+         WHERE lower(b.wallet_address) = lower($1) AND b.tenant_id = $2
            AND mp.released_at IS NOT NULL
       )
       SELECT *
@@ -10918,8 +11313,8 @@ app.get('/me/dashboard/last-seen', authRequired, async (req, res) => {
   const me = String(req.user?.sub || '').toLowerCase();
   if (!me) return res.status(401).json({ error: 'unauthorized' });
   const { rows } = await pool.query(
-    `SELECT last_seen_digest FROM user_dashboard_state WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-    [me]
+    `SELECT last_seen_digest FROM user_dashboard_state WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 LIMIT 1`,
+    [me, req.tenantId]
   );
   res.json({ lastSeen: rows[0]?.last_seen_digest || null });
 });
@@ -10931,11 +11326,11 @@ app.post('/me/dashboard/last-seen', authRequired, async (req, res) => {
   if (Number.isNaN(t.getTime())) return res.status(400).json({ error: 'invalid timestamp' });
 
   await pool.query(
-    `INSERT INTO user_dashboard_state (wallet_address, last_seen_digest, updated_at)
-     VALUES ($1, $2, now())
-     ON CONFLICT (wallet_address) DO UPDATE
+    `INSERT INTO user_dashboard_state (wallet_address, last_seen_digest, updated_at, tenant_id)
+     VALUES ($1, $2, now(), $3)
+     ON CONFLICT (wallet_address, tenant_id) DO UPDATE
        SET last_seen_digest = EXCLUDED.last_seen_digest, updated_at = now()`,
-    [me, t.toISOString()]
+    [me, t.toISOString(), req.tenantId]
   );
   res.json({ ok: true, lastSeen: t.toISOString() });
 });
@@ -10964,17 +11359,17 @@ app.get("/projects", requireApprovedVendorOrAdmin, async (req, res) => {
     const myWallet = String(user?.sub || '').toLowerCase();
 
     // Require admin OR approved vendor
-if (!isAdmin) {
-  if (!myWallet) return res.status(401).json({ error: 'login_required' });
-  const { rows: st } = await pool.query(
-    `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-    [myWallet]
-  );
-  const status = (st[0]?.status || 'pending').toLowerCase();
-  if (status !== 'approved') {
-    return res.status(403).json({ error: 'vendor_not_approved' });
-  }
-}
+    if (!isAdmin) {
+      if (!myWallet) return res.status(401).json({ error: 'login_required' });
+      const { rows: st } = await pool.query(
+        `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+        [myWallet]
+      );
+      const status = (st[0]?.status || 'pending').toLowerCase();
+      if (status !== 'approved') {
+        return res.status(403).json({ error: 'vendor_not_approved' });
+      }
+    }
 
     const where = [];
     const params = [];
@@ -11004,10 +11399,10 @@ if (!isAdmin) {
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
     const sortSql = {
-      latest:   'p.created_at DESC',
-      oldest:   'p.created_at ASC',
-      bids:     'agg_bids_total DESC NULLS LAST',
-      paid:     'agg_ms_paid DESC NULLS LAST',
+      latest: 'p.created_at DESC',
+      oldest: 'p.created_at ASC',
+      bids: 'agg_bids_total DESC NULLS LAST',
+      paid: 'agg_ms_paid DESC NULLS LAST',
       activity: 'last_activity_at DESC NULLS LAST',
     }[sort] || 'last_activity_at DESC NULLS LAST';
 
@@ -11137,9 +11532,9 @@ app.get("/projects/:id/overview", requireApprovedVendorOrAdmin, async (req, res)
       return res.status(403).json({ error: "Forbidden" });
     }
 
- // Bids for this proposal (include doc + files)
-const { rows: bidRows } = await pool.query(
-  `SELECT bid_id,
+    // Bids for this proposal (include doc + files)
+    const { rows: bidRows } = await pool.query(
+      `SELECT bid_id,
           proposal_id,
           vendor_name,
           wallet_address,
@@ -11156,10 +11551,10 @@ const { rows: bidRows } = await pool.query(
      FROM bids
     WHERE proposal_id = $1
     ORDER BY created_at ASC`,
-  [id]
-);
+      [id]
+    );
 
-// 2. INSERT THIS FIX: Hydrate bids with payment status (clears "Pending" if tx exists)
+    // 2. INSERT THIS FIX: Hydrate bids with payment status (clears "Pending" if tx exists)
     const hydratedBids = await Promise.all(
       bidRows.map(b => overlayPaidFromMp(b, pool))
     );
@@ -11167,59 +11562,59 @@ const { rows: bidRows } = await pool.query(
     // 3. Update the next line to use 'hydratedBids' instead of 'bidRows'
     const bidsOut = hydratedBids.map(r => {
       let doc = r.doc;
-      if (typeof doc === 'string') { try { doc = JSON.parse(doc); } catch {} }
+      if (typeof doc === 'string') { try { doc = JSON.parse(doc); } catch { } }
 
       let files = r.files;
-      if (typeof files === 'string') { try { files = JSON.parse(files); } catch {} }
+      if (typeof files === 'string') { try { files = JSON.parse(files); } catch { } }
       if (!Array.isArray(files)) files = files ? [files] : [];
 
       return { ...r, doc: doc || null, files };
     });
 
-const bidIds = bidsOut.map(b => b.bid_id);
+    const bidIds = bidsOut.map(b => b.bid_id);
 
-// Load proofs for all bids of this project
-let proofs = [];
-if (bidIds.length) {
-  const { rows: proofRows } = await pool.query(
-    `SELECT proof_id, bid_id, milestone_index, title, description, status,
+    // Load proofs for all bids of this project
+    let proofs = [];
+    if (bidIds.length) {
+      const { rows: proofRows } = await pool.query(
+        `SELECT proof_id, bid_id, milestone_index, title, description, status,
             files, file_meta, gps_lat, gps_lon, capture_time, submitted_at, updated_at
        FROM proofs
       WHERE bid_id = ANY($1::bigint[])
       ORDER BY submitted_at ASC`,
-    [ bidIds ]
-  );
+        [bidIds]
+      );
 
-  // Sanitize + add safe geo (keeps submitted_at for your activity timeline)
-  proofs = await Promise.all(proofRows.map(async pr => ({
-    proof_id: pr.proof_id,
-    bid_id: pr.bid_id,
-    milestone_index: pr.milestone_index,
-    title: pr.title,
-    description: pr.description,
-    status: pr.status,
-    files: Array.isArray(pr.files)
-      ? pr.files
-      : (typeof pr.files === 'string' ? JSON.parse(pr.files || '[]') : []),
-    submitted_at: pr.submitted_at,
-    updated_at: pr.updated_at,
-    taken_at: pr.capture_time || null,          // EXIF-derived time you store
-    location: await buildSafeGeoForProof(pr)    // city/state/country + rounded coords
-  })));
-}
+      // Sanitize + add safe geo (keeps submitted_at for your activity timeline)
+      proofs = await Promise.all(proofRows.map(async pr => ({
+        proof_id: pr.proof_id,
+        bid_id: pr.bid_id,
+        milestone_index: pr.milestone_index,
+        title: pr.title,
+        description: pr.description,
+        status: pr.status,
+        files: Array.isArray(pr.files)
+          ? pr.files
+          : (typeof pr.files === 'string' ? JSON.parse(pr.files || '[]') : []),
+        submitted_at: pr.submitted_at,
+        updated_at: pr.updated_at,
+        taken_at: pr.capture_time || null,          // EXIF-derived time you store
+        location: await buildSafeGeoForProof(pr)    // city/state/country + rounded coords
+      })));
+    }
 
     // Build milestone list: combine bid.milestones JSON + proof status + payments (paymentTxHash)
     const approvedProof = new Set(
       proofs.filter(p => String(p.status).toLowerCase() === 'approved')
-            .map(p => `${p.bid_id}:${p.milestone_index}`)
+        .map(p => `${p.bid_id}:${p.milestone_index}`)
     );
 
     const msItems = [];
     const paymentsActivity = [];
     for (const b of bidsOut) {
       const arr = Array.isArray(b.milestones) ? b.milestones
-                : typeof b.milestones === 'string' ? JSON.parse(b.milestones || '[]')
-                : [];
+        : typeof b.milestones === 'string' ? JSON.parse(b.milestones || '[]')
+          : [];
       arr.forEach((m, idx) => {
         const key = `${b.bid_id}:${idx}`;
         const paid = !!(m && m.paymentTxHash);
@@ -11237,7 +11632,7 @@ if (bidIds.length) {
         msItems.push({
           bid_id: b.bid_id,
           index: idx,
-          title: m?.name || `Milestone ${idx+1}`,
+          title: m?.name || `Milestone ${idx + 1}`,
           amount_usd: m?.amount ?? null,
           status: paid ? 'paid' : (completed ? 'completed' : 'pending'),
           submitted_proof_id: null, // linked below if we want
@@ -11262,31 +11657,31 @@ if (bidIds.length) {
       ...bidsOut.map(b => ({ type: 'bid_submitted', at: b.created_at, bid_id: b.bid_id, actor_role: 'vendor', vendor_name: b.vendor_name })),
       ...proofs.map(p => ({ type: 'proof_submitted', at: p.submitted_at, proof_id: p.proof_id, bid_id: p.bid_id, milestone_index: p.milestone_index })),
       ...paymentsActivity
-    ].filter(Boolean).sort((a,b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+    ].filter(Boolean).sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
 
- return res.json({
-  proposal: {
-    id: prj.proposal_id,
-    title: prj.title,
-    status: prj.status,
-    owner_wallet: prj.owner_wallet,
-    owner_email: prj.owner_email,
-    created_at: prj.created_at,
-    updated_at: prj.updated_at
-  },
-  bids: {
-    total: bidsOut.length,
-    approved: bidsOut.filter(b => String(b.status).toLowerCase() === 'approved').length,
-    items: bidsOut
-  },
-  milestones,
-  proofs,
-  activity
-});
-} catch (err) {
-  console.error("GET /projects/:id/overview error", err);
-  res.status(500).json({ error: "Server error" });
-}
+    return res.json({
+      proposal: {
+        id: prj.proposal_id,
+        title: prj.title,
+        status: prj.status,
+        owner_wallet: prj.owner_wallet,
+        owner_email: prj.owner_email,
+        created_at: prj.created_at,
+        updated_at: prj.updated_at
+      },
+      bids: {
+        total: bidsOut.length,
+        approved: bidsOut.filter(b => String(b.status).toLowerCase() === 'approved').length,
+        items: bidsOut
+      },
+      milestones,
+      proofs,
+      activity
+    });
+  } catch (err) {
+    console.error("GET /projects/:id/overview error", err);
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 // ==================================================================
@@ -11323,12 +11718,12 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
     // 2. SUCCESS: If Pinata gives us a key, cache it and return it.
     if (response.ok) {
       const keyData = await response.json();
-      
+
       _cachedPinataToken = {
         data: keyData,
         expiresAt: Date.now() + (24 * 60 * 60 * 1000) // 24 hours
       };
-      
+
       return res.json(keyData);
     }
 
@@ -11336,7 +11731,7 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
     // We manually construct a token object using your SERVER'S existing JWT.
     // This bypasses the "Generate" endpoint completely.
     console.warn("⚠️ Pinata KeyGen Failed (Rate Limit). Using Emergency Fallback.");
-    
+
     const fallbackData = {
       JWT: process.env.PINATA_JWT, // Use the main key so upload succeeds
       pinata_api_key: "",          // Not needed for JWT auth
@@ -11364,7 +11759,7 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
 app.post("/payments/release", adminGuard, async (req, res) => {
   try {
     const { bidId, milestoneIndex } = req.body;
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [ bidId ]);
+    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1 AND tenant_id=$2", [bidId, req.tenantId]);
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
 
     const bid = rows[0];
@@ -11377,7 +11772,8 @@ app.post("/payments/release", adminGuard, async (req, res) => {
     const receipt = await blockchainService.sendToken(
       bid.preferred_stablecoin,
       bid.wallet_address,
-      ms.amount
+      ms.amount,
+      req.tenantId
     );
     res.json({ success: true, receipt });
   } catch (err) {
@@ -11415,23 +11811,23 @@ app.post("/ipfs/upload-file", async (req, res) => {
     // 2. QUEUEING LOGIC: Wait for previous uploads to finish before starting this batch
     // This effectively locks the upload process to one-at-a-time across the whole server.
     await (globalPinataQueue = globalPinataQueue.then(async () => {
-        for (const f of files) {
-            try {
-                // Upload
-                const result = await pinataUploadFile(f);
-                results.push(result);
-                
-                // 3. SAFETY DELAY: 1000ms is safer than 300ms for free/tier-1 plans
-                console.log(`[Pinata] Uploaded ${f.name}. Waiting...`);
-                await new Promise(r => setTimeout(r, 1500)); 
-            } catch (innerErr) {
-                console.error(`[Pinata] Failed to upload ${f.name}`, innerErr);
-                throw innerErr; // Stop this batch if a file fails
-            }
+      for (const f of files) {
+        try {
+          // Upload
+          const result = await pinataUploadFile(f, req.tenantId);
+          results.push(result);
+
+          // 3. SAFETY DELAY: 1000ms is safer than 300ms for free/tier-1 plans
+          console.log(`[Pinata] Uploaded ${f.name}. Waiting...`);
+          await new Promise(r => setTimeout(r, 1500));
+        } catch (innerErr) {
+          console.error(`[Pinata] Failed to upload ${f.name}`, innerErr);
+          throw innerErr; // Stop this batch if a file fails
         }
+      }
     }).catch(err => {
-        // If the queue broke, re-throw so we send a 500 error below
-        throw err;
+      // If the queue broke, re-throw so we send a 500 error below
+      throw err;
     }));
 
     res.json(files.length === 1 ? results[0] : results);
@@ -11447,20 +11843,20 @@ app.post("/ipfs/upload-json", async (req, res) => {
   try {
     // Add to the SAME global queue as the files
     await (globalPinataQueue = globalPinataQueue.then(async () => {
-        
-        // 1. Attempt the upload
-        const result = await pinataUploadJson(req.body || {});
-        
-        // 2. Safety delay: Cool down the API key after this upload
-        console.log(`[Pinata] Uploaded JSON Metadata. Waiting...`);
-        await new Promise(r => setTimeout(r, 2000)); 
-        
-        // 3. Send response
-        res.json(result);
+
+      // 1. Attempt the upload
+      const result = await pinataUploadJson(req.body || {}, req.tenantId);
+
+      // 2. Safety delay: Cool down the API key after this upload
+      console.log(`[Pinata] Uploaded JSON Metadata. Waiting...`);
+      await new Promise(r => setTimeout(r, 2000));
+
+      // 3. Send response
+      res.json(result);
 
     }).catch(err => {
-        // If the queue fails, throw so the outer catch block handles it
-        throw err;
+      // If the queue fails, throw so the outer catch block handles it
+      throw err;
     }));
 
   } catch (err) {
@@ -11496,7 +11892,7 @@ app.post('/templates', adminGuard, async (req, res) => {
       await pool.query(
         `INSERT INTO template_milestones (template_id, idx, name, amount, days_offset, acceptance)
          VALUES ($1,$2,$3,$4,$5,$6)`,
-        [tid, m.idx, m.name, Number(m.amount)||0, Number(m.days_offset)||0, JSON.stringify(m.acceptance||[])]
+        [tid, m.idx, m.name, Number(m.amount) || 0, Number(m.days_offset) || 0, JSON.stringify(m.acceptance || [])]
       );
     }
 
@@ -11543,12 +11939,12 @@ app.post('/bids/from-template', requireApprovedVendorOrAdmin, async (req, res) =
     const ms = Array.isArray(b.milestones) && b.milestones.length
       ? b.milestones.map(x => normalizeMilestone(x))
       : msRows.map(r => ({
-          name: r.name,
-          amount: Number(r.amount) || 0,
-          dueDate: new Date(now + (Number(r.days_offset) || 0) * 86400 * 1000).toISOString(),
-          acceptance: r.acceptance || [],
-          archived: false,
-        }));
+        name: r.name,
+        amount: Number(r.amount) || 0,
+        dueDate: new Date(now + (Number(r.days_offset) || 0) * 86400 * 1000).toISOString(),
+        acceptance: r.acceptance || [],
+        archived: false,
+      }));
 
     // Totals/duration
     const priceUSD = ms.reduce((a, m) => a + (Number(m.amount) || 0), 0);
@@ -11562,22 +11958,22 @@ app.post('/bids/from-template', requireApprovedVendorOrAdmin, async (req, res) =
 
     const notes = b.notes || `Created from template "${t[0].title}"`;
     const preferred = String(b.preferredStablecoin || 'USDT').toUpperCase() === 'USDC' ? 'USDC' : 'USDT';
-const files = Array.isArray(b.files)
-  ? b.files
-      .map(x =>
-        typeof x === 'string'
-          ? { url: x }
-          : {
+    const files = Array.isArray(b.files)
+      ? b.files
+        .map(x =>
+          typeof x === 'string'
+            ? { url: x }
+            : {
               url: String(x?.url || ''),
               name: x?.name || (String(x?.url || '').split('/').pop() || 'file'),
               cid: x?.cid ?? null,
               mimetype: x?.mimetype || x?.contentType || null,
             }
-      )
-      .filter(f => f.url)
-  : [];
+        )
+        .filter(f => f.url)
+      : [];
 
-  const doc = files.length > 0 ? files[0] : null;
+    const doc = files.length > 0 ? files[0] : null;
 
     // --- insert same shape as /bids route ---
     const insertQ = `
@@ -11593,43 +11989,45 @@ const files = Array.isArray(b.files)
         doc,
         files,
         status,
-        created_at
+        created_at,
+        tenant_id
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending', NOW())
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending', NOW(), $11)
       RETURNING *`;
 
     const insertVals = [
-  Number(b.proposalId),
-  String(b.vendorName),
-  priceUSD,
-  days,
-  notes,
-  String(b.walletAddress),
-  preferred,
-  JSON.stringify(ms),
-  JSON.stringify(doc),        
-  JSON.stringify(files),
-];
+      Number(b.proposalId),
+      String(b.vendorName),
+      priceUSD,
+      days,
+      notes,
+      String(b.walletAddress),
+      preferred,
+      JSON.stringify(ms),
+      JSON.stringify(doc),
+      JSON.stringify(files),
+      req.tenantId
+    ];
 
     const { rows } = await pool.query(insertQ, insertVals);
     const inserted = rows[0];
 
     try {
-  const actorWallet = (req.user && (req.user.address || req.user.sub)) || null;
-  const actorRole   = (req.user && req.user.role) || "vendor";
+      const actorWallet = (req.user && (req.user.address || req.user.sub)) || null;
+      const actorRole = (req.user && req.user.role) || "vendor";
 
-  const ins = await pool.query(
-    `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
+      const ins = await pool.query(
+        `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
      VALUES ($1,$2,$3,$4)
      RETURNING audit_id`,
-    [ Number(inserted.bid_id), actorWallet, actorRole, { created: true, source: 'template' } ]
-  );
-  if (typeof enrichAuditRow === "function") {
-    enrichAuditRow(pool, ins.rows[0].audit_id).catch(() => null);
-  }
-} catch (e) {
-  console.error("Template bid audit failed:", e);
-}
+        [Number(inserted.bid_id), actorWallet, actorRole, { created: true, source: 'template' }]
+      );
+      if (typeof enrichAuditRow === "function") {
+        enrichAuditRow(pool, ins.rows[0].audit_id).catch(() => null);
+      }
+    } catch (e) {
+      console.error("Template bid audit failed:", e);
+    }
 
     // Inline Agent2 analysis (same behavior as /bids)
     const { rows: pr } = await pool.query(`SELECT * FROM proposals WHERE proposal_id=$1`, [inserted.proposal_id]);
@@ -11638,16 +12036,16 @@ const files = Array.isArray(b.files)
     const INLINE_ANALYSIS_DEADLINE_MS = Number(process.env.AGENT2_INLINE_TIMEOUT_MS || 12000);
     const analysis = await withTimeout(
       prop
-        ? runAgent2OnBid(inserted, prop)
+        ? runAgent2OnBid(inserted, prop, { tenantId: req.tenantId })
         : Promise.resolve({
-            status: 'error',
-            summary: 'Proposal not found for analysis.',
-            risks: [],
-            fit: 'low',
-            milestoneNotes: [],
-            confidence: 0,
-            pdfUsed: false,
-          }),
+          status: 'error',
+          summary: 'Proposal not found for analysis.',
+          risks: [],
+          fit: 'low',
+          milestoneNotes: [],
+          confidence: 0,
+          pdfUsed: false,
+        }),
       INLINE_ANALYSIS_DEADLINE_MS,
       {
         status: 'timeout',
@@ -11692,18 +12090,18 @@ const files = Array.isArray(b.files)
 // --- 1. HELPER: Calculate Distance (Haversine Formula) ---
 function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
   const R = 6371; // Radius of the earth in km
-  const dLat = deg2rad(lat2 - lat1); 
-  const dLon = deg2rad(lon2 - lon1); 
-  const a = 
-    Math.sin(dLat/2) * Math.sin(dLat/2) +
-    Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) * Math.sin(dLon/2) * Math.sin(dLon/2); 
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)); 
+  const dLat = deg2rad(lat2 - lat1);
+  const dLon = deg2rad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   const d = R * c; // Distance in km
   return d;
 }
 
 function deg2rad(deg) {
-  return deg * (Math.PI/180);
+  return deg * (Math.PI / 180);
 }
 
 // --- 2. GET ROUTE: Fetch Reports (Missing Piece!) ---
@@ -11711,27 +12109,27 @@ app.get('/api/reports', async (req, res) => {
   try {
     // 1. Check Auth (Admin or explicit role)
     // Relaxed for this demo, but ideally verify req.user
-    
+
     // 2. Parse Filters
     const statusParam = String(req.query.status || 'all').toLowerCase();
-    
+
     let query = "SELECT * FROM school_reports";
-    const params = [];
-    const conditions = [];
+    const params = [req.tenantId];
+    const conditions = ["tenant_id = $1"];
 
     // Filter Logic
     if (statusParam !== 'all') {
-        if (statusParam === 'completed' || statusParam === 'paid') {
-            // Frontend 'completed' maps to DB 'paid'
-            conditions.push("(status = 'paid' OR status = 'completed')");
-        } else {
-            conditions.push("status = $1");
-            params.push(statusParam);
-        }
+      if (statusParam === 'completed' || statusParam === 'paid') {
+        // Frontend 'completed' maps to DB 'paid'
+        conditions.push("(status = 'paid' OR status = 'completed')");
+      } else {
+        params.push(statusParam);
+        conditions.push(`status = $${params.length}`);
+      }
     }
 
     if (conditions.length > 0) {
-        query += " WHERE " + conditions.join(" AND ");
+      query += " WHERE " + conditions.join(" AND ");
     }
 
     query += " ORDER BY created_at DESC";
@@ -11756,30 +12154,30 @@ app.post('/api/reports', authRequired, async (req, res) => {
       rating,
       imageCid,
       imageUrl,
-      aiAnalysis = {}, 
+      aiAnalysis = {},
       location // Device location
     } = req.body;
 
     const wallet = String(req.user?.sub || "").toLowerCase();
-    
+
     // ============================================================
     // STEP 1: PREPARE LOCATIONS (Normalize Data)
     // ============================================================
-    
+
     // Helper: Normalize Coords
     const normalizeCoords = (loc) => {
-        if (!loc) return null;
-        let obj = loc;
-        if (typeof loc === 'string') { try { obj = JSON.parse(loc); } catch { return null; } }
-        if (typeof obj !== 'object') return null;
-        
-        const lat = obj.lat ?? obj.latitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[1] : null);
-        const lon = obj.lng ?? obj.lon ?? obj.longitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[0] : null);
-        
-        if (lat != null && lon != null && !isNaN(Number(lat)) && Number(lat) !== 0) {
-            return { lat: Number(lat), lon: Number(lon) };
-        }
-        return null;
+      if (!loc) return null;
+      let obj = loc;
+      if (typeof loc === 'string') { try { obj = JSON.parse(loc); } catch { return null; } }
+      if (typeof obj !== 'object') return null;
+
+      const lat = obj.lat ?? obj.latitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[1] : null);
+      const lon = obj.lng ?? obj.lon ?? obj.longitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[0] : null);
+
+      if (lat != null && lon != null && !isNaN(Number(lat)) && Number(lat) !== 0) {
+        return { lat: Number(lat), lon: Number(lon) };
+      }
+      return null;
     };
 
     // A. Get Device Location
@@ -11788,22 +12186,22 @@ app.post('/api/reports', authRequired, async (req, res) => {
 
     // B. Extract Image EXIF (Security Check)
     if (imageUrl) {
-        try {
-            const meta = await extractFileMetaFromUrl({ url: imageUrl });
-            if (meta?.exif?.gpsLatitude) {
-                imageLoc = { lat: meta.exif.gpsLatitude, lon: meta.exif.gpsLongitude };
-                
-                // Add to analysis
-                aiAnalysis.geo = { 
-                    lat: meta.exif.gpsLatitude, 
-                    lon: meta.exif.gpsLongitude, 
-                    source: "image_exif" 
-                };
-                
-                // Trust Image GPS over Device GPS if available
-                reportLoc = imageLoc; 
-            }
-        } catch (exifErr) { console.warn("EXIF skipped:", exifErr.message); }
+      try {
+        const meta = await extractFileMetaFromUrl({ url: imageUrl });
+        if (meta?.exif?.gpsLatitude) {
+          imageLoc = { lat: meta.exif.gpsLatitude, lon: meta.exif.gpsLongitude };
+
+          // Add to analysis
+          aiAnalysis.geo = {
+            lat: meta.exif.gpsLatitude,
+            lon: meta.exif.gpsLongitude,
+            source: "image_exif"
+          };
+
+          // Trust Image GPS over Device GPS if available
+          reportLoc = imageLoc;
+        }
+      } catch (exifErr) { console.warn("EXIF skipped:", exifErr.message); }
     }
 
     let finalAnalysis = { ...aiAnalysis };
@@ -11814,64 +12212,64 @@ app.post('/api/reports', authRequired, async (req, res) => {
     // ============================================================
 
     if (category === 'infrastructure') {
-        // --- LOGIC A: INFRASTRUCTURE (No Proposal Check) ---
-        finalAnalysis.vendor = "N/A (Infrastructure)";
-        
-        // Validation: Must have valid GPS data
-        if (reportLoc) {
-            finalAnalysis.verification = "verified_gps_only";
-            finalAnalysis.location_status = "gps_present";
-            finalAnalysis.highlights = [...(finalAnalysis.highlights || []), "Location Data Present"];
-        } else {
-            finalAnalysis.verification = "missing_gps";
-            finalAnalysis.location_status = "no_gps_data";
-        }
+      // --- LOGIC A: INFRASTRUCTURE (No Proposal Check) ---
+      finalAnalysis.vendor = "N/A (Infrastructure)";
+
+      // Validation: Must have valid GPS data
+      if (reportLoc) {
+        finalAnalysis.verification = "verified_gps_only";
+        finalAnalysis.location_status = "gps_present";
+        finalAnalysis.highlights = [...(finalAnalysis.highlights || []), "Location Data Present"];
+      } else {
+        finalAnalysis.verification = "missing_gps";
+        finalAnalysis.location_status = "no_gps_data";
+      }
 
     } else {
-        // --- LOGIC B: FOOD (Strict Proposal Match) ---
-        
-        // 1. Fetch Active Food Proposals
-        const { rows: candidates } = await pool.query(`
+      // --- LOGIC B: FOOD (Strict Proposal Match) ---
+
+      // 1. Fetch Active Food Proposals
+      const { rows: candidates } = await pool.query(`
           SELECT p.proposal_id, p.org_name, p.title, p.location, b.vendor_name
           FROM proposals p
           JOIN bids b ON b.proposal_id = p.proposal_id
           WHERE LOWER(b.status) IN ('approved', 'completed', 'paid', 'funded')
         `);
 
-        // 2. Fuzzy Match School Name
-        const normalizeStr = (str) => (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
-        const targetName = normalizeStr(schoolName);
-        
-        proposalMatch = candidates.find(c => {
-            const rawDb = normalizeStr(c.org_name + " " + c.title);
-            return rawDb.includes(targetName) || targetName.includes(rawDb);
-        });
+      // 2. Fuzzy Match School Name
+      const normalizeStr = (str) => (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+      const targetName = normalizeStr(schoolName);
 
-        // 3. Verify Distance
-        const proposalLoc = proposalMatch ? normalizeCoords(proposalMatch.location) : null;
+      proposalMatch = candidates.find(c => {
+        const rawDb = normalizeStr(c.org_name + " " + c.title);
+        return rawDb.includes(targetName) || targetName.includes(rawDb);
+      });
 
-        if (proposalMatch) {
-            finalAnalysis.vendor = proposalMatch.vendor_name;
-            finalAnalysis.proposal_id = proposalMatch.proposal_id;
+      // 3. Verify Distance
+      const proposalLoc = proposalMatch ? normalizeCoords(proposalMatch.location) : null;
 
-            if (proposalLoc && reportLoc) {
-                const dist = getDistanceFromLatLonInKm(reportLoc.lat, reportLoc.lon, proposalLoc.lat, proposalLoc.lon);
-                finalAnalysis.distance_km = dist.toFixed(3);
+      if (proposalMatch) {
+        finalAnalysis.vendor = proposalMatch.vendor_name;
+        finalAnalysis.proposal_id = proposalMatch.proposal_id;
 
-                if (dist <= 0.5) {
-                    finalAnalysis.verification = "verified_match"; // Success
-                    finalAnalysis.location_status = "match";
-                } else {
-                    finalAnalysis.verification = "flagged_distance"; // Fail
-                    finalAnalysis.location_status = "mismatch";
-                }
-            } else {
-                finalAnalysis.verification = "unknown_gps";
-            }
+        if (proposalLoc && reportLoc) {
+          const dist = getDistanceFromLatLonInKm(reportLoc.lat, reportLoc.lon, proposalLoc.lat, proposalLoc.lon);
+          finalAnalysis.distance_km = dist.toFixed(3);
+
+          if (dist <= 0.5) {
+            finalAnalysis.verification = "verified_match"; // Success
+            finalAnalysis.location_status = "match";
+          } else {
+            finalAnalysis.verification = "flagged_distance"; // Fail
+            finalAnalysis.location_status = "mismatch";
+          }
         } else {
-            finalAnalysis.vendor = "Unknown Vendor";
-            finalAnalysis.verification = "proposal_not_found";
+          finalAnalysis.verification = "unknown_gps";
         }
+      } else {
+        finalAnalysis.vendor = "Unknown Vendor";
+        finalAnalysis.verification = "proposal_not_found";
+      }
     }
 
     // ============================================================
@@ -11879,80 +12277,80 @@ app.post('/api/reports', authRequired, async (req, res) => {
     // ============================================================
     await pool.query(
       `INSERT INTO school_reports 
-       (report_id, school_name, description, rating, image_cid, image_url, ai_analysis, location, wallet_address, status, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', NOW())
+       (report_id, school_name, description, rating, image_cid, image_url, ai_analysis, location, wallet_address, status, created_at, tenant_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', NOW(), $10)
        ON CONFLICT (report_id) DO NOTHING`,
       [
-        id, schoolName, description, rating, imageCid || null, imageUrl || null, 
-        JSON.stringify(finalAnalysis), JSON.stringify(location || {}), wallet
+        id, schoolName, description, rating, imageCid || null, imageUrl || null,
+        JSON.stringify(finalAnalysis), JSON.stringify(location || {}), wallet, req.tenantId
       ]
     );
 
     // ============================================================
     // STEP 4: PAYMENT GATING
     // ============================================================
-    
+
     let isPayable = false;
     let rejectReason = "";
 
     // CHECK 1: CATEGORY SPECIFIC CONTENT
     let contentValid = false;
     if (category === 'infrastructure') {
-        // Needs Severity > 0
-        if (finalAnalysis.severity > 0) contentValid = true;
-        else rejectReason = "no_damage_detected";
+      // Needs Severity > 0
+      if (finalAnalysis.severity > 0) contentValid = true;
+      else rejectReason = "no_damage_detected";
     } else {
-        // Needs Food Score > 0
-        if (finalAnalysis.score > 0 || finalAnalysis.isFood === true) contentValid = true;
-        else rejectReason = "no_food_detected";
+      // Needs Food Score > 0
+      if (finalAnalysis.score > 0 || finalAnalysis.isFood === true) contentValid = true;
+      else rejectReason = "no_food_detected";
     }
 
     // CHECK 2: LOCATION VERIFICATION
     let locationValid = false;
     if (category === 'infrastructure') {
-        // Infra: Just needs valid GPS data (Since no proposal to match)
-        if (finalAnalysis.verification === 'verified_gps_only') locationValid = true;
-        else rejectReason = "missing_gps_data";
+      // Infra: Just needs valid GPS data (Since no proposal to match)
+      if (finalAnalysis.verification === 'verified_gps_only') locationValid = true;
+      else rejectReason = "missing_gps_data";
     } else {
-        // Food: Must match DB Proposal
-        if (finalAnalysis.verification === 'verified_match') locationValid = true;
-        else rejectReason = `location_verification_failed (${finalAnalysis.verification})`;
+      // Food: Must match DB Proposal
+      if (finalAnalysis.verification === 'verified_match') locationValid = true;
+      else rejectReason = `location_verification_failed (${finalAnalysis.verification})`;
     }
 
     // FINAL DECISION
     if (contentValid && locationValid) {
-        isPayable = true;
+      isPayable = true;
     }
 
     let txHash = null;
     let finalStatus = rejectReason || 'pending';
 
     if (isPayable) {
-        try {
-            console.log(`[Reward] Sending 0.05 USDT to ${wallet} for ${category} report.`);
-            const receipt = await blockchainService.sendToken("USDT", wallet, 0.05);
-            txHash = receipt.hash;
-            finalStatus = 'paid';
-        } catch (payErr) { 
-            console.error(`[Reward] Payment failed:`, payErr.message); 
-            finalStatus = 'payment_failed';
-        }
+      try {
+        console.log(`[Reward] Sending 0.05 USDT to ${wallet} for ${category} report.`);
+        const receipt = await blockchainService.sendToken("USDT", wallet, 0.05, req.tenantId);
+        txHash = receipt.hash;
+        finalStatus = 'paid';
+      } catch (payErr) {
+        console.error(`[Reward] Payment failed:`, payErr.message);
+        finalStatus = 'payment_failed';
+      }
     } else {
-        console.log(`[Reward] Skipped. Category: ${category}, Reason: ${rejectReason}`);
+      console.log(`[Reward] Skipped. Category: ${category}, Reason: ${rejectReason}`);
     }
 
     // Update Status
     await pool.query(
-        `UPDATE school_reports SET status = $1, tx_hash = $2 WHERE report_id = $3`,
-        [finalStatus, txHash, id]
+      `UPDATE school_reports SET status = $1, tx_hash = $2 WHERE report_id = $3 AND tenant_id = $4`,
+      [finalStatus, txHash, id, req.tenantId]
     );
 
-    res.json({ 
-        success: true, 
-        rewardTx: txHash, 
-        status: finalStatus,
-        identifiedVendor: finalAnalysis.vendor,
-        verification: finalAnalysis.verification 
+    res.json({
+      success: true,
+      rewardTx: txHash,
+      status: finalStatus,
+      identifiedVendor: finalAnalysis.vendor,
+      verification: finalAnalysis.verification
     });
 
   } catch (err) {
@@ -11966,7 +12364,7 @@ app.delete('/api/reports/:id', authRequired, async (req, res) => {
   try {
     const { id } = req.params;
     const wallet = String(req.user?.sub || "").toLowerCase();
-    
+
     // Check if Admin
     const isAdmin = (req.user?.role === 'admin') || isAdminAddress(wallet);
 
@@ -11975,12 +12373,12 @@ app.delete('/api/reports/:id', authRequired, async (req, res) => {
 
     if (isAdmin) {
       // Admin can delete ANY report
-      query = 'DELETE FROM school_reports WHERE report_id = $1';
-      params = [id];
+      query = 'DELETE FROM school_reports WHERE report_id = $1 AND tenant_id = $2';
+      params = [id, req.tenantId];
     } else {
       // Users can only delete THEIR OWN reports
-      query = 'DELETE FROM school_reports WHERE report_id = $1 AND lower(wallet_address) = lower($2)';
-      params = [id, wallet];
+      query = 'DELETE FROM school_reports WHERE report_id = $1 AND lower(wallet_address) = lower($2) AND tenant_id = $3';
+      params = [id, wallet, req.tenantId];
     }
 
     const { rowCount } = await pool.query(query, params);
@@ -12008,11 +12406,11 @@ app.put('/api/reports/:id/archive', authRequired, async (req, res) => {
     let params;
 
     if (isAdmin) {
-      query = "UPDATE school_reports SET status = 'archived' WHERE report_id = $1";
-      params = [id];
+      query = "UPDATE school_reports SET status = 'archived' WHERE report_id = $1 AND tenant_id = $2";
+      params = [id, req.tenantId];
     } else {
-      query = "UPDATE school_reports SET status = 'archived' WHERE report_id = $1 AND lower(wallet_address) = lower($2)";
-      params = [id, wallet];
+      query = "UPDATE school_reports SET status = 'archived' WHERE report_id = $1 AND lower(wallet_address) = lower($2) AND tenant_id = $3";
+      params = [id, wallet, req.tenantId];
     }
 
     const { rowCount } = await pool.query(query, params);
