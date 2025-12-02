@@ -3033,6 +3033,14 @@ async function resolveTenant(req, res, next) {
     }
   }
 
+  // 2. Try Cookie (Fallback for initial loads or missing headers)
+  if (!req.tenantId && req.cookies && req.cookies.lx_tenant_id) {
+    const cookieTenant = req.cookies.lx_tenant_id;
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cookieTenant)) {
+      req.tenantId = cookieTenant;
+    }
+  }
+
   // 2. Default to Global Tenant if not found
   if (!req.tenantId) {
     req.tenantId = '00000000-0000-0000-0000-000000000000';
