@@ -3348,6 +3348,19 @@ app.use(resolveTenant);    // 🏢 Multi-tenancy context
 // Ensure JSON parsing is registered before admin routes
 app.use(express.json({ limit: '2mb' }));
 
+// DEBUG: Dump tenant members (Top Level)
+app.get("/api/debug/tenant-members", async (req, res) => {
+  try {
+    const slug = req.query.slug;
+    if (!slug) return res.json({ error: "no slug" });
+    const { rows: tenant } = await pool.query("SELECT id FROM tenants WHERE slug=$1", [slug]);
+    if (!tenant.length) return res.json({ error: "tenant not found" });
+
+    const { rows: members } = await pool.query("SELECT * FROM tenant_members WHERE tenant_id=$1", [tenant[0].id]);
+    res.json({ tenantId: tenant[0].id, members });
+  } catch (e) { res.json({ error: e.message }); }
+});
+
 // --- Accept both camelCase + snake_case + id/entityKey from clients
 function normalizeEntitySelector(body = {}) {
   const norm = (v) => (v == null ? null : String(v).trim());
@@ -4035,6 +4048,8 @@ app.get("/api/tenants/lookup", async (req, res) => {
     res.status(500).json({ error: "Lookup failed" });
   }
 });
+
+
 
 app.get("/api/tenants/current", async (req, res) => {
   try {
