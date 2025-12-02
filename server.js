@@ -12268,9 +12268,9 @@ app.post('/api/reports', authRequired, async (req, res) => {
     } else {
       // --- LOGIC B: FOOD (Strict Proposal Match) ---
 
-      // 1. Fetch Active Food Proposals
+      // 1. Fetch Active Food Proposals (Include tenant_id)
       const { rows: candidates } = await pool.query(`
-          SELECT p.proposal_id, p.org_name, p.title, p.location, b.vendor_name
+          SELECT p.proposal_id, p.org_name, p.title, p.location, p.tenant_id, b.vendor_name
           FROM proposals p
           JOIN bids b ON b.proposal_id = p.proposal_id
           WHERE LOWER(b.status) IN ('approved', 'completed', 'paid', 'funded')
@@ -12291,6 +12291,8 @@ app.post('/api/reports', authRequired, async (req, res) => {
       if (proposalMatch) {
         finalAnalysis.vendor = proposalMatch.vendor_name;
         finalAnalysis.proposal_id = proposalMatch.proposal_id;
+        // Capture tenant ID from the matched proposal
+        req.tenantId = proposalMatch.tenant_id;
 
         if (proposalLoc && reportLoc) {
           const dist = getDistanceFromLatLonInKm(reportLoc.lat, reportLoc.lon, proposalLoc.lat, proposalLoc.lon);
@@ -12315,6 +12317,9 @@ app.post('/api/reports', authRequired, async (req, res) => {
     // ============================================================
     // STEP 3: SAVE REPORT
     // ============================================================
+    // Fallback to default tenant if not matched (e.g. infrastructure or failed match)
+    const targetTenantId = req.tenantId || '00000000-0000-0000-0000-000000000000';
+
     await pool.query(
       `INSERT INTO school_reports 
        (report_id, school_name, description, rating, image_cid, image_url, ai_analysis, location, wallet_address, status, created_at, tenant_id)
@@ -12322,7 +12327,7 @@ app.post('/api/reports', authRequired, async (req, res) => {
        ON CONFLICT (report_id) DO NOTHING`,
       [
         id, schoolName, description, rating, imageCid || null, imageUrl || null,
-        JSON.stringify(finalAnalysis), JSON.stringify(location || {}), wallet, req.tenantId
+        JSON.stringify(finalAnalysis), JSON.stringify(location || {}), wallet, targetTenantId
       ]
     );
 
