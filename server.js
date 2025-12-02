@@ -904,41 +904,7 @@ async function attachPaymentState(bids) {
   }
 })();
 
-// --- DB MIGRATION: Add tenant_id to school_reports ---
-(async () => {
-  try {
-    await pool.query(`
-      ALTER TABLE school_reports
-      ADD COLUMN IF NOT EXISTS tenant_id UUID REFERENCES tenants(id);
-    `);
-    console.log('[db] Successfully added "tenant_id" column to school_reports table');
-  } catch (e) {
-    console.error('[db] Failed to add tenant_id column to school_reports:', e);
-  }
-})();
 
-// --- DB MIGRATION: Add tenant_id to user_dashboard_state and update PK ---
-(async () => {
-  try {
-    await pool.query(`
-      ALTER TABLE user_dashboard_state
-      ADD COLUMN IF NOT EXISTS tenant_id UUID REFERENCES tenants(id);
-    `);
-    // Truncate to avoid PK violation on null tenant_id during migration
-    await pool.query(`TRUNCATE TABLE user_dashboard_state`);
-
-    await pool.query(`
-      ALTER TABLE user_dashboard_state DROP CONSTRAINT IF EXISTS user_dashboard_state_pkey;
-    `);
-
-    await pool.query(`
-      ALTER TABLE user_dashboard_state ADD PRIMARY KEY (wallet_address, tenant_id);
-    `);
-    console.log('[db] Successfully updated user_dashboard_state PK to (wallet_address, tenant_id)');
-  } catch (e) {
-    console.error('[db] Failed to migrate user_dashboard_state:', e);
-  }
-})();
 
 (async () => {
   try {
@@ -1148,7 +1114,7 @@ async function attachPaymentState(bids) {
     `);
 
     // 4. Add tenant_id to existing tables
-    const tables = ['proposals', 'bids', 'proofs', 'vendor_profiles', 'proposer_profiles'];
+    const tables = ['proposals', 'bids', 'proofs', 'vendor_profiles', 'proposer_profiles', 'school_reports', 'user_dashboard_state'];
     for (const table of tables) {
       await pool.query(`
         ALTER TABLE ${table}
@@ -1175,6 +1141,15 @@ async function attachPaymentState(bids) {
         WHERE tenant_id IS NULL;
       `, [defaultTenantId]);
     }
+
+    // 6. Special Handling: user_dashboard_state PK update
+    // (Safe to run after backfill because tenant_id is now populated)
+    await pool.query(`
+      ALTER TABLE user_dashboard_state DROP CONSTRAINT IF EXISTS user_dashboard_state_pkey;
+    `);
+    await pool.query(`
+      ALTER TABLE user_dashboard_state ADD PRIMARY KEY (wallet_address, tenant_id);
+    `);
 
     console.log('[db] multi-tenancy schema ready & migrated');
   } catch (e) {
