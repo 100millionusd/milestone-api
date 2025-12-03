@@ -186,6 +186,8 @@ function roleFromDurableOrIntent(roles, intent) {
   if (roles.length === 1 && !intent) return roles[0];
   // explicit intent wins (only allow vendor/proposer/reporter here)
   if (intent === 'vendor' || intent === 'proposer' || intent === 'reporter') return intent;
+  // 🛑 FIX: Allow admin intent ONLY if they actually have the admin role
+  if (intent === 'admin' && roles.includes('admin')) return 'admin';
   // if there’s a single non-admin durable role, pick it
   const nonAdmin = roles.filter(r => r !== 'admin');
   if (nonAdmin.length === 1) return nonAdmin[0];
