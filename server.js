@@ -9906,8 +9906,8 @@ app.post("/profile/choose-role", authGuard, async (req, res) => {
     const wallet = String(req.user?.address || req.user?.sub || "").toLowerCase();
     if (!wallet) return res.status(401).json({ error: "unauthorized" });
 
-    const roleIntent = String(req.body?.role || req.query?.role || "").trim().toLowerCase(); // 'vendor' | 'proposer'
-    if (roleIntent !== "vendor" && roleIntent !== "proposer") {
+    const roleIntent = String(req.body?.role || req.query?.role || "").trim().toLowerCase(); // 'vendor' | 'proposer' | 'admin'
+    if (roleIntent !== "vendor" && roleIntent !== "proposer" && roleIntent !== "admin") {
       return res.status(400).json({ error: "role_required" });
     }
 
