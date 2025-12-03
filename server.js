@@ -3787,6 +3787,27 @@ app.post("/auth/login", async (req, res) => {
   let roles = await durableRolesForAddress(address, req.tenantId);
   let role = roleFromDurableOrIntent(roles, roleIntent);
   if (!role) {
+    // 🛑 FIX: If login fails (e.g. trying to be admin on Root), check if they have tenants elsewhere
+    try {
+      const { rows: myTenants } = await pool.query(
+        `SELECT t.slug, t.name, tm.role 
+         FROM tenant_members tm
+         JOIN tenants t ON t.id = tm.tenant_id
+         WHERE lower(tm.wallet_address) = lower($1)`,
+        [address]
+      );
+
+      if (myTenants.length > 0) {
+        // Return 200 with special action so frontend can redirect
+        return res.json({
+          action: 'select_tenant',
+          tenants: myTenants
+        });
+      }
+    } catch (e) {
+      console.error('Error checking tenants:', e);
+    }
+
     return res.status(400).json({
       error: "role_required",
       message: 'Choose "vendor" (Submit a Bid) or "proposer" (Submit Proposal).'
