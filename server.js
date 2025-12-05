@@ -237,7 +237,9 @@ async function durableRolesForAddress(address, tenantId) {
     for (const row of m.rows) {
       if (row.role) roles.push(row.role);
     }
-  } catch { }
+  } catch (e) {
+    console.error('[Auth] durableRolesForAddress error checking tenant_members:', e);
+  }
 
   return roles;
 }
@@ -3032,6 +3034,9 @@ async function resolveTenant(req, res, next) {
     // Basic UUID validation
     if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tenantIdHeader)) {
       req.tenantId = tenantIdHeader;
+      console.log('[Middleware] resolveTenant: Found X-Tenant-ID header:', req.tenantId);
+    } else {
+      console.log('[Middleware] resolveTenant: Invalid X-Tenant-ID header:', tenantIdHeader);
     }
   }
 
@@ -3361,6 +3366,34 @@ app.get("/api/debug/tenant-members", async (req, res) => {
     const { rows: members } = await pool.query("SELECT * FROM tenant_members WHERE tenant_id=$1", [tenant[0].id]);
     res.json({ tenantId: tenant[0].id, members });
   } catch (e) { res.json({ error: e.message }); }
+});
+
+// DEBUG: Force Init DB (Run migrations manually)
+app.get("/api/debug/init-db", async (req, res) => {
+  try {
+    // 3. Tenant Members (User Roles within a Tenant)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS tenant_members (
+        id SERIAL PRIMARY KEY,
+        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        wallet_address TEXT NOT NULL,
+        role TEXT NOT NULL, -- 'admin', 'vendor', 'proposer'
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(tenant_id, wallet_address)
+      );
+    `);
+    // 4. Add tenant_id to existing tables
+    const tables = ['proposals', 'bids', 'proofs', 'vendor_profiles', 'proposer_profiles', 'school_reports', 'user_dashboard_state', 'milestone_payments'];
+    for (const table of tables) {
+      await pool.query(`
+        ALTER TABLE ${table}
+        ADD COLUMN IF NOT EXISTS tenant_id UUID REFERENCES tenants(id);
+      `);
+    }
+    res.json({ ok: true, message: "DB init ran" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // --- Accept both camelCase + snake_case + id/entityKey from clients
@@ -3784,7 +3817,9 @@ app.post("/auth/login", async (req, res) => {
   }
 
   // Decide role from durable roles + button intent
+  console.log('[Auth] Login request:', { address, roleIntent, tenantId: req.tenantId });
   let roles = await durableRolesForAddress(address, req.tenantId);
+  console.log('[Auth] Durable roles found:', roles);
   let role = roleFromDurableOrIntent(roles, roleIntent);
   if (!role) {
     // 🛑 FIX: If login fails (e.g. trying to be admin on Root), check if they have tenants elsewhere
