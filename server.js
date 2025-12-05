@@ -4180,7 +4180,7 @@ app.post("/api/tenants/config", authGuard, adminGuard, async (req, res) => {
     if (!key || value === undefined) return res.status(400).json({ error: "key and value required" });
 
     // Allowlist of permitted keys to prevent abuse
-    const ALLOWED_KEYS = ['pinata_jwt', 'pinata_gateway', 'payment_address', 'payment_stablecoin', 'safe_chain_id', 'safe_rpc_url', 'safe_owner_key', 'safe_service_url', 'safe_api_key', 'safe_reconcile_minutes', 'safe_threshold_usd'];
+    const ALLOWED_KEYS = ['pinata_jwt', 'pinata_gateway', 'payment_address', 'payment_stablecoin', 'safe_chain_id', 'safe_rpc_url', 'safe_owner_key', 'safe_service_url', 'safe_api_key', 'safe_reconcile_minutes', 'safe_threshold_usd', 'safe_address'];
     if (!ALLOWED_KEYS.includes(key)) {
       return res.status(400).json({ error: "Invalid config key" });
     }
@@ -7858,21 +7858,23 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
         if (willUseSafe) {
           try {
             // FIX: Prefer tenant config for Safe settings
-            const [tChainId, tRpc, tKey, tService, tApiKey, tThreshold] = await Promise.all([
+            const [tChainId, tRpc, tKey, tService, tApiKey, tThreshold, tSafeAddr] = await Promise.all([
               tenantService.getTenantConfig(req.tenantId, 'safe_chain_id'),
               tenantService.getTenantConfig(req.tenantId, 'safe_rpc_url'),
               tenantService.getTenantConfig(req.tenantId, 'safe_owner_key'),
               tenantService.getTenantConfig(req.tenantId, 'safe_service_url'),
               tenantService.getTenantConfig(req.tenantId, 'safe_api_key'),
-              tenantService.getTenantConfig(req.tenantId, 'safe_threshold_usd')
+              tenantService.getTenantConfig(req.tenantId, 'safe_threshold_usd'),
+              tenantService.getTenantConfig(req.tenantId, 'safe_address')
             ]);
 
             const RPC_URL = tRpc || process.env.SEPOLIA_RPC_URL;
             const SAFE_API_KEY = tApiKey || process.env.SAFE_API_KEY; // Tenant override
 
             // FIX: Prefer tenant config for payment address (Safe Address)
+            // Check safe_address first, then payment_address (legacy), then env
             const tenantPaymentAddress = await tenantService.getTenantConfig(req.tenantId, 'payment_address');
-            const safeAddrRaw = tenantPaymentAddress || process.env.SAFE_ADDRESS || "";
+            const safeAddrRaw = tSafeAddr || tenantPaymentAddress || process.env.SAFE_ADDRESS || "";
             const SAFE_ADDRESS_CS = ethers.utils.getAddress(String(safeAddrRaw).trim()); // checksummed
 
             const TX_SERVICE_BASE = (tService || process.env.SAFE_TXSERVICE_URL || "https://api.safe.global/tx-service/sep")
