@@ -3595,6 +3595,7 @@ function adminGuard(req, res, next) {
   const isAdminNow = isAdminAddress(addr);
 
   if (req.user.role !== "admin" && !isAdminNow) {
+    console.log('[AdminGuard] 403 Forbidden. User:', req.user, 'Path:', req.path, 'IsAdminAddr:', isAdminNow);
     return res.status(403).json({ error: "Forbidden" });
   }
   next();
