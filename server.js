@@ -3821,11 +3821,11 @@ app.post("/auth/login", async (req, res) => {
       const w = address.toLowerCase();
       const { rows } = await pool.query(
         `INSERT INTO vendor_profiles
-           (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at)
-         VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW())
+           (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at, tenant_id)
+         VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW(), $2)
          ON CONFLICT (wallet_address) DO NOTHING
          RETURNING wallet_address, vendor_name, email, phone, telegram_chat_id, whatsapp`,
-        [w]
+        [w, req.tenantId]
       );
 
       if (rows && rows.length) {
