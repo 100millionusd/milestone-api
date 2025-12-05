@@ -4052,6 +4052,7 @@ app.post("/api/tenants", requireAuth, async (req, res) => {
     const creatorAddress = req.user?.address || req.user?.sub;
     console.log('[API] createTenant: Creator address:', creatorAddress, 'User obj:', req.user);
 
+    let adminMember = null;
     if (creatorAddress) {
       try {
         await pool.query(
@@ -4059,6 +4060,14 @@ app.post("/api/tenants", requireAuth, async (req, res) => {
           [tenant.id, creatorAddress]
         );
         console.log('[API] createTenant: Added admin member:', creatorAddress, 'to tenant:', tenant.id);
+
+        // Verify immediately
+        const { rows: verify } = await pool.query(
+          `SELECT * FROM tenant_members WHERE tenant_id=$1 AND wallet_address=$2`,
+          [tenant.id, creatorAddress]
+        );
+        adminMember = verify[0];
+        console.log('[API] createTenant: Verified admin member:', adminMember);
       } catch (err) {
         console.error('[API] createTenant: Failed to add admin member:', err);
       }
@@ -4066,7 +4075,7 @@ app.post("/api/tenants", requireAuth, async (req, res) => {
       console.warn('[API] createTenant: No creator address found, skipping admin member add.');
     }
 
-    res.json(tenant);
+    res.json({ ...tenant, adminMember });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
