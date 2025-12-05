@@ -234,6 +234,7 @@ async function durableRolesForAddress(address, tenantId) {
       `SELECT role FROM tenant_members WHERE lower(wallet_address)=lower($1) AND tenant_id=$2`,
       [addr, tenantId]
     );
+    console.log('[Auth] durableRolesForAddress: Checking tenant_members for', addr, 'tenant:', tenantId, 'Found:', m.rows);
     for (const row of m.rows) {
       if (row.role) roles.push(row.role);
     }
