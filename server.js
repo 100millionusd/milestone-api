@@ -4165,6 +4165,39 @@ app.get("/api/tenants/current", async (req, res) => {
   }
 });
 
+// Set Tenant Config (Admin Only)
+app.post("/api/tenants/config", adminGuard, async (req, res) => {
+  try {
+    const { key, value, isEncrypted } = req.body;
+    if (!key || value === undefined) return res.status(400).json({ error: "key and value required" });
+
+    // Allowlist of permitted keys to prevent abuse
+    const ALLOWED_KEYS = ['pinata_jwt', 'pinata_gateway', 'payment_address', 'payment_stablecoin'];
+    if (!ALLOWED_KEYS.includes(key)) {
+      return res.status(400).json({ error: "Invalid config key" });
+    }
+
+    await tenantService.setTenantConfig(req.tenantId, key, value, !!isEncrypted);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /api/tenants/config failed", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get Tenant Config (Admin Only)
+app.get("/api/tenants/config/:key", adminGuard, async (req, res) => {
+  try {
+    const { key } = req.params;
+    const val = await tenantService.getTenantConfig(req.tenantId, key);
+    // Return wrapped object to handle nulls/empty strings clearly
+    res.json({ value: val });
+  } catch (e) {
+    console.error("GET /api/tenants/config/:key failed", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ==============================
 // Routes — Health & Test
 // ==============================
