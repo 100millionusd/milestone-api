@@ -3814,8 +3814,8 @@ app.post("/auth/login", async (req, res) => {
     });
   }
 
-  // Seed vendor row ONLY when intent=vendor and user isn't a vendor yet
-  if (role === "vendor" && !roles.includes("vendor")) {
+  // Seed vendor row ONLY when intent=vendor and user isn't a vendor yet AND isn't an admin
+  if (role === "vendor" && !roles.includes("vendor") && !roles.includes("admin")) {
     __vendorSeedGuard++; // temporarily lift the global insert guard
     try {
       const w = address.toLowerCase();
