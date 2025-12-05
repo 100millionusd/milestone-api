@@ -7839,7 +7839,12 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
           try {
             const RPC_URL = process.env.SEPOLIA_RPC_URL;
             const SAFE_API_KEY = process.env.SAFE_API_KEY;
-            const SAFE_ADDRESS_CS = ethers.utils.getAddress(String(process.env.SAFE_ADDRESS || "").trim()); // checksummed
+
+            // FIX: Prefer tenant config for payment address (Safe Address)
+            const tenantPaymentAddress = await tenantService.getTenantConfig(req.tenantId, 'payment_address');
+            const safeAddrRaw = tenantPaymentAddress || process.env.SAFE_ADDRESS || "";
+            const SAFE_ADDRESS_CS = ethers.utils.getAddress(String(safeAddrRaw).trim()); // checksummed
+
             const TX_SERVICE_BASE = (process.env.SAFE_TXSERVICE_URL || "https://api.safe.global/tx-service/sep")
               .trim()
               .replace(/\/+$/, "");
@@ -11873,16 +11878,31 @@ app.get("/projects/:id/overview", requireApprovedVendorOrAdmin, async (req, res)
 // ROBUST TOKEN ROUTE: Implements "Cache" + "Emergency Fallback"
 // This guarantees the frontend ALWAYS gets a token, even if Pinata is down/blocking.
 // ==================================================================
-let _cachedPinataToken = null;
+// ==================================================================
+// ROBUST TOKEN ROUTE: Implements "Cache" + "Emergency Fallback"
+// This guarantees the frontend ALWAYS gets a token, even if Pinata is down/blocking.
+// ==================================================================
+const _cachedPinataTokens = {}; // tenantId -> { data, expiresAt }
 
 app.get("/auth/pinata-token", requireAuth, async (req, res) => {
   try {
+    const tenantId = req.tenantId || 'global';
+
     // 1. SERVE CACHE: If we have a valid key in memory, use it.
-    if (_cachedPinataToken && _cachedPinataToken.expiresAt > Date.now()) {
-      return res.json(_cachedPinataToken.data);
+    const cached = _cachedPinataTokens[tenantId];
+    if (cached && cached.expiresAt > Date.now()) {
+      return res.json(cached.data);
     }
 
-    console.log("Attempting to generate new Pinata Token...");
+    console.log(`Attempting to generate new Pinata Token for tenant ${tenantId}...`);
+
+    // Fetch tenant config
+    const tenantJwt = await tenantService.getTenantConfig(req.tenantId, 'pinata_jwt');
+    const jwtToUse = tenantJwt || process.env.PINATA_JWT;
+
+    if (!jwtToUse) {
+      return res.status(500).json({ error: "Pinata not configured" });
+    }
 
     const uuid = crypto.randomUUID();
     const body = {
@@ -11895,7 +11915,7 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.PINATA_JWT}`
+        "Authorization": `Bearer ${jwtToUse}`
       },
       body: JSON.stringify(body)
     });
@@ -11904,7 +11924,7 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
     if (response.ok) {
       const keyData = await response.json();
 
-      _cachedPinataToken = {
+      _cachedPinataTokens[tenantId] = {
         data: keyData,
         expiresAt: Date.now() + (24 * 60 * 60 * 1000) // 24 hours
       };
@@ -11918,13 +11938,13 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
     console.warn("⚠️ Pinata KeyGen Failed (Rate Limit). Using Emergency Fallback.");
 
     const fallbackData = {
-      JWT: process.env.PINATA_JWT, // Use the main key so upload succeeds
+      JWT: jwtToUse,               // Use the configured key so upload succeeds
       pinata_api_key: "",          // Not needed for JWT auth
       pinata_api_secret: ""        // Not needed for JWT auth
     };
 
     // Cache this fallback too, so we don't keep hitting the API error
-    _cachedPinataToken = {
+    _cachedPinataTokens[tenantId] = {
       data: fallbackData,
       expiresAt: Date.now() + (1 * 60 * 60 * 1000) // Cache fallback for 1 hour
     };
@@ -11934,7 +11954,9 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("Pinata Token Route Fatal Error:", err);
     // Even on fatal crash, try to send the main JWT
-    res.json({ JWT: process.env.PINATA_JWT });
+    // Fetch config again just in case (or use global fallback)
+    const tenantJwt = await tenantService.getTenantConfig(req.tenantId, 'pinata_jwt').catch(() => null);
+    res.json({ JWT: tenantJwt || process.env.PINATA_JWT });
   }
 });
 
