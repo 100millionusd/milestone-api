@@ -3397,6 +3397,32 @@ app.get("/api/debug/init-db", async (req, res) => {
   }
 });
 
+// Debug: Check auth status for address/tenant
+app.get('/api/debug/auth-check', async (req, res) => {
+  try {
+    const address = String(req.query.address || '').toLowerCase();
+    const tenantId = req.query.tenantId;
+
+    if (!address || !tenantId) return res.json({ error: 'Missing address or tenantId' });
+
+    const { rows: members } = await pool.query(
+      `SELECT * FROM tenant_members WHERE lower(wallet_address)=lower($1) AND tenant_id=$2`,
+      [address, tenantId]
+    );
+
+    const roles = await durableRolesForAddress(address, tenantId);
+
+    res.json({
+      address,
+      tenantId,
+      members,
+      durableRoles: roles
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // --- Accept both camelCase + snake_case + id/entityKey from clients
 function normalizeEntitySelector(body = {}) {
   const norm = (v) => (v == null ? null : String(v).trim());
