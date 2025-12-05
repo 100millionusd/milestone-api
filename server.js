@@ -4167,7 +4167,7 @@ app.get("/api/tenants/current", async (req, res) => {
 });
 
 // Set Tenant Config (Admin Only)
-app.post("/api/tenants/config", adminGuard, async (req, res) => {
+app.post("/api/tenants/config", authGuard, adminGuard, async (req, res) => {
   try {
     const { key, value, isEncrypted } = req.body;
     if (!key || value === undefined) return res.status(400).json({ error: "key and value required" });
@@ -4187,7 +4187,7 @@ app.post("/api/tenants/config", adminGuard, async (req, res) => {
 });
 
 // Get Tenant Config (Admin Only)
-app.get("/api/tenants/config/:key", adminGuard, async (req, res) => {
+app.get("/api/tenants/config/:key", authGuard, adminGuard, async (req, res) => {
   try {
     const { key } = req.params;
     const val = await tenantService.getTenantConfig(req.tenantId, key);
