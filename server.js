@@ -4180,7 +4180,7 @@ app.post("/api/tenants/config", authGuard, adminGuard, async (req, res) => {
     if (!key || value === undefined) return res.status(400).json({ error: "key and value required" });
 
     // Allowlist of permitted keys to prevent abuse
-    const ALLOWED_KEYS = ['pinata_jwt', 'pinata_gateway', 'payment_address', 'payment_stablecoin'];
+    const ALLOWED_KEYS = ['pinata_jwt', 'pinata_gateway', 'payment_address', 'payment_stablecoin', 'safe_chain_id', 'safe_rpc_url', 'safe_owner_key', 'safe_service_url'];
     if (!ALLOWED_KEYS.includes(key)) {
       return res.status(400).json({ error: "Invalid config key" });
     }
@@ -7837,19 +7837,27 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
         // ---------- SAFE PATH (EIP-712; direct POST; sep base; checksummed addr; hard self-verify) ----------
         if (willUseSafe) {
           try {
-            const RPC_URL = process.env.SEPOLIA_RPC_URL;
-            const SAFE_API_KEY = process.env.SAFE_API_KEY;
+            // FIX: Prefer tenant config for Safe settings
+            const [tChainId, tRpc, tKey, tService] = await Promise.all([
+              tenantService.getTenantConfig(req.tenantId, 'safe_chain_id'),
+              tenantService.getTenantConfig(req.tenantId, 'safe_rpc_url'),
+              tenantService.getTenantConfig(req.tenantId, 'safe_owner_key'),
+              tenantService.getTenantConfig(req.tenantId, 'safe_service_url')
+            ]);
+
+            const RPC_URL = tRpc || process.env.SEPOLIA_RPC_URL;
+            const SAFE_API_KEY = process.env.SAFE_API_KEY; // Keep global for now unless user wants to override
 
             // FIX: Prefer tenant config for payment address (Safe Address)
             const tenantPaymentAddress = await tenantService.getTenantConfig(req.tenantId, 'payment_address');
             const safeAddrRaw = tenantPaymentAddress || process.env.SAFE_ADDRESS || "";
             const SAFE_ADDRESS_CS = ethers.utils.getAddress(String(safeAddrRaw).trim()); // checksummed
 
-            const TX_SERVICE_BASE = (process.env.SAFE_TXSERVICE_URL || "https://api.safe.global/tx-service/sep")
+            const TX_SERVICE_BASE = (tService || process.env.SAFE_TXSERVICE_URL || "https://api.safe.global/tx-service/sep")
               .trim()
               .replace(/\/+$/, "");
 
-            if (!RPC_URL) throw new Error("SEPOLIA_RPC_URL not configured");
+            if (!RPC_URL) throw new Error("RPC_URL not configured");
             if (!SAFE_API_KEY) throw new Error("SAFE_API_KEY not configured");
             if (!SAFE_ADDRESS_CS) throw new Error("SAFE_ADDRESS not configured");
 
@@ -7863,8 +7871,8 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
             const ZERO = "0x0000000000000000000000000000000000000000";
             const safeContract = new ethers.Contract(SAFE_ADDRESS_CS, SAFE_ABI, provider);
 
-            // 1) pick a Safe owner key from env
-            const rawKeys = (process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
+            // 1) pick a Safe owner key from env or tenant config
+            const rawKeys = (tKey || process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
               .split(",").map(s => s.trim()).filter(Boolean)
               .map(k => (k.startsWith("0x") ? k : `0x${k}`));
             if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured");
@@ -7898,7 +7906,7 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
             if (typeof data !== "string" || !data.startsWith("0x")) throw new Error("[SAFE] invalid ERC20.transfer data");
 
             // 5) EIP-712 typed data (SafeTx)
-            const chainId = 11155111; // Sepolia
+            const chainId = Number(tChainId || process.env.SAFE_CHAIN_ID || 11155111); // Default Sepolia
             const op = 0; // CALL
             const nonceBn = await safeContract.nonce();
             const nonce = ethers.BigNumber.isBigNumber(nonceBn) ? nonceBn.toNumber() : Number(nonceBn);
