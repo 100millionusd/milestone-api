@@ -4115,7 +4115,7 @@ app.get("/api/tenants/lookup", async (req, res) => {
     if (!slug) return res.status(400).json({ error: "Missing slug" });
 
     const { rows } = await pool.query(
-      "SELECT id, name, slug FROM tenants WHERE slug = $1",
+      "SELECT id, name, slug FROM tenants WHERE lower(slug) = lower($1)",
       [slug]
     );
     if (!rows[0]) return res.status(404).json({ error: "Tenant not found" });
