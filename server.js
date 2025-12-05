@@ -4048,12 +4048,22 @@ app.post("/api/tenants", requireAuth, async (req, res) => {
     const tenant = await tenantService.createTenant(name, slug);
 
     // Add creator as the first admin member
+    // Add creator as the first admin member
     const creatorAddress = req.user?.address || req.user?.sub;
+    console.log('[API] createTenant: Creator address:', creatorAddress, 'User obj:', req.user);
+
     if (creatorAddress) {
-      await pool.query(
-        `INSERT INTO tenant_members (tenant_id, wallet_address, role) VALUES ($1, $2, 'admin')`,
-        [tenant.id, creatorAddress]
-      );
+      try {
+        await pool.query(
+          `INSERT INTO tenant_members (tenant_id, wallet_address, role) VALUES ($1, $2, 'admin')`,
+          [tenant.id, creatorAddress]
+        );
+        console.log('[API] createTenant: Added admin member:', creatorAddress, 'to tenant:', tenant.id);
+      } catch (err) {
+        console.error('[API] createTenant: Failed to add admin member:', err);
+      }
+    } else {
+      console.warn('[API] createTenant: No creator address found, skipping admin member add.');
     }
 
     res.json(tenant);
