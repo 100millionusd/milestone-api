@@ -169,14 +169,20 @@ async function loadRowsForPeriod(pool, periodId, cutoffEpochSec /* or null */, t
        JOIN bids b ON b.bid_id = ba.bid_id
       WHERE ba.batch_id IS NULL
         AND ba.leaf_hash IS NOT NULL
-        AND b.tenant_id = $2
         -- Fix: Instead of restricting to ONE hour, we take everything unbatched 
         -- that is created before the next hour starts.
-        AND ba.created_at < ((to_timestamp($1, 'YYYY-MM-DD"T"HH24') AT TIME ZONE 'UTC') + interval '1 hour')
+        -- AND ba.created_at < ((to_timestamp($1, 'YYYY-MM-DD"T"HH24') AT TIME ZONE 'UTC') + interval '1 hour')
       ORDER BY ba.audit_id ASC`,
     [periodId, tenantId]
   );
   console.log(`[Anchor] loadRowsForPeriod: period=${periodId}, tenant=${tenantId}, found=${q.rows.length} rows`);
+  if (q.rows.length > 0) {
+    console.log(`[Anchor] First row created_at: ${q.rows[0].created_at}`);
+  } else {
+    // Debug: check if any rows exist for this tenant at all
+    const check = await pool.query('SELECT count(*) FROM bid_audits ba JOIN bids b ON b.bid_id=ba.bid_id WHERE b.tenant_id=$1 AND ba.batch_id IS NULL', [tenantId]);
+    console.log(`[Anchor] Total unbatched rows for tenant: ${check.rows[0].count}`);
+  }
   return q.rows;
 }
 
