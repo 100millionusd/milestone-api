@@ -2255,12 +2255,12 @@ function normalizeProfile(profileRaw) {
 // ==============================
 // PDF Extraction (debug-friendly with retries)
 // ==============================
-async function extractPdfInfoFromDoc(doc) {
+async function extractPdfInfoFromDoc(doc, jwt) {
   if (!doc?.url) return { used: false, reason: "no_file" };
   const name = doc.name || "";
   const isPdfName = /\.pdf($|\?)/i.test(name);
   try {
-    const buf = await fetchAsBuffer(doc.url);
+    const buf = await fetchAsBuffer(doc.url, jwt);
     const first5 = buf.slice(0, 5).toString(); // "%PDF-"
     const isPdf = first5 === "%PDF-" || isPdfName || (doc.mimetype || "").toLowerCase().includes("pdf");
     if (!isPdf) {
@@ -2281,14 +2281,14 @@ async function extractPdfInfoFromDoc(doc) {
   }
 }
 
-async function waitForPdfInfoFromDoc(doc, { maxMs = 12000, stepMs = 1500 } = {}) {
+async function waitForPdfInfoFromDoc(doc, { maxMs = 12000, stepMs = 1500 } = {}, jwt) {
   const start = Date.now();
-  let last = await extractPdfInfoFromDoc(doc);
+  let last = await extractPdfInfoFromDoc(doc, jwt);
   if (!doc?.url || last.reason === "not_pdf" || last.reason === "no_file") return last;
   while (!last.used && Date.now() - start < maxMs) {
     if (!["http_error", "no_text_extracted", "pdf_parse_failed"].includes(last.reason || "")) break;
     await new Promise((r) => setTimeout(r, stepMs));
-    last = await extractPdfInfoFromDoc(doc);
+    last = await extractPdfInfoFromDoc(doc, jwt);
   }
   return last;
 }
@@ -2522,14 +2522,14 @@ async function headOk(u, headers = {}) {
   } catch { return false; }
 }
 
-async function checkCidAlive(cid) {
+async function checkCidAlive(cid, jwt) {
   if (!cid) return false;
   // 1) your configured gateway (supports mypinata auth)
   const baseHost = PINATA_GATEWAY.replace(/^https?:\/\//, '');
   const primary = `https://${baseHost}/ipfs/${cid}`;
   const headers = {};
   if (/\.mypinata\.cloud$/i.test(baseHost)) {
-    if (PINATA_JWT) headers['Authorization'] = `Bearer ${PINATA_JWT}`;
+    if (jwt) headers['Authorization'] = `Bearer ${jwt}`;
     if (PINATA_GATEWAY_TOKEN) headers['x-pinata-gateway-token'] = PINATA_GATEWAY_TOKEN;
   }
   if (await headOk(primary, headers)) return true;
@@ -2548,7 +2548,7 @@ async function checkCidAlive(cid) {
 
 /** Fetch a URL into a Buffer (supports mypinata.cloud auth + public fallbacks) */
 /** Fetch a URL into a Buffer (supports mypinata.cloud auth + public fallbacks) */
-async function fetchAsBuffer(urlStr) {
+async function fetchAsBuffer(urlStr, jwt) {
   // 1. 🛡️ SANITIZE: Remove trailing dots/punctuation
   let orig = String(urlStr).trim().replace(/[.,;]+$/, "");
 
@@ -2596,7 +2596,7 @@ async function fetchAsBuffer(urlStr) {
   const isDedicated = /\.mypinata\.cloud$/i.test(new URL(orig).hostname);
   const headers = {};
   if (isDedicated) {
-    if (PINATA_JWT) headers["Authorization"] = `Bearer ${PINATA_JWT}`;
+    if (jwt) headers["Authorization"] = `Bearer ${jwt}`;
     if (PINATA_GATEWAY_TOKEN) headers["x-pinata-gateway-token"] = PINATA_GATEWAY_TOKEN;
   }
 
@@ -2919,20 +2919,17 @@ class BlockchainService {
         tenantService.getTenantConfig(tenantId, 'ETH_RPC_URL')
       ]);
 
+      if (!tenantKey) {
+        throw new Error("Tenant Direct Payment (ETH_PRIVATE_KEY) not configured");
+      }
+
       let provider = this.provider;
       if (tenantRpc) {
         provider = new ethers.providers.JsonRpcProvider(tenantRpc);
       }
 
-      if (tenantKey) {
-        const pk = tenantKey.startsWith("0x") ? tenantKey : `0x${tenantKey}`;
-        signer = new ethers.Wallet(pk, provider);
-      } else if (tenantRpc && signer) {
-        // If we have a new RPC but no new key, try to reconnect existing signer
-        if (this.signer) {
-          signer = this.signer.connect(provider);
-        }
-      }
+      const pk = tenantKey.startsWith("0x") ? tenantKey : `0x${tenantKey}`;
+      signer = new ethers.Wallet(pk, provider);
     }
 
     if (!signer) return 0;
@@ -3284,7 +3281,8 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride, tenantId } 
   const docObj = coerceJson(bidRow.doc);
   let pdfInfo = { used: false, reason: "no_file" };
   try {
-    pdfInfo = await waitForPdfInfoFromDoc(docObj);
+    const pinataJwt = tenantId ? await tenantService.getTenantConfig(tenantId, 'pinata_jwt') : null;
+    pdfInfo = await waitForPdfInfoFromDoc(docObj, {}, pinataJwt);
   } catch (e) {
     pdfInfo = { used: false, reason: "extract_exception", error: String(e).slice(0, 200) };
   }
@@ -3874,7 +3872,7 @@ app.post("/auth/login", async (req, res) => {
     // 🛑 FIX: If login fails (e.g. trying to be admin on Root), check if they have tenants elsewhere
     try {
       const { rows: myTenants } = await pool.query(
-        `SELECT t.slug, t.name, tm.role 
+        `SELECT t.slug, t.name, tm.role
          FROM tenant_members tm
          JOIN tenants t ON t.id = tm.tenant_id
          WHERE lower(tm.wallet_address) = lower($1)`,
@@ -4416,8 +4414,8 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
     // Use client.query, NOT pool.query
     params.push(req.tenantId);
     const profileQuery = `
-      SELECT wallet_address 
-      FROM proposer_profiles 
+      SELECT wallet_address
+      FROM proposer_profiles
       WHERE ${whereClause} AND status <> 'archived' AND tenant_id = $${params.length}
     `;
 
@@ -4439,8 +4437,8 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
 
     // 3. Archive 'proposer_profiles' (using the client)
     const { rowCount: rc1 } = await client.query(
-      `UPDATE proposer_profiles 
-       SET status='archived', updated_at=NOW() 
+      `UPDATE proposer_profiles
+       SET status='archived', updated_at=NOW()
        WHERE wallet_address = ANY($1) AND status <> 'archived' AND tenant_id = $2`,
       [walletAddresses, req.tenantId]
     );
@@ -4458,8 +4456,8 @@ app.post('/admin/entities/archive', adminGuard, async (req, res) => {
       : `${cols.statusCol}='archived'`;
 
     const { rowCount: rc2 } = await client.query(
-      `UPDATE proposals 
-       SET ${setSql} 
+      `UPDATE proposals
+       SET ${setSql}
        WHERE owner_wallet = ANY($1) AND ${cols.statusCol} <> 'archived' AND tenant_id = $2`,
       [walletAddresses, req.tenantId]
     );
@@ -4503,8 +4501,8 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
     // Use client.query, NOT pool.query
     params.push(req.tenantId);
     const profileQuery = `
-      SELECT wallet_address 
-      FROM proposer_profiles 
+      SELECT wallet_address
+      FROM proposer_profiles
       WHERE ${whereClause} AND status = 'archived' AND tenant_id = $${params.length}
     `;
 
@@ -4526,8 +4524,8 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
 
     // 3. Unarchive 'proposer_profiles' (set to 'active')
     const { rowCount: rc1 } = await client.query(
-      `UPDATE proposer_profiles 
-       SET status='active', updated_at=NOW() 
+      `UPDATE proposer_profiles
+       SET status='active', updated_at=NOW()
        WHERE wallet_address = ANY($1) AND status = 'archived' AND tenant_id = $2`,
       [walletAddresses, req.tenantId]
     );
@@ -4548,8 +4546,8 @@ app.post('/admin/entities/unarchive', adminGuard, async (req, res) => {
       : `${cols.statusCol}=$2`;
 
     const { rowCount: rc2 } = await client.query(
-      `UPDATE proposals 
-       SET ${setSql} 
+      `UPDATE proposals
+       SET ${setSql}
        WHERE owner_wallet = ANY($1) AND ${cols.statusCol}='archived' AND tenant_id = $3`,
       [walletAddresses, toStatus, req.tenantId] // Pass both parameters
     );
@@ -4938,17 +4936,17 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           COALESCE(MAX(NULLIF(p.org_name,'')), '')                 AS entity_name,
           COUNT(*)::int                                            AS proposals_count,
           MAX(COALESCE(p.updated_at, p.created_at))               AS last_proposal_at,
-          
+
           -- FIX: Use LOWER(TRIM()) for safer checks
           COALESCE(SUM(CASE WHEN LOWER(TRIM(p.status)) IN ('approved','funded','completed')
                             THEN COALESCE(p.amount_usd,0) ELSE 0 END),0)::numeric AS total_awarded_usd,
 
           -- FIX: Count 'funded' and 'completed' as approved too; use LOWER(TRIM())
           COUNT(*) FILTER (WHERE LOWER(TRIM(p.status)) IN ('approved', 'funded', 'completed'))::int AS approved_count,
-          
+
           -- FIX: Handle pending case-insensitively
           COUNT(*) FILTER (WHERE LOWER(TRIM(p.status)) = 'pending')::int       AS pending_count,
-          
+
           -- FIX: Handle rejected case-insensitively
           COUNT(*) FILTER (WHERE LOWER(TRIM(p.status)) = 'rejected')::int      AS rejected_count,
 
@@ -5003,13 +5001,13 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
           COALESCE(NULLIF(ents.org_name,''), props.entity_name, '')       AS entity_name,
           COALESCE(ents.contact_email, props.email)                       AS email,
           COALESCE(ents.phone, props.phone)                               AS phone,
-          COALESCE(ents.telegram_chat_id, props.telegram_chat_id)         AS telegram_chat_id,  
-          COALESCE(ents.telegram_username, props.telegram_username)       AS telegram_username, 
+          COALESCE(ents.telegram_chat_id, props.telegram_chat_id)         AS telegram_chat_id,
+          COALESCE(ents.telegram_username, props.telegram_username)       AS telegram_username,
           COALESCE(ents.address_raw, props.address_raw)                   AS address_raw,
           COALESCE(ents.city, props.city)                                 AS city,
           COALESCE(ents.country, props.country)                           AS country,
           COALESCE(props.proposals_count, 0)::int                         AS proposals_count,
-          
+
           -- Pass counts through from props CTE
           COALESCE(props.approved_count, 0)::int                          AS approved_count,
           COALESCE(props.pending_count, 0)::int                           AS pending_count,
@@ -5029,8 +5027,8 @@ app.get('/admin/entities', adminGuard, async (req, res) => {
         entity_name,
         email,
         phone,
-        telegram_chat_id,  
-        telegram_username, 
+        telegram_chat_id,
+        telegram_username,
         address_raw,
         city,
         country,
@@ -5173,11 +5171,11 @@ app.post("/proposer-profile", authGuard, async (req, res) => {
     }
 
     const { rows } = await pool.query(
-      `INSERT INTO proposer_profiles 
+      `INSERT INTO proposer_profiles
         (wallet_address, org_name, contact_email, phone, website, address, city, country, telegram_chat_id, whatsapp, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-       ON CONFLICT (wallet_address) 
-       DO UPDATE SET 
+       ON CONFLICT (wallet_address)
+       DO UPDATE SET
          org_name = EXCLUDED.org_name,
          contact_email = EXCLUDED.contact_email,
          phone = EXCLUDED.phone,
@@ -5194,11 +5192,11 @@ app.post("/proposer-profile", authGuard, async (req, res) => {
 
     // Also update user_profiles for backward compatibility
     await pool.query(
-      `INSERT INTO user_profiles 
+      `INSERT INTO user_profiles
         (wallet_address, display_name, email, phone, website, address, city, country, telegram_chat_id, whatsapp, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-       ON CONFLICT (wallet_address) 
-       DO UPDATE SET 
+       ON CONFLICT (wallet_address)
+       DO UPDATE SET
          display_name = EXCLUDED.display_name,
          email = EXCLUDED.email,
          phone = EXCLUDED.phone,
@@ -5807,7 +5805,7 @@ app.patch("/bids/:id/milestones", adminGuard, async (req, res) => {
     // (Optional) Enforce sum === bid price
     // const sum = norm.reduce((s, m) => s + Number(m.amount || 0), 0);
     // if (Number(current.price_usd) !== sum) {
-    //   return res.status(400).json({ error: \`Sum of milestone amounts (\${sum}) must equal bid price (\${current.price_usd})\` });
+    //   return res.status(400).json({ error: `Sum of milestone amounts (${sum}) must equal bid price (${current.price_usd})` });
     // }
 
     const { rows: upd } = await pool.query(
@@ -6333,8 +6331,8 @@ app.post('/admin/oversight/reconcile-payouts', adminGuard, async (req, res) => {
   try {
     // 1. Fetch all pending payouts that have a transaction hash
     const { rows: pendingRows } = await pool.query(`
-      SELECT id, bid_id, milestone_index, tx_hash 
-      FROM milestone_payments 
+      SELECT id, bid_id, milestone_index, tx_hash
+      FROM milestone_payments
       WHERE status = 'pending' AND tx_hash IS NOT NULL AND tenant_id = $1
     `, [req.tenantId]);
 
@@ -6872,7 +6870,7 @@ async function autoReconcileSafeTransactionsOnce() {
       console.log(`[safe-reconcile] pending batch: ${pendingTxs.length}`);
     }
 
-    // Group pending txs by tenant to batch config fetching? 
+    // Group pending txs by tenant to batch config fetching?
     // Or just fetch per row (simpler for now, 50 rows max)
 
     const { default: SafeApiKit } = await import('@safe-global/api-kit');
@@ -6944,7 +6942,7 @@ async function autoReconcileSafeTransactionsOnce() {
             'SELECT * FROM proposals WHERE proposal_id=(SELECT proposal_id FROM bids WHERE bid_id=$1)',
             [row.bid_id]
           );
-          if (proposal && typeof notifyPaymentReleased === 'function') {
+          if (proposal && typeof notifyPaymentReleased === "function") {
             await notifyPaymentReleased({
               bid: { bid_id: row.bid_id }, // minimal payload is fine
               proposal,
@@ -7029,6 +7027,8 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
       [bidId]
     );
 
+    const pinataJwt = await tenantService.getTenantConfig(req.tenantId, 'pinata_jwt');
+
     // ==================================================================
     // 1. Extract Text from the BID PDF (The Vendor's Offer)
     // ==================================================================
@@ -7049,7 +7049,7 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
       try {
         const cleanUrl = bidPdfFile.url.trim().replace(/[.,;]+$/, "");
         const info = await withTimeout(
-          waitForPdfInfoFromDoc({ ...bidPdfFile, url: cleanUrl }), 8000, () => ({ used: false, reason: 'timeout' })
+          waitForPdfInfoFromDoc({ ...bidPdfFile, url: cleanUrl }, {}, pinataJwt), 8000, () => ({ used: false, reason: 'timeout' })
         );
         if (info.used && info.text) {
           bidPdfText = `BID PDF CONTENT (Truncated):\n"""\n${info.text.slice(0, 10000)}\n"""`;
@@ -7073,7 +7073,7 @@ app.post('/bids/:id/chat', adminOrBidOwnerGuard, async (req, res) => {
       try {
         const cleanUrl = propPdfFile.url.trim().replace(/[.,;]+$/, "");
         const info = await withTimeout(
-          waitForPdfInfoFromDoc({ ...propPdfFile, url: cleanUrl }), 8000, () => ({ used: false, reason: 'timeout' })
+          waitForPdfInfoFromDoc({ ...propPdfFile, url: cleanUrl }, {}, pinataJwt), 8000, () => ({ used: false, reason: 'timeout' })
         );
         if (info.used && info.text) {
           proposalPdfText = `PROPOSAL PDF CONTENT (Truncated):\n"""\n${info.text.slice(0, 10000)}\n"""`;
@@ -7835,12 +7835,11 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
         // Decide if this payment will go via Safe (based on threshold + address)
         // Decide if this payment will go via Safe (based on threshold + address)
         const tThreshold = await tenantService.getTenantConfig(req.tenantId, 'safe_threshold_usd');
-        const threshold = Number(tThreshold || process.env.SAFE_THRESHOLD_USD || 0);
+        const threshold = Number(tThreshold || 0);
 
         const willUseSafe =
           threshold > 0 &&
-          msAmountUSD >= threshold &&
-          !!process.env.SAFE_ADDRESS; // Note: SAFE_ADDRESS might be overridden later, but we check existence here.
+          msAmountUSD >= threshold;
         // Actually, we should check if we HAVE a safe address.
         // Re-check safe address existence inside the block or assume true if threshold met?
         // Let's keep existing logic but use the new threshold.
@@ -7882,16 +7881,16 @@ app.post("/bids/:id/pay-milestone", adminGuard, async (req, res) => {
               tenantService.getTenantConfig(req.tenantId, 'safe_address')
             ]);
 
-            const RPC_URL = tRpc || process.env.SEPOLIA_RPC_URL;
-            const SAFE_API_KEY = tApiKey || process.env.SAFE_API_KEY; // Tenant override
+            const RPC_URL = tRpc;
+            const SAFE_API_KEY = tApiKey;
 
             // FIX: Prefer tenant config for payment address (Safe Address)
-            // Check safe_address first, then payment_address (legacy), then env
+            // Check safe_address first, then payment_address (legacy)
             const tenantPaymentAddress = await tenantService.getTenantConfig(req.tenantId, 'payment_address');
-            const safeAddrRaw = tSafeAddr || tenantPaymentAddress || process.env.SAFE_ADDRESS || "";
+            const safeAddrRaw = tSafeAddr || tenantPaymentAddress || "";
             const SAFE_ADDRESS_CS = ethers.utils.getAddress(String(safeAddrRaw).trim()); // checksummed
 
-            const TX_SERVICE_BASE = (tService || process.env.SAFE_TXSERVICE_URL || "https://api.safe.global/tx-service/sep")
+            const TX_SERVICE_BASE = (tService || "https://api.safe.global/tx-service/sep")
               .trim()
               .replace(/\/+$/, "");
 
@@ -9521,10 +9520,11 @@ app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
     const proofDesc = String(proof?.description || '').trim();
 
     // === B) Extract PDF text from any proof files ===
+    const pinataJwt = await tenantService.getTenantConfig(req.tenantId, 'pinata_jwt');
     let pdfText = '';
     for (const f of files) {
       if (!f?.url) continue;
-      const info = await waitForPdfInfoFromDoc({ url: f.url, name: f.name || '' });
+      const info = await waitForPdfInfoFromDoc({ url: f.url, name: f.name || '' }, {}, pinataJwt);
       if (info.used && info.text) {
         pdfText += `\n\n[${f.name || 'file'}]\n${info.text}`;
       }
@@ -11944,7 +11944,7 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
 
     // Fetch tenant config
     const tenantJwt = await tenantService.getTenantConfig(req.tenantId, 'pinata_jwt');
-    const jwtToUse = tenantJwt || process.env.PINATA_JWT;
+    const jwtToUse = tenantJwt;
 
     if (!jwtToUse) {
       return res.status(500).json({ error: "Pinata not configured" });
@@ -12002,7 +12002,7 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
     // Even on fatal crash, try to send the main JWT
     // Fetch config again just in case (or use global fallback)
     const tenantJwt = await tenantService.getTenantConfig(req.tenantId, 'pinata_jwt').catch(() => null);
-    res.json({ JWT: tenantJwt || process.env.PINATA_JWT });
+    res.json({ JWT: tenantJwt });
   }
 });
 
