@@ -2308,21 +2308,40 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function pinataUploadFile(file, tenantId = null) {
   let pKey = process.env.PINATA_API_KEY;
   let pSecret = process.env.PINATA_SECRET_API_KEY;
+  let pJwt = process.env.PINATA_JWT; // Fallback env JWT
 
   if (tenantId) {
-    const tKey = await tenantService.getTenantConfig(tenantId, 'PINATA_API_KEY');
-    const tSecret = await tenantService.getTenantConfig(tenantId, 'PINATA_SECRET_API_KEY');
-    if (tKey && tSecret) {
-      pKey = tKey;
-      pSecret = tSecret;
+    // Try JWT first (preferred by frontend settings)
+    const tJwt = await tenantService.getTenantConfig(tenantId, 'pinata_jwt');
+    if (tJwt) {
+      pJwt = tJwt;
+      pKey = null; // Clear keys if using JWT
+      pSecret = null;
+    } else {
+      // Try Legacy Keys
+      const tKey = await tenantService.getTenantConfig(tenantId, 'PINATA_API_KEY');
+      const tSecret = await tenantService.getTenantConfig(tenantId, 'PINATA_SECRET_API_KEY');
+      if (tKey && tSecret) {
+        pKey = tKey;
+        pSecret = tSecret;
+        pJwt = null;
+      }
     }
   }
 
-  if (!pKey || !pSecret) {
-    throw new Error("Pinata not configured");
+  console.log(`[Pinata] Uploading file ${file.name} for tenant ${tenantId || 'default'}`);
+  console.log(`[Pinata] Auth Mode: ${pJwt ? 'JWT (Masked: ' + pJwt.slice(0, 10) + '...)' : (pKey ? 'API Key' : 'NONE')}`);
+
+  if (!pKey && !pSecret && !pJwt) {
+    throw new Error("Pinata not configured (No Keys or JWT)");
   }
 
-  const localPinata = new pinataSDK(pKey, pSecret);
+  let localPinata;
+  if (pJwt) {
+    localPinata = new pinataSDK({ pinataJWTKey: pJwt });
+  } else {
+    localPinata = new pinataSDK(pKey, pSecret);
+  }
 
   // Increase max retries to 5 to be very safe
   const maxRetries = 5;
