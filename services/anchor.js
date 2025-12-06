@@ -172,10 +172,11 @@ async function loadRowsForPeriod(pool, periodId, cutoffEpochSec /* or null */, t
         AND b.tenant_id = $2
         -- Fix: Instead of restricting to ONE hour, we take everything unbatched 
         -- that is created before the next hour starts.
-        AND ba.created_at < (to_timestamp($1, 'YYYY-MM-DD"T"HH24') + interval '1 hour')
+        AND ba.created_at < ((to_timestamp($1, 'YYYY-MM-DD"T"HH24') AT TIME ZONE 'UTC') + interval '1 hour')
       ORDER BY ba.audit_id ASC`,
     [periodId, tenantId]
   );
+  console.log(`[Anchor] loadRowsForPeriod: period=${periodId}, tenant=${tenantId}, found=${q.rows.length} rows`);
   return q.rows;
 }
 
