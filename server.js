@@ -6078,12 +6078,7 @@ app.get('/admin/anchor', async (req, res) => {
   }
 });
 
-const out = await anchorPeriod(pool, period, req.tenantId, anchorConfig);
-res.json({ ok: true, ...out });
-  } catch (e) {
-  res.status(500).json({ ok: false, error: String(e.message || e) });
-}
-});
+
 
 // GET /admin/anchor/finalize?period=YYYY-MM-DDTHH&tx=0xTXHASH
 // Use this if you already anchored externally; verifies on-chain root and links DB rows.
