@@ -2361,9 +2361,18 @@ async function pinataUploadFile(file, tenantId = null) {
       // 2. Try Upload
       const result = await localPinata.pinFileToIPFS(stream, options);
 
+      // Use configured gateway or fallback
+      let gateway = "https://gateway.pinata.cloud";
+      if (tenantId) {
+        const tGw = await tenantService.getTenantConfig(tenantId, 'pinata_gateway');
+        if (tGw) gateway = tGw.replace(/\/+$/, '');
+      } else if (process.env.PINATA_GATEWAY_DOMAIN) {
+        gateway = `https://${process.env.PINATA_GATEWAY_DOMAIN}`;
+      }
+
       return {
         cid: result.IpfsHash,
-        url: `https://gateway.pinata.cloud/ipfs/${result.IpfsHash}`,
+        url: `${gateway}/ipfs/${result.IpfsHash}`,
         name: file.name,
         size: result.PinSize,
         timestamp: result.Timestamp
@@ -2567,14 +2576,21 @@ async function checkCidAlive(cid, jwt) {
 
 /** Fetch a URL into a Buffer (supports mypinata.cloud auth + public fallbacks) */
 /** Fetch a URL into a Buffer (supports mypinata.cloud auth + public fallbacks) */
-async function fetchAsBuffer(urlStr, jwt) {
+async function fetchAsBuffer(urlStr, jwt, tenantId = null) {
   // 1. 🛡️ SANITIZE: Remove trailing dots/punctuation
   let orig = String(urlStr).trim().replace(/[.,;]+$/, "");
 
   // 2. ⚡ HIJACK: If URL is using the slow public gateway, force swap to your FAST Dedicated Gateway
   // This prevents waiting 15s for a timeout before trying the good link.
   if (orig.includes("gateway.pinata.cloud")) {
-    orig = orig.replace("gateway.pinata.cloud", "sapphire-given-snake-741.mypinata.cloud");
+    let dedicated = "sapphire-given-snake-741.mypinata.cloud"; // Default fallback
+    if (tenantId) {
+      const tGw = await tenantService.getTenantConfig(tenantId, 'pinata_gateway');
+      if (tGw) dedicated = tGw.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+    } else if (process.env.PINATA_GATEWAY_DOMAIN) {
+      dedicated = process.env.PINATA_GATEWAY_DOMAIN;
+    }
+    orig = orig.replace("gateway.pinata.cloud", dedicated);
   }
 
   function tryOnce(u, headers = {}) {
@@ -3570,7 +3586,9 @@ function authGuard(req, res, next) {
       address: String(user.sub).toLowerCase(),
       role: user.role || null,
       roles: Array.isArray(user.roles) ? user.roles : [],
+      tenant_id: user.tenant_id || null
     };
+    req.tenantId = user.tenant_id || null; // Explicitly set for convenience
     return next();
   } catch {
     return res.status(401).json({ error: 'unauthenticated' });
