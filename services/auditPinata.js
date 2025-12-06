@@ -1,5 +1,11 @@
-const { ethers } = require('ethers');
-const stringify = require('json-stable-stringify');
+const ethersLib = require('ethers');
+// Handle both v5 (exports.ethers) and v6 (exports)
+const ethers = ethersLib.ethers || ethersLib;
+
+// Handle v5 vs v6 utils location
+const toUtf8Bytes = ethers.toUtf8Bytes || (ethers.utils && ethers.utils.toUtf8Bytes);
+const keccak256 = ethers.keccak256 || (ethers.utils && ethers.utils.keccak256);
+
 
 function canonicalize(obj) {
   return stringify(obj, { space: 0 });
@@ -47,8 +53,8 @@ async function enrichAuditRow(pool, auditId, uploadFn) {
 
     // 4) canonicalize + hash
     const canonical = canonicalize(eventJson);
-    const bytes = ethers.toUtf8Bytes(canonical);
-    const leafHashHex = ethers.keccak256(bytes);
+    const bytes = toUtf8Bytes(canonical);
+    const leafHashHex = keccak256(bytes);
     // Store as hex string (Postgres bytea can take hex format \x...) 
     // or if the column is bytea, we can pass a Buffer. 
     // The previous code used Buffer.from(hex, 'hex'). 
@@ -80,7 +86,7 @@ async function enrichAuditRow(pool, auditId, uploadFn) {
       [auditId, cid, leafHash]
     );
 
-    console.log(`[Audit] Enriched audit ${auditId} with CID ${cid}`);
+    console.log(`[Audit] Enriched audit ${auditId} with CID ${cid}, leafHash=${leafHashHex}`);
   } catch (e) {
     console.error(`[Audit] Failed to enrich audit ${auditId}:`, e);
   }
