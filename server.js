@@ -6014,9 +6014,12 @@ app.get('/admin/anchor', async (req, res) => {
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
 
   let user = verifyJwt(token);
-  const isCron = token === process.env.ANCHOR_SECRET; // Simple static key for GitHub Actions
+  const isCron = process.env.ANCHOR_SECRET && token === process.env.ANCHOR_SECRET; // Check env var exists too
+
+  console.log(`[Anchor] Auth Check: Token=${token.slice(0, 5)}... isCron=${isCron} User=${user?.sub}`);
 
   if (!user && !isCron) {
+    console.warn('[Anchor] Auth Failed: Invalid token and not cron secret');
     return res.status(401).json({ error: 'unauthenticated' });
   }
 
@@ -6030,6 +6033,8 @@ app.get('/admin/anchor', async (req, res) => {
       req.tenantId = user.tenant_id;
     }
   }
+
+  console.log(`[Anchor] Proceeding with TenantID=${req.tenantId}`);
   try {
     const period = req.query.period ? String(req.query.period) : periodIdForDate();
 
