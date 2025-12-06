@@ -1,80 +1,89 @@
-// services/auditPinata.js
+const { ethers } = require('ethers');
 const stringify = require('json-stable-stringify');
-const { keccak256 } = require('ethers/lib/utils');
 
 function canonicalize(obj) {
   return stringify(obj, { space: 0 });
 }
 
-async function uploadJsonToPinata(json) {
-  const PINATA_JWT = process.env.PINATA_JWT;
-  if (!PINATA_JWT) throw new Error('PINATA_JWT not set');
-  const doFetch = globalThis.fetch || require('node-fetch');
-
-  const r = await doFetch('https://api.pinata.cloud/pinning/pinJSONToIPFS', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${PINATA_JWT}` },
-    body: JSON.stringify({ pinataContent: json }),
-  });
-  if (!r.ok) {
-    let msg = `Pinata ${r.status}`;
-    try { const j = await r.json(); msg = j?.error || msg; } catch {}
-    throw new Error(msg);
-  }
-  const j = await r.json();
-  return { cid: j.IpfsHash };
-}
-
 /**
  * Enrich one bid_audits row: build canonical JSON -> IPFS -> keccak(utf8) -> write ipfs_cid + leaf_hash.
  * Uses audit_id (NOT id).
+ * @param {Object} pool - Postgres pool
+ * @param {number} auditId - ID of the audit row
+ * @param {Function} uploadFn - async (fileObj, tenantId) => { cid, ... }
  */
-async function enrichAuditRow(pool, auditId) {
-  // 1) load the audit row
-  const { rows } = await pool.query(
-    `SELECT audit_id, bid_id, actor_wallet, actor_role, changes, created_at
+async function enrichAuditRow(pool, auditId, uploadFn) {
+  try {
+    // 1) load the audit row
+    const { rows } = await pool.query(
+      `SELECT audit_id, bid_id, actor_wallet, actor_role, changes, created_at
        FROM bid_audits
-      WHERE audit_id = $1`,
-    [auditId]
-  );
-  if (!rows.length) return;
-  const row = rows[0];
+       WHERE audit_id = $1`,
+      [auditId]
+    );
+    if (!rows.length) return;
+    const row = rows[0];
 
-  // 2) build minimal public-safe JSON
-  const changedFields = row.changes && typeof row.changes === 'object'
-    ? Object.keys(row.changes)
-    : [];
-  const eventJson = {
-    _schema: 'bid-audit@v1',
-    itemType: 'bid',
-    itemId: Number(row.bid_id),
-    action: 'update',
-    actorRole: row.actor_role || 'admin',
-    actorAddress: row.actor_wallet || null,
-    changedFields,
-    changes: row.changes || null,
-    createdAt: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString(),
-  };
+    // 2) Get tenantId from bids to use tenant-specific Pinata config
+    const { rows: bidRows } = await pool.query('SELECT tenant_id FROM bids WHERE bid_id=$1', [row.bid_id]);
+    const tenantId = bidRows[0]?.tenant_id;
 
-  // 3) canonicalize + hash
-  const canonical = canonicalize(eventJson);
-  const bytes = Buffer.from(canonical, 'utf8');
-  const leafHashHex = keccak256(bytes);
-  const leafHash = Buffer.from(leafHashHex.slice(2), 'hex');
+    // 3) build minimal public-safe JSON
+    const changedFields = row.changes && typeof row.changes === 'object'
+      ? Object.keys(row.changes)
+      : [];
 
-  // 4) upload to IPFS
-  const { cid } = await uploadJsonToPinata(eventJson);
+    const eventJson = {
+      _schema: 'bid-audit@v1',
+      itemType: 'bid',
+      itemId: Number(row.bid_id),
+      action: 'update',
+      actorRole: row.actor_role || 'admin',
+      actorAddress: row.actor_wallet || null,
+      changedFields,
+      changes: row.changes || null,
+      createdAt: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString(),
+    };
 
-  // 5) write back
-  await pool.query(
-    `UPDATE bid_audits
-        SET ipfs_cid = $2,
-            leaf_hash = $3
-      WHERE audit_id = $1`,
-    [auditId, cid, leafHash]
-  );
+    // 4) canonicalize + hash
+    const canonical = canonicalize(eventJson);
+    const bytes = ethers.toUtf8Bytes(canonical);
+    const leafHashHex = ethers.keccak256(bytes);
+    // Store as hex string (Postgres bytea can take hex format \x...) 
+    // or if the column is bytea, we can pass a Buffer. 
+    // The previous code used Buffer.from(hex, 'hex'). 
+    // Let's stick to Buffer for bytea compatibility if needed, or hex string if text.
+    // Assuming leaf_hash is BYTEA.
+    const leafHash = Buffer.from(leafHashHex.slice(2), 'hex');
 
-  return { cid, leafHash: leafHashHex };
+    // 5) upload to IPFS using the provided helper (which handles tenant config)
+    const fileObj = {
+      name: `audit-${auditId}.json`,
+      data: Buffer.from(canonical),
+      mimetype: 'application/json'
+    };
+
+    let cid = null;
+    if (typeof uploadFn === 'function') {
+      const result = await uploadFn(fileObj, tenantId);
+      cid = result.cid;
+    } else {
+      console.warn('[Audit] No uploadFn provided, skipping IPFS upload');
+    }
+
+    // 6) write back
+    await pool.query(
+      `UPDATE bid_audits
+          SET ipfs_cid = $2,
+              leaf_hash = $3
+        WHERE audit_id = $1`,
+      [auditId, cid, leafHash]
+    );
+
+    console.log(`[Audit] Enriched audit ${auditId} with CID ${cid}`);
+  } catch (e) {
+    console.error(`[Audit] Failed to enrich audit ${auditId}:`, e);
+  }
 }
 
 module.exports = { enrichAuditRow };

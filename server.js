@@ -2647,7 +2647,7 @@ async function writeAudit(bidId, req, changes) {
       [Number(bidId), actorWallet, actorRole, changes]
     );
     if (typeof enrichAuditRow === 'function') {
-      enrichAuditRow(pool, rows[0].audit_id).catch(() => null); // adds ipfs_cid & leaf_hash
+      enrichAuditRow(pool, rows[0].audit_id, pinataUploadFile).catch(() => null); // adds ipfs_cid & leaf_hash
     }
   } catch (e) {
     console.warn('writeAudit failed (non-fatal):', String(e).slice(0, 200));
@@ -5524,7 +5524,7 @@ app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
         [Number(inserted.bid_id ?? inserted.id), actorWallet, actorRole, { created: true }]
       );
       if (typeof enrichAuditRow === "function") {
-        enrichAuditRow(pool, ins.rows[0].audit_id).catch(() => null);
+        enrichAuditRow(pool, ins.rows[0].audit_id, pinataUploadFile).catch(() => null);
       }
     } catch { }
 
@@ -5753,7 +5753,7 @@ app.patch("/bids/:id", adminGuard, async (req, res) => {
         'INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes) VALUES ($1,$2,$3,$4) RETURNING audit_id',
         [bidId, actorWallet, actorRole, changes]
       );
-      enrichAuditRow(pool, ins.rows[0].audit_id).catch(/* ... */);
+      enrichAuditRow(pool, ins.rows[0].audit_id, pinataUploadFile).catch(/* ... */);
     }
 
     // Return normalized bid
@@ -5848,7 +5848,7 @@ app.patch("/bids/:id/milestones", adminGuard, async (req, res) => {
     );
 
     // fire-and-forget enrichment (IPFS + hash)
-    enrichAuditRow(pool, ins.rows[0].audit_id).catch(err =>
+    enrichAuditRow(pool, ins.rows[0].audit_id, pinataUploadFile).catch(err =>
       console.error('audit enrich failed:', err)
     );
 
@@ -6773,7 +6773,7 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
        RETURNING audit_id`,
       [r.bid_id, payload]
     );
-    if (typeof enrichAuditRow === 'function') enrichAuditRow(pool, ins.rows[0].audit_id).catch(() => { });
+    if (typeof enrichAuditRow === 'function') enrichAuditRow(pool, ins.rows[0].audit_id, pinataUploadFile).catch(() => { });
 
     // Notify admins (best-effort)
     const [{ rows: bRows }, { rows: pRows }] = await Promise.all([
@@ -6836,7 +6836,7 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
          RETURNING audit_id`,
         [pr.bid_id, payload]
       );
-      if (typeof enrichAuditRow === 'function') enrichAuditRow(pool, ins.rows[0].audit_id).catch(() => { });
+      if (typeof enrichAuditRow === 'function') enrichAuditRow(pool, ins.rows[0].audit_id, pinataUploadFile).catch(() => { });
 
       const [{ rows: bRows }, { rows: pRows }] = await Promise.all([
         pool.query('SELECT * FROM bids WHERE bid_id=$1', [pr.bid_id]),
@@ -12314,7 +12314,7 @@ app.post('/bids/from-template', requireApprovedVendorOrAdmin, async (req, res) =
         [Number(inserted.bid_id), actorWallet, actorRole, { created: true, source: 'template' }]
       );
       if (typeof enrichAuditRow === "function") {
-        enrichAuditRow(pool, ins.rows[0].audit_id).catch(() => null);
+        enrichAuditRow(pool, ins.rows[0].audit_id, pinataUploadFile).catch(() => null);
       }
     } catch (e) {
       console.error("Template bid audit failed:", e);
