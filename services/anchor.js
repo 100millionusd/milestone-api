@@ -181,7 +181,17 @@ async function loadRowsForPeriod(pool, periodId, cutoffEpochSec /* or null */, t
   } else {
     // Debug: check if any rows exist for this tenant at all
     const check = await pool.query('SELECT count(*) FROM bid_audits ba JOIN bids b ON b.bid_id=ba.bid_id WHERE b.tenant_id=$1 AND ba.batch_id IS NULL', [tenantId]);
-    console.log(`[Anchor] Total unbatched rows for tenant: ${check.rows[0].count}`);
+    console.log(`[Anchor] Total unbatched rows for tenant ${tenantId}: ${check.rows[0].count}`);
+
+    // Debug: List ALL unbatched audits to see what tenants they belong to
+    const allUnbatched = await pool.query(`
+      SELECT ba.audit_id, b.tenant_id, ba.leaf_hash 
+      FROM bid_audits ba 
+      JOIN bids b ON b.bid_id=ba.bid_id 
+      WHERE ba.batch_id IS NULL 
+      LIMIT 5
+    `);
+    console.log('[Anchor] Sample unbatched audits in DB:', allUnbatched.rows);
   }
   return q.rows;
 }
