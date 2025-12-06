@@ -3588,7 +3588,10 @@ function authGuard(req, res, next) {
       roles: Array.isArray(user.roles) ? user.roles : [],
       tenant_id: user.tenant_id || null
     };
-    req.tenantId = user.tenant_id || null; // Explicitly set for convenience
+    // Only set req.tenantId from JWT if not already set by resolveTenant (header)
+    if (!req.tenantId && user.tenant_id) {
+      req.tenantId = user.tenant_id;
+    }
     return next();
   } catch {
     return res.status(401).json({ error: 'unauthenticated' });
