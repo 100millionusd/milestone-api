@@ -6,6 +6,8 @@ const ethers = ethersLib.ethers || ethersLib;
 const toUtf8Bytes = ethers.toUtf8Bytes || (ethers.utils && ethers.utils.toUtf8Bytes);
 const keccak256 = ethers.keccak256 || (ethers.utils && ethers.utils.keccak256);
 
+const stringify = require('json-stable-stringify');
+
 
 function canonicalize(obj) {
   return stringify(obj, { space: 0 });
