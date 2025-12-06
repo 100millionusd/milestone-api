@@ -6018,10 +6018,12 @@ app.get('/admin/anchor', async (req, res) => {
 
   console.log(`[Anchor] Auth Check: Token=${token.slice(0, 5)}... isCron=${isCron} User=${user?.sub}`);
 
-  if (!user && !isCron) {
-    console.warn('[Anchor] Auth Failed: Invalid token and not cron secret');
-    return res.status(401).json({ error: 'unauthenticated' });
-  }
+  // if (!user && !isCron) {
+  //   console.warn('[Anchor] Auth Failed: Invalid token and not cron secret');
+  //   return res.status(401).json({ error: 'unauthenticated' });
+  // }
+  // ^ REVERTED: User says this broke the existing cron job which likely has no auth or uses headers.
+  // We allow it to proceed. If it's unauthenticated, it relies on resolveTenant (headers/cookies).
 
   // If it's the cron job, we might need to assume a default tenant or use a header
   // If it's a user, we use their tenant_id
