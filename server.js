@@ -6040,19 +6040,49 @@ app.get('/admin/anchor', async (req, res) => {
   try {
     const period = req.query.period ? String(req.query.period) : periodIdForDate();
 
-    // Fetch tenant-specific anchoring config
-    const anchorConfig = {
-      rpcUrl: await tenantService.getTenantConfig(req.tenantId, 'ANCHOR_RPC_URL'),
-      chainId: await tenantService.getTenantConfig(req.tenantId, 'ANCHOR_CHAIN_ID'),
-      contractAddr: await tenantService.getTenantConfig(req.tenantId, 'ANCHOR_CONTRACT'),
-      privateKey: await tenantService.getTenantConfig(req.tenantId, 'ANCHOR_PRIVATE_KEY'),
-    };
+    // If tenantId is default (0000...), it means the request came from a global cron job (or unauthenticated source)
+    // In this case, we must iterate over ALL tenants to ensure everyone gets anchored.
+    let tenantsToAnchor = [];
+    if (req.tenantId === '00000000-0000-0000-0000-000000000000') {
+      console.log('[Anchor] Default tenant detected. Fetching ALL active tenants...');
+      const { rows } = await pool.query("SELECT id FROM tenants");
+      tenantsToAnchor = rows.map(r => r.id);
+    } else {
+      tenantsToAnchor = [req.tenantId];
+    }
 
-    const out = await anchorPeriod(pool, period, req.tenantId, anchorConfig);
-    res.json({ ok: true, ...out });
+    const results = [];
+    for (const tId of tenantsToAnchor) {
+      try {
+        // Fetch tenant-specific anchoring config
+        const anchorConfig = {
+          rpcUrl: await tenantService.getTenantConfig(tId, 'ANCHOR_RPC_URL'),
+          chainId: await tenantService.getTenantConfig(tId, 'ANCHOR_CHAIN_ID'),
+          contractAddr: await tenantService.getTenantConfig(tId, 'ANCHOR_CONTRACT'),
+          privateKey: await tenantService.getTenantConfig(tId, 'ANCHOR_PRIVATE_KEY'),
+        };
+
+        // Run anchoring for this tenant
+        const result = await anchorPeriod(pool, period, tId, anchorConfig);
+        results.push({ tenantId: tId, ...result });
+      } catch (err) {
+        console.error(`[Anchor] Failed for tenant ${tId}:`, err);
+        results.push({ tenantId: tId, ok: false, error: err.message });
+      }
+    }
+
+    return res.json(results);
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    console.error('[Anchor] Error:', e);
+    return res.status(500).json({ error: e.message });
   }
+});
+
+const out = await anchorPeriod(pool, period, req.tenantId, anchorConfig);
+res.json({ ok: true, ...out });
+  } catch (e) {
+  res.status(500).json({ ok: false, error: String(e.message || e) });
+}
 });
 
 // GET /admin/anchor/finalize?period=YYYY-MM-DDTHH&tx=0xTXHASH
