@@ -6008,7 +6008,28 @@ app.get('/audit', async (req, res) => {
 
 // GET /admin/anchor?period=YYYY-MM-DDTHH
 // Anchors the specified hour (UTC) on-chain and writes batch/proofs to DB.
-app.get('/admin/anchor', authGuard, async (req, res) => {
+app.get('/admin/anchor', async (req, res) => {
+  // Manual Auth Check: Support both JWT (Admin) AND Static Secret (Cron Job)
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+
+  let user = verifyJwt(token);
+  const isCron = token === process.env.ANCHOR_SECRET; // Simple static key for GitHub Actions
+
+  if (!user && !isCron) {
+    return res.status(401).json({ error: 'unauthenticated' });
+  }
+
+  // If it's the cron job, we might need to assume a default tenant or use a header
+  // If it's a user, we use their tenant_id
+  if (user) {
+    req.user = user;
+    // Apply the same fix as authGuard: overwrite default if user has one
+    const isDefault = req.tenantId === '00000000-0000-0000-0000-000000000000';
+    if ((!req.tenantId || isDefault) && user.tenant_id) {
+      req.tenantId = user.tenant_id;
+    }
+  }
   try {
     const period = req.query.period ? String(req.query.period) : periodIdForDate();
 
