@@ -4192,7 +4192,7 @@ app.post("/api/tenants/config", authGuard, adminGuard, async (req, res) => {
     if (!key || value === undefined) return res.status(400).json({ error: "key and value required" });
 
     // Allowlist of permitted keys to prevent abuse
-    const ALLOWED_KEYS = ['pinata_jwt', 'pinata_gateway', 'payment_address', 'payment_stablecoin', 'safe_chain_id', 'safe_rpc_url', 'safe_owner_key', 'safe_service_url', 'safe_api_key', 'safe_reconcile_minutes', 'safe_threshold_usd', 'safe_address', 'ETH_PRIVATE_KEY', 'ETH_RPC_URL'];
+    const ALLOWED_KEYS = ['pinata_jwt', 'pinata_gateway', 'payment_address', 'payment_stablecoin', 'safe_chain_id', 'safe_rpc_url', 'safe_owner_key', 'safe_service_url', 'safe_api_key', 'safe_reconcile_minutes', 'safe_threshold_usd', 'safe_address', 'ETH_PRIVATE_KEY', 'ETH_RPC_URL', 'ANCHOR_RPC_URL', 'ANCHOR_CHAIN_ID', 'ANCHOR_CONTRACT', 'ANCHOR_PRIVATE_KEY'];
     if (!ALLOWED_KEYS.includes(key)) {
       return res.status(400).json({ error: "Invalid config key" });
     }
