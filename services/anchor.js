@@ -74,7 +74,7 @@ function isAlreadyAnchoredError(err) {
       const reasonHex = '0x' + data.slice(138);
       const reason = ethers.utils.toUtf8String(reasonHex).toLowerCase();
       if (reason.includes('already anchored')) return true;
-    } catch {}
+    } catch { }
   }
   return false;
 }
@@ -119,8 +119,8 @@ function buildBothVariants(rows) {
   const sortedIndexByAudit = new Map(sortedPairs.map((p, i) => [p.audit_id, i]));
 
   return {
-    db:     { rootHex: dbRootHex,     tree: dbTree,     indexByAudit: dbIndexByAudit,         order: 'db'     },
-    sorted: { rootHex: sortedRootHex, tree: sortedTree, indexByAudit: sortedIndexByAudit,     order: 'sorted' },
+    db: { rootHex: dbRootHex, tree: dbTree, indexByAudit: dbIndexByAudit, order: 'db' },
+    sorted: { rootHex: sortedRootHex, tree: sortedTree, indexByAudit: sortedIndexByAudit, order: 'sorted' },
   };
 }
 
@@ -130,7 +130,10 @@ function buildBothVariants(rows) {
 /* --------------------------
    DB row loader (with cutoff)
 ---------------------------*/
-async function loadRowsForPeriod(pool, periodId, cutoffEpochSec /* or null */) {
+/* --------------------------
+   DB row loader (with cutoff)
+---------------------------*/
+async function loadRowsForPeriod(pool, periodId, cutoffEpochSec /* or null */, tenantId) {
   // Calculate the end of the current period (approx) to ensure we don't grab future data if running ahead
   // But primarily, we want to REMOVE the strict "to_char" equality check for the specific hour
   // so we can grab older orphans.
@@ -139,14 +142,16 @@ async function loadRowsForPeriod(pool, periodId, cutoffEpochSec /* or null */) {
     // Case A: Linking to an EXISTING anchor (Must be precise to reproduce the tree)
     // We strictly rely on the timestamp cutoff.
     const q = await pool.query(
-      `SELECT audit_id, leaf_hash
-         FROM bid_audits
-        WHERE batch_id IS NULL
-          AND leaf_hash IS NOT NULL
+      `SELECT ba.audit_id, ba.leaf_hash
+         FROM bid_audits ba
+         JOIN bids b ON b.bid_id = ba.bid_id
+        WHERE ba.batch_id IS NULL
+          AND ba.leaf_hash IS NOT NULL
+          AND b.tenant_id = $3
           -- Fix: Grab this period's data OR any older un-batched data
-          AND created_at <= to_timestamp($2)
-        ORDER BY audit_id ASC`,
-      [periodId, cutoffEpochSec] // Note: periodId ($1) is technically unused in query now, but kept for param alignment if you want to keep the signature
+          AND ba.created_at <= to_timestamp($2)
+        ORDER BY ba.audit_id ASC`,
+      [periodId, cutoffEpochSec, tenantId]
     );
     return q.rows;
   }
@@ -154,20 +159,22 @@ async function loadRowsForPeriod(pool, periodId, cutoffEpochSec /* or null */) {
   // Case B: Creating a NEW anchor
   // We grab everything currently available up to the end of this period (or just everything unbatched).
   // To avoid grabbing data from "the future" (if clock skews), we can keep a loose upper bound or just grab all unbatched.
-  
+
   // Recommended Fix: Grab all unbatched items created up to "Now" (end of this period hour)
   // We assume periodId corresponds to "current processing time". 
-  
+
   const q = await pool.query(
-    `SELECT audit_id, leaf_hash
-       FROM bid_audits
-      WHERE batch_id IS NULL
-        AND leaf_hash IS NOT NULL
+    `SELECT ba.audit_id, ba.leaf_hash
+       FROM bid_audits ba
+       JOIN bids b ON b.bid_id = ba.bid_id
+      WHERE ba.batch_id IS NULL
+        AND ba.leaf_hash IS NOT NULL
+        AND b.tenant_id = $2
         -- Fix: Instead of restricting to ONE hour, we take everything unbatched 
         -- that is created before the next hour starts.
-        AND created_at < (to_timestamp($1, 'YYYY-MM-DD"T"HH24') + interval '1 hour')
-      ORDER BY audit_id ASC`,
-    [periodId]
+        AND ba.created_at < (to_timestamp($1, 'YYYY-MM-DD"T"HH24') + interval '1 hour')
+      ORDER BY ba.audit_id ASC`,
+    [periodId, tenantId]
   );
   return q.rows;
 }
@@ -206,15 +213,16 @@ async function findAnchorTimestamp(provider, contractAddr, periodBytes32) {
 /* -----------------------------------
    Anchor current period on-chain & DB
 ------------------------------------*/
-async function anchorPeriod(pool, periodId) {
+async function anchorPeriod(pool, periodId, tenantId, config = {}) {
   if (!periodId) periodId = periodIdForDate();
+  if (!tenantId) throw new Error('tenantId required for anchoring');
 
-  return withPeriodLock(pool, periodId, async () => {
-    // Env
-    const rpcUrl = process.env.ANCHOR_RPC_URL;
-    const chainId = Number(process.env.ANCHOR_CHAIN_ID);
-    const pk = process.env.ANCHOR_PRIVATE_KEY;
-    const contractAddr = process.env.ANCHOR_CONTRACT;
+  return withPeriodLock(pool, periodId + ':' + tenantId, async () => {
+    // Env or Config
+    const rpcUrl = config.rpcUrl || process.env.ANCHOR_RPC_URL;
+    const chainId = Number(config.chainId || process.env.ANCHOR_CHAIN_ID);
+    const pk = config.privateKey || process.env.ANCHOR_PRIVATE_KEY;
+    const contractAddr = config.contractAddr || process.env.ANCHOR_CONTRACT;
 
     if (!rpcUrl) throw new Error('ANCHOR_RPC_URL not set');
     if (!chainId) throw new Error('ANCHOR_CHAIN_ID not set');
@@ -237,7 +245,7 @@ async function anchorPeriod(pool, periodId) {
     if (current && current.toLowerCase() !== ZERO32) {
       // It is already anchored on-chain. Try to match the exact snapshot using the event timestamp.
       const anchorTs = await findAnchorTimestamp(provider, contractAddr, periodBytes32).catch(() => null);
-      const rows = await loadRowsForPeriod(pool, periodId, anchorTs);
+      const rows = await loadRowsForPeriod(pool, periodId, anchorTs, tenantId);
       if (!rows.length) {
         return { ok: true, message: 'nothing to link for this period', periodId, count: 0 };
       }
@@ -263,7 +271,7 @@ async function anchorPeriod(pool, periodId) {
     }
 
     // --- Not anchored yet: compute leaves now (full hour to-date) ---
-    const rows = await loadRowsForPeriod(pool, periodId, /*cutoff*/ null);
+    const rows = await loadRowsForPeriod(pool, periodId, /*cutoff*/ null, tenantId);
     if (!rows.length) {
       return { ok: true, message: 'nothing to anchor for this period', periodId, count: 0 };
     }
@@ -282,7 +290,7 @@ async function anchorPeriod(pool, periodId) {
         const cur2 = await c.roots(periodBytes32);
         if (cur2 && cur2.toLowerCase() !== ZERO32) {
           const anchorTs = await findAnchorTimestamp(provider, contractAddr, periodBytes32).catch(() => null);
-          const rows2 = await loadRowsForPeriod(pool, periodId, anchorTs);
+          const rows2 = await loadRowsForPeriod(pool, periodId, anchorTs, tenantId);
           const v2 = buildBothVariants(rows2);
           if (cur2.toLowerCase() === v2.db.rootHex.toLowerCase()) {
             return await _linkWithVariant(pool, periodId, chainId, contractAddr, null, rows2, v2.db);
@@ -312,7 +320,7 @@ async function anchorPeriod(pool, periodId) {
         const cur2 = await c.roots(periodBytes32);
         if (cur2 && cur2.toLowerCase() !== ZERO32) {
           const anchorTs = await findAnchorTimestamp(provider, contractAddr, periodBytes32).catch(() => null);
-          const rows2 = await loadRowsForPeriod(pool, periodId, anchorTs);
+          const rows2 = await loadRowsForPeriod(pool, periodId, anchorTs, tenantId);
           const v2 = buildBothVariants(rows2);
           if (cur2.toLowerCase() === v2.db.rootHex.toLowerCase()) {
             return await _linkWithVariant(pool, periodId, chainId, contractAddr, null, rows2, v2.db);
@@ -352,12 +360,13 @@ async function anchorPeriod(pool, periodId) {
    Finalize an already-anchored period (verify + write to DB)
    Auto-detects leaf order & uses event timestamp snapshot if available.
 -------------------------------------------------------------*/
-async function finalizeExistingAnchor(pool, periodId, txHash = null) {
+async function finalizeExistingAnchor(pool, periodId, txHash = null, tenantId, config = {}) {
   if (!periodId) throw new Error('periodId (YYYY-MM-DDTHH) required');
+  if (!tenantId) throw new Error('tenantId required');
 
-  const rpcUrl = process.env.ANCHOR_RPC_URL;
-  const chainId = Number(process.env.ANCHOR_CHAIN_ID);
-  const contractAddr = process.env.ANCHOR_CONTRACT;
+  const rpcUrl = config.rpcUrl || process.env.ANCHOR_RPC_URL;
+  const chainId = Number(config.chainId || process.env.ANCHOR_CHAIN_ID);
+  const contractAddr = config.contractAddr || process.env.ANCHOR_CONTRACT;
   if (!rpcUrl || !chainId || !contractAddr) throw new Error('ANCHOR envs missing');
 
   const provider = new ethers.providers.JsonRpcProvider(rpcUrl, chainId);
@@ -372,7 +381,7 @@ async function finalizeExistingAnchor(pool, periodId, txHash = null) {
 
   // Try to find the anchor block timestamp for precise snapshot
   const anchorTs = await findAnchorTimestamp(provider, contractAddr, periodBytes32).catch(() => null);
-  const rows = await loadRowsForPeriod(pool, periodId, anchorTs);
+  const rows = await loadRowsForPeriod(pool, periodId, anchorTs, tenantId);
 
   if (!rows.length) return { ok: true, message: 'nothing to link', periodId, count: 0 };
 

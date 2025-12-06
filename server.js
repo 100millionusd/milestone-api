@@ -5949,7 +5949,16 @@ app.get('/audit', async (req, res) => {
 app.get('/admin/anchor', async (req, res) => {
   try {
     const period = req.query.period ? String(req.query.period) : periodIdForDate();
-    const out = await anchorPeriod(pool, period);
+
+    // Fetch tenant-specific anchoring config
+    const anchorConfig = {
+      rpcUrl: await tenantService.getTenantConfig(req.tenantId, 'ANCHOR_RPC_URL'),
+      chainId: await tenantService.getTenantConfig(req.tenantId, 'ANCHOR_CHAIN_ID'),
+      contractAddr: await tenantService.getTenantConfig(req.tenantId, 'ANCHOR_CONTRACT'),
+      privateKey: await tenantService.getTenantConfig(req.tenantId, 'ANCHOR_PRIVATE_KEY'),
+    };
+
+    const out = await anchorPeriod(pool, period, req.tenantId, anchorConfig);
     res.json({ ok: true, ...out });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
@@ -5965,7 +5974,16 @@ app.get('/admin/anchor/finalize', async (req, res) => {
     if (!/^\d{4}-\d{2}-\d{2}T\d{2}$/.test(period)) {
       return res.status(400).json({ ok: false, error: 'period must be YYYY-MM-DDTHH (UTC hour)' });
     }
-    const out = await finalizeExistingAnchor(pool, period, tx);
+
+    // Fetch tenant-specific anchoring config
+    const anchorConfig = {
+      rpcUrl: await tenantService.getTenantConfig(req.tenantId, 'ANCHOR_RPC_URL'),
+      chainId: await tenantService.getTenantConfig(req.tenantId, 'ANCHOR_CHAIN_ID'),
+      contractAddr: await tenantService.getTenantConfig(req.tenantId, 'ANCHOR_CONTRACT'),
+      // privateKey not needed for finalize (read-only verification), but RPC/Contract are
+    };
+
+    const out = await finalizeExistingAnchor(pool, period, tx, req.tenantId, anchorConfig);
     res.json({ ok: true, ...out });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
