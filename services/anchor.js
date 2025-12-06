@@ -175,6 +175,35 @@ async function loadRowsForPeriod(pool, periodId, cutoffEpochSec /* or null */, t
       ORDER BY ba.audit_id ASC`,
     [periodId, tenantId]
   );
+
+  console.log(`[Anchor] loadRowsForPeriod: period=${periodId}, tenant=${tenantId}, found=${q.rows.length} rows`);
+
+  if (q.rows.length === 0) {
+    // Deep Debug: Why did we find nothing?
+    console.log('[Anchor] 0 rows found. Running diagnostics...');
+
+    // 1. Check if ANY unbatched rows exist for this tenant
+    const checkTenant = await pool.query(
+      'SELECT count(*) FROM bid_audits ba JOIN bids b ON b.bid_id=ba.bid_id WHERE b.tenant_id=$1 AND ba.batch_id IS NULL',
+      [tenantId]
+    );
+    console.log(`[Anchor] Total unbatched rows for tenant ${tenantId}: ${checkTenant.rows[0].count}`);
+
+    // 2. List top 5 unbatched rows globally to check Tenant IDs and Timestamps
+    const globalCheck = await pool.query(`
+      SELECT ba.audit_id, b.tenant_id, ba.created_at, ba.leaf_hash 
+      FROM bid_audits ba 
+      JOIN bids b ON b.bid_id=ba.bid_id 
+      WHERE ba.batch_id IS NULL 
+      ORDER BY ba.created_at DESC
+      LIMIT 5
+    `);
+    console.log('[Anchor] Global unbatched rows (Top 5):');
+    globalCheck.rows.forEach(r => {
+      console.log(` - Audit ${r.audit_id}: Tenant=${r.tenant_id}, Created=${r.created_at.toISOString()}, Hash=${r.leaf_hash ? 'Yes' : 'NULL'}`);
+    });
+  }
+
   return q.rows;
 }
 
