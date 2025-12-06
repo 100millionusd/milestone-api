@@ -4209,6 +4209,13 @@ app.post("/api/tenants/config", authGuard, adminGuard, async (req, res) => {
 app.get("/api/tenants/config/:key", authGuard, adminGuard, async (req, res) => {
   try {
     const { key } = req.params;
+
+    // Allowlist of permitted keys
+    const ALLOWED_KEYS = ['pinata_jwt', 'pinata_gateway', 'payment_address', 'payment_stablecoin', 'safe_chain_id', 'safe_rpc_url', 'safe_owner_key', 'safe_service_url', 'safe_api_key', 'safe_reconcile_minutes', 'safe_threshold_usd', 'safe_address', 'ETH_PRIVATE_KEY', 'ETH_RPC_URL', 'ANCHOR_RPC_URL', 'ANCHOR_CHAIN_ID', 'ANCHOR_CONTRACT', 'ANCHOR_PRIVATE_KEY'];
+    if (!ALLOWED_KEYS.includes(key)) {
+      return res.status(400).json({ error: "Invalid config key" });
+    }
+
     const val = await tenantService.getTenantConfig(req.tenantId, key);
     // Return wrapped object to handle nulls/empty strings clearly
     res.json({ value: val });
@@ -5385,6 +5392,19 @@ app.post("/bids", requireApprovedVendorOrAdmin, async (req, res) => {
     // validate request
     const { error, value } = bidSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.message });
+
+    // Sanitize filenames to prevent DB/PDF errors
+    if (Array.isArray(value.files)) {
+      value.files.forEach(f => {
+        if (f && typeof f.name === 'string') {
+          // Remove control characters and other weirdness
+          f.name = f.name.replace(/[\x00-\x1F\x7F]/g, "").trim();
+        }
+      });
+    }
+    if (value.doc && typeof value.doc.name === 'string') {
+      value.doc.name = value.doc.name.replace(/[\x00-\x1F\x7F]/g, "").trim();
+    }
 
     // pick a doc for back-compat/Agent2 (prefer PDF from files, else first file, else provided doc)
     const docCompat =
