@@ -3589,7 +3589,9 @@ function authGuard(req, res, next) {
       tenant_id: user.tenant_id || null
     };
     // Only set req.tenantId from JWT if not already set by resolveTenant (header)
-    if (!req.tenantId && user.tenant_id) {
+    // OR if resolveTenant set the default '0000...' and JWT has a real one
+    const isDefault = req.tenantId === '00000000-0000-0000-0000-000000000000';
+    if ((!req.tenantId || isDefault) && user.tenant_id) {
       req.tenantId = user.tenant_id;
     }
     return next();
@@ -6006,7 +6008,7 @@ app.get('/audit', async (req, res) => {
 
 // GET /admin/anchor?period=YYYY-MM-DDTHH
 // Anchors the specified hour (UTC) on-chain and writes batch/proofs to DB.
-app.get('/admin/anchor', async (req, res) => {
+app.get('/admin/anchor', authGuard, async (req, res) => {
   try {
     const period = req.query.period ? String(req.query.period) : periodIdForDate();
 
