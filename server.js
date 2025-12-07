@@ -4764,7 +4764,16 @@ app.get("/proposals/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
-    const { rows } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1 AND tenant_id=$2", [id, req.tenantId]);
+    let q = "SELECT * FROM proposals WHERE proposal_id=$1";
+    const params = [id];
+
+    // Enforce tenant isolation UNLESS it's the Default Tenant (Global View)
+    if (req.tenantId !== '00000000-0000-0000-0000-000000000000') {
+      q += " AND tenant_id=$2";
+      params.push(req.tenantId);
+    }
+
+    const { rows } = await pool.query(q, params);
     if (!rows[0]) return res.status(404).json({ error: "not found" });
     res.json(toCamel(rows[0]));
   } catch (err) {
@@ -5356,13 +5365,20 @@ app.get("/bids", async (req, res) => {
 
     // --- PUBLIC PAGE (guest + specific proposal) — keep sanitized shape ---
     if (SCOPE_BIDS_FOR_VENDOR && role !== 'admin' && !caller && Number.isFinite(pid)) {
-      const { rows } = await pool.query(
-        `SELECT bid_id, proposal_id, vendor_name, price_usd, days, status, created_at, updated_at, milestones
-           FROM bids
-          WHERE proposal_id = $1 AND status <> 'archived' AND tenant_id = $2
-          ORDER BY bid_id DESC`,
-        [pid, req.tenantId]
-      );
+      let q = `SELECT bid_id, proposal_id, vendor_name, price_usd, days, status, created_at, updated_at, milestones
+                 FROM bids
+                WHERE proposal_id = $1 AND status <> 'archived'`;
+      const params = [pid];
+
+      // Enforce tenant isolation UNLESS it's the Default Tenant (Global View)
+      if (req.tenantId !== '00000000-0000-0000-0000-000000000000') {
+        q += ` AND tenant_id = $2`;
+        params.push(req.tenantId);
+      }
+
+      q += ` ORDER BY bid_id DESC`;
+
+      const { rows } = await pool.query(q, params);
 
       // keep the public sanitized payload (no payment metadata here)
       const out = rows.map(r => {
@@ -5946,8 +5962,7 @@ app.get('/audit', async (req, res) => {
   if (!itemType || !Number.isFinite(itemId)) return res.json([]);
 
   if (itemType === 'bid') {
-    const { rows } = await pool.query(
-      `SELECT
+    let q = `SELECT
      ba.created_at,
      ba.actor_role,
      ba.actor_wallet,
@@ -5963,10 +5978,18 @@ app.get('/audit', async (req, res) => {
    FROM bid_audits ba
    JOIN bids b ON b.bid_id = ba.bid_id
    LEFT JOIN audit_batches ab ON ab.id = ba.batch_id
-   WHERE ba.bid_id = $1 AND b.tenant_id = $2
-   ORDER BY ba.created_at DESC`,
-      [itemId, req.tenantId]
-    );
+   WHERE ba.bid_id = $1`;
+    const params = [itemId];
+
+    // Enforce tenant isolation UNLESS it's the Default Tenant (Global View)
+    if (req.tenantId !== '00000000-0000-0000-0000-000000000000') {
+      q += ` AND b.tenant_id = $2`;
+      params.push(req.tenantId);
+    }
+
+    q += ` ORDER BY ba.created_at DESC`;
+
+    const { rows } = await pool.query(q, params);
     return res.json(rows.map(r => ({
       created_at: r.created_at,
       action: 'update',
@@ -5994,8 +6017,7 @@ app.get('/audit', async (req, res) => {
 
   if (itemType === 'proposal') {
     // join through bids to show all bid audits for this proposal
-    const { rows } = await pool.query(
-      `SELECT
+    let q = `SELECT
      ba.created_at,
      ba.actor_role,
      ba.actor_wallet,
@@ -6011,10 +6033,18 @@ app.get('/audit', async (req, res) => {
    FROM bid_audits ba
    JOIN bids b ON b.bid_id = ba.bid_id
    LEFT JOIN audit_batches ab ON ab.id = ba.batch_id
-   WHERE b.proposal_id = $1 AND b.tenant_id = $2
-   ORDER BY ba.created_at DESC`,
-      [itemId, req.tenantId]
-    );
+   WHERE b.proposal_id = $1`;
+    const params = [itemId];
+
+    // Enforce tenant isolation UNLESS it's the Default Tenant (Global View)
+    if (req.tenantId !== '00000000-0000-0000-0000-000000000000') {
+      q += ` AND b.tenant_id = $2`;
+      params.push(req.tenantId);
+    }
+
+    q += ` ORDER BY ba.created_at DESC`;
+
+    const { rows } = await pool.query(q, params);
     return res.json(rows.map(r => ({
       created_at: r.created_at,
       action: 'update',
