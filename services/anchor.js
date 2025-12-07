@@ -152,11 +152,11 @@ async function loadRowsForPeriod(pool, periodId, cutoffEpochSec /* or null */, t
          JOIN bids b ON b.bid_id = ba.bid_id
         WHERE ba.batch_id IS NULL
           AND ba.leaf_hash IS NOT NULL
-          AND b.tenant_id = $3
+          AND b.tenant_id = $2
           -- Fix: Grab this period's data OR any older un-batched data
-          AND ba.created_at <= to_timestamp($2)
+          AND ba.created_at <= to_timestamp($1)
         ORDER BY ba.audit_id ASC`,
-      [periodId, cutoffEpochSec, tenantId]
+      [cutoffEpochSec, tenantId]
     );
     return q.rows;
   }
@@ -176,7 +176,7 @@ async function loadRowsForPeriod(pool, periodId, cutoffEpochSec /* or null */, t
         AND ba.leaf_hash IS NOT NULL
         AND b.tenant_id = $2
         -- Fix: Ensure we compare against UTC time for the period end
-        AND ba.created_at < ((to_timestamp($1, 'YYYY-MM-DD"T"HH24') AT TIME ZONE 'UTC') + interval '1 hour')
+        AND ba.created_at < ((to_timestamp($1::text, 'YYYY-MM-DD"T"HH24') AT TIME ZONE 'UTC') + interval '1 hour')
       ORDER BY ba.audit_id ASC`,
     [periodId, tenantId]
   );
@@ -231,15 +231,12 @@ async function findAnchorTimestamp(provider, contractAddr, periodBytes32) {
 
   const fromBlock = fromEnv != null ? fromEnv : Math.max(0, latest - lookback);
 
-  console.log(`[Anchor] Searching logs from ${fromBlock} to latest for topic ${topic0}`);
   const logs = await provider.getLogs({
     address: contractAddr,
     fromBlock,
     toBlock: 'latest',
     topics: [topic0, periodBytes32], // topic[1] == periodId bytes32
   });
-
-  console.log(`[Anchor] Found ${logs ? logs.length : 0} logs`);
 
   if (!logs || logs.length === 0) return null;
 
