@@ -134,6 +134,10 @@ function buildBothVariants(rows) {
 /* --------------------------
    DB row loader (with cutoff)
 ---------------------------*/
+// Set default ANCHOR_EVENT_TOPIC0 if missing (Keccak of Anchored(bytes32,bytes32))
+if (!process.env.ANCHOR_EVENT_TOPIC0) {
+  process.env.ANCHOR_EVENT_TOPIC0 = '0xa34b8972ff170527846956acf8a20640ac6f8829b9c748bb92ccccddd797c1f8';
+}
 async function loadRowsForPeriod(pool, periodId, cutoffEpochSec /* or null */, tenantId) {
   // Calculate the end of the current period (approx) to ensure we don't grab future data if running ahead
   // But primarily, we want to REMOVE the strict "to_char" equality check for the specific hour
