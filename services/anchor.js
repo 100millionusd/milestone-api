@@ -215,7 +215,10 @@ async function loadRowsForPeriod(pool, periodId, cutoffEpochSec /* or null */, t
 // and assumes periodId (bytes32) is indexed as topic[1].
 async function findAnchorTimestamp(provider, contractAddr, periodBytes32) {
   const topic0 = process.env.ANCHOR_EVENT_TOPIC0; // e.g. 0x<keccak(Anchored(bytes32,bytes32))>
-  if (!topic0) return null;
+  if (!topic0) {
+    console.warn('[Anchor] Missing ANCHOR_EVENT_TOPIC0 env var');
+    return null;
+  }
 
   const latest = await provider.getBlockNumber();
   const fromEnv = process.env.ANCHOR_EVENT_FROM_BLOCK
@@ -224,12 +227,15 @@ async function findAnchorTimestamp(provider, contractAddr, periodBytes32) {
 
   const fromBlock = fromEnv != null ? fromEnv : Math.max(0, latest - lookback);
 
+  console.log(`[Anchor] Searching logs from ${fromBlock} to latest for topic ${topic0}`);
   const logs = await provider.getLogs({
     address: contractAddr,
     fromBlock,
     toBlock: 'latest',
     topics: [topic0, periodBytes32], // topic[1] == periodId bytes32
   });
+
+  console.log(`[Anchor] Found ${logs ? logs.length : 0} logs`);
 
   if (!logs || logs.length === 0) return null;
 
