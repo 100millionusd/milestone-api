@@ -4323,6 +4323,13 @@ app.get("/proposals", softAuth, async (req, res) => {
     const params = [req.tenantId];
     const conditions = ["tenant_id = $1"];
 
+    // GLOBAL VIEW: If on Default Tenant (0000...), show ALL public proposals from ALL tenants
+    if (req.tenantId === '00000000-0000-0000-0000-000000000000') {
+      // Remove the "tenant_id = $1" restriction
+      params.length = 0; // clear params
+      conditions.length = 0; // clear conditions
+    }
+
     // 3. Apply Filtering Logic
     if (!isAdmin) {
       // 🔒 SECURITY: Non-admins (Public/Guests/Vendors) see ONLY approved/funded/completed
