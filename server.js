@@ -3133,6 +3133,7 @@ const proposalUpdateSchema = Joi.object({
   docs: Joi.array(),
   ownerEmail: Joi.string().email().allow(""),
   ownerPhone: Joi.string().allow(""),
+  is_public: Joi.boolean(), // ✅ Added
 }).min(1);
 
 // Reusable file item schema (accept both mimetype and contentType)
@@ -3438,6 +3439,11 @@ app.get("/api/debug/init-db", async (req, res) => {
         ADD COLUMN IF NOT EXISTS tenant_id UUID REFERENCES tenants(id);
       `);
     }
+    // 5. Add is_public to proposals (default true)
+    await pool.query(`
+      ALTER TABLE proposals
+      ADD COLUMN IF NOT EXISTS is_public BOOLEAN DEFAULT TRUE;
+    `);
     res.json({ ok: true, message: "DB init ran" });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -4847,6 +4853,7 @@ app.patch("/proposals/:id", adminOrProposalOwnerGuard, async (req, res) => {
       ownerEmail: 'owner_email',
       ownerPhone: 'owner_phone',
       docs: 'docs',
+      is_public: 'is_public', // ✅ Added
     };
 
     const sets = [];
