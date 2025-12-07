@@ -5978,7 +5978,9 @@ app.get('/audit', async (req, res) => {
    FROM bid_audits ba
    JOIN bids b ON b.bid_id = ba.bid_id
    LEFT JOIN audit_batches ab ON ab.id = ba.batch_id
-   WHERE ba.bid_id = $1`;
+   WHERE ba.bid_id = $1
+     -- Filter out system spam (ipfs_missing)
+     AND NOT (ba.changes ? 'ipfs_missing' AND jsonb_array_length(jsonb_object_keys(ba.changes)) = 1)`;
     const params = [itemId];
 
     // Enforce tenant isolation UNLESS it's the Default Tenant (Global View)
@@ -6033,7 +6035,9 @@ app.get('/audit', async (req, res) => {
    FROM bid_audits ba
    JOIN bids b ON b.bid_id = ba.bid_id
    LEFT JOIN audit_batches ab ON ab.id = ba.batch_id
-   WHERE b.proposal_id = $1`;
+   WHERE b.proposal_id = $1
+     -- Filter out system spam (ipfs_missing)
+     AND NOT (ba.changes ? 'ipfs_missing' AND jsonb_array_length(jsonb_object_keys(ba.changes)) = 1)`;
     const params = [itemId];
 
     // Enforce tenant isolation UNLESS it's the Default Tenant (Global View)
