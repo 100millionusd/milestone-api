@@ -82,9 +82,10 @@ function isAlreadyAnchoredError(err) {
 /* --------------------------
    Per-period advisory lock
 ---------------------------*/
-async function withPeriodLock(pool, periodId, fn) {
-  // Derive a signed 63-bit key from periodId
-  const hex = ethers.utils.keccak256(Buffer.from(periodId, 'utf8')).slice(2);
+async function withPeriodLock(pool, periodId, tenantId, fn) {
+  // Derive a signed 63-bit key from periodId + tenantId to prevent cross-tenant collisions
+  const rawKey = `${periodId}-${tenantId || 'global'}`;
+  const hex = ethers.utils.keccak256(Buffer.from(rawKey, 'utf8')).slice(2);
   const asBig = BigInt('0x' + hex) % (2n ** 63n - 1n);
   const key = asBig.toString();
 
@@ -245,7 +246,7 @@ async function anchorPeriod(pool, periodId, tenantId, config = {}) {
   if (!periodId) periodId = periodIdForDate();
   if (!tenantId) throw new Error('tenantId required for anchoring');
 
-  return withPeriodLock(pool, periodId + ':' + tenantId, async () => {
+  return withPeriodLock(pool, periodId, tenantId, async () => {
     // Env or Config
     const rpcUrl = config.rpcUrl || process.env.ANCHOR_RPC_URL;
     const chainId = Number(config.chainId || process.env.ANCHOR_CHAIN_ID);
