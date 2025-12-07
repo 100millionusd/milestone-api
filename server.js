@@ -6080,7 +6080,6 @@ app.get('/admin/anchor', async (req, res) => {
     } else {
       tenantsToAnchor = [req.tenantId];
     }
-    console.log(`[Anchor] Tenants to process: ${tenantsToAnchor.join(', ')}`);
 
     const results = [];
     for (const tId of tenantsToAnchor) {
