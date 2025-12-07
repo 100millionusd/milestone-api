@@ -169,7 +169,19 @@ function verifyJwt(t) {
   } catch {
     return null;
   }
+  return null;
 }
+}
+
+// Soft Auth Middleware: Try to populate req.user, but don't fail if no token
+const softAuth = (req, res, next) => {
+  const t = readJwtFromReq(req);
+  if (t) {
+    const u = verifyJwt(t);
+    if (u) req.user = u;
+  }
+  next();
+};
 
 // === ROLE HELPERS (paste once, under auth utilities; do NOT redeclare JWT_SECRET) =========
 const VALID_ROLES = ['vendor', 'proposer', 'admin', 'reporter']; // ✅ Added 'reporter'
@@ -4298,10 +4310,11 @@ app.get("/test", (_req, res) => res.json({ ok: true }));
 // ==============================
 // Routes — Proposals
 // ==============================
-app.get("/proposals", async (req, res) => {
+app.get("/proposals", softAuth, async (req, res) => {
   try {
-    // 1. Determine if the caller is an admin
+    // 1. Determine if the caller is an admin OR vendor
     const isAdmin = (req.user?.role === 'admin') || (req.user?.sub && isAdminAddress(req.user.sub));
+    const isVendor = (req.user?.role === 'vendor');
 
     // 2. Parse query params
     const statusParam = (req.query.status || "").toLowerCase().trim();
@@ -4313,9 +4326,13 @@ app.get("/proposals", async (req, res) => {
 
     // 3. Apply Filtering Logic
     if (!isAdmin) {
-      // 🔒 SECURITY: Non-admins (Public/Guests/Vendors) see ONLY approved/funded/completed AND public proposals
+      // 🔒 SECURITY: Non-admins (Public/Guests/Vendors) see ONLY approved/funded/completed
       conditions.push("LOWER(status) IN ('approved', 'funded', 'completed')");
-      conditions.push("is_public = TRUE");
+
+      // Public users ONLY see public projects. Vendors see ALL (even private).
+      if (!isVendor) {
+        conditions.push("is_public = TRUE");
+      }
     } else {
       // 🔓 ADMIN: Can filter by specific status, otherwise sees all non-archived
       if (statusParam) {
