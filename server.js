@@ -4313,8 +4313,9 @@ app.get("/proposals", async (req, res) => {
 
     // 3. Apply Filtering Logic
     if (!isAdmin) {
-      // 🔒 SECURITY: Non-admins (Public/Guests/Vendors) see ONLY approved proposals
-      conditions.push("status = 'approved'");
+      // 🔒 SECURITY: Non-admins (Public/Guests/Vendors) see ONLY approved/funded/completed AND public proposals
+      conditions.push("LOWER(status) IN ('approved', 'funded', 'completed')");
+      conditions.push("is_public = TRUE");
     } else {
       // 🔓 ADMIN: Can filter by specific status, otherwise sees all non-archived
       if (statusParam) {
@@ -5599,7 +5600,13 @@ app.post("/bids/:id/approve", adminGuard, async (req, res) => {
     const bid = rows[0];
     await writeAudit(id, req, { status: { to: 'approved' } });
 
-    // 2) Pull proposal + vendor profile for contacts
+    // 2) Update Proposal status -> approved (so it shows on public page)
+    await pool.query(
+      `UPDATE proposals SET status='approved', updated_at=NOW() WHERE proposal_id=$1`,
+      [bid.proposal_id]
+    );
+
+    // 3) Pull proposal + vendor profile for contacts
     const [{ rows: prjRows }, { rows: vpRows }] = await Promise.all([
       pool.query(`SELECT * FROM proposals WHERE proposal_id=$1`, [bid.proposal_id]),
       pool.query(`SELECT * FROM vendor_profiles WHERE LOWER(wallet_address)=LOWER($1)`, [bid.wallet_address])
