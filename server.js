@@ -6087,7 +6087,7 @@ app.get('/admin/anchor', async (req, res) => {
   let user = verifyJwt(token);
   const isCron = process.env.ANCHOR_SECRET && token === process.env.ANCHOR_SECRET; // Check env var exists too
 
-  console.log(`[Anchor] Auth Check: Token=${token.slice(0, 5)}... isCron=${isCron} User=${user?.sub}`);
+
 
   // if (!user && !isCron) {
   //   console.warn('[Anchor] Auth Failed: Invalid token and not cron secret');
@@ -6107,7 +6107,7 @@ app.get('/admin/anchor', async (req, res) => {
     }
   }
 
-  console.log(`[Anchor] Proceeding with TenantID=${req.tenantId}`);
+
   try {
     const period = req.query.period ? String(req.query.period) : periodIdForDate();
 
@@ -6115,7 +6115,7 @@ app.get('/admin/anchor', async (req, res) => {
     // In this case, we must iterate over ALL tenants to ensure everyone gets anchored.
     let tenantsToAnchor = [];
     if (req.tenantId === '00000000-0000-0000-0000-000000000000') {
-      console.log('[Anchor] Default tenant detected. Fetching ALL active tenants...');
+
       const { rows } = await pool.query("SELECT id FROM tenants");
       tenantsToAnchor = rows.map(r => r.id);
     } else {
@@ -7021,7 +7021,7 @@ async function runIpfsMonitor({ days = MONITOR_LOOKBACK_DAYS } = {}) {
     }
   }
 
-  console.log(`[ipfs-monitor] lookback=${days}d checked=${checked} flagged=${flagged} in ${Date.now() - started}ms`);
+
   return { checked, flagged, days };
 }
 
