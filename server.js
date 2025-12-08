@@ -245,7 +245,7 @@ async function durableRolesForAddress(address, tenantId) {
       `SELECT role FROM tenant_members WHERE lower(wallet_address)=lower($1) AND tenant_id=$2`,
       [addr, tenantId]
     );
-    console.log('[Auth] durableRolesForAddress: Checking tenant_members for', addr, 'tenant:', tenantId, 'Found:', m.rows);
+
     for (const row of m.rows) {
       if (row.role) roles.push(row.role);
     }
@@ -3092,9 +3092,7 @@ async function resolveTenant(req, res, next) {
     // Basic UUID validation
     if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tenantIdHeader)) {
       req.tenantId = tenantIdHeader;
-      console.log('[Middleware] resolveTenant: Found X-Tenant-ID header:', req.tenantId);
-    } else {
-      console.log('[Middleware] resolveTenant: Invalid X-Tenant-ID header:', tenantIdHeader);
+
     }
   }
 
