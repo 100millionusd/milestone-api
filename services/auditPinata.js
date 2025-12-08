@@ -88,7 +88,7 @@ async function enrichAuditRow(pool, auditId, uploadFn) {
       [auditId, cid, leafHash]
     );
 
-    console.log(`[Audit] Enriched audit ${auditId} with CID ${cid}, leafHash=${leafHashHex}`);
+
   } catch (e) {
     console.error(`[Audit] Failed to enrich audit ${auditId}:`, e);
   }
