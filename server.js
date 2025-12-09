@@ -328,7 +328,7 @@ function requireAdmin(req, res, next) {
 // Config
 // ==============================
 const PORT = Number(process.env.PORT || 3000);
-const DEFAULT_ORIGIN = "https://lithiumx.netlify.app";
+const DEFAULT_ORIGIN = "https://milestonex.io";
 
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || DEFAULT_ORIGIN)
   .split(",")
