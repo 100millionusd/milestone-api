@@ -3399,7 +3399,13 @@ app.use(
   cors({
     origin: (origin, cb) => {
       if (!origin) return cb(null, true);
+      // Allow exact match
       if (CORS_ORIGINS.includes(origin)) return cb(null, true);
+      // Allow subdomains of milestonex.io
+      if (origin.endsWith('.milestonex.io') || origin === 'https://milestonex.io') return cb(null, true);
+      // Allow subdomains of lithiumx.netlify.app (legacy)
+      if (origin.endsWith('.lithiumx.netlify.app')) return cb(null, true);
+
       return cb(new Error("Not allowed by CORS"));
     },
     credentials: true,
