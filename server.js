@@ -12463,7 +12463,7 @@ function normalizeMilestone(x) {
 // -------------------------------------------------------
 let globalPinataQueue = Promise.resolve();
 
-app.post("/ipfs/upload-file", async (req, res) => {
+app.post("/ipfs/upload-file", authGuard, async (req, res) => {
   try {
     if (!req.files || !req.files.file) return res.status(400).json({ error: "No file uploaded" });
 
@@ -12509,7 +12509,7 @@ app.post("/ipfs/upload-file", async (req, res) => {
 
 // ✅ QUEUE-PROTECTED JSON ROUTE
 // This prevents the "Proposal JSON" step from crashing due to rate limits
-app.post("/ipfs/upload-json", async (req, res) => {
+app.post("/ipfs/upload-json", authGuard, async (req, res) => {
   try {
     // Add to the SAME global queue as the files
     const task = async () => {
