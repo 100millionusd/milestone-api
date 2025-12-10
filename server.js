@@ -9022,6 +9022,18 @@ app.get("/proofs/:bidId", adminOrBidOwnerGuard, async (req, res) => {
     );
     const out = await Promise.all(rows.map(async (r) => {
       const camel = toCamel(r);
+
+      // 🛡️ FIX: Ensure private gateway URLs have the token
+      if (process.env.PINATA_GATEWAY_TOKEN && Array.isArray(camel.files)) {
+        camel.files = camel.files.map(f => {
+          if (f.url && f.url.includes('.mypinata.cloud') && !f.url.includes('token=')) {
+            const separator = f.url.includes('?') ? '&' : '?';
+            return { ...f, url: `${f.url}${separator}token=${process.env.PINATA_GATEWAY_TOKEN}` };
+          }
+          return f;
+        });
+      }
+
       camel.geoApprox = await buildSafeGeoForProof(r); // uses gps_lat/lon if present
       return camel;
     }));
