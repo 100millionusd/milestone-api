@@ -10917,13 +10917,36 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
     ]);
 
     // Robust JSON coercion (handles jsonb, json text, null)
-    const items = list.rows.map(r => {
+    const items = await Promise.all(list.rows.map(async (r) => {
       let doc = r.doc;
       if (typeof doc === 'string') { try { doc = JSON.parse(doc); } catch { } }
 
       let files = r.files;
       if (typeof files === 'string') { try { files = JSON.parse(files); } catch { } }
       if (!Array.isArray(files)) files = files ? [files] : [];
+
+      // 🛡️ FIX: Ensure private gateway URLs in the 'proof' string have the token
+      // (Note: milestones are not in the SELECT list for this endpoint, but if they were added, we'd patch them here)
+      // Wait, looking at the SELECT list (lines 10895+), 'milestones' IS NOT SELECTED.
+      // So this endpoint doesn't return milestones.
+      // But 'files' ARE selected (line 10900).
+
+      let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+      if (!gatewayToken && req.tenantId) {
+        try {
+          gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+        } catch (e) { }
+      }
+
+      if (gatewayToken && Array.isArray(files)) {
+        files = files.map(f => {
+          if (f.url && f.url.includes('.mypinata.cloud') && !f.url.includes('token=')) {
+            const separator = f.url.includes('?') ? '&' : '?';
+            return { ...f, url: `${f.url}${separator}token=${gatewayToken}` };
+          }
+          return f;
+        });
+      }
 
       return {
         id: r.bid_id,
@@ -10937,7 +10960,7 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
         doc: doc || null,   // << expose doc
         files,              // << expose files[]
       };
-    });
+    }));
 
     res.json({ items, total: count.rows[0].cnt, page, pageSize: limit });
   } catch (e) {
@@ -10974,20 +10997,48 @@ app.get('/admin/proofs-bids', adminGuard, async (req, res) => {
     );
 
     // Return camelCase keys the React page expects
-    const out = hydrated.map(r => ({
-      bidId: Number(r.bid_id),
-      proposalId: Number(r.proposal_id),
-      vendorName: r.vendor_name,
-      walletAddress: r.wallet_address,
-      priceUsd: r.price_usd == null ? null : Number(r.price_usd),
-      status: r.status ?? null,
-      createdAt: r.created_at,
-      milestones: Array.isArray(r.milestones)
+    // Return camelCase keys the React page expects
+    const out = await Promise.all(hydrated.map(async (r) => {
+      let milestones = Array.isArray(r.milestones)
         ? r.milestones
         : (typeof r.milestones === 'string'
           ? (() => { try { return JSON.parse(r.milestones || '[]'); } catch { return []; } })()
           : []
-        ),
+        );
+
+      // 🛡️ FIX: Ensure private gateway URLs in the 'proof' string have the token
+      let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+      if (!gatewayToken && req.tenantId) {
+        try {
+          gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+        } catch (e) { }
+      }
+
+      if (gatewayToken) {
+        milestones = milestones.map(m => {
+          if (typeof m?.proof === 'string' && m.proof.includes('.mypinata.cloud') && !m.proof.includes('token=')) {
+            // Regex to find the URL and append token
+            const newProof = m.proof.replace(/(https:\/\/[^ ]+\.mypinata\.cloud\/ipfs\/[^ \n]+)/g, (match) => {
+              if (match.includes('token=')) return match;
+              const separator = match.includes('?') ? '&' : '?';
+              return `${match}${separator}token=${gatewayToken}`;
+            });
+            return { ...m, proof: newProof };
+          }
+          return m;
+        });
+      }
+
+      return {
+        bidId: Number(r.bid_id),
+        proposalId: Number(r.proposal_id),
+        vendorName: r.vendor_name,
+        walletAddress: r.wallet_address,
+        priceUsd: r.price_usd == null ? null : Number(r.price_usd),
+        status: r.status ?? null,
+        createdAt: r.created_at,
+        milestones,
+      };
     }));
 
     // Make sure Netlify / browsers don’t cache this list
