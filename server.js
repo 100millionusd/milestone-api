@@ -3840,6 +3840,33 @@ app.post("/auth/verify", async (req, res) => {
         rows = bidsRes.rows;
       }
 
+      // 3. Fallback: Try tenant_members (e.g. invited members)
+      if (rows.length === 0) {
+        const tmRes = await pool.query(
+          `SELECT tenant_id FROM tenant_members WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+          [address]
+        );
+        rows = tmRes.rows;
+      }
+
+      // 4. Fallback: Try proposals (owners)
+      if (rows.length === 0) {
+        const propRes = await pool.query(
+          `SELECT tenant_id FROM proposals WHERE lower(owner_wallet)=lower($1) LIMIT 1`,
+          [address]
+        );
+        rows = propRes.rows;
+      }
+
+      // 5. Fallback: Try proposer_profiles
+      if (rows.length === 0) {
+        const ppRes = await pool.query(
+          `SELECT tenant_id FROM proposer_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+          [address]
+        );
+        rows = ppRes.rows;
+      }
+
       if (rows.length > 0 && rows[0].tenant_id) {
         req.tenantId = rows[0].tenant_id;
       }
