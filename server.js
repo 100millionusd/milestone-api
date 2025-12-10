@@ -12363,7 +12363,8 @@ app.post("/ipfs/upload-file", async (req, res) => {
 
     // 2. QUEUEING LOGIC: Wait for previous uploads to finish before starting this batch
     // This effectively locks the upload process to one-at-a-time across the whole server.
-    await (globalPinataQueue = globalPinataQueue.then(async () => {
+    // 2. QUEUEING LOGIC: Wait for previous uploads to finish before starting this batch
+    const task = async () => {
       for (const f of files) {
         try {
           // Upload
@@ -12378,10 +12379,16 @@ app.post("/ipfs/upload-file", async (req, res) => {
           throw innerErr; // Stop this batch if a file fails
         }
       }
-    }).catch(err => {
-      // If the queue broke, re-throw so we send a 500 error below
-      throw err;
-    }));
+    };
+
+    // Chain to global queue, ensuring we catch errors to keep the queue alive
+    const nextPromise = globalPinataQueue.catch(() => { }).then(task);
+
+    // Update global queue immediately
+    globalPinataQueue = nextPromise;
+
+    // Wait for OUR result (and let it throw if it fails)
+    await nextPromise;
 
     res.json(files.length === 1 ? results[0] : results);
   } catch (err) {
@@ -12395,8 +12402,7 @@ app.post("/ipfs/upload-file", async (req, res) => {
 app.post("/ipfs/upload-json", async (req, res) => {
   try {
     // Add to the SAME global queue as the files
-    await (globalPinataQueue = globalPinataQueue.then(async () => {
-
+    const task = async () => {
       // 1. Attempt the upload
       const result = await pinataUploadJson(req.body || {}, req.tenantId);
 
@@ -12404,13 +12410,20 @@ app.post("/ipfs/upload-json", async (req, res) => {
       console.log(`[Pinata] Uploaded JSON Metadata. Waiting...`);
       await new Promise(r => setTimeout(r, 2000));
 
-      // 3. Send response
-      res.json(result);
+      return result;
+    };
 
-    }).catch(err => {
-      // If the queue fails, throw so the outer catch block handles it
-      throw err;
-    }));
+    // Chain to global queue, ensuring we catch errors to keep the queue alive
+    const nextPromise = globalPinataQueue.catch(() => { }).then(task);
+
+    // Update global queue immediately
+    globalPinataQueue = nextPromise;
+
+    // Wait for OUR result
+    const result = await nextPromise;
+
+    // 3. Send response
+    res.json(result);
 
   } catch (err) {
     console.error("JSON Upload error:", err);
