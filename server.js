@@ -3790,7 +3790,7 @@ async function adminOrProposalOwnerGuard(req, res, next) {
 app.post("/auth/nonce", (req, res) => {
   const address = norm(req.body?.address);
   if (!address) return res.status(400).json({ error: "address required" });
-  const nonce = `LithiumX login nonce: ${Math.floor(Math.random() * 1e9)}`;
+  const nonce = `Milestone login nonce: ${Math.floor(Math.random() * 1e9)}`;
   putNonce(address, nonce);
   res.json({ nonce });
 });
@@ -3822,6 +3822,21 @@ app.post("/auth/verify", async (req, res) => {
   }
 
   // Determine durable roles and effective role (from intent)
+  // FIX: If tenantId is default, try to find the user's tenant from their profile
+  if (req.tenantId === '00000000-0000-0000-0000-000000000000') {
+    try {
+      const { rows } = await pool.query(
+        `SELECT tenant_id FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+        [address]
+      );
+      if (rows.length > 0 && rows[0].tenant_id) {
+        req.tenantId = rows[0].tenant_id;
+      }
+    } catch (e) {
+      console.error('Error looking up tenant for wallet:', e);
+    }
+  }
+
   let roles = await durableRolesForAddress(address, req.tenantId);
   let role = roleFromDurableOrIntent(roles, roleIntent);
   if (!role) {
@@ -3839,11 +3854,11 @@ app.post("/auth/verify", async (req, res) => {
       const w = (address || "").toLowerCase();
       const { rows } = await pool.query(
         `INSERT INTO vendor_profiles
-           (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at)
-         VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW())
+           (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at, tenant_id)
+         VALUES ($1, '', NULL, NULL, NULL, NULL, 'pending', NOW(), NOW(), $2)
          ON CONFLICT (wallet_address) DO NOTHING
          RETURNING wallet_address, vendor_name, email, phone, telegram_chat_id, whatsapp`,
-        [w]
+        [w, req.tenantId]
       );
 
       // On first-ever insert → send notifications (best-effort)
@@ -3880,7 +3895,7 @@ app.post("/auth/verify", async (req, res) => {
     role = "admin";
   }
 
-  const token = signJwt({ sub: address, role, roles });
+  const token = signJwt({ sub: address, role, roles, tenant_id: req.tenantId });
 
   res.cookie("auth_token", token, {
     httpOnly: true,
