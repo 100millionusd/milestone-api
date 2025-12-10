@@ -2388,9 +2388,13 @@ async function pinataUploadFile(file, tenantId = null) {
         gateway = `https://${process.env.PINATA_GATEWAY_DOMAIN}`;
       }
 
+      console.log(`[Pinata] Gateway: ${gateway}, Token: ${gatewayToken ? 'YES (Masked: ' + gatewayToken.slice(0, 5) + '...)' : 'NO'}`);
+
       let finalUrl = `${gateway}/ipfs/${result.IpfsHash}`;
       if (gatewayToken) {
         finalUrl += `?token=${gatewayToken}`;
+      } else {
+        console.warn('[Pinata] WARNING: Private gateway might require a token, but none found.');
       }
 
       return {
@@ -8972,19 +8976,34 @@ app.get("/proofs", adminGuard, async (req, res) => {
 
     const { rows } = await pool.query(sql, params);
 
-    const out = await Promise.all(rows.map(async (r) => ({
-      proofId: Number(r.proof_id),
-      bidId: Number(r.bid_id),
-      milestoneIndex: Number(r.milestone_index),
-      status: String(r.status || "pending"),
-      title: r.title || "",
-      description: r.description || "",
-      files: Array.isArray(r.files) ? r.files : (r.files ? r.files : []),
-      aiAnalysis: r.ai_analysis ?? null,
-      submittedAt: r.submitted_at,
-      updatedAt: r.updated_at,
-      geoApprox: await buildSafeGeoForProof(r),
-    })));
+    const out = await Promise.all(rows.map(async (r) => {
+      let files = Array.isArray(r.files) ? r.files : (typeof r.files === 'string' ? JSON.parse(r.files || '[]') : []);
+
+      // 🛡️ FIX: Ensure private gateway URLs have the token
+      if (process.env.PINATA_GATEWAY_TOKEN) {
+        files = files.map(f => {
+          if (f.url && f.url.includes('.mypinata.cloud') && !f.url.includes('token=')) {
+            const separator = f.url.includes('?') ? '&' : '?';
+            return { ...f, url: `${f.url}${separator}token=${process.env.PINATA_GATEWAY_TOKEN}` };
+          }
+          return f;
+        });
+      }
+
+      return {
+        proofId: Number(r.proof_id),
+        bidId: Number(r.bid_id),
+        milestoneIndex: Number(r.milestone_index),
+        status: String(r.status || "pending"),
+        title: r.title || "",
+        description: r.description || "",
+        files, // <--- Use the modified variable
+        aiAnalysis: r.ai_analysis ?? null,
+        submittedAt: r.submitted_at,
+        updatedAt: r.updated_at,
+        geoApprox: await buildSafeGeoForProof(r),
+      };
+    }));
 
     console.log(`[GET /proofs] bidId=${Number.isInteger(bidId) ? bidId : 'ALL'} -> ${out.length}`);
     return res.json(out);
