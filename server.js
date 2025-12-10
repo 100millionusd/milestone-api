@@ -616,6 +616,17 @@ async function overlayPaidFromMp(bid, pool) {
     [bidId, bid.tenant_id]
   );
 
+  // FIX: Also fetch latest proofs to overlay approval status
+  const { rows: proofRows } = await pool.query(
+    `SELECT DISTINCT ON (milestone_index)
+            milestone_index, status, proof_id
+       FROM proofs
+      WHERE bid_id = $1 AND tenant_id = $2
+      ORDER BY milestone_index, proof_id DESC`,
+    [bidId, bid.tenant_id]
+  );
+  const proofsByIdx = new Map(proofRows.map(r => [Number(r.milestone_index), r]));
+
   // Create a map for O(1) lookup
   const byIdx = new Map(mpRows.map(r => [Number(r.milestone_index), r]));
 
@@ -653,6 +664,18 @@ async function overlayPaidFromMp(bid, pool) {
     } else if (s === 'pending') {
       // It is genuinely pending in the DB (no tx hash yet)
       msArr[i].paymentPending = true;
+    }
+
+    // FIX: Overlay Proof Status
+    const p = proofsByIdx.get(i);
+    if (p) {
+      msArr[i].proofStatus = p.status; // 'approved', 'pending', 'rejected'
+
+      // If proof is approved and payment hasn't happened yet, show "Approved"
+      if (p.status === 'approved' && msArr[i].status !== 'paid') {
+        msArr[i].status = 'approved';
+        msArr[i].completed = true;
+      }
     }
   }
 
