@@ -89,8 +89,26 @@ async function withPeriodLock(pool, periodId, tenantId, fn) {
   const asBig = BigInt('0x' + hex) % (2n ** 63n - 1n);
   const key = asBig.toString();
 
-  const got = await pool.query('SELECT pg_try_advisory_lock($1)::boolean AS ok', [key]);
-  if (!got.rows?.[0]?.ok) throw new Error('anchor_locked');
+  // --- CHANGED SECTION START: Retry Logic ---
+  let locked = false;
+  // Try 5 times, waiting 2 seconds between attempts (10 seconds total)
+  for (let i = 0; i < 5; i++) {
+    try {
+      const got = await pool.query('SELECT pg_try_advisory_lock($1)::boolean AS ok', [key]);
+      if (got.rows?.[0]?.ok) {
+        locked = true;
+        break;
+      }
+    } catch (err) {
+      console.warn('[Anchor] Error checking lock status:', err.message);
+    }
+    
+    console.log(`[Anchor] Lock busy for key ${key} (attempt ${i + 1}/5). Waiting...`);
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+
+  if (!locked) throw new Error('anchor_locked');
+  // --- CHANGED SECTION END ---
 
   try {
     return await fn();
