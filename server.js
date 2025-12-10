@@ -5482,10 +5482,12 @@ app.get("/bids", async (req, res) => {
         const hydrated = await Promise.all(rows.map(r => overlayPaidFromMp(r, pool)));
         return res.json(mapRows(hydrated));
       } else {
+        console.log(`[Bids] Fetching for wallet=${caller} tenant=${req.tenantId}`);
         const { rows } = await pool.query(
           "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 ORDER BY bid_id DESC",
           [caller, req.tenantId]
         );
+        console.log(`[Bids] Found ${rows.length} rows`);
         const hydrated = await Promise.all(rows.map(r => overlayPaidFromMp(r, pool)));
         return res.json(mapRows(hydrated));
       }
