@@ -3613,10 +3613,16 @@ function authGuard(req, res, next) {
       roles: Array.isArray(user.roles) ? user.roles : [],
       tenant_id: user.tenant_id || null
     };
+
+    // Debug logging
+    // console.log(`[AuthGuard] Decoded user:`, user);
+    // console.log(`[AuthGuard] Current req.tenantId:`, req.tenantId);
+
     // Only set req.tenantId from JWT if not already set by resolveTenant (header)
     // OR if resolveTenant set the default '0000...' and JWT has a real one
     const isDefault = req.tenantId === '00000000-0000-0000-0000-000000000000';
     if ((!req.tenantId || isDefault) && user.tenant_id) {
+      console.log(`[AuthGuard] Overriding tenantId ${req.tenantId} with ${user.tenant_id}`);
       req.tenantId = user.tenant_id;
     }
     return next();
