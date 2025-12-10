@@ -8982,8 +8982,16 @@ app.get("/proofs", adminGuard, async (req, res) => {
       // 🛡️ FIX: Ensure private gateway URLs have the token
       // Check env var OR tenant config
       let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+
+      console.log(`[DEBUG] GET /proofs - TenantID: ${req.tenantId}, EnvToken: ${gatewayToken ? 'YES' : 'NO'}`);
+
       if (!gatewayToken && req.tenantId) {
-        gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+        try {
+          gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+          console.log(`[DEBUG] GET /proofs - DB Token Lookup: ${gatewayToken ? 'FOUND' : 'NOT FOUND'}`);
+        } catch (e) {
+          console.error(`[DEBUG] GET /proofs - DB Token Lookup FAILED:`, e);
+        }
       }
 
       if (gatewayToken) {
@@ -9032,8 +9040,16 @@ app.get("/proofs/:bidId", adminOrBidOwnerGuard, async (req, res) => {
       // 🛡️ FIX: Ensure private gateway URLs have the token
       // Check env var OR tenant config
       let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+
+      console.log(`[DEBUG] GET /proofs/:bidId - TenantID: ${req.tenantId}, EnvToken: ${gatewayToken ? 'YES' : 'NO'}`);
+
       if (!gatewayToken && req.tenantId) {
-        gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+        try {
+          gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+          console.log(`[DEBUG] GET /proofs/:bidId - DB Token Lookup: ${gatewayToken ? 'FOUND' : 'NOT FOUND'}`);
+        } catch (e) {
+          console.error(`[DEBUG] GET /proofs/:bidId - DB Token Lookup FAILED:`, e);
+        }
       }
 
       if (gatewayToken && Array.isArray(camel.files)) {
