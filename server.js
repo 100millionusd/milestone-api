@@ -3825,10 +3825,21 @@ app.post("/auth/verify", async (req, res) => {
   // FIX: If tenantId is default, try to find the user's tenant from their profile
   if (req.tenantId === '00000000-0000-0000-0000-000000000000') {
     try {
-      const { rows } = await pool.query(
+      // 1. Try vendor_profiles
+      let { rows } = await pool.query(
         `SELECT tenant_id FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
         [address]
       );
+
+      // 2. Fallback: Try bids table (maybe they have bids assigned but no profile yet)
+      if (rows.length === 0) {
+        const bidsRes = await pool.query(
+          `SELECT tenant_id FROM bids WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+          [address]
+        );
+        rows = bidsRes.rows;
+      }
+
       if (rows.length > 0 && rows[0].tenant_id) {
         req.tenantId = rows[0].tenant_id;
       }
