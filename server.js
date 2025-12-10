@@ -2376,16 +2376,26 @@ async function pinataUploadFile(file, tenantId = null) {
 
       // Use configured gateway or fallback
       let gateway = "https://gateway.pinata.cloud";
+      let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+
       if (tenantId) {
         const tGw = await tenantService.getTenantConfig(tenantId, 'pinata_gateway');
         if (tGw) gateway = tGw.replace(/\/+$/, '');
+
+        const tGwToken = await tenantService.getTenantConfig(tenantId, 'pinata_gateway_token');
+        if (tGwToken) gatewayToken = tGwToken;
       } else if (process.env.PINATA_GATEWAY_DOMAIN) {
         gateway = `https://${process.env.PINATA_GATEWAY_DOMAIN}`;
       }
 
+      let finalUrl = `${gateway}/ipfs/${result.IpfsHash}`;
+      if (gatewayToken) {
+        finalUrl += `?token=${gatewayToken}`;
+      }
+
       return {
         cid: result.IpfsHash,
-        url: `${gateway}/ipfs/${result.IpfsHash}`,
+        url: finalUrl,
         name: file.name,
         size: result.PinSize,
         timestamp: result.Timestamp
