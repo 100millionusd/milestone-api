@@ -3948,7 +3948,7 @@ app.post("/auth/verify", async (req, res) => {
   // one-time nonce, then done
   nonces.delete(address);
 
-  return res.json({ token, role, roles });
+  return res.json({ token, role, roles, tenantId: req.tenantId });
 });
 
 // nonce compat for frontend
