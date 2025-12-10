@@ -3641,7 +3641,14 @@ app.use((req, _res, next) => {
   const token = req.cookies?.auth_token;
   if (token) {
     const user = verifyJwt(token);
-    if (user) req.user = user; // { sub: address, role }
+    if (user) {
+      req.user = user; // { sub: address, role }
+      // FIX: Override tenantId if default
+      const isDefault = req.tenantId === '00000000-0000-0000-0000-000000000000';
+      if ((!req.tenantId || isDefault) && user.tenant_id) {
+        req.tenantId = user.tenant_id;
+      }
+    }
   }
   next();
 });
@@ -3653,7 +3660,14 @@ app.use((req, _res, next) => {
     const m = auth.match(/^bearer\s+(.+)$/i);
     if (m) {
       const user = verifyJwt(m[1]);
-      if (user) req.user = user; // { sub, role }
+      if (user) {
+        req.user = user; // { sub, role }
+        // FIX: Override tenantId if default
+        const isDefault = req.tenantId === '00000000-0000-0000-0000-000000000000';
+        if ((!req.tenantId || isDefault) && user.tenant_id) {
+          req.tenantId = user.tenant_id;
+        }
+      }
     }
   }
   next();
