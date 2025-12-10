@@ -3869,6 +3869,9 @@ app.post("/auth/verify", async (req, res) => {
 
       if (rows.length > 0 && rows[0].tenant_id) {
         req.tenantId = rows[0].tenant_id;
+        console.log(`[Auth] Resolved tenant for ${address}: ${req.tenantId}`);
+      } else {
+        console.log(`[Auth] No tenant found for ${address} in any table.`);
       }
     } catch (e) {
       console.error('Error looking up tenant for wallet:', e);
