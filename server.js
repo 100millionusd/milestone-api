@@ -8980,11 +8980,17 @@ app.get("/proofs", adminGuard, async (req, res) => {
       let files = Array.isArray(r.files) ? r.files : (typeof r.files === 'string' ? JSON.parse(r.files || '[]') : []);
 
       // 🛡️ FIX: Ensure private gateway URLs have the token
-      if (process.env.PINATA_GATEWAY_TOKEN) {
+      // Check env var OR tenant config
+      let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+      if (!gatewayToken && req.tenantId) {
+        gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+      }
+
+      if (gatewayToken) {
         files = files.map(f => {
           if (f.url && f.url.includes('.mypinata.cloud') && !f.url.includes('token=')) {
             const separator = f.url.includes('?') ? '&' : '?';
-            return { ...f, url: `${f.url}${separator}token=${process.env.PINATA_GATEWAY_TOKEN}` };
+            return { ...f, url: `${f.url}${separator}token=${gatewayToken}` };
           }
           return f;
         });
@@ -9024,11 +9030,17 @@ app.get("/proofs/:bidId", adminOrBidOwnerGuard, async (req, res) => {
       const camel = toCamel(r);
 
       // 🛡️ FIX: Ensure private gateway URLs have the token
-      if (process.env.PINATA_GATEWAY_TOKEN && Array.isArray(camel.files)) {
+      // Check env var OR tenant config
+      let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+      if (!gatewayToken && req.tenantId) {
+        gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+      }
+
+      if (gatewayToken && Array.isArray(camel.files)) {
         camel.files = camel.files.map(f => {
           if (f.url && f.url.includes('.mypinata.cloud') && !f.url.includes('token=')) {
             const separator = f.url.includes('?') ? '&' : '?';
-            return { ...f, url: `${f.url}${separator}token=${process.env.PINATA_GATEWAY_TOKEN}` };
+            return { ...f, url: `${f.url}${separator}token=${gatewayToken}` };
           }
           return f;
         });
