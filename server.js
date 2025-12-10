@@ -2401,13 +2401,23 @@ async function pinataUploadFile(file, tenantId = null) {
       let gateway = "https://gateway.pinata.cloud";
       let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
 
-      if (tenantId) {
-        const tGw = await tenantService.getTenantConfig(tenantId, 'pinata_gateway');
-        if (tGw) gateway = tGw.replace(/\/+$/, '');
+      // Helper to get config with fallback to Default Tenant
+      const getConfig = async (key) => {
+        if (tenantId) {
+          const val = await tenantService.getTenantConfig(tenantId, key);
+          if (val) return val;
+        }
+        // Fallback to Default Tenant
+        return await tenantService.getTenantConfig('00000000-0000-0000-0000-000000000000', key);
+      };
 
-        const tGwToken = await tenantService.getTenantConfig(tenantId, 'pinata_gateway_token');
-        if (tGwToken) gatewayToken = tGwToken;
-      } else if (process.env.PINATA_GATEWAY_DOMAIN) {
+      const tGw = await getConfig('pinata_gateway');
+      if (tGw) gateway = tGw.replace(/\/+$/, '');
+
+      const tGwToken = await getConfig('pinata_gateway_token');
+      if (tGwToken) gatewayToken = tGwToken;
+
+      if (!tGw && !tenantId && process.env.PINATA_GATEWAY_DOMAIN) {
         gateway = `https://${process.env.PINATA_GATEWAY_DOMAIN}`;
       }
 
@@ -2456,16 +2466,25 @@ async function pinataUploadFile(file, tenantId = null) {
 // Paste this immediately after the 'pinataUploadFile' function
 // =====================================================================
 async function pinataUploadJson(jsonData, tenantId = null) {
+  // Helper to get config with fallback to Default Tenant
+  const getConfig = async (key) => {
+    if (tenantId) {
+      const val = await tenantService.getTenantConfig(tenantId, key);
+      if (val) return val;
+    }
+    // Fallback to Default Tenant
+    return await tenantService.getTenantConfig('00000000-0000-0000-0000-000000000000', key);
+  };
+
   let pKey = process.env.PINATA_API_KEY;
   let pSecret = process.env.PINATA_SECRET_API_KEY;
 
-  if (tenantId) {
-    const tKey = await tenantService.getTenantConfig(tenantId, 'PINATA_API_KEY');
-    const tSecret = await tenantService.getTenantConfig(tenantId, 'PINATA_SECRET_API_KEY');
-    if (tKey && tSecret) {
-      pKey = tKey;
-      pSecret = tSecret;
-    }
+  const tKey = await getConfig('PINATA_API_KEY');
+  const tSecret = await getConfig('PINATA_SECRET_API_KEY');
+
+  if (tKey && tSecret) {
+    pKey = tKey;
+    pSecret = tSecret;
   }
 
   if (!pKey || !pSecret) {
@@ -2495,9 +2514,28 @@ async function pinataUploadJson(jsonData, tenantId = null) {
       // Perform the upload
       const result = await localPinata.pinJSONToIPFS(body, options);
 
+      // Resolve Gateway URL with fallback
+      let gateway = "https://gateway.pinata.cloud";
+      let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+
+      const tGw = await getConfig('pinata_gateway');
+      if (tGw) gateway = tGw.replace(/\/+$/, '');
+
+      const tGwToken = await getConfig('pinata_gateway_token');
+      if (tGwToken) gatewayToken = tGwToken;
+
+      if (!tGw && !tenantId && process.env.PINATA_GATEWAY_DOMAIN) {
+        gateway = `https://${process.env.PINATA_GATEWAY_DOMAIN}`;
+      }
+
+      let finalUrl = `${gateway}/ipfs/${result.IpfsHash}`;
+      if (gatewayToken) {
+        finalUrl += `?token=${gatewayToken}`;
+      }
+
       return {
         cid: result.IpfsHash,
-        url: `https://gateway.pinata.cloud/ipfs/${result.IpfsHash}`,
+        url: finalUrl,
         timestamp: result.Timestamp
       };
 
