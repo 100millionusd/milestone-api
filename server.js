@@ -9739,13 +9739,18 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
       return res.status(400).json({ error: "bad bidId or milestone index" });
     }
 
-    // Find the most recent proof for this milestone
+    // 1. Resolve the correct tenant_id from the bid itself
+    const { rows: bids } = await pool.query('SELECT tenant_id FROM bids WHERE bid_id = $1', [bidId]);
+    if (!bids[0]) return res.status(404).json({ error: "Bid not found" });
+    const targetTenantId = bids[0].tenant_id;
+
+    // Find the most recent proof for this milestone (using the BID's tenant)
     const { rows: proofs } = await pool.query(
       `SELECT proof_id FROM proofs
          WHERE bid_id = $1 AND milestone_index = $2 AND tenant_id = $3
          ORDER BY submitted_at DESC NULLS LAST, updated_at DESC NULLS LAST
          LIMIT 1`,
-      [bidId, idx, req.tenantId]
+      [bidId, idx, targetTenantId]
     );
     if (!proofs.length) return res.status(404).json({ error: "No proof found for this milestone" });
 
@@ -9757,7 +9762,7 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
          SET status = 'rejected', updated_at = NOW()
        WHERE proof_id = $1 AND tenant_id = $2
        RETURNING proof_id, bid_id, milestone_index, status, updated_at`,
-      [proofId, req.tenantId]
+      [proofId, targetTenantId]
     );
 
     // Notify
