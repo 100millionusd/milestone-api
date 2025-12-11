@@ -7959,16 +7959,18 @@ app.post("/proofs/:id/reject", adminGuard, async (req, res) => {
     const reason = String(req.body?.reason || "").trim() || null;
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid proof id" });
 
-    const { rows: cur } = await pool.query(`SELECT * FROM proofs WHERE proof_id=$1 AND tenant_id=$2`, [id, req.tenantId]);
+    // 1. Fetch proof by ID only (ignoring tenant_id initially)
+    const { rows: cur } = await pool.query(`SELECT * FROM proofs WHERE proof_id=$1`, [id]);
     const proof = cur[0];
     if (!proof) return res.status(404).json({ error: "Proof not found" });
 
+    // 2. Update using the proof's actual tenant_id
     const { rows: upd } = await pool.query(
       `UPDATE proofs
           SET status='rejected', updated_at=NOW()
         WHERE proof_id=$1 AND tenant_id=$2
       RETURNING *`,
-      [id, req.tenantId]
+      [id, proof.tenant_id]
     );
 
     await writeAudit(Number(proof.bid_id), req, {
@@ -9220,6 +9222,11 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) =
       return res.status(400).json({ error: "Invalid bidId or milestoneIndex" });
     }
 
+    // 1. Resolve the correct tenant_id from the bid itself
+    const { rows: bids } = await pool.query('SELECT tenant_id FROM bids WHERE bid_id = $1', [bidId]);
+    if (!bids[0]) return res.status(404).json({ error: "Bid not found" });
+    const targetTenantId = bids[0].tenant_id;
+
     // Flip the LATEST proof for this (bid, milestone) to rejected
     const { rows } = await pool.query(`
       WITH latest AS (
@@ -9239,7 +9246,7 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) =
          RETURNING p.*
       )
       SELECT * FROM upd;
-    `, [bidId, idx, req.tenantId]);
+    `, [bidId, idx, targetTenantId]);
 
     const updated = rows[0];
     await writeAudit(bidId, req, { proof_rejected: { index: idx, proofId: updated.proof_id, reason } });
