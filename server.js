@@ -2399,7 +2399,7 @@ async function pinataUploadFile(file, tenantId = null) {
 
       // Use configured gateway or fallback
       let gateway = "https://gateway.pinata.cloud";
-      let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+      let gatewayToken = PINATA_GATEWAY_TOKEN;
 
       // Helper to get config with fallback to Default Tenant
       const getConfig = async (key) => {
@@ -2516,7 +2516,7 @@ async function pinataUploadJson(jsonData, tenantId = null) {
 
       // Resolve Gateway URL with fallback
       let gateway = "https://gateway.pinata.cloud";
-      let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+      let gatewayToken = PINATA_GATEWAY_TOKEN;
 
       const tGw = await getConfig('pinata_gateway');
       if (tGw) gateway = tGw.replace(/\/+$/, '');
