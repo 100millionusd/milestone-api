@@ -7900,11 +7900,25 @@ app.get("/proofs", async (req, res) => {
     if (!Number.isFinite(bidId) && !Number.isFinite(proposalId)) {
       // If Admin, list ALL proofs (paginated/limited?)
       if (isAdmin) {
-        let q = `${selectSql}`;
+        // Robust Query: Join bids to ensure we see proofs for our tenant's bids, 
+        // even if proof.tenant_id is mismatched (e.g. created in global context).
+        let q = `
+          SELECT
+            p.*,
+            mp.tx_hash AS payment_tx_hash,
+            mp.safe_tx_hash AS safe_payment_tx_hash,
+            mp.status AS payment_status,
+            mp.released_at AS paid_at
+          FROM proofs p
+          JOIN bids b ON b.bid_id = p.bid_id
+          LEFT JOIN milestone_payments mp
+            ON mp.bid_id = p.bid_id
+            AND mp.milestone_index = p.milestone_index
+        `;
         const params = [];
         // Filter by tenant ONLY if not Global Admin
         if (req.tenantId !== DEFAULT_TENANT_ID) {
-          q += ` WHERE p.tenant_id = $1`;
+          q += ` WHERE b.tenant_id = $1`;
           params.push(req.tenantId);
         }
         q += ` ORDER BY p.proof_id DESC`;
@@ -9056,15 +9070,10 @@ app.get("/proofs", async (req, res) => {
 // Allow admin OR the bid owner (vendor) to read proofs for that bid
 app.get("/proofs/:bidId", adminOrBidOwnerGuard, async (req, res) => {
   try {
-    const DEFAULT_TENANT_ID = '00000000-0000-0000-0000-000000000000';
+    // Trust the guard (adminOrBidOwnerGuard) to handle access control.
+    // We fetch ALL proofs for this bid, regardless of proof.tenant_id (which might be mismatched).
     let q = "SELECT * FROM proofs WHERE bid_id=$1";
     const params = [req.params.bidId];
-
-    // Filter by tenant ONLY if not Global Admin
-    if (req.tenantId !== DEFAULT_TENANT_ID) {
-      q += " AND tenant_id=$2";
-      params.push(req.tenantId);
-    }
 
     q += " ORDER BY submitted_at DESC NULLS LAST";
 
