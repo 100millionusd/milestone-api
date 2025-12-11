@@ -1225,6 +1225,22 @@ async function attachPaymentState(bids) {
       ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
     `);
 
+    // 4c. Add Notifications Table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id SERIAL PRIMARY KEY,
+        tenant_id UUID REFERENCES tenants(id),
+        recipient_wallet TEXT NOT NULL,
+        type TEXT NOT NULL, -- 'milestone_approved', 'payment_released', 'bid_awarded'
+        title TEXT,
+        message TEXT,
+        data JSONB DEFAULT '{}'::jsonb,
+        is_read BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_notifications_recipient ON notifications(recipient_wallet);
+    `);
+
     // 5. Create Default Tenant (if none exists) & Migrate Data
     // We use a specific UUID for the default tenant to make migration idempotent
     const defaultTenantId = '00000000-0000-0000-0000-000000000000';
@@ -1665,6 +1681,17 @@ async function notifyBidApproved(bid, proposal, vendor) {
       vendorEmails.length ? sendEmail(vendorEmails, subject, html) : null,
       vendorPhone ? sendWhatsApp(vendorPhone, text) : null,
     ].filter(Boolean));
+
+    // In-App Notification
+    await createNotification({
+      tenantId: bid.tenant_id,
+      wallet: bid.wallet_address || vendor?.wallet_address,
+      type: 'bid_awarded',
+      title: 'Bid Awarded',
+      message: `Your bid for "${title}" has been awarded!`,
+      data: { bidId: bid.bid_id, proposalId: proposal?.proposal_id }
+    });
+
   } catch (e) {
     console.warn('notifyBidApproved failed:', e);
   }
@@ -1943,6 +1970,16 @@ async function notifyProofApproved({ proof, bid, proposal, msIndex }) {
       ) : null,
     ].filter(Boolean));
 
+    // In-App Notification
+    await createNotification({
+      tenantId: bid.tenant_id,
+      wallet: bid.wallet_address,
+      type: 'milestone_approved',
+      title: 'Milestone Approved',
+      message: `Milestone #${msIndex} for "${proposal?.title || 'Project'}" has been approved.`,
+      data: { bidId: bid.bid_id, milestoneIndex: msIndex - 1 }
+    });
+
     console.log("[notify] proof approved sent", { bidId: bid.bid_id, msIndex });
   } catch (e) {
     console.warn("[notify] proof approved failed:", String(e).slice(0, 200));
@@ -2007,6 +2044,16 @@ async function notifyPaymentReleased({ bid, proposal, msIndex, amount, txHash })
         : sendWhatsApp(vendorPhone, text)
     ) : null,
   ].filter(Boolean));
+
+  // In-App Notification
+  await createNotification({
+    tenantId: bid.tenant_id,
+    wallet: bid.wallet_address,
+    type: 'payment_released',
+    title: 'Payment Released',
+    message: `Payment for Milestone #${msIndex} of "${proposal?.title || 'Project'}" has been released.`,
+    data: { bidId: bid.bid_id, milestoneIndex: msIndex - 1, txHash }
+  });
 }
 
 async function notifyIpfsMissing({ bid, proposal, cid, where, proofId = null, url = null }) {
@@ -2047,6 +2094,22 @@ async function notifyIpfsMissing({ bid, proposal, cid, where, proofId = null, ur
     ].filter(Boolean));
   } catch (e) {
     console.warn('notifyIpfsMissing failed:', String(e).slice(0, 200));
+  }
+}
+
+// ==============================
+// Notifications — In-App Persistence
+// ==============================
+async function createNotification({ tenantId, wallet, type, title, message, data }) {
+  try {
+    if (!wallet) return;
+    await pool.query(
+      `INSERT INTO notifications (tenant_id, recipient_wallet, type, title, message, data)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [tenantId, wallet, type, title, message, data || {}]
+    );
+  } catch (e) {
+    console.warn('[Notifications] createNotification failed:', e);
   }
 }
 
@@ -13348,6 +13411,45 @@ app.put('/api/reports/:id/archive', authRequired, async (req, res) => {
   } catch (err) {
     console.error("ARCHIVE /api/reports error:", err);
     res.status(500).json({ error: "Failed to archive report" });
+  }
+});
+
+// ==============================
+// Notification Endpoints
+// ==============================
+
+// GET /api/notifications
+app.get("/api/notifications", authRequired, async (req, res) => {
+  try {
+    const wallet = req.user.sub || req.user.address;
+    const { rows } = await pool.query(
+      `SELECT * FROM notifications
+       WHERE recipient_wallet = $1 AND tenant_id = $2
+       ORDER BY created_at DESC
+       LIMIT 50`,
+      [wallet, req.tenantId]
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error("GET /api/notifications error", e);
+    res.status(500).json({ error: "Failed to fetch notifications" });
+  }
+});
+
+// POST /api/notifications/:id/read
+app.post("/api/notifications/:id/read", authRequired, async (req, res) => {
+  try {
+    const wallet = req.user.sub || req.user.address;
+    const { id } = req.params;
+    await pool.query(
+      `UPDATE notifications SET is_read = TRUE
+       WHERE id = $1 AND recipient_wallet = $2 AND tenant_id = $3`,
+      [id, wallet, req.tenantId]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    console.error("POST /api/notifications/:id/read error", e);
+    res.status(500).json({ error: "Failed to mark notification as read" });
   }
 });
 
