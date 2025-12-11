@@ -9120,10 +9120,19 @@ app.get("/proofs", adminGuard, async (req, res) => {
 // Allow admin OR the bid owner (vendor) to read proofs for that bid
 app.get("/proofs/:bidId", adminOrBidOwnerGuard, async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      "SELECT * FROM proofs WHERE bid_id=$1 AND status != 'rejected' AND tenant_id=$2 ORDER BY submitted_at DESC NULLS LAST",
-      [req.params.bidId, req.tenantId]
-    );
+    const DEFAULT_TENANT_ID = '00000000-0000-0000-0000-000000000000';
+    let q = "SELECT * FROM proofs WHERE bid_id=$1";
+    const params = [req.params.bidId];
+
+    // Filter by tenant ONLY if not Global Admin
+    if (req.tenantId !== DEFAULT_TENANT_ID) {
+      q += " AND tenant_id=$2";
+      params.push(req.tenantId);
+    }
+
+    q += " ORDER BY submitted_at DESC NULLS LAST";
+
+    const { rows } = await pool.query(q, params);
     const out = await Promise.all(rows.map(async (r) => {
       const camel = toCamel(r);
 
