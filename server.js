@@ -9997,25 +9997,13 @@ app.post("/api/proofs/upload", authRequired, async (req, res) => {
       // Assuming 'uploadToPinata' helper exists or we implement inline.
       // For this snippet, I'll assume a simple buffer upload to Pinata.
 
-      const formData = new FormData();
-      formData.append('file', file.data, { filename: file.name });
-
-      // Use the configured Pinata keys
-      const pinRes = await axios.post('https://api.pinata.cloud/pinning/pinFileToIPFS', formData, {
-        maxBodyLength: Infinity,
-        headers: {
-          'Content-Type': `multipart/form-data; boundary=${formData._boundary}`,
-          'pinata_api_key': PINATA_API_KEY,
-          'pinata_secret_api_key': PINATA_SECRET_API_KEY
-        }
-      });
-
-      if (pinRes.data && pinRes.data.IpfsHash) {
-        uploaded.push({
-          name: file.name,
-          cid: pinRes.data.IpfsHash,
-          url: `https://${PINATA_GATEWAY}/ipfs/${pinRes.data.IpfsHash}`
-        });
+      // Use the existing helper which handles retries, auth, and gateways
+      try {
+        const result = await pinataUploadFile(file, req.tenantId);
+        uploaded.push(result);
+      } catch (err) {
+        console.error("Upload failed for file:", file.name, err);
+        // Continue with other files or throw? Let's continue but maybe warn.
       }
     }
 
