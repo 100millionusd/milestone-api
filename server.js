@@ -9879,7 +9879,7 @@ app.get("/api/proofs/change-requests", authRequired, async (req, res) => {
               FROM change_request_responses resp
               WHERE resp.change_request_id = cr.id) as responses
       FROM change_requests cr
-      WHERE cr.tenant_id = $1
+      WHERE (cr.tenant_id = $1 OR cr.tenant_id IS NULL)
     `;
     const params = [tenantId];
     let idx = 2;
