@@ -8710,11 +8710,16 @@ app.post("/proofs", authRequired, async (req, res) => {
     }
 
     // 3) Duplicate guards
-    const { rows: pend } = await pool.query(
-      `SELECT 1 FROM proofs WHERE bid_id=$1 AND milestone_index=$2 AND status='pending' AND tenant_id=$3 LIMIT 1`,
+    // FIX: Only check the LATEST proof. If an older proof is stuck in 'pending' (zombie), ignore it.
+    const { rows: latestProof } = await pool.query(
+      `SELECT status FROM proofs
+        WHERE bid_id=$1 AND milestone_index=$2 AND tenant_id=$3
+        ORDER BY submitted_at DESC NULLS LAST, updated_at DESC NULLS LAST, proof_id DESC
+        LIMIT 1`,
       [bidId, milestoneIndex, req.tenantId]
     );
-    if (pend.length) {
+
+    if (latestProof.length > 0 && latestProof[0].status === 'pending') {
       return res.status(409).json({ error: "A proof is already pending review for this milestone." });
     }
     const { rows: lastRows } = await pool.query(
