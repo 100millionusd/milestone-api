@@ -7885,20 +7885,28 @@ app.get("/proofs", async (req, res) => {
         AND mp.milestone_index = p.milestone_index
     `;
 
+    const DEFAULT_TENANT_ID = '00000000-0000-0000-0000-000000000000';
     let rows;
     if (Number.isFinite(bidId)) {
-      ({ rows } = await pool.query(
-        `${selectSql} WHERE p.bid_id = $1 AND p.tenant_id = $2 ORDER BY p.proof_id ASC`,
-        [bidId, req.tenantId]
-      ));
+      let q = `${selectSql} WHERE p.bid_id = $1`;
+      const params = [bidId];
+      if (req.tenantId !== DEFAULT_TENANT_ID) {
+        q += ` AND p.tenant_id = $2`;
+        params.push(req.tenantId);
+      }
+      q += ` ORDER BY p.proof_id ASC`;
+      ({ rows } = await pool.query(q, params));
     } else {
-      ({ rows } = await pool.query(
-        `${selectSql}
+      let q = `${selectSql}
          JOIN bids b ON b.bid_id = p.bid_id
-         WHERE b.proposal_id = $1 AND b.tenant_id = $2
-         ORDER BY p.proof_id ASC`,
-        [proposalId, req.tenantId]
-      ));
+         WHERE b.proposal_id = $1`;
+      const params = [proposalId];
+      if (req.tenantId !== DEFAULT_TENANT_ID) {
+        q += ` AND b.tenant_id = $2`;
+        params.push(req.tenantId);
+      }
+      q += ` ORDER BY p.proof_id ASC`;
+      ({ rows } = await pool.query(q, params));
     }
 
     // normalize for the frontend
