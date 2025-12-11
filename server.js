@@ -7864,12 +7864,6 @@ app.post('/bids/:id/analyze', adminOrBidOwnerGuard, async (req, res) => {
 
 app.get("/proofs", async (req, res) => {
   try {
-    const bidId = Number(req.query.bidId);
-    const proposalId = Number(req.query.proposalId);
-    if (!Number.isFinite(bidId) && !Number.isFinite(proposalId)) {
-      return res.status(400).json({ error: "Provide bidId or proposalId" });
-    }
-
     // FIX: Added LEFT JOIN to milestone_payments (mp) to fetch payment status and tx_hash
     // We coalesce payment_tx_hash: prefer the one in milestone_payments, fallback to proof/bid logic if needed
     const selectSql = `
@@ -7885,9 +7879,41 @@ app.get("/proofs", async (req, res) => {
         AND mp.milestone_index = p.milestone_index
     `;
 
+    const bidId = Number(req.query.bidId);
+    const proposalId = Number(req.query.proposalId);
     const DEFAULT_TENANT_ID = '00000000-0000-0000-0000-000000000000';
     let rows;
-    if (Number.isFinite(bidId)) {
+
+    // Check if Admin (for listing all proofs)
+    let isAdmin = false;
+    try {
+      const token = req.headers.authorization?.startsWith('Bearer ')
+        ? req.headers.authorization.slice(7)
+        : req.cookies?.auth_token;
+      const user = token ? verifyJwt(token) : null;
+      if (user?.sub && isAdminAddress(String(user.sub).toLowerCase())) {
+        isAdmin = true;
+      }
+    } catch { }
+
+    // If no params provided:
+    if (!Number.isFinite(bidId) && !Number.isFinite(proposalId)) {
+      // If Admin, list ALL proofs (paginated/limited?)
+      if (isAdmin) {
+        let q = `${selectSql}`;
+        const params = [];
+        // Filter by tenant ONLY if not Global Admin
+        if (req.tenantId !== DEFAULT_TENANT_ID) {
+          q += ` WHERE p.tenant_id = $1`;
+          params.push(req.tenantId);
+        }
+        q += ` ORDER BY p.proof_id DESC`;
+        const { rows: allRows } = await pool.query(q, params);
+        rows = allRows;
+      } else {
+        return res.status(400).json({ error: "Provide bidId or proposalId" });
+      }
+    } else if (Number.isFinite(bidId)) {
       let q = `${selectSql} WHERE p.bid_id = $1`;
       const params = [bidId];
       if (req.tenantId !== DEFAULT_TENANT_ID) {
@@ -9023,26 +9049,22 @@ app.get("/proofs", async (req, res) => {
     return res.json(out);
   } catch (e) {
     console.error("GET /proofs failed:", e);
-    return res.status(500).json({ error: "Failed to load proofs" });
-  }
-});
+    // Normalized proofs feed for admin UI (newest first, camelCase fields)
+    app.get("/proofs", adminGuard, async (req, res) => {
+      try {
+        let bidId = Number(req.query.bidId);
+        const proposalId = Number(req.query.proposalId);
 
-// Normalized proofs feed for admin UI (newest first, camelCase fields)
-app.get("/proofs", adminGuard, async (req, res) => {
-  try {
-    let bidId = Number(req.query.bidId);
-    const proposalId = Number(req.query.proposalId);
+        // Fallback: resolve bidId from proposalId (so /projects/136 works even if it passes proposalId)
+        if (!Number.isFinite(bidId) && Number.isFinite(proposalId)) {
+          const { rows: [b] } = await pool.query(
+            `SELECT bid_id FROM bids WHERE proposal_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 1`,
+            [proposalId, req.tenantId]
+          );
+          if (b) bidId = Number(b.bid_id);
+        }
 
-    // Fallback: resolve bidId from proposalId (so /projects/136 works even if it passes proposalId)
-    if (!Number.isFinite(bidId) && Number.isFinite(proposalId)) {
-      const { rows: [b] } = await pool.query(
-        `SELECT bid_id FROM bids WHERE proposal_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 1`,
-        [proposalId, req.tenantId]
-      );
-      if (b) bidId = Number(b.bid_id);
-    }
-
-    const baseSql = `
+        const baseSql = `
       SELECT
         proof_id,
         bid_id,
@@ -9056,205 +9078,205 @@ app.get("/proofs", adminGuard, async (req, res) => {
         updated_at
       FROM proofs
     `;
-    const params = [];
-    const where = Number.isFinite(bidId) ? "WHERE bid_id = $1 AND tenant_id = $2" : "WHERE tenant_id = $1";
-    if (Number.isFinite(bidId)) params.push(bidId);
-    params.push(req.tenantId);
+        const params = [];
+        const where = Number.isFinite(bidId) ? "WHERE bid_id = $1 AND tenant_id = $2" : "WHERE tenant_id = $1";
+        if (Number.isFinite(bidId)) params.push(bidId);
+        params.push(req.tenantId);
 
-    const order = "ORDER BY proof_id DESC";
-    const sql = [baseSql, where, order].filter(Boolean).join("\n");
+        const order = "ORDER BY proof_id DESC";
+        const sql = [baseSql, where, order].filter(Boolean).join("\n");
 
-    const { rows } = await pool.query(sql, params);
+        const { rows } = await pool.query(sql, params);
 
-    const out = await Promise.all(rows.map(async (r) => {
-      let files = Array.isArray(r.files) ? r.files : (typeof r.files === 'string' ? JSON.parse(r.files || '[]') : []);
+        const out = await Promise.all(rows.map(async (r) => {
+          let files = Array.isArray(r.files) ? r.files : (typeof r.files === 'string' ? JSON.parse(r.files || '[]') : []);
 
-      // 🛡️ FIX: Ensure private gateway URLs have the token
-      // Check env var OR tenant config
-      let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+          // 🛡️ FIX: Ensure private gateway URLs have the token
+          // Check env var OR tenant config
+          let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
 
-      console.log(`[DEBUG] GET /proofs - TenantID: ${req.tenantId}, EnvToken: ${gatewayToken ? 'YES' : 'NO'}`);
+          console.log(`[DEBUG] GET /proofs - TenantID: ${req.tenantId}, EnvToken: ${gatewayToken ? 'YES' : 'NO'}`);
 
-      if (!gatewayToken && req.tenantId) {
-        try {
-          gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
-          console.log(`[DEBUG] GET /proofs - DB Token Lookup: ${gatewayToken ? 'FOUND' : 'NOT FOUND'}`);
-        } catch (e) {
-          console.error(`[DEBUG] GET /proofs - DB Token Lookup FAILED:`, e);
-        }
-      }
-
-      if (gatewayToken) {
-        files = files.map(f => {
-          if (f.url && f.url.includes('.mypinata.cloud') && !f.url.includes('token=')) {
-            const separator = f.url.includes('?') ? '&' : '?';
-            return { ...f, url: `${f.url}${separator}token=${gatewayToken}` };
+          if (!gatewayToken && req.tenantId) {
+            try {
+              gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+              console.log(`[DEBUG] GET /proofs - DB Token Lookup: ${gatewayToken ? 'FOUND' : 'NOT FOUND'}`);
+            } catch (e) {
+              console.error(`[DEBUG] GET /proofs - DB Token Lookup FAILED:`, e);
+            }
           }
-          return f;
-        });
-      }
 
-      return {
-        proofId: Number(r.proof_id),
-        bidId: Number(r.bid_id),
-        milestoneIndex: Number(r.milestone_index),
-        status: String(r.status || "pending"),
-        title: r.title || "",
-        description: r.description || "",
-        files, // <--- Use the modified variable
-        aiAnalysis: r.ai_analysis ?? null,
-        submittedAt: r.submitted_at,
-        updatedAt: r.updated_at,
-        geoApprox: await buildSafeGeoForProof(r),
-      };
-    }));
-
-    console.log(`[GET /proofs] bidId=${Number.isInteger(bidId) ? bidId : 'ALL'} -> ${out.length}`);
-    return res.json(out);
-  } catch (err) {
-    console.error("[GET /proofs] error:", err);
-    return res.status(500).json({ error: err.message || "Internal error" });
-  }
-});
-
-// Allow admin OR the bid owner (vendor) to read proofs for that bid
-app.get("/proofs/:bidId", adminOrBidOwnerGuard, async (req, res) => {
-  try {
-    const DEFAULT_TENANT_ID = '00000000-0000-0000-0000-000000000000';
-    let q = "SELECT * FROM proofs WHERE bid_id=$1";
-    const params = [req.params.bidId];
-
-    // Filter by tenant ONLY if not Global Admin
-    if (req.tenantId !== DEFAULT_TENANT_ID) {
-      q += " AND tenant_id=$2";
-      params.push(req.tenantId);
-    }
-
-    q += " ORDER BY submitted_at DESC NULLS LAST";
-
-    const { rows } = await pool.query(q, params);
-    const out = await Promise.all(rows.map(async (r) => {
-      const camel = toCamel(r);
-
-      // 🛡️ FIX: Ensure private gateway URLs have the token
-      // Check env var OR tenant config
-      let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
-
-      console.log(`[DEBUG] GET /proofs/:bidId - TenantID: ${req.tenantId}, EnvToken: ${gatewayToken ? 'YES' : 'NO'}`);
-
-      if (!gatewayToken && req.tenantId) {
-        try {
-          gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
-          console.log(`[DEBUG] GET /proofs/:bidId - DB Token Lookup: ${gatewayToken ? 'FOUND' : 'NOT FOUND'}`);
-        } catch (e) {
-          console.error(`[DEBUG] GET /proofs/:bidId - DB Token Lookup FAILED:`, e);
-        }
-      }
-
-      if (gatewayToken && Array.isArray(camel.files)) {
-        camel.files = camel.files.map(f => {
-          if (f.url && f.url.includes('.mypinata.cloud') && !f.url.includes('token=')) {
-            const separator = f.url.includes('?') ? '&' : '?';
-            return { ...f, url: `${f.url}${separator}token=${gatewayToken}` };
+          if (gatewayToken) {
+            files = files.map(f => {
+              if (f.url && f.url.includes('.mypinata.cloud') && !f.url.includes('token=')) {
+                const separator = f.url.includes('?') ? '&' : '?';
+                return { ...f, url: `${f.url}${separator}token=${gatewayToken}` };
+              }
+              return f;
+            });
           }
-          return f;
-        });
+
+          return {
+            proofId: Number(r.proof_id),
+            bidId: Number(r.bid_id),
+            milestoneIndex: Number(r.milestone_index),
+            status: String(r.status || "pending"),
+            title: r.title || "",
+            description: r.description || "",
+            files, // <--- Use the modified variable
+            aiAnalysis: r.ai_analysis ?? null,
+            submittedAt: r.submitted_at,
+            updatedAt: r.updated_at,
+            geoApprox: await buildSafeGeoForProof(r),
+          };
+        }));
+
+        console.log(`[GET /proofs] bidId=${Number.isInteger(bidId) ? bidId : 'ALL'} -> ${out.length}`);
+        return res.json(out);
+      } catch (err) {
+        console.error("[GET /proofs] error:", err);
+        return res.status(500).json({ error: err.message || "Internal error" });
       }
+    });
 
-      camel.geoApprox = await buildSafeGeoForProof(r); // uses gps_lat/lon if present
-      return camel;
-    }));
-    res.json(out);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+    // Allow admin OR the bid owner (vendor) to read proofs for that bid
+    app.get("/proofs/:bidId", adminOrBidOwnerGuard, async (req, res) => {
+      try {
+        const DEFAULT_TENANT_ID = '00000000-0000-0000-0000-000000000000';
+        let q = "SELECT * FROM proofs WHERE bid_id=$1";
+        const params = [req.params.bidId];
 
-// Approve the latest proof for a milestone (ADMIN) — robust by proof_id
-app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) => {
-  try {
-    const bidId = Number(req.params.bidId);
-    const idx = Number(req.params.milestoneIndex);
+        // Filter by tenant ONLY if not Global Admin
+        if (req.tenantId !== DEFAULT_TENANT_ID) {
+          q += " AND tenant_id=$2";
+          params.push(req.tenantId);
+        }
 
-    if (!Number.isInteger(bidId) || !Number.isInteger(idx)) {
-      return res.status(400).json({ error: "Invalid bidId or milestoneIndex" });
-    }
+        q += " ORDER BY submitted_at DESC NULLS LAST";
 
-    // Always pick the latest by proof_id (most robust)
-    const { rows: proofs } = await pool.query(
-      `SELECT *
+        const { rows } = await pool.query(q, params);
+        const out = await Promise.all(rows.map(async (r) => {
+          const camel = toCamel(r);
+
+          // 🛡️ FIX: Ensure private gateway URLs have the token
+          // Check env var OR tenant config
+          let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+
+          console.log(`[DEBUG] GET /proofs/:bidId - TenantID: ${req.tenantId}, EnvToken: ${gatewayToken ? 'YES' : 'NO'}`);
+
+          if (!gatewayToken && req.tenantId) {
+            try {
+              gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+              console.log(`[DEBUG] GET /proofs/:bidId - DB Token Lookup: ${gatewayToken ? 'FOUND' : 'NOT FOUND'}`);
+            } catch (e) {
+              console.error(`[DEBUG] GET /proofs/:bidId - DB Token Lookup FAILED:`, e);
+            }
+          }
+
+          if (gatewayToken && Array.isArray(camel.files)) {
+            camel.files = camel.files.map(f => {
+              if (f.url && f.url.includes('.mypinata.cloud') && !f.url.includes('token=')) {
+                const separator = f.url.includes('?') ? '&' : '?';
+                return { ...f, url: `${f.url}${separator}token=${gatewayToken}` };
+              }
+              return f;
+            });
+          }
+
+          camel.geoApprox = await buildSafeGeoForProof(r); // uses gps_lat/lon if present
+          return camel;
+        }));
+        res.json(out);
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // Approve the latest proof for a milestone (ADMIN) — robust by proof_id
+    app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) => {
+      try {
+        const bidId = Number(req.params.bidId);
+        const idx = Number(req.params.milestoneIndex);
+
+        if (!Number.isInteger(bidId) || !Number.isInteger(idx)) {
+          return res.status(400).json({ error: "Invalid bidId or milestoneIndex" });
+        }
+
+        // Always pick the latest by proof_id (most robust)
+        const { rows: proofs } = await pool.query(
+          `SELECT *
          FROM proofs
         WHERE bid_id = $1 AND milestone_index = $2 AND tenant_id = $3
         ORDER BY proof_id DESC
         LIMIT 1`,
-      [bidId, idx, req.tenantId]
-    );
-    if (!proofs.length) {
-      return res.status(404).json({ error: "No proof found for this milestone" });
-    }
+          [bidId, idx, req.tenantId]
+        );
+        if (!proofs.length) {
+          return res.status(404).json({ error: "No proof found for this milestone" });
+        }
 
-    const latest = proofs[0];
+        const latest = proofs[0];
 
-    // Already approved? Return as ok.
-    if (String(latest.status).toLowerCase() === "approved") {
-      return res.json({ ok: true, proof: toCamel(latest) });
-    }
+        // Already approved? Return as ok.
+        if (String(latest.status).toLowerCase() === "approved") {
+          return res.json({ ok: true, proof: toCamel(latest) });
+        }
 
-    // Mark as approved
-    const { rows } = await pool.query(
-      `UPDATE proofs
+        // Mark as approved
+        const { rows } = await pool.query(
+          `UPDATE proofs
           SET status = 'approved', updated_at = NOW()
         WHERE proof_id = $1 AND tenant_id = $2
         RETURNING *`,
-      [latest.proof_id, req.tenantId]
-    );
-    const updated = rows[0];
-    await writeAudit(bidId, req, { proof_approved: { index: idx, proofId: updated.proof_id } });
+          [latest.proof_id, req.tenantId]
+        );
+        const updated = rows[0];
+        await writeAudit(bidId, req, { proof_approved: { index: idx, proofId: updated.proof_id } });
 
-    // Notify (admins + vendor) if enabled
-    if (NOTIFY_ENABLED) {
-      try {
-        const { rows: [bid] } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
-        if (bid) {
-          const { rows: [proposal] } = await pool.query(
-            "SELECT * FROM proposals WHERE proposal_id=$1",
-            [bid.proposal_id]
-          );
-          if (proposal && typeof notifyProofApproved === "function") {
-            console.log("[notify] approve about to send", { bidId, ms: idx + 1, proofId: updated.proof_id });
-            await notifyProofApproved({
-              proof: updated,
-              bid,
-              proposal,
-              msIndex: idx + 1
-            });
+        // Notify (admins + vendor) if enabled
+        if (NOTIFY_ENABLED) {
+          try {
+            const { rows: [bid] } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+            if (bid) {
+              const { rows: [proposal] } = await pool.query(
+                "SELECT * FROM proposals WHERE proposal_id=$1",
+                [bid.proposal_id]
+              );
+              if (proposal && typeof notifyProofApproved === "function") {
+                console.log("[notify] approve about to send", { bidId, ms: idx + 1, proofId: updated.proof_id });
+                await notifyProofApproved({
+                  proof: updated,
+                  bid,
+                  proposal,
+                  msIndex: idx + 1
+                });
+              }
+            }
+          } catch (e) {
+            console.warn("notifyProofApproved failed (non-fatal):", String(e).slice(0, 200));
           }
         }
+
+        return res.json({ ok: true, proof: toCamel(updated) });
       } catch (e) {
-        console.warn("notifyProofApproved failed (non-fatal):", String(e).slice(0, 200));
+        console.error("Approve milestone proof failed:", e);
+        return res.status(500).json({ error: "Internal error" });
       }
-    }
+    });
 
-    return res.json({ ok: true, proof: toCamel(updated) });
-  } catch (e) {
-    console.error("Approve milestone proof failed:", e);
-    return res.status(500).json({ error: "Internal error" });
-  }
-});
+    // Reject the latest proof for a milestone (ADMIN) — clean version
+    app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) => {
+      try {
+        const bidId = Number(req.params.bidId);
+        const idx = Number(req.params.milestoneIndex);
+        const reason = String(req.body?.reason || req.body?.message || req.body?.note || '').trim() || null;
 
-// Reject the latest proof for a milestone (ADMIN) — clean version
-app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) => {
-  try {
-    const bidId = Number(req.params.bidId);
-    const idx = Number(req.params.milestoneIndex);
-    const reason = String(req.body?.reason || req.body?.message || req.body?.note || '').trim() || null;
+        if (!Number.isInteger(bidId) || !Number.isInteger(idx)) {
+          return res.status(400).json({ error: "Invalid bidId or milestoneIndex" });
+        }
 
-    if (!Number.isInteger(bidId) || !Number.isInteger(idx)) {
-      return res.status(400).json({ error: "Invalid bidId or milestoneIndex" });
-    }
-
-    // Flip the LATEST proof for this (bid, milestone) to rejected (ignoring tenant_id)
-    const { rows } = await pool.query(`
+        // Flip the LATEST proof for this (bid, milestone) to rejected (ignoring tenant_id)
+        const { rows } = await pool.query(`
       WITH latest AS (
         SELECT proof_id
           FROM proofs
@@ -9275,188 +9297,188 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) =
       SELECT * FROM upd;
     `, [bidId, idx, reason]);
 
-    const updated = rows[0];
-    await writeAudit(bidId, req, { proof_rejected: { index: idx, proofId: updated.proof_id, reason } });
-    if (!updated) {
-      return res.status(404).json({ error: "No proof found for this milestone" });
-    }
+        const updated = rows[0];
+        await writeAudit(bidId, req, { proof_rejected: { index: idx, proofId: updated.proof_id, reason } });
+        if (!updated) {
+          return res.status(404).json({ error: "No proof found for this milestone" });
+        }
 
-    // ---- Notifications (kept INSIDE the async handler) ----
-    try {
-      if (process.env.NOTIFY_ENABLED === "true") {
-        const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
-        const bid = bids[0];
-        const { rows: prj } = await pool.query(
-          "SELECT * FROM proposals WHERE proposal_id=$1",
-          [bid.proposal_id || bid.proposalId]
-        );
-        const proposal = prj[0] || null;
+        // ---- Notifications (kept INSIDE the async handler) ----
+        try {
+          if (process.env.NOTIFY_ENABLED === "true") {
+            const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+            const bid = bids[0];
+            const { rows: prj } = await pool.query(
+              "SELECT * FROM proposals WHERE proposal_id=$1",
+              [bid.proposal_id || bid.proposalId]
+            );
+            const proposal = prj[0] || null;
 
-        const subject = "❌ Proof rejected";
+            const subject = "❌ Proof rejected";
 
-        const en = [
-          '❌ Proof rejected',
-          `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
-          `Bid: ${bidId} • Milestone: ${idx}`,
-          reason ? `Reason: ${reason}` : ''
-        ].filter(Boolean).join('\n');
+            const en = [
+              '❌ Proof rejected',
+              `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
+              `Bid: ${bidId} • Milestone: ${idx}`,
+              reason ? `Reason: ${reason}` : ''
+            ].filter(Boolean).join('\n');
 
-        const es = [
-          '❌ Prueba rechazada',
-          `Proyecto: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
-          `Oferta: ${bidId} • Hito: ${idx}`,
-          reason ? `Motivo: ${reason}` : ''
-        ].filter(Boolean).join('\n');
+            const es = [
+              '❌ Prueba rechazada',
+              `Proyecto: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
+              `Oferta: ${bidId} • Hito: ${idx}`,
+              reason ? `Motivo: ${reason}` : ''
+            ].filter(Boolean).join('\n');
 
-        const { text: msg, html } = bi(en, es);
+            const { text: msg, html } = bi(en, es);
 
-        const { rows: vprows } = await pool.query(
-          `SELECT email, phone, telegram_chat_id
+            const { rows: vprows } = await pool.query(
+              `SELECT email, phone, telegram_chat_id
              FROM vendor_profiles
             WHERE lower(wallet_address)=lower($1)
             LIMIT 1`,
-          [(bid.wallet_address || "").toLowerCase()]
-        );
-        const vp = vprows[0] || {};
-        const vendorEmail = (vp.email || "").trim();
-        const vendorPhone = (vp.phone || "").trim();
-        const vendorTg = (vp.telegram_chat_id || "").trim();
+              [(bid.wallet_address || "").toLowerCase()]
+            );
+            const vp = vprows[0] || {};
+            const vendorEmail = (vp.email || "").trim();
+            const vendorPhone = (vp.phone || "").trim();
+            const vendorTg = (vp.telegram_chat_id || "").trim();
 
-        const waVars = {
-          "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
-          "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
-          "3": `#${idx}`,
-          "4": reason ? reason : "No reason provided"
-        };
+            const waVars = {
+              "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
+              "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
+              "3": `#${idx}`,
+              "4": reason ? reason : "No reason provided"
+            };
 
-        await Promise.all(
-          [
-            TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, msg) : null,
-            ...(TWILIO_WA_CONTENT_SID
-              ? (ADMIN_WHATSAPP || []).map(n => sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars))
-              : (ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, msg))),
-            MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
+            await Promise.all(
+              [
+                TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, msg) : null,
+                ...(TWILIO_WA_CONTENT_SID
+                  ? (ADMIN_WHATSAPP || []).map(n => sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars))
+                  : (ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, msg))),
+                MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
 
-            // Vendor
-            vendorTg ? sendTelegram([vendorTg], msg) : null,
-            vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
-            vendorPhone
-              ? (TWILIO_WA_CONTENT_SID
-                ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
-                : sendWhatsApp(vendorPhone, msg))
-              : null,
-          ].filter(Boolean)
-        );
+                // Vendor
+                vendorTg ? sendTelegram([vendorTg], msg) : null,
+                vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
+                vendorPhone
+                  ? (TWILIO_WA_CONTENT_SID
+                    ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
+                    : sendWhatsApp(vendorPhone, msg))
+                  : null,
+              ].filter(Boolean)
+            );
+          }
+        } catch (e) {
+          console.warn("notify-on-reject (proofs route) failed:", String(e).slice(0, 200));
+        }
+        // -------------------------------------------------------
+
+        return res.json({ ok: true, proof: toCamel(updated) });
+      } catch (e) {
+        console.error("Reject milestone proof failed (proofs route):", e);
+        return res.status(500).json({ error: "Internal error" });
       }
-    } catch (e) {
-      console.warn("notify-on-reject (proofs route) failed:", String(e).slice(0, 200));
+    });
+
+    // --- EXIF date normalization + extraction (robust) ---
+    function normExifDate(raw) {
+      if (!raw) return null;
+      const s = String(raw).trim();
+
+      // EXIF style: 2024:09:30 14:22:11(.sss optional)
+      let m = s.match(/^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?$/);
+      if (m) {
+        const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`;
+        const d = new Date(iso);
+        return Number.isNaN(d.getTime()) ? null : d.toISOString();
+      }
+
+      // ISO-ish already?
+      const d2 = new Date(s);
+      if (!Number.isNaN(d2.getTime())) return d2.toISOString();
+
+      return null;
     }
-    // -------------------------------------------------------
+    function pick(obj, ...keys) {
+      for (const k of keys) {
+        if (obj && obj[k] != null && obj[k] !== '') return obj[k];
+      }
+      return null;
+    }
+    function extractAnyDateFromExif(exif) {
+      if (!exif || typeof exif !== 'object') return null;
 
-    return res.json({ ok: true, proof: toCamel(updated) });
-  } catch (e) {
-    console.error("Reject milestone proof failed (proofs route):", e);
-    return res.status(500).json({ error: "Internal error" });
-  }
-});
+      // Common fields (both cases)
+      const direct =
+        pick(exif,
+          'createDate', 'CreateDate',
+          'dateTimeOriginal', 'DateTimeOriginal',
+          'modifyDate', 'ModifyDate',
+          'dateTime', 'DateTime'
+        ) ||
+        // sometimes nested
+        pick(exif?.Photo || {}, 'DateTimeOriginal') ||
+        pick(exif?.ExifIFD || {}, 'DateTimeOriginal') ||
+        pick(exif?.QuickTime || {}, 'CreateDate');
 
-// --- EXIF date normalization + extraction (robust) ---
-function normExifDate(raw) {
-  if (!raw) return null;
-  const s = String(raw).trim();
+      let iso = normExifDate(direct);
+      if (iso) return iso;
 
-  // EXIF style: 2024:09:30 14:22:11(.sss optional)
-  let m = s.match(/^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?$/);
-  if (m) {
-    const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`;
-    const d = new Date(iso);
-    return Number.isNaN(d.getTime()) ? null : d.toISOString();
-  }
+      // GPS date+time pair
+      if (exif.GPSDateStamp && exif.GPSTimeStamp) {
+        iso = normExifDate(`${exif.GPSDateStamp} ${exif.GPSTimeStamp}`);
+        if (iso) return iso;
+      }
 
-  // ISO-ish already?
-  const d2 = new Date(s);
-  if (!Number.isNaN(d2.getTime())) return d2.toISOString();
-
-  return null;
-}
-function pick(obj, ...keys) {
-  for (const k of keys) {
-    if (obj && obj[k] != null && obj[k] !== '') return obj[k];
-  }
-  return null;
-}
-function extractAnyDateFromExif(exif) {
-  if (!exif || typeof exif !== 'object') return null;
-
-  // Common fields (both cases)
-  const direct =
-    pick(exif,
-      'createDate', 'CreateDate',
-      'dateTimeOriginal', 'DateTimeOriginal',
-      'modifyDate', 'ModifyDate',
-      'dateTime', 'DateTime'
-    ) ||
-    // sometimes nested
-    pick(exif?.Photo || {}, 'DateTimeOriginal') ||
-    pick(exif?.ExifIFD || {}, 'DateTimeOriginal') ||
-    pick(exif?.QuickTime || {}, 'CreateDate');
-
-  let iso = normExifDate(direct);
-  if (iso) return iso;
-
-  // GPS date+time pair
-  if (exif.GPSDateStamp && exif.GPSTimeStamp) {
-    iso = normExifDate(`${exif.GPSDateStamp} ${exif.GPSTimeStamp}`);
-    if (iso) return iso;
-  }
-
-  // Fallback: scan all string values that look like dates
-  const stack = [exif];
-  const seen = new Set();
-  while (stack.length) {
-    const cur = stack.pop();
-    if (!cur || typeof cur !== 'object' || seen.has(cur)) continue;
-    seen.add(cur);
-    for (const v of Object.values(cur)) {
+      // Fallback: scan all string values that look like dates
+      const stack = [exif];
+      const seen = new Set();
+      while (stack.length) {
+        const cur = stack.pop();
+        if (!cur || typeof cur !== 'object' || seen.has(cur)) continue;
+        seen.add(cur);
+        for (const v of Object.values(cur)) {
+          if (typeof v === 'string') {
+            const tryIso = normExifDate(v);
+            if (tryIso) return tryIso;
+          } else if (v && typeof v === 'object') {
+            stack.push(v);
+          }
+        }
+      }
+      return null;
+    }
+    function deriveCaptureFromMeta(fileMeta) {
+      const arr = Array.isArray(fileMeta) ? fileMeta : [];
+      for (const m of arr) {
+        const iso = extractAnyDateFromExif(m?.exif || {});
+        if (iso) return iso;
+      }
+      return null;
+    }
+    function asArrayJson(v) {
+      if (Array.isArray(v)) return v;
       if (typeof v === 'string') {
-        const tryIso = normExifDate(v);
-        if (tryIso) return tryIso;
-      } else if (v && typeof v === 'object') {
-        stack.push(v);
+        try { const j = JSON.parse(v); return Array.isArray(j) ? j : []; } catch { return []; }
       }
-    }
-  }
-  return null;
-}
-function deriveCaptureFromMeta(fileMeta) {
-  const arr = Array.isArray(fileMeta) ? fileMeta : [];
-  for (const m of arr) {
-    const iso = extractAnyDateFromExif(m?.exif || {});
-    if (iso) return iso;
-  }
-  return null;
-}
-function asArrayJson(v) {
-  if (Array.isArray(v)) return v;
-  if (typeof v === 'string') {
-    try { const j = JSON.parse(v); return Array.isArray(j) ? j : []; } catch { return []; }
-  }
-  return [];
-}
-
-// ==============================
-// Public — Geo feed (no auth)
-// ==============================
-app.get("/public/geo/:bidId", async (req, res) => {
-  try {
-    const bidId = Number(req.params.bidId);
-    if (!Number.isInteger(bidId)) {
-      return res.status(400).json({ error: "Invalid bidId" });
+      return [];
     }
 
-    // NOTE: must select file_meta + capture_time for the takenAt value
-    const { rows } = await pool.query(
-      `SELECT
+    // ==============================
+    // Public — Geo feed (no auth)
+    // ==============================
+    app.get("/public/geo/:bidId", async (req, res) => {
+      try {
+        const bidId = Number(req.params.bidId);
+        if (!Number.isInteger(bidId)) {
+          return res.status(400).json({ error: "Invalid bidId" });
+        }
+
+        // NOTE: must select file_meta + capture_time for the takenAt value
+        const { rows } = await pool.query(
+          `SELECT
          proof_id, bid_id, milestone_index, status, title,
          submitted_at, updated_at,
          file_meta, capture_time,
@@ -9464,82 +9486,82 @@ app.get("/public/geo/:bidId", async (req, res) => {
        FROM proofs
        WHERE bid_id = $1 AND status != 'rejected'
        ORDER BY proof_id DESC`,
-      [bidId]
-    );
+          [bidId]
+        );
 
-    const out = await Promise.all(rows.map(async (r) => {
-      // derive from EXIF if capture_time is missing
-      let meta = [];
-      if (Array.isArray(r.file_meta)) meta = r.file_meta;
-      else if (typeof r.file_meta === "string") {
-        try { meta = JSON.parse(r.file_meta) || []; } catch { meta = []; }
+        const out = await Promise.all(rows.map(async (r) => {
+          // derive from EXIF if capture_time is missing
+          let meta = [];
+          if (Array.isArray(r.file_meta)) meta = r.file_meta;
+          else if (typeof r.file_meta === "string") {
+            try { meta = JSON.parse(r.file_meta) || []; } catch { meta = []; }
+          }
+          const derived = deriveCaptureFromMeta(meta);  // <-- requires helpers below
+          const captureTime = r.capture_time || derived || null;
+
+          return {
+            proofId: Number(r.proof_id),
+            bidId: Number(r.bid_id),
+            milestoneIndex: Number(r.milestone_index),
+            status: String(r.status || "pending"),
+            title: r.title || "",
+            submittedAt: r.submitted_at,
+            updatedAt: r.updated_at,
+            geoApprox: await buildSafeGeoForProof(r),
+            captureTime, // <-- frontend reads this as takenAt
+          };
+        }));
+
+        res.json(out);
+      } catch (e) {
+        console.error("[GET /public/geo/:bidId] error:", e);
+        res.status(500).json({ error: "Internal error" });
       }
-      const derived = deriveCaptureFromMeta(meta);  // <-- requires helpers below
-      const captureTime = r.capture_time || derived || null;
+    });
 
-      return {
-        proofId: Number(r.proof_id),
-        bidId: Number(r.bid_id),
-        milestoneIndex: Number(r.milestone_index),
-        status: String(r.status || "pending"),
-        title: r.title || "",
-        submittedAt: r.submitted_at,
-        updatedAt: r.updated_at,
-        geoApprox: await buildSafeGeoForProof(r),
-        captureTime, // <-- frontend reads this as takenAt
-      };
-    }));
+    app.get("/public/geo/proof/:proofId", async (req, res) => {
+      try {
+        const proofId = Number(req.params.proofId);
+        if (!Number.isFinite(proofId)) return res.status(400).json({ error: "Invalid proofId" });
 
-    res.json(out);
-  } catch (e) {
-    console.error("[GET /public/geo/:bidId] error:", e);
-    res.status(500).json({ error: "Internal error" });
-  }
-});
-
-app.get("/public/geo/proof/:proofId", async (req, res) => {
-  try {
-    const proofId = Number(req.params.proofId);
-    if (!Number.isFinite(proofId)) return res.status(400).json({ error: "Invalid proofId" });
-
-    const { rows } = await pool.query(
-      `SELECT proof_id, bid_id, milestone_index, status, title, submitted_at, updated_at,
+        const { rows } = await pool.query(
+          `SELECT proof_id, bid_id, milestone_index, status, title, submitted_at, updated_at,
               gps_lat, gps_lon, gps_alt
          FROM proofs
         WHERE proof_id = $1
         LIMIT 1`,
-      [proofId]
-    );
-    if (!rows[0]) return res.status(404).json({ error: "Proof not found" });
+          [proofId]
+        );
+        if (!rows[0]) return res.status(404).json({ error: "Proof not found" });
 
-    const r = rows[0];
-    res.json({
-      proofId: Number(r.proof_id),
-      bidId: Number(r.bid_id),
-      milestoneIndex: Number(r.milestone_index),
-      status: String(r.status || "pending"),
-      title: r.title || "",
-      submittedAt: r.submitted_at,
-      updatedAt: r.updated_at,
-      geoApprox: await buildSafeGeoForProof(r),
+        const r = rows[0];
+        res.json({
+          proofId: Number(r.proof_id),
+          bidId: Number(r.bid_id),
+          milestoneIndex: Number(r.milestone_index),
+          status: String(r.status || "pending"),
+          title: r.title || "",
+          submittedAt: r.submitted_at,
+          updatedAt: r.updated_at,
+          geoApprox: await buildSafeGeoForProof(r),
+        });
+      } catch (e) {
+        console.error("[GET /public/geo/proof/:proofId] error:", e);
+        res.status(500).json({ error: "Internal error" });
+      }
     });
-  } catch (e) {
-    console.error("[GET /public/geo/proof/:proofId] error:", e);
-    res.status(500).json({ error: "Internal error" });
-  }
-});
 
-// --- Latest proof status per milestone for a bid --------------------------------
-app.get('/bids/:bidId/proofs/latest-status', adminGuard, async (req, res) => {
-  try {
-    const bidId = Number(req.params.bidId);
-    if (!Number.isFinite(bidId)) return res.status(400).json({ error: 'Invalid bid id' });
+    // --- Latest proof status per milestone for a bid --------------------------------
+    app.get('/bids/:bidId/proofs/latest-status', adminGuard, async (req, res) => {
+      try {
+        const bidId = Number(req.params.bidId);
+        if (!Number.isFinite(bidId)) return res.status(400).json({ error: 'Invalid bid id' });
 
-    // Debug log so you can confirm it's hit from the admin page
-    console.log('[latest-status] GET', { bidId, user: req.user?.sub, role: req.user?.role });
+        // Debug log so you can confirm it's hit from the admin page
+        console.log('[latest-status] GET', { bidId, user: req.user?.sub, role: req.user?.role });
 
-    // Pick the most recent proof per milestone (submitted_at, then updated_at, then id)
-    const { rows } = await pool.query(`
+        // Pick the most recent proof per milestone (submitted_at, then updated_at, then id)
+        const { rows } = await pool.query(`
       WITH ranked AS (
         SELECT
           milestone_index,
@@ -9558,97 +9580,97 @@ app.get('/bids/:bidId/proofs/latest-status', adminGuard, async (req, res) => {
       WHERE rn = 1
     `, [bidId, req.tenantId]);
 
-    const byIndex = {};
-    for (const r of rows) {
-      byIndex[Number(r.milestone_index)] = String(r.status || 'pending');
-    }
+        const byIndex = {};
+        for (const r of rows) {
+          byIndex[Number(r.milestone_index)] = String(r.status || 'pending');
+        }
 
-    res.set('Cache-Control', 'no-store');
-    return res.json({ byIndex });
-  } catch (e) {
-    console.error('[latest-status] error', e);
-    return res.status(500).json({ error: 'Internal error' });
-  }
-});
-
-// Re-run Agent2 on a single proof (admin only)
-app.all('/proofs/:id/analyze', (req, res, next) => {
-  if (req.method === 'POST') return next();
-  if (req.method === 'OPTIONS') {
-    res.set('Allow', 'POST, OPTIONS');
-    return res.sendStatus(204);
-  }
-  res.set('Allow', 'POST, OPTIONS');
-  return res.status(405).json({ error: 'Method Not Allowed. Use POST /proofs/:id/analyze.' });
-});
-
-app.post('/proofs/:id/analyze', adminGuard, async (req, res) => {
-  const proofId = Number(req.params.id);
-  if (!Number.isFinite(proofId)) return res.status(400).json({ error: 'Invalid proof id' });
-
-  try {
-    // 1) Load proof
-    const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1 AND tenant_id=$2', [proofId, req.tenantId]);
-    const proof = pr[0];
-    if (!proof) return res.status(404).json({ error: 'Proof not found' });
-    const proofDesc = String(proof.description || '').trim();
-
-    // 2) Load bid + proposal for context
-    const { rows: br } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [proof.bid_id]);
-    const bid = br[0];
-    if (!bid) return res.status(404).json({ error: 'Bid not found for proof' });
-
-    const { rows: por } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
-    const proposal = por[0] || null;
-
-    // 3) Build prompt inputs
-    const vendorPrompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
-    const files = Array.isArray(proof.files)
-      ? proof.files
-      : (typeof proof.files === 'string' ? JSON.parse(proof.files || '[]') : []);
-    const description = String(proof.description || '').slice(0, 2000);
-
-    // --- EXIF/GPS prep from the saved proof row ---
-    const meta = Array.isArray(proof.file_meta)
-      ? proof.file_meta
-      : (typeof proof.file_meta === "string" ? JSON.parse(proof.file_meta || "[]") : []);
-
-    const gpsItems = meta.filter(m =>
-      Number.isFinite(m?.exif?.gpsLatitude) && Number.isFinite(m?.exif?.gpsLongitude)
-    );
-    const gpsCount = gpsItems.length;
-    const firstGps = gpsItems[0]
-      ? {
-        lat: Number(gpsItems[0].exif.gpsLatitude),
-        lon: Number(gpsItems[0].exif.gpsLongitude),
-        alt: Number.isFinite(Number(gpsItems[0].exif?.gpsAltitude))
-          ? Number(gpsItems[0].exif.gpsAltitude)
-          : null,
+        res.set('Cache-Control', 'no-store');
+        return res.json({ byIndex });
+      } catch (e) {
+        console.error('[latest-status] error', e);
+        return res.status(500).json({ error: 'Internal error' });
       }
-      : { lat: null, lon: null, alt: null };
+    });
 
-    const captureIso = proof.capture_time || null; // we saved this on submit
-    const lat = Number.isFinite(firstGps?.lat) ? firstGps.lat : (Number.isFinite(proof.gps_lat) ? Number(proof.gps_lat) : null);
-    const lon = Number.isFinite(firstGps?.lon) ? firstGps.lon : (Number.isFinite(proof.gps_lon) ? Number(proof.gps_lon) : null);
+    // Re-run Agent2 on a single proof (admin only)
+    app.all('/proofs/:id/analyze', (req, res, next) => {
+      if (req.method === 'POST') return next();
+      if (req.method === 'OPTIONS') {
+        res.set('Allow', 'POST, OPTIONS');
+        return res.sendStatus(204);
+      }
+      res.set('Allow', 'POST, OPTIONS');
+      return res.status(405).json({ error: 'Method Not Allowed. Use POST /proofs/:id/analyze.' });
+    });
 
-    let rgeo = null;
-    if (Number.isFinite(lat) && Number.isFinite(lon)) {
-      try { rgeo = await reverseGeocode(lat, lon); } catch { }
-    }
-    const metaBlock = summarizeMeta(meta);
-    const capNote = captureIso
-      ? `First capture time (EXIF, ISO8601): ${captureIso}`
-      : 'No capture time in EXIF.';
-    const gpsNote = gpsCount
-      ? `GPS present in ${gpsCount} file(s). First fix: ${firstGps.lat}, ${firstGps.lon}${firstGps.alt != null ? ` • alt ${firstGps.alt}m` : ''}`
-      : 'No GPS in submitted media.';
+    app.post('/proofs/:id/analyze', adminGuard, async (req, res) => {
+      const proofId = Number(req.params.id);
+      if (!Number.isFinite(proofId)) return res.status(400).json({ error: 'Invalid proof id' });
 
-    // Milestone info for this proof
-    const msArr = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
-    const ms = msArr[proof.milestone_index] || {};
+      try {
+        // 1) Load proof
+        const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1 AND tenant_id=$2', [proofId, req.tenantId]);
+        const proof = pr[0];
+        if (!proof) return res.status(404).json({ error: 'Proof not found' });
+        const proofDesc = String(proof.description || '').trim();
 
-    // 4) Base prompt (now includes EXIF/GPS + capture time block)
-    const basePrompt = `
+        // 2) Load bid + proposal for context
+        const { rows: br } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [proof.bid_id]);
+        const bid = br[0];
+        if (!bid) return res.status(404).json({ error: 'Bid not found for proof' });
+
+        const { rows: por } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
+        const proposal = por[0] || null;
+
+        // 3) Build prompt inputs
+        const vendorPrompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
+        const files = Array.isArray(proof.files)
+          ? proof.files
+          : (typeof proof.files === 'string' ? JSON.parse(proof.files || '[]') : []);
+        const description = String(proof.description || '').slice(0, 2000);
+
+        // --- EXIF/GPS prep from the saved proof row ---
+        const meta = Array.isArray(proof.file_meta)
+          ? proof.file_meta
+          : (typeof proof.file_meta === "string" ? JSON.parse(proof.file_meta || "[]") : []);
+
+        const gpsItems = meta.filter(m =>
+          Number.isFinite(m?.exif?.gpsLatitude) && Number.isFinite(m?.exif?.gpsLongitude)
+        );
+        const gpsCount = gpsItems.length;
+        const firstGps = gpsItems[0]
+          ? {
+            lat: Number(gpsItems[0].exif.gpsLatitude),
+            lon: Number(gpsItems[0].exif.gpsLongitude),
+            alt: Number.isFinite(Number(gpsItems[0].exif?.gpsAltitude))
+              ? Number(gpsItems[0].exif.gpsAltitude)
+              : null,
+          }
+          : { lat: null, lon: null, alt: null };
+
+        const captureIso = proof.capture_time || null; // we saved this on submit
+        const lat = Number.isFinite(firstGps?.lat) ? firstGps.lat : (Number.isFinite(proof.gps_lat) ? Number(proof.gps_lat) : null);
+        const lon = Number.isFinite(firstGps?.lon) ? firstGps.lon : (Number.isFinite(proof.gps_lon) ? Number(proof.gps_lon) : null);
+
+        let rgeo = null;
+        if (Number.isFinite(lat) && Number.isFinite(lon)) {
+          try { rgeo = await reverseGeocode(lat, lon); } catch { }
+        }
+        const metaBlock = summarizeMeta(meta);
+        const capNote = captureIso
+          ? `First capture time (EXIF, ISO8601): ${captureIso}`
+          : 'No capture time in EXIF.';
+        const gpsNote = gpsCount
+          ? `GPS present in ${gpsCount} file(s). First fix: ${firstGps.lat}, ${firstGps.lon}${firstGps.alt != null ? ` • alt ${firstGps.alt}m` : ''}`
+          : 'No GPS in submitted media.';
+
+        // Milestone info for this proof
+        const msArr = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
+        const ms = msArr[proof.milestone_index] || {};
+
+        // 4) Base prompt (now includes EXIF/GPS + capture time block)
+        const basePrompt = `
 You are Agent2. Evaluate a vendor's submitted proof for a specific milestone.
 
 Return strict JSON:
@@ -9685,428 +9707,428 @@ Hints:
 - ${capNote}
 `.trim();
 
-    const fullPrompt = vendorPrompt ? `${vendorPrompt}\n\n---\n${basePrompt}` : basePrompt;
+        const fullPrompt = vendorPrompt ? `${vendorPrompt}\n\n---\n${basePrompt}` : basePrompt;
 
-    // 5) Run OpenAI (or fallback)
-    let analysis;
-    if (!openai) {
-      analysis = {
-        summary: "OpenAI not configured; no automatic proof analysis.",
-        evidence: [],
-        gaps: [],
-        fit: "low",
-        confidence: 0,
-        geo: { gpsCount, firstFix: firstGps, captureTime: captureIso || null },
-      };
-    } else {
-      const resp = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        temperature: 0.2,
-        messages: [{ role: "user", content: fullPrompt }],
-        response_format: { type: "json_object" },
-      });
+        // 5) Run OpenAI (or fallback)
+        let analysis;
+        if (!openai) {
+          analysis = {
+            summary: "OpenAI not configured; no automatic proof analysis.",
+            evidence: [],
+            gaps: [],
+            fit: "low",
+            confidence: 0,
+            geo: { gpsCount, firstFix: firstGps, captureTime: captureIso || null },
+          };
+        } else {
+          const resp = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            temperature: 0.2,
+            messages: [{ role: "user", content: fullPrompt }],
+            response_format: { type: "json_object" },
+          });
 
+          try {
+            const raw = resp.choices?.[0]?.message?.content || "{}";
+            analysis = JSON.parse(raw);
+          } catch {
+            analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
+          }
+        } // ← end else
+
+        // ↓↓↓ THIS BLOCK GOES OUTSIDE the else, before the DB UPDATE ↓↓↓
+
+        // Ensure geo always present
+        if (!analysis.geo) {
+          analysis.geo = { gpsCount, firstFix: firstGps, captureTime: captureIso || null };
+        }
+
+        // Attach GPS + human-readable location (uses the `lat`/`lon` you computed above)
+        analysis.geo.lat = Number.isFinite(lat) ? lat : (analysis.geo.lat ?? null);
+        analysis.geo.lon = Number.isFinite(lon) ? lon : (analysis.geo.lon ?? null);
+        if (captureIso && !analysis.geo.captureTime) analysis.geo.captureTime = captureIso;
+
+        if (rgeo) {
+          Object.assign(analysis.geo, {
+            // handle either new {provider,label} or older {source,displayName}
+            provider: rgeo.provider || rgeo.source || null,
+            address: rgeo.label || rgeo.displayName || null,
+            country: rgeo.country ?? null,
+            state: rgeo.state || rgeo.region || null,
+            county: rgeo.county || rgeo.province || null,
+            city: rgeo.city || rgeo.municipality || null,
+            suburb: rgeo.suburb ?? null,
+            postcode: rgeo.postcode ?? null,
+          });
+        }
+
+        // (optional) add a readable line to the summary
+        const locBits = [analysis.geo.city, analysis.geo.state, analysis.geo.country].filter(Boolean);
+        if (locBits.length) {
+          const locLine = `Location: ${locBits.join(", ")} (${analysis.geo.lat?.toFixed?.(6)}, ${analysis.geo.lon?.toFixed?.(6)})`;
+          if (!String(analysis.summary || "").includes(locLine)) {
+            analysis.summary = `${analysis.summary ? analysis.summary.trim() + "\n\n" : ""}${locLine}`;
+          }
+        }
+
+        // 6) Save & return
+        const { rows: upd } = await pool.query(
+          'UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2 RETURNING *',
+          [JSON.stringify(analysis), proofId]
+        );
+        return res.json(toCamel(upd[0]));
+      } catch (e) {
+        console.error('proof analyze error:', e);
+        return res.status(500).json({ error: 'Failed to analyze proof' });
+      }
+    });
+
+    // Reject the latest proof for a milestone (ADMIN)
+    // URL: POST /bids/:bidId/milestones/:idx/reject
+    app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => {
       try {
-        const raw = resp.choices?.[0]?.message?.content || "{}";
-        analysis = JSON.parse(raw);
-      } catch {
-        analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
-      }
-    } // ← end else
+        const bidId = Number(req.params.bidId);
+        const idx = Number(req.params.idx);
+        const reason = (req.body && req.body.reason) ? String(req.body.reason).slice(0, 500) : null;
 
-    // ↓↓↓ THIS BLOCK GOES OUTSIDE the else, before the DB UPDATE ↓↓↓
+        if (!Number.isInteger(bidId) || !Number.isInteger(idx)) {
+          return res.status(400).json({ error: "bad bidId or milestone index" });
+        }
 
-    // Ensure geo always present
-    if (!analysis.geo) {
-      analysis.geo = { gpsCount, firstFix: firstGps, captureTime: captureIso || null };
-    }
-
-    // Attach GPS + human-readable location (uses the `lat`/`lon` you computed above)
-    analysis.geo.lat = Number.isFinite(lat) ? lat : (analysis.geo.lat ?? null);
-    analysis.geo.lon = Number.isFinite(lon) ? lon : (analysis.geo.lon ?? null);
-    if (captureIso && !analysis.geo.captureTime) analysis.geo.captureTime = captureIso;
-
-    if (rgeo) {
-      Object.assign(analysis.geo, {
-        // handle either new {provider,label} or older {source,displayName}
-        provider: rgeo.provider || rgeo.source || null,
-        address: rgeo.label || rgeo.displayName || null,
-        country: rgeo.country ?? null,
-        state: rgeo.state || rgeo.region || null,
-        county: rgeo.county || rgeo.province || null,
-        city: rgeo.city || rgeo.municipality || null,
-        suburb: rgeo.suburb ?? null,
-        postcode: rgeo.postcode ?? null,
-      });
-    }
-
-    // (optional) add a readable line to the summary
-    const locBits = [analysis.geo.city, analysis.geo.state, analysis.geo.country].filter(Boolean);
-    if (locBits.length) {
-      const locLine = `Location: ${locBits.join(", ")} (${analysis.geo.lat?.toFixed?.(6)}, ${analysis.geo.lon?.toFixed?.(6)})`;
-      if (!String(analysis.summary || "").includes(locLine)) {
-        analysis.summary = `${analysis.summary ? analysis.summary.trim() + "\n\n" : ""}${locLine}`;
-      }
-    }
-
-    // 6) Save & return
-    const { rows: upd } = await pool.query(
-      'UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2 RETURNING *',
-      [JSON.stringify(analysis), proofId]
-    );
-    return res.json(toCamel(upd[0]));
-  } catch (e) {
-    console.error('proof analyze error:', e);
-    return res.status(500).json({ error: 'Failed to analyze proof' });
-  }
-});
-
-// Reject the latest proof for a milestone (ADMIN)
-// URL: POST /bids/:bidId/milestones/:idx/reject
-app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => {
-  try {
-    const bidId = Number(req.params.bidId);
-    const idx = Number(req.params.idx);
-    const reason = (req.body && req.body.reason) ? String(req.body.reason).slice(0, 500) : null;
-
-    if (!Number.isInteger(bidId) || !Number.isInteger(idx)) {
-      return res.status(400).json({ error: "bad bidId or milestone index" });
-    }
-
-    // Find the most recent proof for this milestone (ignoring tenant_id to handle legacy/mismatched data)
-    const { rows: proofs } = await pool.query(
-      `SELECT proof_id, tenant_id FROM proofs
+        // Find the most recent proof for this milestone (ignoring tenant_id to handle legacy/mismatched data)
+        const { rows: proofs } = await pool.query(
+          `SELECT proof_id, tenant_id FROM proofs
          WHERE bid_id = $1 AND milestone_index = $2
          ORDER BY submitted_at DESC NULLS LAST, updated_at DESC NULLS LAST
          LIMIT 1`,
-      [bidId, idx]
-    );
-    if (!proofs.length) return res.status(404).json({ error: "No proof found for this milestone" });
+          [bidId, idx]
+        );
+        if (!proofs.length) return res.status(404).json({ error: "No proof found for this milestone" });
 
-    const proofId = proofs[0].proof_id;
+        const proofId = proofs[0].proof_id;
 
-    // Mark as rejected
-    const { rows } = await pool.query(
-      `UPDATE proofs
+        // Mark as rejected
+        const { rows } = await pool.query(
+          `UPDATE proofs
          SET status = 'rejected', rejection_reason = $2, updated_at = NOW()
        WHERE proof_id = $1
        RETURNING proof_id, bid_id, milestone_index, status, updated_at`,
-      [proofId, reason]
-    );
-
-    // Notify
-    try {
-      if (process.env.NOTIFY_ENABLED === "true") {
-        const { rows: pr } = await pool.query("SELECT * FROM proofs WHERE proof_id=$1", [proofId]);
-        const proof = pr[0];
-        const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
-        const bid = bids[0];
-        const { rows: prj } = await pool.query(
-          "SELECT * FROM proposals WHERE proposal_id=$1",
-          [bid.proposal_id || bid.proposalId]
+          [proofId, reason]
         );
-        const proposal = prj[0] || null;
 
-        const subject = "❌ Proof rejected";
-        const msg = [
-          "❌ Proof rejected",
-          `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
-          `Bid: ${bidId} • Milestone: ${idx}`,
-          reason ? `Reason: ${reason}` : ""
-        ].filter(Boolean).join("\n");
-        const html = msg.replace(/\n/g, "<br>");
+        // Notify
+        try {
+          if (process.env.NOTIFY_ENABLED === "true") {
+            const { rows: pr } = await pool.query("SELECT * FROM proofs WHERE proof_id=$1", [proofId]);
+            const proof = pr[0];
+            const { rows: bids } = await pool.query("SELECT * FROM bids WHERE bid_id=$1", [bidId]);
+            const bid = bids[0];
+            const { rows: prj } = await pool.query(
+              "SELECT * FROM proposals WHERE proposal_id=$1",
+              [bid.proposal_id || bid.proposalId]
+            );
+            const proposal = prj[0] || null;
 
-        // Load vendor contacts (email/phone/telegram) from vendor_profiles
-        const { rows: vprows } = await pool.query(
-          `SELECT email, phone, telegram_chat_id
+            const subject = "❌ Proof rejected";
+            const msg = [
+              "❌ Proof rejected",
+              `Project: ${proposal?.title || proposal?.name || proposal?.proposal_id}`,
+              `Bid: ${bidId} • Milestone: ${idx}`,
+              reason ? `Reason: ${reason}` : ""
+            ].filter(Boolean).join("\n");
+            const html = msg.replace(/\n/g, "<br>");
+
+            // Load vendor contacts (email/phone/telegram) from vendor_profiles
+            const { rows: vprows } = await pool.query(
+              `SELECT email, phone, telegram_chat_id
          FROM vendor_profiles
         WHERE lower(wallet_address)=lower($1)
         LIMIT 1`,
-          [(bid.wallet_address || "").toLowerCase()]
-        );
-        const vp = vprows[0] || {};
-        const vendorEmail = (vp.email || "").trim();
-        const vendorPhone = (vp.phone || "").trim();
-        const vendorTg = (vp.telegram_chat_id || "").trim();
+              [(bid.wallet_address || "").toLowerCase()]
+            );
+            const vp = vprows[0] || {};
+            const vendorEmail = (vp.email || "").trim();
+            const vendorPhone = (vp.phone || "").trim();
+            const vendorTg = (vp.telegram_chat_id || "").trim();
 
-        // WhatsApp template variables (if TWILIO_WA_CONTENT_SID is set)
-        const waVars = {
-          "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
-          "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
-          "3": `#${idx}`,
-          "4": reason ? reason : "No reason provided"
-        };
+            // WhatsApp template variables (if TWILIO_WA_CONTENT_SID is set)
+            const waVars = {
+              "1": `${proposal?.title || "(untitled)"} — ${proposal?.org_name || ""}`,
+              "2": `${bid.vendor_name || ""} (${bid.wallet_address || ""})`,
+              "3": `#${idx}`,
+              "4": reason ? reason : "No reason provided"
+            };
 
-        await Promise.all(
-          [
-            // Admins
-            TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, msg) : null,
-            ...(TWILIO_WA_CONTENT_SID
-              ? (ADMIN_WHATSAPP || []).map(n => sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars))
-              : (ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, msg))),
-            MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
+            await Promise.all(
+              [
+                // Admins
+                TELEGRAM_ADMIN_CHAT_IDS?.length ? sendTelegram(TELEGRAM_ADMIN_CHAT_IDS, msg) : null,
+                ...(TWILIO_WA_CONTENT_SID
+                  ? (ADMIN_WHATSAPP || []).map(n => sendWhatsAppTemplate(n, TWILIO_WA_CONTENT_SID, waVars))
+                  : (ADMIN_WHATSAPP || []).map(n => sendWhatsApp(n, msg))),
+                MAIL_ADMIN_TO?.length ? sendEmail(MAIL_ADMIN_TO, subject, html) : null,
 
-            // Vendor (email + optional TG/WA)
-            vendorTg ? sendTelegram([vendorTg], msg) : null,
-            vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
-            vendorPhone
-              ? (TWILIO_WA_CONTENT_SID
-                ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
-                : sendWhatsApp(vendorPhone, msg))
-              : null,
-          ].filter(Boolean)
-        );
+                // Vendor (email + optional TG/WA)
+                vendorTg ? sendTelegram([vendorTg], msg) : null,
+                vendorEmail ? sendEmail([vendorEmail], subject, html) : null,
+                vendorPhone
+                  ? (TWILIO_WA_CONTENT_SID
+                    ? sendWhatsAppTemplate(vendorPhone, TWILIO_WA_CONTENT_SID, waVars)
+                    : sendWhatsApp(vendorPhone, msg))
+                  : null,
+              ].filter(Boolean)
+            );
+          }
+        } catch (e) {
+          console.warn("notify-on-reject failed (non-fatal):", String(e).slice(0, 200));
+        }
+
+        return res.json({ ok: true, proof: rows[0] });
+      } catch (e) {
+        console.error("Reject milestone proof failed:", e);
+        return res.status(500).json({ error: "Internal error" });
       }
-    } catch (e) {
-      console.warn("notify-on-reject failed (non-fatal):", String(e).slice(0, 200));
-    }
+    });
 
-    return res.json({ ok: true, proof: rows[0] });
-  } catch (e) {
-    console.error("Reject milestone proof failed:", e);
-    return res.status(500).json({ error: "Internal error" });
-  }
-});
+    // --- Vendor-safe: Archive a proof -------------------------------------------
+    // POST /proofs/:id/archive
+    // Auth: admin OR vendor who owns the bid (wallet matches)
+    app.post('/proofs/:id/archive', authRequired, async (req, res) => {
+      const proofId = Number(req.params.id);
+      if (!Number.isFinite(proofId)) {
+        return res.status(400).json({ error: 'Invalid proof id' });
+      }
 
-// --- Vendor-safe: Archive a proof -------------------------------------------
-// POST /proofs/:id/archive
-// Auth: admin OR vendor who owns the bid (wallet matches)
-app.post('/proofs/:id/archive', authRequired, async (req, res) => {
-  const proofId = Number(req.params.id);
-  if (!Number.isFinite(proofId)) {
-    return res.status(400).json({ error: 'Invalid proof id' });
-  }
-
-  try {
-    // Load proof + owning bid (to verify ownership)
-    const { rows } = await pool.query(
-      `SELECT p.proof_id, p.bid_id, p.milestone_index, p.status,
+      try {
+        // Load proof + owning bid (to verify ownership)
+        const { rows } = await pool.query(
+          `SELECT p.proof_id, p.bid_id, p.milestone_index, p.status,
               b.wallet_address AS bid_wallet
          FROM proofs p
          JOIN bids b ON b.bid_id = p.bid_id
         WHERE p.proof_id = $1 AND p.tenant_id = $2`,
-      [proofId, req.tenantId]
-    );
-    const pr = rows[0];
-    if (!pr) return res.status(404).json({ error: 'Proof not found' });
+          [proofId, req.tenantId]
+        );
+        const pr = rows[0];
+        if (!pr) return res.status(404).json({ error: 'Proof not found' });
 
-    const caller = String(req.user?.sub || '').toLowerCase();
-    const isAdmin = String(req.user?.role || '').toLowerCase() === 'admin';
-    const owner = String(pr.bid_wallet || '').toLowerCase();
+        const caller = String(req.user?.sub || '').toLowerCase();
+        const isAdmin = String(req.user?.role || '').toLowerCase() === 'admin';
+        const owner = String(pr.bid_wallet || '').toLowerCase();
 
-    if (!isAdmin && !caller) return res.status(401).json({ error: 'Unauthorized' });
-    if (!isAdmin && caller !== owner) return res.status(403).json({ error: 'Forbidden' });
+        if (!isAdmin && !caller) return res.status(401).json({ error: 'Unauthorized' });
+        if (!isAdmin && caller !== owner) return res.status(403).json({ error: 'Forbidden' });
 
-    if (String(pr.status || '').toLowerCase() === 'archived') {
-      return res.json({ ok: true, proof: toCamel(pr) });
-    }
+        if (String(pr.status || '').toLowerCase() === 'archived') {
+          return res.json({ ok: true, proof: toCamel(pr) });
+        }
 
-    const { rows: upd } = await pool.query(
-      `UPDATE proofs
+        const { rows: upd } = await pool.query(
+          `UPDATE proofs
           SET status = 'archived', updated_at = NOW()
         WHERE proof_id = $1 AND tenant_id = $2
         RETURNING *`,
-      [proofId, req.tenantId]
-    );
+          [proofId, req.tenantId]
+        );
 
-    return res.json({ ok: true, proof: toCamel(upd[0]) });
-  } catch (err) {
-    console.error('archive proof error:', err);
-    return res.status(500).json({ error: 'Internal error archiving proof' });
-  }
-});
-
-// --- Agent2 Chat about a SPECIFIC PROOF (SSE) -------------------------------
-app.all('/proofs/:id/chat', (req, res, next) => {
-  if (req.method === 'POST') return next();
-  if (req.method === 'OPTIONS') {
-    res.set('Allow', 'POST, OPTIONS');
-    return res.sendStatus(204);
-  }
-  res.set('Allow', 'POST, OPTIONS');
-  return res.status(405).json({ error: 'Method Not Allowed. Use POST /proofs/:id/chat.' });
-});
-
-// NOTE: keep adminGuard, or relax to adminOrBidOwnerGuard if vendors should access their own proofs.
-app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
-  if (!openai) return res.status(503).json({ error: 'OpenAI not configured' });
-
-  const proofId = Number(req.params.id);
-  if (!Number.isFinite(proofId)) return res.status(400).json({ error: 'Invalid proof id' });
-
-  // SSE headers
-  res.set({
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
-    'Connection': 'keep-alive',
-  });
-  if (typeof res.flushHeaders === 'function') res.flushHeaders();
-
-  try {
-    // 1) Load proof
-    const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1 AND tenant_id=$2', [proofId, req.tenantId]);
-    const proof = pr[0];
-    if (!proof) {
-      res.write(`data: ERROR Proof not found\n\n`);
-      res.write(`data: [DONE]\n\n`);
-      return res.end();
-    }
-
-    // 2) Load bid + proposal
-    const { rows: br } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [proof.bid_id]);
-    const bid = br[0];
-    if (!bid) {
-      res.write(`data: ERROR Bid not found for proof\n\n`);
-      res.write(`data: [DONE]\n\n`);
-      return res.end();
-    }
-
-    const { rows: por } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
-    const proposal = por[0] || null;
-
-    // 3) Normalize proof payload (single source of truth)
-    const files = Array.isArray(proof?.files)
-      ? proof.files
-      : (typeof proof?.files === 'string' ? JSON.parse(proof.files || '[]') : []);
-
-    const meta = Array.isArray(proof?.file_meta)
-      ? proof.file_meta
-      : (typeof proof?.file_meta === 'string' ? JSON.parse(proof.file_meta || '[]') : []);
-
-    const metaBlock = summarizeMeta(meta);
-
-    // === A) Proof description string ===
-    const proofDesc = String(proof?.description || '').trim();
-
-    // === B) Extract PDF text from any proof files ===
-    const pinataJwt = await tenantService.getTenantConfig(req.tenantId, 'pinata_jwt');
-    let pdfText = '';
-    for (const f of files) {
-      if (!f?.url) continue;
-      const info = await waitForPdfInfoFromDoc({ url: f.url, name: f.name || '' }, {}, pinataJwt);
-      if (info.used && info.text) {
-        pdfText += `\n\n[${f.name || 'file'}]\n${info.text}`;
+        return res.json({ ok: true, proof: toCamel(upd[0]) });
+      } catch (err) {
+        console.error('archive proof error:', err);
+        return res.status(500).json({ error: 'Internal error archiving proof' });
       }
-    }
-    pdfText = pdfText.trim();
+    });
 
-    // === C) Build location block from AI geo or GPS (+ reverse geocode) ===
-    let aiGeo = null;
-    try { aiGeo = JSON.parse(proof?.ai_analysis || '{}')?.geo || null; } catch { }
+    // --- Agent2 Chat about a SPECIFIC PROOF (SSE) -------------------------------
+    app.all('/proofs/:id/chat', (req, res, next) => {
+      if (req.method === 'POST') return next();
+      if (req.method === 'OPTIONS') {
+        res.set('Allow', 'POST, OPTIONS');
+        return res.sendStatus(204);
+      }
+      res.set('Allow', 'POST, OPTIONS');
+      return res.status(405).json({ error: 'Method Not Allowed. Use POST /proofs/:id/chat.' });
+    });
 
-    const lat = Number.isFinite(aiGeo?.lat) ? Number(aiGeo.lat)
-      : (Number.isFinite(proof?.gps_lat) ? Number(proof.gps_lat) : null);
-    const lon = Number.isFinite(aiGeo?.lon) ? Number(aiGeo.lon)
-      : (Number.isFinite(proof?.gps_lon) ? Number(proof.gps_lon) : null);
+    // NOTE: keep adminGuard, or relax to adminOrBidOwnerGuard if vendors should access their own proofs.
+    app.post('/proofs/:id/chat', adminGuard, async (req, res) => {
+      if (!openai) return res.status(503).json({ error: 'OpenAI not configured' });
 
-    let rgeo = null;
-    if (Number.isFinite(lat) && Number.isFinite(lon)) {
-      try { rgeo = await reverseGeocode(lat, lon); } catch { }
-    }
+      const proofId = Number(req.params.id);
+      if (!Number.isFinite(proofId)) return res.status(400).json({ error: 'Invalid proof id' });
 
-    const loc = {
-      lat, lon,
-      country: aiGeo?.country ?? rgeo?.country ?? null,
-      state: aiGeo?.state ?? rgeo?.state ?? null,
-      county: aiGeo?.county ?? rgeo?.county ?? null,
-      city: aiGeo?.city ?? rgeo?.city ?? null,
-      suburb: aiGeo?.suburb ?? rgeo?.suburb ?? null,
-      postcode: aiGeo?.postcode ?? rgeo?.postcode ?? null,
-      address: aiGeo?.address ?? rgeo?.displayName ?? rgeo?.label ?? null,
-      provider: aiGeo?.provider ?? rgeo?.provider ?? rgeo?.source ?? null,
-    };
-
-    const locationBlock = loc ? [
-      'Known location:',
-      (Number.isFinite(loc.lat) && Number.isFinite(loc.lon))
-        ? `- Coords: ${loc.lat.toFixed(6)}, ${loc.lon.toFixed(6)}`
-        : '- Coords: n/a',
-      loc.address ? `- Address: ${loc.address}` : '',
-      loc.city ? `- City: ${loc.city}` : '',
-      loc.state ? `- State/Region: ${loc.state}` : '',
-      loc.country ? `- Country: ${loc.country}` : '',
-      loc.provider ? `- Source: ${loc.provider}` : '',
-    ].filter(Boolean).join('\n') : 'Known location: (none)';
-
-    const userText = String(req.body?.message || 'Analyze this proof for completeness and risks.').slice(0, 2000);
-
-    // Gather any images from proof; also BEFORE images from proposal docs (if present)
-    const proposalImages = collectProposalImages(proposal);
-    const proofImages = files.filter(isImageFile);
-    const hasAnyImages = proposalImages.length > 0 || proofImages.length > 0;
-
-    // 4) Create context block
-    const context = [
-      'You are Agent 2 for LithiumX.',
-      'Answer ONLY using the provided bid/proposal fields and the submitted proof (description + extracted PDF text).',
-      'If something is not present in that material, say it is not stated in the submitted proof.',
-      '',
-      '--- PROPOSAL ---',
-      JSON.stringify({
-        org: proposal?.org_name || '',
-        title: proposal?.title || '',
-        summary: proposal?.summary || '',
-        budgetUSD: proposal?.amount_usd ?? 0,
-      }, null, 2),
-      '',
-      '--- BID ---',
-      JSON.stringify({
-        vendor: bid.vendor_name || '',
-        priceUSD: bid.price_usd ?? 0,
-        days: bid.days ?? 0,
-        notes: bid.notes || '',
-        milestones: (Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || '[]')),
-      }, null, 2),
-      '',
-      '--- PROOF ---',
-      JSON.stringify({
-        title: proof?.title || '',
-        description: proofDesc.slice(0, 4000),
-        files: files.map(f => ({ name: f.name, url: f.url })),
-      }, null, 2),
-      '',
-      '--- IMAGE/VIDEO METADATA ---',
-      metaBlock,
-      '',
-
-      // >>> INSERTED LINES <<<
-      '--- KNOWN LOCATION ---',
-      locationBlock,
-      '',
-      // <<< END INSERTION <<<
-
-      pdfText
-        ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText.slice(0, 15000)}`
-        : `--- NO PDF TEXT AVAILABLE ---`,
-    ].join('\n');
-
-    // ——— FIX: Base64 Proxy for Proof Chat (Prevents Timeouts) ———
-    const urlToContent = async (f) => {
-      const name = (f.name || f.url || "").toLowerCase();
-      const mime = (f.mimetype || "").toLowerCase();
-      if (!mime.startsWith("image/") && !/\.(jpe?g|png|webp|gif)$/.test(name)) return null;
+      // SSE headers
+      res.set({
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+      });
+      if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
       try {
-        // Clean URL & Force Cloudflare (Fastest Download)
-        let url = (f.url || "").trim().replace(/[.,;]+$/, "");
-        url = url.replace("gateway.pinata.cloud", "cf-ipfs.com");
+        // 1) Load proof
+        const { rows: pr } = await pool.query('SELECT * FROM proofs WHERE proof_id=$1 AND tenant_id=$2', [proofId, req.tenantId]);
+        const proof = pr[0];
+        if (!proof) {
+          res.write(`data: ERROR Proof not found\n\n`);
+          res.write(`data: [DONE]\n\n`);
+          return res.end();
+        }
 
-        // Download buffer using your robust fetcher
-        const buf = await fetchAsBuffer(url);
-        const b64 = buf.toString('base64');
-        let finalMime = mime.startsWith("image/") ? mime : "image/jpeg";
+        // 2) Load bid + proposal
+        const { rows: br } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [proof.bid_id]);
+        const bid = br[0];
+        if (!bid) {
+          res.write(`data: ERROR Bid not found for proof\n\n`);
+          res.write(`data: [DONE]\n\n`);
+          return res.end();
+        }
 
-        return { type: 'image_url', image_url: { url: `data:${finalMime};base64,${b64}` } };
-      } catch (e) {
-        console.warn(`[ProofChat] Skipped image ${f.url}:`, e.message);
-        return null;
-      }
-    };
+        const { rows: por } = await pool.query('SELECT * FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
+        const proposal = por[0] || null;
 
-    // 5) Choose vision vs text model
-    let stream;
-    if (hasAnyImages) {
-      const systemMsg = `
+        // 3) Normalize proof payload (single source of truth)
+        const files = Array.isArray(proof?.files)
+          ? proof.files
+          : (typeof proof?.files === 'string' ? JSON.parse(proof.files || '[]') : []);
+
+        const meta = Array.isArray(proof?.file_meta)
+          ? proof.file_meta
+          : (typeof proof?.file_meta === 'string' ? JSON.parse(proof.file_meta || '[]') : []);
+
+        const metaBlock = summarizeMeta(meta);
+
+        // === A) Proof description string ===
+        const proofDesc = String(proof?.description || '').trim();
+
+        // === B) Extract PDF text from any proof files ===
+        const pinataJwt = await tenantService.getTenantConfig(req.tenantId, 'pinata_jwt');
+        let pdfText = '';
+        for (const f of files) {
+          if (!f?.url) continue;
+          const info = await waitForPdfInfoFromDoc({ url: f.url, name: f.name || '' }, {}, pinataJwt);
+          if (info.used && info.text) {
+            pdfText += `\n\n[${f.name || 'file'}]\n${info.text}`;
+          }
+        }
+        pdfText = pdfText.trim();
+
+        // === C) Build location block from AI geo or GPS (+ reverse geocode) ===
+        let aiGeo = null;
+        try { aiGeo = JSON.parse(proof?.ai_analysis || '{}')?.geo || null; } catch { }
+
+        const lat = Number.isFinite(aiGeo?.lat) ? Number(aiGeo.lat)
+          : (Number.isFinite(proof?.gps_lat) ? Number(proof.gps_lat) : null);
+        const lon = Number.isFinite(aiGeo?.lon) ? Number(aiGeo.lon)
+          : (Number.isFinite(proof?.gps_lon) ? Number(proof.gps_lon) : null);
+
+        let rgeo = null;
+        if (Number.isFinite(lat) && Number.isFinite(lon)) {
+          try { rgeo = await reverseGeocode(lat, lon); } catch { }
+        }
+
+        const loc = {
+          lat, lon,
+          country: aiGeo?.country ?? rgeo?.country ?? null,
+          state: aiGeo?.state ?? rgeo?.state ?? null,
+          county: aiGeo?.county ?? rgeo?.county ?? null,
+          city: aiGeo?.city ?? rgeo?.city ?? null,
+          suburb: aiGeo?.suburb ?? rgeo?.suburb ?? null,
+          postcode: aiGeo?.postcode ?? rgeo?.postcode ?? null,
+          address: aiGeo?.address ?? rgeo?.displayName ?? rgeo?.label ?? null,
+          provider: aiGeo?.provider ?? rgeo?.provider ?? rgeo?.source ?? null,
+        };
+
+        const locationBlock = loc ? [
+          'Known location:',
+          (Number.isFinite(loc.lat) && Number.isFinite(loc.lon))
+            ? `- Coords: ${loc.lat.toFixed(6)}, ${loc.lon.toFixed(6)}`
+            : '- Coords: n/a',
+          loc.address ? `- Address: ${loc.address}` : '',
+          loc.city ? `- City: ${loc.city}` : '',
+          loc.state ? `- State/Region: ${loc.state}` : '',
+          loc.country ? `- Country: ${loc.country}` : '',
+          loc.provider ? `- Source: ${loc.provider}` : '',
+        ].filter(Boolean).join('\n') : 'Known location: (none)';
+
+        const userText = String(req.body?.message || 'Analyze this proof for completeness and risks.').slice(0, 2000);
+
+        // Gather any images from proof; also BEFORE images from proposal docs (if present)
+        const proposalImages = collectProposalImages(proposal);
+        const proofImages = files.filter(isImageFile);
+        const hasAnyImages = proposalImages.length > 0 || proofImages.length > 0;
+
+        // 4) Create context block
+        const context = [
+          'You are Agent 2 for LithiumX.',
+          'Answer ONLY using the provided bid/proposal fields and the submitted proof (description + extracted PDF text).',
+          'If something is not present in that material, say it is not stated in the submitted proof.',
+          '',
+          '--- PROPOSAL ---',
+          JSON.stringify({
+            org: proposal?.org_name || '',
+            title: proposal?.title || '',
+            summary: proposal?.summary || '',
+            budgetUSD: proposal?.amount_usd ?? 0,
+          }, null, 2),
+          '',
+          '--- BID ---',
+          JSON.stringify({
+            vendor: bid.vendor_name || '',
+            priceUSD: bid.price_usd ?? 0,
+            days: bid.days ?? 0,
+            notes: bid.notes || '',
+            milestones: (Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || '[]')),
+          }, null, 2),
+          '',
+          '--- PROOF ---',
+          JSON.stringify({
+            title: proof?.title || '',
+            description: proofDesc.slice(0, 4000),
+            files: files.map(f => ({ name: f.name, url: f.url })),
+          }, null, 2),
+          '',
+          '--- IMAGE/VIDEO METADATA ---',
+          metaBlock,
+          '',
+
+          // >>> INSERTED LINES <<<
+          '--- KNOWN LOCATION ---',
+          locationBlock,
+          '',
+          // <<< END INSERTION <<<
+
+          pdfText
+            ? `--- PROOF PDF TEXT (truncated) ---\n${pdfText.slice(0, 15000)}`
+            : `--- NO PDF TEXT AVAILABLE ---`,
+        ].join('\n');
+
+        // ——— FIX: Base64 Proxy for Proof Chat (Prevents Timeouts) ———
+        const urlToContent = async (f) => {
+          const name = (f.name || f.url || "").toLowerCase();
+          const mime = (f.mimetype || "").toLowerCase();
+          if (!mime.startsWith("image/") && !/\.(jpe?g|png|webp|gif)$/.test(name)) return null;
+
+          try {
+            // Clean URL & Force Cloudflare (Fastest Download)
+            let url = (f.url || "").trim().replace(/[.,;]+$/, "");
+            url = url.replace("gateway.pinata.cloud", "cf-ipfs.com");
+
+            // Download buffer using your robust fetcher
+            const buf = await fetchAsBuffer(url);
+            const b64 = buf.toString('base64');
+            let finalMime = mime.startsWith("image/") ? mime : "image/jpeg";
+
+            return { type: 'image_url', image_url: { url: `data:${finalMime};base64,${b64}` } };
+          } catch (e) {
+            console.warn(`[ProofChat] Skipped image ${f.url}:`, e.message);
+            return null;
+          }
+        };
+
+        // 5) Choose vision vs text model
+        let stream;
+        if (hasAnyImages) {
+          const systemMsg = `
 You are Agent2 for LithiumX.
 You CAN analyze the attached images.
 Task: Compare "BEFORE" (proposal) vs "AFTER" (proof) images to assess progress.
@@ -10125,156 +10147,156 @@ ALWAYS provide:
    • Confidence [0–1]
 `.trim();
 
-      const userContent = [
-        { type: 'text', text: `User request: ${userText}\n\nCompare BEFORE (proposal docs) vs AFTER (proof) images.` },
-      ];
+          const userContent = [
+            { type: 'text', text: `User request: ${userText}\n\nCompare BEFORE (proposal docs) vs AFTER (proof) images.` },
+          ];
 
-      // Process BEFORE Images (Proposal) - Limit 3
-      const beforeImgs = proposalImages.slice(0, 3);
-      const beforeProcessed = await Promise.all(beforeImgs.map(urlToContent));
-      const validBefore = beforeProcessed.filter(Boolean);
+          // Process BEFORE Images (Proposal) - Limit 3
+          const beforeImgs = proposalImages.slice(0, 3);
+          const beforeProcessed = await Promise.all(beforeImgs.map(urlToContent));
+          const validBefore = beforeProcessed.filter(Boolean);
 
-      if (validBefore.length > 0) {
-        userContent.push({ type: 'text', text: 'BEFORE (from proposal):' });
-        userContent.push(...validBefore);
-      } else {
-        userContent.push({ type: 'text', text: 'BEFORE: (none available)' });
+          if (validBefore.length > 0) {
+            userContent.push({ type: 'text', text: 'BEFORE (from proposal):' });
+            userContent.push(...validBefore);
+          } else {
+            userContent.push({ type: 'text', text: 'BEFORE: (none available)' });
+          }
+
+          // Process AFTER Images (Proof) - Limit 3
+          const afterImgs = proofImages.slice(0, 3);
+          const afterProcessed = await Promise.all(afterImgs.map(urlToContent));
+          const validAfter = afterProcessed.filter(Boolean);
+
+          if (validAfter.length > 0) {
+            userContent.push({ type: 'text', text: 'AFTER (from proof):' });
+            userContent.push(...validAfter);
+          } else {
+            userContent.push({ type: 'text', text: 'AFTER: (none available)' });
+          }
+
+          userContent.push({ type: 'text', text: `\n\n--- CONTEXT ---\n${context}` });
+
+          console.log(`[ProofChat] Sending Vision request: ${validBefore.length} before + ${validAfter.length} after.`);
+
+          stream = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            temperature: 0.2,
+            stream: true,
+            messages: [
+              { role: 'system', content: systemMsg },
+              { role: 'user', content: userContent },
+            ],
+          });
+
+        } else {
+          // Text-only fallback (unchanged)
+          stream = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            temperature: 0.2,
+            stream: true,
+            messages: [
+              { role: 'system', content: 'Be concise. Cite specific items from the provided proof context.' },
+              { role: 'user', content: `${userText}\n\n--- CONTEXT ---\n${context}` },
+            ],
+          });
+        }
+
+        // 6) Stream tokens
+        let full = '';
+        for await (const part of stream) {
+          const token = part?.choices?.[0]?.delta?.content || '';
+          if (token) {
+            full += token;
+            res.write(`data: ${token}\n\n`);
+          }
+        }
+
+        // 7) Footer: low-confidence hint + next checks
+        const conf = extractConfidenceFromText(full);
+        const nextChecks = buildNextChecks({
+          hasAnyPdfText: false,
+          imageCount: proofImages.length,
+          ocrSeen: /[A-Za-z0-9]{3,}/.test(full || '')
+        });
+
+        if (conf !== null && conf < 0.35) {
+          res.write(`data: \n\n`);
+          res.write(`data: 🔎 Needs human review (low confidence: ${conf.toFixed(2)})\n\n`);
+        }
+        if (nextChecks.length) {
+          res.write(`data: \n\n`);
+          res.write(`data: Next checks:\n\n`);
+          for (const item of nextChecks) res.write(`data: • ${item}\n\n`);
+        }
+
+        res.write(`data: [DONE]\n\n`);
+        res.end();
+      } catch (err) {
+        console.error('/proofs/:id/chat SSE error:', err);
+        try {
+          res.write(`data: ERROR ${String(err).slice(0, 200)}\n\n`);
+          res.write(`data: [DONE]\n\n`);
+          res.end();
+        } catch { }
       }
-
-      // Process AFTER Images (Proof) - Limit 3
-      const afterImgs = proofImages.slice(0, 3);
-      const afterProcessed = await Promise.all(afterImgs.map(urlToContent));
-      const validAfter = afterProcessed.filter(Boolean);
-
-      if (validAfter.length > 0) {
-        userContent.push({ type: 'text', text: 'AFTER (from proof):' });
-        userContent.push(...validAfter);
-      } else {
-        userContent.push({ type: 'text', text: 'AFTER: (none available)' });
-      }
-
-      userContent.push({ type: 'text', text: `\n\n--- CONTEXT ---\n${context}` });
-
-      console.log(`[ProofChat] Sending Vision request: ${validBefore.length} before + ${validAfter.length} after.`);
-
-      stream = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.2,
-        stream: true,
-        messages: [
-          { role: 'system', content: systemMsg },
-          { role: 'user', content: userContent },
-        ],
-      });
-
-    } else {
-      // Text-only fallback (unchanged)
-      stream = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.2,
-        stream: true,
-        messages: [
-          { role: 'system', content: 'Be concise. Cite specific items from the provided proof context.' },
-          { role: 'user', content: `${userText}\n\n--- CONTEXT ---\n${context}` },
-        ],
-      });
-    }
-
-    // 6) Stream tokens
-    let full = '';
-    for await (const part of stream) {
-      const token = part?.choices?.[0]?.delta?.content || '';
-      if (token) {
-        full += token;
-        res.write(`data: ${token}\n\n`);
-      }
-    }
-
-    // 7) Footer: low-confidence hint + next checks
-    const conf = extractConfidenceFromText(full);
-    const nextChecks = buildNextChecks({
-      hasAnyPdfText: false,
-      imageCount: proofImages.length,
-      ocrSeen: /[A-Za-z0-9]{3,}/.test(full || '')
     });
 
-    if (conf !== null && conf < 0.35) {
-      res.write(`data: \n\n`);
-      res.write(`data: 🔎 Needs human review (low confidence: ${conf.toFixed(2)})\n\n`);
+    // ==============================
+    // Routes — Vendor profile (fill once, used in Admin Vendors)
+    // ==============================
+    const profileSchema = Joi.object({
+      vendorName: Joi.string().min(2).max(140).required(),
+      email: Joi.string().email().allow(''),
+      phone: Joi.string().allow(''),
+      address: Joi.alternatives().try(
+        Joi.string().allow(''),
+        Joi.object({
+          line1: Joi.string().allow(''),
+          city: Joi.string().allow(''),
+          country: Joi.string().allow(''),
+          postalCode: Joi.string().allow(''),
+        })
+      ).default(''),
+      website: Joi.string().allow(''),
+    });
+
+    // helpers (add once near your other helpers if missing)
+    function normWebsite(s) {
+      if (!s) return null;
+      s = String(s).trim();
+      if (!s) return null;
+      return /^https?:\/\//i.test(s) ? s : `https://${s}`;
     }
-    if (nextChecks.length) {
-      res.write(`data: \n\n`);
-      res.write(`data: Next checks:\n\n`);
-      for (const item of nextChecks) res.write(`data: • ${item}\n\n`);
+    function _addrText(a, city, country) {
+      if (!a) return null;
+      if (typeof a === 'string') {
+        const line = a.trim();
+        return [line, city || '', country || ''].filter(Boolean).join(', ') || line || null;
+      }
+      if (typeof a === 'object') {
+        const line = a.line1 || a.address1 || '';
+        const cty = a.city || city || '';
+        const ctry = a.country || country || '';
+        return [line, cty, ctry].filter(Boolean).join(', ') || null;
+      }
+      return null;
     }
 
-    res.write(`data: [DONE]\n\n`);
-    res.end();
-  } catch (err) {
-    console.error('/proofs/:id/chat SSE error:', err);
-    try {
-      res.write(`data: ERROR ${String(err).slice(0, 200)}\n\n`);
-      res.write(`data: [DONE]\n\n`);
-      res.end();
-    } catch { }
-  }
-});
+    // ---- Save generic profile (NO vendor insert here) ----
+    app.post("/profile", authRequired, async (req, res) => {
+      try {
+        const wallet = String(req.user?.sub || "").toLowerCase();
+        if (!wallet) return res.status(401).json({ error: "unauthorized" });
 
-// ==============================
-// Routes — Vendor profile (fill once, used in Admin Vendors)
-// ==============================
-const profileSchema = Joi.object({
-  vendorName: Joi.string().min(2).max(140).required(),
-  email: Joi.string().email().allow(''),
-  phone: Joi.string().allow(''),
-  address: Joi.alternatives().try(
-    Joi.string().allow(''),
-    Joi.object({
-      line1: Joi.string().allow(''),
-      city: Joi.string().allow(''),
-      country: Joi.string().allow(''),
-      postalCode: Joi.string().allow(''),
-    })
-  ).default(''),
-  website: Joi.string().allow(''),
-});
+        const b = req.body || {};
+        const displayName =
+          (b.vendorName ?? b.orgName ?? b.displayName ?? b.display_name ?? "").trim();
 
-// helpers (add once near your other helpers if missing)
-function normWebsite(s) {
-  if (!s) return null;
-  s = String(s).trim();
-  if (!s) return null;
-  return /^https?:\/\//i.test(s) ? s : `https://${s}`;
-}
-function _addrText(a, city, country) {
-  if (!a) return null;
-  if (typeof a === 'string') {
-    const line = a.trim();
-    return [line, city || '', country || ''].filter(Boolean).join(', ') || line || null;
-  }
-  if (typeof a === 'object') {
-    const line = a.line1 || a.address1 || '';
-    const cty = a.city || city || '';
-    const ctry = a.country || country || '';
-    return [line, cty, ctry].filter(Boolean).join(', ') || null;
-  }
-  return null;
-}
+        const addrText = _addrText(b.address, b.city, b.country);
 
-// ---- Save generic profile (NO vendor insert here) ----
-app.post("/profile", authRequired, async (req, res) => {
-  try {
-    const wallet = String(req.user?.sub || "").toLowerCase();
-    if (!wallet) return res.status(401).json({ error: "unauthorized" });
-
-    const b = req.body || {};
-    const displayName =
-      (b.vendorName ?? b.orgName ?? b.displayName ?? b.display_name ?? "").trim();
-
-    const addrText = _addrText(b.address, b.city, b.country);
-
-    await pool.query(
-      `
+        await pool.query(
+          `
       INSERT INTO user_profiles
         (wallet_address, display_name, email, phone, website, address, city, country, telegram_chat_id, whatsapp, updated_at)
       VALUES
@@ -10291,153 +10313,153 @@ app.post("/profile", authRequired, async (req, res) => {
         whatsapp          = EXCLUDED.whatsapp,
         updated_at        = NOW()
       `,
-      [
-        wallet,
-        displayName || null,
-        b.email ?? null,
-        b.phone ?? null,
-        normWebsite(b.website) ?? null,
-        addrText,
-        b.address?.city ?? b.city ?? null,
-        b.address?.country ?? b.country ?? null,
-        b.telegramChatId ?? b.telegram_chat_id ?? null,
-        b.whatsapp ?? null,
-      ]
-    );
+          [
+            wallet,
+            displayName || null,
+            b.email ?? null,
+            b.phone ?? null,
+            normWebsite(b.website) ?? null,
+            addrText,
+            b.address?.city ?? b.city ?? null,
+            b.address?.country ?? b.country ?? null,
+            b.telegramChatId ?? b.telegram_chat_id ?? null,
+            b.whatsapp ?? null,
+          ]
+        );
 
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("POST /profile error", e);
-    return res.status(500).json({ error: "profile_save_failed" });
-  }
-});
+        return res.json({ ok: true });
+      } catch (e) {
+        console.error("POST /profile error", e);
+        return res.status(500).json({ error: "profile_save_failed" });
+      }
+    });
 
-// ---------- address helper (place this ABOVE the /vendor/profile route) ----------
-function _addrObj(addr, city = null, country = null) {
-  let o;
-  if (addr && typeof addr === 'object') {
-    o = { ...addr };
-  } else if (typeof addr === 'string') {
-    try {
-      const parsed = JSON.parse(addr);
-      o = parsed && typeof parsed === 'object' ? { ...parsed } : { line1: addr };
-    } catch {
-      o = { line1: addr };
+    // ---------- address helper (place this ABOVE the /vendor/profile route) ----------
+    function _addrObj(addr, city = null, country = null) {
+      let o;
+      if (addr && typeof addr === 'object') {
+        o = { ...addr };
+      } else if (typeof addr === 'string') {
+        try {
+          const parsed = JSON.parse(addr);
+          o = parsed && typeof parsed === 'object' ? { ...parsed } : { line1: addr };
+        } catch {
+          o = { line1: addr };
+        }
+      } else {
+        o = {};
+      }
+      if (city && !o.city) o.city = city;
+      if (country && !o.country) o.country = country;
+
+      const addressText = [o.line1, o.line2, o.city, o.state, o.postalCode, o.country]
+        .filter(Boolean).join(', ');
+
+      return { ...o, addressText };
     }
-  } else {
-    o = {};
-  }
-  if (city && !o.city) o.city = city;
-  if (country && !o.country) o.country = country;
 
-  const addressText = [o.line1, o.line2, o.city, o.state, o.postalCode, o.country]
-    .filter(Boolean).join(', ');
+    app.get('/vendor/profile', authRequired, async (req, res) => {
+      try {
+        const wallet = String(req.user?.address || req.user?.sub || '').toLowerCase();
+        if (!wallet) return res.status(401).json({ error: 'unauthenticated' });
 
-  return { ...o, addressText };
-}
-
-app.get('/vendor/profile', authRequired, async (req, res) => {
-  try {
-    const wallet = String(req.user?.address || req.user?.sub || '').toLowerCase();
-    if (!wallet) return res.status(401).json({ error: 'unauthenticated' });
-
-    // 1. [FIX] Added telegram_chat_id and telegram_username to the SQL query
-    const { rows } = await pool.query(
-      `SELECT wallet_address, vendor_name, email, phone, website, address,
+        // 1. [FIX] Added telegram_chat_id and telegram_username to the SQL query
+        const { rows } = await pool.query(
+          `SELECT wallet_address, vendor_name, email, phone, website, address,
               telegram_chat_id, telegram_username
          FROM vendor_profiles
         WHERE lower(wallet_address) = lower($1)
         LIMIT 1`,
-      [wallet]
-    );
+          [wallet]
+        );
 
-    if (!rows.length) {
-      // Return an empty-but-valid shape so the UI doesn't crash
-      return res.json({
-        walletAddress: wallet,
-        vendorName: '',
-        email: '',
-        phone: '',
-        website: '',
-        address: { line1: '', city: '', postalCode: '', country: '' },
-        telegram_chat_id: null,
-        telegram_username: null,
-      });
-    }
+        if (!rows.length) {
+          // Return an empty-but-valid shape so the UI doesn't crash
+          return res.json({
+            walletAddress: wallet,
+            vendorName: '',
+            email: '',
+            phone: '',
+            website: '',
+            address: { line1: '', city: '', postalCode: '', country: '' },
+            telegram_chat_id: null,
+            telegram_username: null,
+          });
+        }
 
-    const r = rows[0];
+        const r = rows[0];
 
-    // address can be stored as string or JSON; normalize to object
-    let addr = { line1: '', city: '', postalCode: '', country: '' };
-    if (typeof r.address === 'string' && r.address.trim().startsWith('{')) {
-      try {
-        const a = JSON.parse(r.address);
-        addr = {
-          line1: a?.line1 || '',
-          city: a?.city || '',
-          postalCode: a?.postalCode || a?.postal_code || '',
-          country: a?.country || ''
-        };
-      } catch {
-        addr = { line1: r.address || '', city: '', postalCode: '', country: '' };
+        // address can be stored as string or JSON; normalize to object
+        let addr = { line1: '', city: '', postalCode: '', country: '' };
+        if (typeof r.address === 'string' && r.address.trim().startsWith('{')) {
+          try {
+            const a = JSON.parse(r.address);
+            addr = {
+              line1: a?.line1 || '',
+              city: a?.city || '',
+              postalCode: a?.postalCode || a?.postal_code || '',
+              country: a?.country || ''
+            };
+          } catch {
+            addr = { line1: r.address || '', city: '', postalCode: '', country: '' };
+          }
+        } else if (typeof r.address === 'string') {
+          addr = { line1: r.address || '', city: '', postalCode: '', country: '' };
+        }
+
+        // 2. [FIX] Added the new fields to the JSON response
+        // The frontend page checks for all these property names
+        return res.json({
+          walletAddress: r.wallet_address,
+          vendorName: r.vendor_name || '',
+          email: r.email || '',
+          phone: r.phone || '',
+          website: r.website || '',
+          address: addr,
+          telegram_chat_id: r.telegram_chat_id,
+          telegramChatId: r.telegram_chat_id, // Alias for frontend
+          telegram_username: r.telegram_username,
+          telegramUsername: r.telegram_username // Alias for frontend
+        });
+      } catch (e) {
+        console.error('GET /vendor/profile error:', e);
+        return res.status(500).json({ error: 'failed_to_load_vendor_profile' });
       }
-    } else if (typeof r.address === 'string') {
-      addr = { line1: r.address || '', city: '', postalCode: '', country: '' };
-    }
-
-    // 2. [FIX] Added the new fields to the JSON response
-    // The frontend page checks for all these property names
-    return res.json({
-      walletAddress: r.wallet_address,
-      vendorName: r.vendor_name || '',
-      email: r.email || '',
-      phone: r.phone || '',
-      website: r.website || '',
-      address: addr,
-      telegram_chat_id: r.telegram_chat_id,
-      telegramChatId: r.telegram_chat_id, // Alias for frontend
-      telegram_username: r.telegram_username,
-      telegramUsername: r.telegram_username // Alias for frontend
     });
-  } catch (e) {
-    console.error('GET /vendor/profile error:', e);
-    return res.status(500).json({ error: 'failed_to_load_vendor_profile' });
-  }
-});
 
-// ── PROPOSER PROFILE (Entity) — STRICTLY SEPARATE FROM VENDOR ──────────────────
-app.post('/proposer/profile', requireAuth, async (req, res) => {
-  try {
-    const wallet = String(req.user?.address || req.user?.sub || '').toLowerCase();
-    if (!wallet) return res.status(401).json({ error: 'unauthenticated' });
+    // ── PROPOSER PROFILE (Entity) — STRICTLY SEPARATE FROM VENDOR ──────────────────
+    app.post('/proposer/profile', requireAuth, async (req, res) => {
+      try {
+        const wallet = String(req.user?.address || req.user?.sub || '').toLowerCase();
+        if (!wallet) return res.status(401).json({ error: 'unauthenticated' });
 
-    // 🔒 HARD SEPARATION:
-    // If this wallet is (now) a proposer, nuke any vendor profile for the same wallet.
-    await pool.query('DELETE FROM vendor_profiles WHERE wallet_address = $1 AND tenant_id = $2', [wallet, req.tenantId]);
+        // 🔒 HARD SEPARATION:
+        // If this wallet is (now) a proposer, nuke any vendor profile for the same wallet.
+        await pool.query('DELETE FROM vendor_profiles WHERE wallet_address = $1 AND tenant_id = $2', [wallet, req.tenantId]);
 
-    const {
-      vendorName,            // → org_name
-      email,                 // → contact_email
-      phone,
-      website,
-      address,               // object OR string
-      city,
-      country,
-      whatsapp,
-      telegram_chat_id,
-      telegram_username,
-    } = req.body || {};
+        const {
+          vendorName,            // → org_name
+          email,                 // → contact_email
+          phone,
+          website,
+          address,               // object OR string
+          city,
+          country,
+          whatsapp,
+          telegram_chat_id,
+          telegram_username,
+        } = req.body || {};
 
-    // Normalize website like in vendor route (prepend https:// if missing)
-    const rawWebsite = (website || '').trim();
-    const websiteNorm = rawWebsite && !/^https?:\/\//i.test(rawWebsite) ? `https://${rawWebsite}` : rawWebsite || null;
+        // Normalize website like in vendor route (prepend https:// if missing)
+        const rawWebsite = (website || '').trim();
+        const websiteNorm = rawWebsite && !/^https?:\/\//i.test(rawWebsite) ? `https://${rawWebsite}` : rawWebsite || null;
 
-    // Store address: keep JSON when object; keep as text when string
-    const addressVal =
-      typeof address === 'string' ? (address || null)
-        : (address ? JSON.stringify(address) : null);
+        // Store address: keep JSON when object; keep as text when string
+        const addressVal =
+          typeof address === 'string' ? (address || null)
+            : (address ? JSON.stringify(address) : null);
 
-    await pool.query(`
+        await pool.query(`
       INSERT INTO proposer_profiles
         (wallet_address, org_name, contact_email, phone, website, address, city, country,
          whatsapp, telegram_chat_id, telegram_username, updated_at, tenant_id)
@@ -10459,107 +10481,107 @@ app.post('/proposer/profile', requireAuth, async (req, res) => {
         telegram_username = COALESCE(NULLIF(EXCLUDED.telegram_username, ''), proposer_profiles.telegram_username),
         updated_at        = NOW()
     `, [
-      wallet,
-      vendorName ?? null,
-      email ?? null,
-      phone ?? null,
-      websiteNorm,
-      addressVal,
-      city ?? null,
-      country ?? null,
-      whatsapp ?? null,
-      telegram_chat_id ?? null,
-      telegram_username ?? null,
-      req.tenantId
-    ]);
+          wallet,
+          vendorName ?? null,
+          email ?? null,
+          phone ?? null,
+          websiteNorm,
+          addressVal,
+          city ?? null,
+          country ?? null,
+          whatsapp ?? null,
+          telegram_chat_id ?? null,
+          telegram_username ?? null,
+          req.tenantId
+        ]);
 
-    // Minimal, consistent response (don’t leak vendor shape)
-    return res.json({ ok: true, role: 'proposer' });
-  } catch (e) {
-    console.error('POST /proposer/profile error', e);
-    return res.status(500).json({ error: 'Failed to save proposer profile' });
-  }
-});
+        // Minimal, consistent response (don’t leak vendor shape)
+        return res.json({ ok: true, role: 'proposer' });
+      } catch (e) {
+        console.error('POST /proposer/profile error', e);
+        return res.status(500).json({ error: 'Failed to save proposer profile' });
+      }
+    });
 
-// Read Entity/Proposer profile **from proposer_profiles**
-app.get('/proposer/profile', requireAuth, async (req, res) => {
-  try {
-    const addr = String(req.user?.address || req.user?.sub || "").toLowerCase();
-    const r = await pool.query(`
+    // Read Entity/Proposer profile **from proposer_profiles**
+    app.get('/proposer/profile', requireAuth, async (req, res) => {
+      try {
+        const addr = String(req.user?.address || req.user?.sub || "").toLowerCase();
+        const r = await pool.query(`
       SELECT org_name, contact_email, phone, website, address, city, country, telegram_username, telegram_chat_id, whatsapp
       FROM proposer_profiles
       WHERE lower(wallet_address)=lower($1) AND tenant_id=$2
       LIMIT 1
     `, [addr, req.tenantId]);
 
-    if (!r.rows.length) return res.json({}); // empty profile
+        if (!r.rows.length) return res.json({}); // empty profile
 
-    const row = r.rows[0];
-    const norm = (s) => (typeof s === 'string' && s.trim() ? s.trim() : null);
+        const row = r.rows[0];
+        const norm = (s) => (typeof s === 'string' && s.trim() ? s.trim() : null);
 
-    // address may be JSON or plain text -> normalize both
-    let addrObj = null, addressText = null;
-    if (row.address) {
-      if (typeof row.address === 'string' && row.address.trim().startsWith('{')) {
-        try { addrObj = JSON.parse(row.address); } catch { }
+        // address may be JSON or plain text -> normalize both
+        let addrObj = null, addressText = null;
+        if (row.address) {
+          if (typeof row.address === 'string' && row.address.trim().startsWith('{')) {
+            try { addrObj = JSON.parse(row.address); } catch { }
+          }
+          if (addrObj && typeof addrObj === 'object') {
+            const line1 = norm(addrObj.line1);
+            const city = norm(addrObj.city);
+            const pc = norm(addrObj.postalCode) || norm(addrObj.postal_code);
+            const ctry = norm(addrObj.country);
+            addressText = [line1, city, pc, ctry].filter(Boolean).join(', ') || null;
+          } else {
+            addressText = norm(row.address);
+          }
+        }
+
+        res.json({
+          vendorName: row.org_name || '',
+          email: row.contact_email || '',
+          phone: row.phone || '',
+          website: row.website || '',
+          address: addrObj || addressText || null,
+          addressText,
+          telegram_username: row.telegram_username ?? null,
+          telegram_chat_id: row.telegram_chat_id ?? null,
+          whatsapp: row.whatsapp ?? null,
+        });
+      } catch (e) {
+        console.error('GET /proposer/profile error', e);
+        res.status(500).json({ error: 'Failed to load proposer profile' });
       }
-      if (addrObj && typeof addrObj === 'object') {
-        const line1 = norm(addrObj.line1);
-        const city = norm(addrObj.city);
-        const pc = norm(addrObj.postalCode) || norm(addrObj.postal_code);
-        const ctry = norm(addrObj.country);
-        addressText = [line1, city, pc, ctry].filter(Boolean).join(', ') || null;
-      } else {
-        addressText = norm(row.address);
-      }
-    }
-
-    res.json({
-      vendorName: row.org_name || '',
-      email: row.contact_email || '',
-      phone: row.phone || '',
-      website: row.website || '',
-      address: addrObj || addressText || null,
-      addressText,
-      telegram_username: row.telegram_username ?? null,
-      telegram_chat_id: row.telegram_chat_id ?? null,
-      whatsapp: row.whatsapp ?? null,
     });
-  } catch (e) {
-    console.error('GET /proposer/profile error', e);
-    res.status(500).json({ error: 'Failed to load proposer profile' });
-  }
-});
 
-// Choose a role AFTER profile save (SAFE + EXCLUSIVE)
-app.post("/profile/choose-role", authGuard, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const wallet = String(req.user?.address || req.user?.sub || "").toLowerCase();
-    if (!wallet) return res.status(401).json({ error: "unauthorized" });
+    // Choose a role AFTER profile save (SAFE + EXCLUSIVE)
+    app.post("/profile/choose-role", authGuard, async (req, res) => {
+      const client = await pool.connect();
+      try {
+        const wallet = String(req.user?.address || req.user?.sub || "").toLowerCase();
+        if (!wallet) return res.status(401).json({ error: "unauthorized" });
 
-    const roleIntent = String(req.body?.role || req.query?.role || "").trim().toLowerCase(); // 'vendor' | 'proposer' | 'admin'
-    if (roleIntent !== "vendor" && roleIntent !== "proposer" && roleIntent !== "admin") {
-      return res.status(400).json({ error: "role_required" });
-    }
+        const roleIntent = String(req.body?.role || req.query?.role || "").trim().toLowerCase(); // 'vendor' | 'proposer' | 'admin'
+        if (roleIntent !== "vendor" && roleIntent !== "proposer" && roleIntent !== "admin") {
+          return res.status(400).json({ error: "role_required" });
+        }
 
-    // Seed base from user_profiles (used on first insert / fallback fields)
-    const { rows: base } = await client.query(
-      `SELECT display_name, email, phone, website, address, city, country,
+        // Seed base from user_profiles (used on first insert / fallback fields)
+        const { rows: base } = await client.query(
+          `SELECT display_name, email, phone, website, address, city, country,
               telegram_chat_id, whatsapp
          FROM user_profiles
         WHERE lower(wallet_address)=lower($1)`,
-      [wallet]
-    );
-    const p = base[0] || {};
-    const b = req.body || {};
+          [wallet]
+        );
+        const p = base[0] || {};
+        const b = req.body || {};
 
-    await client.query('BEGIN');
+        await client.query('BEGIN');
 
-    if (roleIntent === "vendor") {
-      // ---- UPSERT vendor (safe, don't wipe address JSON) ----
-      await client.query(
-        `INSERT INTO vendor_profiles
+        if (roleIntent === "vendor") {
+          // ---- UPSERT vendor (safe, don't wipe address JSON) ----
+          await client.query(
+            `INSERT INTO vendor_profiles
         (wallet_address, vendor_name, email, phone, website, address, status, created_at, updated_at, telegram_chat_id, whatsapp, tenant_id)
         VALUES
           ($1, COALESCE($2, ''), $3, $4, $5, $6, 'pending', NOW(), NOW(), $7, $8, $9)
@@ -10577,46 +10599,46 @@ app.post("/profile/choose-role", authGuard, async (req, res) => {
         status = COALESCE(NULLIF(vendor_profiles.status, ''), 'pending'),
         updated_at = NOW()
           `,
-        [
-          wallet,
-          (b.vendorName ?? p.display_name ?? "").trim(),
-          b.email ?? p.email ?? null,
-          b.phone ?? p.phone ?? null,
-          b.website ?? p.website ?? null,
-          typeof b.address === "string" ? b.address : (b.address ? JSON.stringify(b.address) : (p.address ?? null)),
-          b.telegram_chat_id ?? p.telegram_chat_id ?? null,
-          b.whatsapp ?? p.whatsapp ?? null,
-          req.tenantId
-        ]
-      );
+            [
+              wallet,
+              (b.vendorName ?? p.display_name ?? "").trim(),
+              b.email ?? p.email ?? null,
+              b.phone ?? p.phone ?? null,
+              b.website ?? p.website ?? null,
+              typeof b.address === "string" ? b.address : (b.address ? JSON.stringify(b.address) : (p.address ?? null)),
+              b.telegram_chat_id ?? p.telegram_chat_id ?? null,
+              b.whatsapp ?? p.whatsapp ?? null,
+              req.tenantId
+            ]
+          );
 
-      // ---- EXCLUSIVITY: make proposer side inactive for this wallet ----
-      await client.query(
-        `UPDATE proposer_profiles
+          // ---- EXCLUSIVITY: make proposer side inactive for this wallet ----
+          await client.query(
+            `UPDATE proposer_profiles
             SET status = 'inactive', updated_at = NOW()
           WHERE lower(wallet_address) = lower($1) AND tenant_id = $2`,
-        [wallet, req.tenantId]
-      );
-    }
+            [wallet, req.tenantId]
+          );
+        }
 
-    if (roleIntent === "proposer") {
-      // Prepare proposer fields (includes telegram_username)
-      const orgName = (b.vendorName ?? b.orgName ?? p.display_name ?? "").trim();
-      const email = b.email ?? p.email ?? null;
-      const phone = b.phone ?? p.phone ?? null;
-      const website = b.website ?? p.website ?? null;
-      const city = b.city ?? p.city ?? null;
-      const country = b.country ?? p.country ?? null;
-      const tgChatId = b.telegram_chat_id ?? p.telegram_chat_id ?? null;
-      const tgUser = b.telegram_username ?? null; // <- include username
-      const whatsapp = b.whatsapp ?? p.whatsapp ?? null;
-      const addressVal =
-        typeof b.address === "string" ? b.address :
-          (b.address ? JSON.stringify(b.address) : (p.address ?? null));
+        if (roleIntent === "proposer") {
+          // Prepare proposer fields (includes telegram_username)
+          const orgName = (b.vendorName ?? b.orgName ?? p.display_name ?? "").trim();
+          const email = b.email ?? p.email ?? null;
+          const phone = b.phone ?? p.phone ?? null;
+          const website = b.website ?? p.website ?? null;
+          const city = b.city ?? p.city ?? null;
+          const country = b.country ?? p.country ?? null;
+          const tgChatId = b.telegram_chat_id ?? p.telegram_chat_id ?? null;
+          const tgUser = b.telegram_username ?? null; // <- include username
+          const whatsapp = b.whatsapp ?? p.whatsapp ?? null;
+          const addressVal =
+            typeof b.address === "string" ? b.address :
+              (b.address ? JSON.stringify(b.address) : (p.address ?? null));
 
-      // ---- UPSERT proposer (safe, don't wipe address JSON) ----
-      await client.query(
-        `INSERT INTO proposer_profiles
+          // ---- UPSERT proposer (safe, don't wipe address JSON) ----
+          await client.query(
+            `INSERT INTO proposer_profiles
           (wallet_address, org_name, contact_email, phone, website, address, city, country,
            telegram_chat_id, telegram_username, whatsapp, status, created_at, updated_at, tenant_id)
         VALUES
@@ -10638,75 +10660,75 @@ app.post("/profile/choose-role", authGuard, async (req, res) => {
     status            = 'active',
     updated_at        = NOW()
         `,
-        [wallet, orgName, email, phone, website, addressVal, city, country, tgChatId, tgUser, whatsapp, req.tenantId]
-      );
+            [wallet, orgName, email, phone, website, addressVal, city, country, tgChatId, tgUser, whatsapp, req.tenantId]
+          );
 
-      // ---- EXCLUSIVITY: make vendor side inactive for this wallet ----
-      await client.query(
-        `UPDATE vendor_profiles
+          // ---- EXCLUSIVITY: make vendor side inactive for this wallet ----
+          await client.query(
+            `UPDATE vendor_profiles
             SET status='inactive', updated_at=NOW()
           WHERE lower(wallet_address)=lower($1) AND tenant_id=$2`,
-        [wallet, req.tenantId]
-      );
-    }
+            [wallet, req.tenantId]
+          );
+        }
 
-    await client.query('COMMIT');
+        await client.query('COMMIT');
 
-    // Recompute durable roles, choose final role, issue token (unchanged)
-    let roles = await durableRolesForAddress(wallet, req.tenantId);
-    let role = roleFromDurableOrIntent(roles, roleIntent);
-    if (isAdminAddress(wallet)) {
-      roles = Array.from(new Set([...(roles || []), "admin"]));
-      role = role === "vendor" || role === "proposer" ? role : "admin";
-    }
-    const token = signJwt({ sub: wallet, role, roles });
-    res.cookie("auth_token", token, {
-      httpOnly: true, secure: true, sameSite: "none", maxAge: 7 * 24 * 3600 * 1000,
+        // Recompute durable roles, choose final role, issue token (unchanged)
+        let roles = await durableRolesForAddress(wallet, req.tenantId);
+        let role = roleFromDurableOrIntent(roles, roleIntent);
+        if (isAdminAddress(wallet)) {
+          roles = Array.from(new Set([...(roles || []), "admin"]));
+          role = role === "vendor" || role === "proposer" ? role : "admin";
+        }
+        const token = signJwt({ sub: wallet, role, roles });
+        res.cookie("auth_token", token, {
+          httpOnly: true, secure: true, sameSite: "none", maxAge: 7 * 24 * 3600 * 1000,
+        });
+        return res.json({ ok: true, role, roles, token });
+      } catch (e) {
+        try { await client.query('ROLLBACK'); } catch { }
+        console.error("POST /profile/choose-role error", e);
+        return res.status(500).json({ error: "choose_role_failed" });
+      } finally {
+        client.release();
+      }
     });
-    return res.json({ ok: true, role, roles, token });
-  } catch (e) {
-    try { await client.query('ROLLBACK'); } catch { }
-    console.error("POST /profile/choose-role error", e);
-    return res.status(500).json({ error: "choose_role_failed" });
-  } finally {
-    client.release();
-  }
-});
 
 
-// VENDOR: create/update ONLY vendor_profiles
-app.post('/vendor/profile', authRequired, async (req, res) => {
-  const wallet = String(req.user?.sub || '').toLowerCase();
-  const { error, value } = profileSchema.validate(req.body || {}, { abortEarly: false });
-  if (error) return res.status(400).json({ error: error.message });
+    // VENDOR: create/update ONLY vendor_profiles
+    app.post('/vendor/profile', authRequired, async (req, res) => {
+      const wallet = String(req.user?.sub || '').toLowerCase();
+      const { error, value } = profileSchema.validate(req.body || {}, { abortEarly: false });
+      if (error) return res.status(400).json({ error: error.message });
 
-  // normalize website
-  const rawWebsite = (value.website || '').trim();
-  const website = rawWebsite && !/^https?:\/\//i.test(rawWebsite) ? `https://${rawWebsite}` : rawWebsite;
+      // normalize website
+      const rawWebsite = (value.website || '').trim();
+      const website = rawWebsite && !/^https?:\/\//i.test(rawWebsite) ? `https://${rawWebsite}` : rawWebsite;
 
-  // normalize address
-  let addressText = '';
-  let addressJson = null;
-  if (typeof value.address === 'string') {
-    addressText = value.address.trim();
-  } else if (value.address && typeof value.address === 'object') {
-    const a = value.address;
-    addressJson = {
-      line1: String(a.line1 || ''),
-      city: String(a.city || ''),
-      postalCode: String(a.postalCode || ''),
-      country: String(a.country || ''),
-    };
-    addressText = [addressJson.line1, addressJson.city, addressJson.postalCode, addressJson.country].filter(Boolean).join(', ');
-  }
-  const addressToStore = addressJson ? JSON.stringify(addressJson) : addressText;
+      // normalize address
+      let addressText = '';
+      let addressJson = null;
+      if (typeof value.address === 'string') {
+        addressText = value.address.trim();
+      } else if (value.address && typeof value.address === 'object') {
+        const a = value.address;
+        addressJson = {
+          line1: String(a.line1 || ''),
+          city: String(a.city || ''),
+          postalCode: String(a.postalCode || ''),
+          country: String(a.country || ''),
+        };
+        addressText = [addressJson.line1, addressJson.city, addressJson.postalCode, addressJson.country].filter(Boolean).join(', ');
+      }
+      const addressToStore = addressJson ? JSON.stringify(addressJson) : addressText;
 
-  try {
-    // 🔒 HARD EXCLUSIVITY: a wallet cannot be an entity (proposer) at the same time
-    await pool.query(`DELETE FROM proposer_profiles WHERE wallet_address = $1 AND tenant_id = $2`, [wallet, req.tenantId]);
+      try {
+        // 🔒 HARD EXCLUSIVITY: a wallet cannot be an entity (proposer) at the same time
+        await pool.query(`DELETE FROM proposer_profiles WHERE wallet_address = $1 AND tenant_id = $2`, [wallet, req.tenantId]);
 
-    const { rows } = await pool.query(
-      `INSERT INTO vendor_profiles
+        const { rows } = await pool.query(
+          `INSERT INTO vendor_profiles
          (wallet_address, vendor_name, email, phone, address, website, created_at, updated_at, tenant_id)
        VALUES
          ($1,$2,$3,$4,$5,$6, now(), now(), $7)
@@ -10718,134 +10740,134 @@ app.post('/vendor/profile', authRequired, async (req, res) => {
          website     = EXCLUDED.website,
          updated_at  = now()
        RETURNING wallet_address, vendor_name, email, phone, address, website`,
-      [wallet, value.vendorName || null, value.email || null, value.phone || null, addressToStore, website || null, req.tenantId]
-    );
+          [wallet, value.vendorName || null, value.email || null, value.phone || null, addressToStore, website || null, req.tenantId]
+        );
 
-    const r = rows[0];
-    let parsed = null;
-    try { parsed = JSON.parse(r.address || ''); } catch { }
-    const address =
-      parsed && typeof parsed === 'object'
-        ? { line1: parsed.line1 || '', city: parsed.city || '', country: parsed.country || '', postalCode: parsed.postalCode || parsed.postal_code || '' }
-        : { line1: r.address || '', city: '', country: '', postalCode: '' };
+        const r = rows[0];
+        let parsed = null;
+        try { parsed = JSON.parse(r.address || ''); } catch { }
+        const address =
+          parsed && typeof parsed === 'object'
+            ? { line1: parsed.line1 || '', city: parsed.city || '', country: parsed.country || '', postalCode: parsed.postalCode || parsed.postal_code || '' }
+            : { line1: r.address || '', city: '', country: '', postalCode: '' };
 
-    res.json({
-      walletAddress: r.wallet_address,
-      vendorName: r.vendor_name || '',
-      email: r.email || '',
-      phone: r.phone || '',
-      website: r.website || '',
-      address,
+        res.json({
+          walletAddress: r.wallet_address,
+          vendorName: r.vendor_name || '',
+          email: r.email || '',
+          phone: r.phone || '',
+          website: r.website || '',
+          address,
+        });
+      } catch (e) {
+        console.error('POST /vendor/profile error:', e);
+        res.status(500).json({ error: 'Failed to save profile' });
+      }
     });
-  } catch (e) {
-    console.error('POST /vendor/profile error:', e);
-    res.status(500).json({ error: 'Failed to save profile' });
-  }
-});
 
-app.post('/tg/webhook', async (req, res) => {
-  try {
-    const update = req.body || {};
-    const from = update?.message?.from || update?.callback_query?.from || {};
-    const chatObj = update?.message?.chat || update?.callback_query?.message?.chat || {};
-    const chatId = chatObj?.id ?? from?.id;
-    const username = from?.username || chatObj?.username || null;
-    const textRaw =
-      update?.message?.text ??
-      update?.callback_query?.data ??
-      update?.message?.caption ??
-      '';
-    const text = String(textRaw).trim();
+    app.post('/tg/webhook', async (req, res) => {
+      try {
+        const update = req.body || {};
+        const from = update?.message?.from || update?.callback_query?.from || {};
+        const chatObj = update?.message?.chat || update?.callback_query?.message?.chat || {};
+        const chatId = chatObj?.id ?? from?.id;
+        const username = from?.username || chatObj?.username || null;
+        const textRaw =
+          update?.message?.text ??
+          update?.callback_query?.data ??
+          update?.message?.caption ??
+          '';
+        const text = String(textRaw).trim();
 
-    if (!chatId) return res.json({ ok: true });
-    const chatIdStr = String(chatId);
+        if (!chatId) return res.json({ ok: true });
+        const chatIdStr = String(chatId);
 
-    // ------------------------------------------------------------------
-    // AUTO-REFRESH USERNAME
-    // ------------------------------------------------------------------
-    if (username) {
-      // Update vendor_profiles
-      await pool.query(
-        `UPDATE vendor_profiles
+        // ------------------------------------------------------------------
+        // AUTO-REFRESH USERNAME
+        // ------------------------------------------------------------------
+        if (username) {
+          // Update vendor_profiles
+          await pool.query(
+            `UPDATE vendor_profiles
            SET telegram_username = $1,
                updated_at = NOW()
          WHERE telegram_chat_id = $2`,
-        [username, chatIdStr]
-      ).catch(() => null);
+            [username, chatIdStr]
+          ).catch(() => null);
 
-      // Update proposals
-      await pool.query(
-        `UPDATE proposals
+          // Update proposals
+          await pool.query(
+            `UPDATE proposals
            SET owner_telegram_username = $1,
                updated_at = NOW()
          WHERE owner_telegram_chat_id = $2`,
-        [username, chatIdStr]
-      ).catch(() => null);
+            [username, chatIdStr]
+          ).catch(() => null);
 
-      // Update proposer_profiles
-      await pool.query(
-        `UPDATE proposer_profiles
+          // Update proposer_profiles
+          await pool.query(
+            `UPDATE proposer_profiles
            SET telegram_username = $1,
                updated_at = NOW()
          WHERE telegram_chat_id = $2`,
-        [username, chatIdStr]
-      ).catch(() => null);
-    }
+            [username, chatIdStr]
+          ).catch(() => null);
+        }
 
-    if (!text) return res.json({ ok: true });
+        if (!text) return res.json({ ok: true });
 
-    // ------------------------------------------------------------------
-    // LINK NEW WALLET
-    // ------------------------------------------------------------------
-    let wallet = '';
-    if (/^\/link\s+/i.test(text)) {
-      wallet = text.slice(6).trim();
-    } else {
-      const m = text.match(/^\/start\s+link_(0x[a-fA-F0-9]{40})$/);
-      if (m) wallet = m[1];
-    }
+        // ------------------------------------------------------------------
+        // LINK NEW WALLET
+        // ------------------------------------------------------------------
+        let wallet = '';
+        if (/^\/link\s+/i.test(text)) {
+          wallet = text.slice(6).trim();
+        } else {
+          const m = text.match(/^\/start\s+link_(0x[a-fA-F0-9]{40})$/);
+          if (m) wallet = m[1];
+        }
 
-    if (!wallet) return res.json({ ok: true });
+        if (!wallet) return res.json({ ok: true });
 
-    if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
-      await sendTelegram([chatIdStr], 'Send: /link 0xYourWalletAddress');
-      return res.json({ ok: true });
-    }
+        if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
+          await sendTelegram([chatIdStr], 'Send: /link 0xYourWalletAddress');
+          return res.json({ ok: true });
+        }
 
-    const walletLower = wallet.toLowerCase();
+        const walletLower = wallet.toLowerCase();
 
-    // --- Unlink this chat ID from any OTHER profiles ---
+        // --- Unlink this chat ID from any OTHER profiles ---
 
-    // Clear from other vendors
-    await pool.query(
-      `UPDATE vendor_profiles
+        // Clear from other vendors
+        await pool.query(
+          `UPDATE vendor_profiles
           SET telegram_chat_id = NULL,
               telegram_username = NULL,
               updated_at = NOW()
         WHERE telegram_chat_id = $1
           AND LOWER(wallet_address) <> LOWER($2)`,
-      [chatIdStr, walletLower]
-    ).catch(() => null);
+          [chatIdStr, walletLower]
+        ).catch(() => null);
 
-    // Clear from other proposer_profiles
-    await pool.query(
-      `UPDATE proposer_profiles
+        // Clear from other proposer_profiles
+        await pool.query(
+          `UPDATE proposer_profiles
           SET telegram_chat_id = NULL,
               telegram_username = NULL,
               updated_at = NOW()
         WHERE telegram_chat_id = $1
           AND LOWER(wallet_address) <> LOWER($2)`, // Using 'wallet_address'
-      [chatIdStr, walletLower]
-    ).catch(() => null);
+          [chatIdStr, walletLower]
+        ).catch(() => null);
 
-    // --- Link this chat ID to the correct profile ---
+        // --- Link this chat ID to the correct profile ---
 
-    // ====================================================================
-    // 1. [THE FIX] UPSERT (INSERT OR UPDATE) 'vendor_profiles'
-    // ====================================================================
-    // This will create a new row if one doesn't exist for this wallet
-    await pool.query(
-      `INSERT INTO vendor_profiles (
+        // ====================================================================
+        // 1. [THE FIX] UPSERT (INSERT OR UPDATE) 'vendor_profiles'
+        // ====================================================================
+        // This will create a new row if one doesn't exist for this wallet
+        await pool.query(
+          `INSERT INTO vendor_profiles (
          wallet_address, 
          telegram_chat_id, 
          telegram_username, 
@@ -10858,27 +10880,27 @@ app.post('/tg/webhook', async (req, res) => {
          telegram_chat_id = EXCLUDED.telegram_chat_id,
          telegram_username = EXCLUDED.telegram_username,
          updated_at = NOW()`,
-      [walletLower, chatIdStr, username]
-    ).catch((dbErr) => {
-      console.error("WEBHOOK VENDOR UPSERT FAILED:", dbErr);
-    });
+          [walletLower, chatIdStr, username]
+        ).catch((dbErr) => {
+          console.error("WEBHOOK VENDOR UPSERT FAILED:", dbErr);
+        });
 
-    // Link to proposals (This is an UPDATE, it's fine)
-    await pool.query(
-      `UPDATE proposals
+        // Link to proposals (This is an UPDATE, it's fine)
+        await pool.query(
+          `UPDATE proposals
          SET owner_telegram_chat_id = $1,
              owner_telegram_username = $2,
              updated_at = NOW()
        WHERE LOWER(owner_wallet) = LOWER($3)`,
-      [chatIdStr, username, walletLower]
-    ).catch(() => null);
+          [chatIdStr, username, walletLower]
+        ).catch(() => null);
 
-    // ====================================================================
-    // 2. [THE FIX] UPSERT (INSERT OR UPDATE) 'proposer_profiles'
-    // ====================================================================
-    // This will create a new row if one doesn't exist for this wallet
-    await pool.query(
-      `INSERT INTO proposer_profiles (
+        // ====================================================================
+        // 2. [THE FIX] UPSERT (INSERT OR UPDATE) 'proposer_profiles'
+        // ====================================================================
+        // This will create a new row if one doesn't exist for this wallet
+        await pool.query(
+          `INSERT INTO proposer_profiles (
          wallet_address, 
          telegram_chat_id, 
          telegram_username, 
@@ -10891,103 +10913,103 @@ app.post('/tg/webhook', async (req, res) => {
          telegram_chat_id = EXCLUDED.telegram_chat_id,
          telegram_username = EXCLUDED.telegram_username,
          updated_at = NOW()`,
-      [walletLower, chatIdStr, username]
-    ).catch((dbErr) => {
-      console.error("WEBHOOK PROPOSER UPSERT FAILED:", dbErr);
+          [walletLower, chatIdStr, username]
+        ).catch((dbErr) => {
+          console.error("WEBHOOK PROPOSER UPSERT FAILED:", dbErr);
+        });
+
+        // --- Confirm to user ---
+        await sendTelegram(
+          [chatIdStr],
+          `✅ Telegram linked to ${wallet}${username ? ` as @${username}` : ''}`
+        );
+
+        return res.json({ ok: true });
+      } catch (e) {
+        console.error("WEBHOOK GLOBAL ERROR:", e);
+        return res.json({ ok: true });
+      }
     });
 
-    // --- Confirm to user ---
-    await sendTelegram(
-      [chatIdStr],
-      `✅ Telegram linked to ${wallet}${username ? ` as @${username}` : ''}`
-    );
+    // ==============================
+    // Routes — Vendor helpers
+    // ==============================
+    app.get("/vendor/bids", async (req, res) => {
+      try {
+        const role = (req.user?.role || "guest").toLowerCase();
+        const caller = (req.user?.sub || "").toLowerCase();
 
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("WEBHOOK GLOBAL ERROR:", e);
-    return res.json({ ok: true });
-  }
-});
+        if (role === "admin") {
+          const { rows } = await pool.query("SELECT * FROM bids WHERE tenant_id=$1 ORDER BY created_at DESC NULLS LAST, bid_id DESC", [req.tenantId]);
+          return res.json(mapRows(rows));
+        }
 
-// ==============================
-// Routes — Vendor helpers
-// ==============================
-app.get("/vendor/bids", async (req, res) => {
-  try {
-    const role = (req.user?.role || "guest").toLowerCase();
-    const caller = (req.user?.sub || "").toLowerCase();
+        // Scope for vendors/guests; require auth when scoping is on
+        if (SCOPE_BIDS_FOR_VENDOR) {
+          if (!caller) return res.status(401).json({ error: "Unauthorized" });
+          const { rows } = await pool.query(
+            "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 ORDER BY created_at DESC NULLS LAST, bid_id DESC",
+            [caller, req.tenantId]
+          );
+          return res.json(mapRows(rows));
+        }
 
-    if (role === "admin") {
-      const { rows } = await pool.query("SELECT * FROM bids WHERE tenant_id=$1 ORDER BY created_at DESC NULLS LAST, bid_id DESC", [req.tenantId]);
-      return res.json(mapRows(rows));
-    }
+        // Flag OFF: safest default is still to scope to caller if present
+        if (caller) {
+          const { rows } = await pool.query(
+            "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 ORDER BY created_at DESC NULLS LAST, bid_id DESC",
+            [caller, req.tenantId]
+          );
+          return res.json(mapRows(rows));
+        }
 
-    // Scope for vendors/guests; require auth when scoping is on
-    if (SCOPE_BIDS_FOR_VENDOR) {
-      if (!caller) return res.status(401).json({ error: "Unauthorized" });
-      const { rows } = await pool.query(
-        "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 ORDER BY created_at DESC NULLS LAST, bid_id DESC",
-        [caller, req.tenantId]
-      );
-      return res.json(mapRows(rows));
-    }
+        // If completely unauthenticated and flag OFF, preserve legacy behavior
+        const { rows } = await pool.query("SELECT * FROM bids WHERE tenant_id=$1 ORDER BY created_at DESC NULLS LAST, bid_id DESC", [req.tenantId]);
+        return res.json(mapRows(rows));
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
 
-    // Flag OFF: safest default is still to scope to caller if present
-    if (caller) {
-      const { rows } = await pool.query(
-        "SELECT * FROM bids WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 ORDER BY created_at DESC NULLS LAST, bid_id DESC",
-        [caller, req.tenantId]
-      );
-      return res.json(mapRows(rows));
-    }
-
-    // If completely unauthenticated and flag OFF, preserve legacy behavior
-    const { rows } = await pool.query("SELECT * FROM bids WHERE tenant_id=$1 ORDER BY created_at DESC NULLS LAST, bid_id DESC", [req.tenantId]);
-    return res.json(mapRows(rows));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/vendor/payments", async (_req, res) => {
-  // Flatten milestones that have paymentTxHash
-  try {
-    const { rows } = await pool.query("SELECT * FROM bids");
-    const out = [];
-    for (const r of rows) {
-      const milestones = Array.isArray(r.milestones) ? r.milestones : JSON.parse(r.milestones || "[]");
-      milestones.forEach((m) => {
-        if (m?.paymentTxHash) {
-          out.push({
-            success: true,
-            transactionHash: m.paymentTxHash,
-            amount: m.amount,
-            currency: r.preferred_stablecoin,
-            toAddress: r.wallet_address,
-            date: m.paymentDate || null,
+    app.get("/vendor/payments", async (_req, res) => {
+      // Flatten milestones that have paymentTxHash
+      try {
+        const { rows } = await pool.query("SELECT * FROM bids");
+        const out = [];
+        for (const r of rows) {
+          const milestones = Array.isArray(r.milestones) ? r.milestones : JSON.parse(r.milestones || "[]");
+          milestones.forEach((m) => {
+            if (m?.paymentTxHash) {
+              out.push({
+                success: true,
+                transactionHash: m.paymentTxHash,
+                amount: m.amount,
+                currency: r.preferred_stablecoin,
+                toAddress: r.wallet_address,
+                date: m.paymentDate || null,
+              });
+            }
           });
         }
-      });
-    }
-    res.json(out);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+        res.json(out);
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
 
-/** ADMIN: list bids (optional filter by vendor wallet)
- *  GET /admin/bids
- *  GET /admin/bids?vendorWallet=0xabc...
- *  Returns: { items, total, page, pageSize }
- */
-app.get('/admin/bids', adminGuard, async (req, res) => {
-  try {
-    const vendorWallet = (String(req.query.vendorWallet || '').toLowerCase()) || null;
-    const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10));
-    const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? '100'), 10)));
-    const offset = (page - 1) * limit;
+    /** ADMIN: list bids (optional filter by vendor wallet)
+     *  GET /admin/bids
+     *  GET /admin/bids?vendorWallet=0xabc...
+     *  Returns: { items, total, page, pageSize }
+     */
+    app.get('/admin/bids', adminGuard, async (req, res) => {
+      try {
+        const vendorWallet = (String(req.query.vendorWallet || '').toLowerCase()) || null;
+        const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10));
+        const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? '100'), 10)));
+        const offset = (page - 1) * limit;
 
-    const listSql = `
+        const listSql = `
   SELECT
     b.bid_id,
     b.proposal_id,
@@ -11005,78 +11027,78 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
   ORDER BY b.created_at DESC NULLS LAST, b.bid_id DESC
   LIMIT $3 OFFSET $4
 `;
-    const countSql = `
+        const countSql = `
       SELECT COUNT(*)::int AS cnt
       FROM bids b
       WHERE ($1::text IS NULL OR LOWER(b.wallet_address) = $1) AND b.tenant_id = $2
     `;
 
-    const [list, count] = await Promise.all([
-      pool.query(listSql, [vendorWallet, req.tenantId, limit, offset]),
-      pool.query(countSql, [vendorWallet, req.tenantId]),
-    ]);
+        const [list, count] = await Promise.all([
+          pool.query(listSql, [vendorWallet, req.tenantId, limit, offset]),
+          pool.query(countSql, [vendorWallet, req.tenantId]),
+        ]);
 
-    // Robust JSON coercion (handles jsonb, json text, null)
-    const items = await Promise.all(list.rows.map(async (r) => {
-      let doc = r.doc;
-      if (typeof doc === 'string') { try { doc = JSON.parse(doc); } catch { } }
+        // Robust JSON coercion (handles jsonb, json text, null)
+        const items = await Promise.all(list.rows.map(async (r) => {
+          let doc = r.doc;
+          if (typeof doc === 'string') { try { doc = JSON.parse(doc); } catch { } }
 
-      let files = r.files;
-      if (typeof files === 'string') { try { files = JSON.parse(files); } catch { } }
-      if (!Array.isArray(files)) files = files ? [files] : [];
+          let files = r.files;
+          if (typeof files === 'string') { try { files = JSON.parse(files); } catch { } }
+          if (!Array.isArray(files)) files = files ? [files] : [];
 
-      // 🛡️ FIX: Ensure private gateway URLs in the 'proof' string have the token
-      // (Note: milestones are not in the SELECT list for this endpoint, but if they were added, we'd patch them here)
-      // Wait, looking at the SELECT list (lines 10895+), 'milestones' IS NOT SELECTED.
-      // So this endpoint doesn't return milestones.
-      // But 'files' ARE selected (line 10900).
+          // 🛡️ FIX: Ensure private gateway URLs in the 'proof' string have the token
+          // (Note: milestones are not in the SELECT list for this endpoint, but if they were added, we'd patch them here)
+          // Wait, looking at the SELECT list (lines 10895+), 'milestones' IS NOT SELECTED.
+          // So this endpoint doesn't return milestones.
+          // But 'files' ARE selected (line 10900).
 
-      let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
-      if (!gatewayToken && req.tenantId) {
-        try {
-          gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
-        } catch (e) { }
-      }
-
-      if (gatewayToken && Array.isArray(files)) {
-        files = files.map(f => {
-          if (f.url && f.url.includes('.mypinata.cloud') && !f.url.includes('token=')) {
-            const separator = f.url.includes('?') ? '&' : '?';
-            return { ...f, url: `${f.url}${separator}token=${gatewayToken}` };
+          let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+          if (!gatewayToken && req.tenantId) {
+            try {
+              gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+            } catch (e) { }
           }
-          return f;
-        });
+
+          if (gatewayToken && Array.isArray(files)) {
+            files = files.map(f => {
+              if (f.url && f.url.includes('.mypinata.cloud') && !f.url.includes('token=')) {
+                const separator = f.url.includes('?') ? '&' : '?';
+                return { ...f, url: `${f.url}${separator}token=${gatewayToken}` };
+              }
+              return f;
+            });
+          }
+
+          return {
+            id: r.bid_id,
+            projectId: r.proposal_id,
+            projectTitle: r.project_title,
+            vendorWallet: r.vendor_wallet,
+            vendorName: r.vendor_name,
+            amountUSD: r.price_usd,
+            status: r.status,
+            createdAt: new Date(r.created_at).toISOString(),
+            doc: doc || null,   // << expose doc
+            files,              // << expose files[]
+          };
+        }));
+
+        res.json({ items, total: count.rows[0].cnt, page, pageSize: limit });
+      } catch (e) {
+        console.error('GET /admin/bids error', e);
+        res.status(500).json({ error: 'Server error' });
       }
+    });
 
-      return {
-        id: r.bid_id,
-        projectId: r.proposal_id,
-        projectTitle: r.project_title,
-        vendorWallet: r.vendor_wallet,
-        vendorName: r.vendor_name,
-        amountUSD: r.price_usd,
-        status: r.status,
-        createdAt: new Date(r.created_at).toISOString(),
-        doc: doc || null,   // << expose doc
-        files,              // << expose files[]
-      };
-    }));
+    // ADMIN: proofs page requires full bids + milestones + payment state
+    app.get('/admin/proofs-bids', adminGuard, async (req, res) => {
+      try {
+        // Optional: auto-drain a few pending SAFE payments each load
+        // await autoDrainPendingSafePayments(pool);
 
-    res.json({ items, total: count.rows[0].cnt, page, pageSize: limit });
-  } catch (e) {
-    console.error('GET /admin/bids error', e);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// ADMIN: proofs page requires full bids + milestones + payment state
-app.get('/admin/proofs-bids', adminGuard, async (req, res) => {
-  try {
-    // Optional: auto-drain a few pending SAFE payments each load
-    // await autoDrainPendingSafePayments(pool);
-
-    const { rows } = await pool.query(
-      `SELECT
+        const { rows } = await pool.query(
+          `SELECT
          bid_id,
          proposal_id,
          vendor_name,
@@ -11088,102 +11110,102 @@ app.get('/admin/proofs-bids', adminGuard, async (req, res) => {
        FROM bids
        WHERE tenant_id = $1
        ORDER BY created_at DESC NULLS LAST, bid_id DESC`,
-      [req.tenantId]
-    );
-
-    // Hydrate with Safe overlay so executed txs flip to PAID immediately
-    const hydrated = await Promise.all(
-      rows.map(b => overlayPaidFromMp(b, pool).catch(() => b)) // don't let one failure kill the list
-    );
-
-    // Return camelCase keys the React page expects
-    // Return camelCase keys the React page expects
-    const out = await Promise.all(hydrated.map(async (r) => {
-      let milestones = Array.isArray(r.milestones)
-        ? r.milestones
-        : (typeof r.milestones === 'string'
-          ? (() => { try { return JSON.parse(r.milestones || '[]'); } catch { return []; } })()
-          : []
+          [req.tenantId]
         );
 
-      // 🛡️ FIX: Ensure private gateway URLs in the 'proof' string have the token
-      let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
-      if (!gatewayToken && req.tenantId) {
-        try {
-          gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
-        } catch (e) { }
-      }
+        // Hydrate with Safe overlay so executed txs flip to PAID immediately
+        const hydrated = await Promise.all(
+          rows.map(b => overlayPaidFromMp(b, pool).catch(() => b)) // don't let one failure kill the list
+        );
 
-      if (gatewayToken) {
-        milestones = milestones.map(m => {
-          if (typeof m?.proof === 'string' && m.proof.includes('.mypinata.cloud') && !m.proof.includes('token=')) {
-            // Regex to find the URL and append token
-            const newProof = m.proof.replace(/(https:\/\/[^ ]+\.mypinata\.cloud\/ipfs\/[^ \n]+)/g, (match) => {
-              if (match.includes('token=')) return match;
-              const separator = match.includes('?') ? '&' : '?';
-              return `${match}${separator}token=${gatewayToken}`;
-            });
-            return { ...m, proof: newProof };
+        // Return camelCase keys the React page expects
+        // Return camelCase keys the React page expects
+        const out = await Promise.all(hydrated.map(async (r) => {
+          let milestones = Array.isArray(r.milestones)
+            ? r.milestones
+            : (typeof r.milestones === 'string'
+              ? (() => { try { return JSON.parse(r.milestones || '[]'); } catch { return []; } })()
+              : []
+            );
+
+          // 🛡️ FIX: Ensure private gateway URLs in the 'proof' string have the token
+          let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+          if (!gatewayToken && req.tenantId) {
+            try {
+              gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+            } catch (e) { }
           }
-          return m;
-        });
+
+          if (gatewayToken) {
+            milestones = milestones.map(m => {
+              if (typeof m?.proof === 'string' && m.proof.includes('.mypinata.cloud') && !m.proof.includes('token=')) {
+                // Regex to find the URL and append token
+                const newProof = m.proof.replace(/(https:\/\/[^ ]+\.mypinata\.cloud\/ipfs\/[^ \n]+)/g, (match) => {
+                  if (match.includes('token=')) return match;
+                  const separator = match.includes('?') ? '&' : '?';
+                  return `${match}${separator}token=${gatewayToken}`;
+                });
+                return { ...m, proof: newProof };
+              }
+              return m;
+            });
+          }
+
+          return {
+            bidId: Number(r.bid_id),
+            proposalId: Number(r.proposal_id),
+            vendorName: r.vendor_name,
+            walletAddress: r.wallet_address,
+            priceUsd: r.price_usd == null ? null : Number(r.price_usd),
+            status: r.status ?? null,
+            createdAt: r.created_at,
+            milestones,
+          };
+        }));
+
+        // Make sure Netlify / browsers don’t cache this list
+        res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+        res.set('Pragma', 'no-cache');
+        res.set('Expires', '0');
+
+        return res.json(out);
+      } catch (e) {
+        console.error('GET /admin/proofs-bids failed', e);
+        return res.status(500).json({ error: 'Failed to fetch bids for proofs' });
       }
+    });
 
-      return {
-        bidId: Number(r.bid_id),
-        proposalId: Number(r.proposal_id),
-        vendorName: r.vendor_name,
-        walletAddress: r.wallet_address,
-        priceUsd: r.price_usd == null ? null : Number(r.price_usd),
-        status: r.status ?? null,
-        createdAt: r.created_at,
-        milestones,
-      };
-    }));
+    // ADMIN: list proposers/entities (from proposals + fallback to proposer_profiles)
+    app.get('/admin/proposers', adminGuard, async (req, res) => {
+      try {
+        const includeArchived = ['true', '1', 'yes'].includes(String(req.query.includeArchived || '').toLowerCase());
+        const qRaw = String(req.query.q || '').trim();
+        const q = qRaw ? `%${qRaw}%` : null;
 
-    // Make sure Netlify / browsers don’t cache this list
-    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
-    res.set('Pragma', 'no-cache');
-    res.set('Expires', '0');
+        const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10));
+        const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? '100'), 10)));
+        const offset = (page - 1) * limit;
 
-    return res.json(out);
-  } catch (e) {
-    console.error('GET /admin/proofs-bids failed', e);
-    return res.status(500).json({ error: 'Failed to fetch bids for proofs' });
-  }
-});
+        // Build WHERE for proposals and proposer_profiles with consistent placeholder indexing
+        const params = [];
+        let p = 0;
 
-// ADMIN: list proposers/entities (from proposals + fallback to proposer_profiles)
-app.get('/admin/proposers', adminGuard, async (req, res) => {
-  try {
-    const includeArchived = ['true', '1', 'yes'].includes(String(req.query.includeArchived || '').toLowerCase());
-    const qRaw = String(req.query.q || '').trim();
-    const q = qRaw ? `%${qRaw}%` : null;
+        const propWhere = [];
+        if (!includeArchived) propWhere.push(`status <> 'archived'`);
+        if (q) {
+          propWhere.push(`(org_name ILIKE $${++p} OR contact ILIKE $${p} OR owner_wallet ILIKE $${p})`);
+          params.push(q);
+        }
+        const whereSql = propWhere.length ? `WHERE ${propWhere.join(' AND ')}` : '';
 
-    const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10));
-    const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? '100'), 10)));
-    const offset = (page - 1) * limit;
+        const ppWhere = [];
+        if (q) {
+          ppWhere.push(`(org_name ILIKE $${++p} OR contact_email ILIKE $${p} OR wallet_address ILIKE $${p})`);
+          params.push(q);
+        }
+        const ppWhereSql = ppWhere.length ? `WHERE ${ppWhere.join(' AND ')}` : '';
 
-    // Build WHERE for proposals and proposer_profiles with consistent placeholder indexing
-    const params = [];
-    let p = 0;
-
-    const propWhere = [];
-    if (!includeArchived) propWhere.push(`status <> 'archived'`);
-    if (q) {
-      propWhere.push(`(org_name ILIKE $${++p} OR contact ILIKE $${p} OR owner_wallet ILIKE $${p})`);
-      params.push(q);
-    }
-    const whereSql = propWhere.length ? `WHERE ${propWhere.join(' AND ')}` : '';
-
-    const ppWhere = [];
-    if (q) {
-      ppWhere.push(`(org_name ILIKE $${++p} OR contact_email ILIKE $${p} OR wallet_address ILIKE $${p})`);
-      params.push(q);
-    }
-    const ppWhereSql = ppWhere.length ? `WHERE ${ppWhere.join(' AND ')}` : '';
-
-    const listSql = `
+        const listSql = `
       WITH base AS (
         SELECT
           proposal_id,
@@ -11300,9 +11322,9 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
       ORDER BY last_proposal_at DESC NULLS LAST, org_name ASC
       LIMIT $${++p} OFFSET $${++p};
     `;
-    const listParams = params.concat([limit, offset]);
+        const listParams = params.concat([limit, offset]);
 
-    const countSql = `
+        const countSql = `
       WITH base AS (
         SELECT
           COALESCE(LOWER(owner_wallet), LOWER(contact), LOWER(org_name)) AS entity_key
@@ -11325,192 +11347,192 @@ app.get('/admin/proposers', adminGuard, async (req, res) => {
       )
       SELECT COUNT(*)::int AS cnt FROM union_keys;
     `;
-    const countParams = params.slice();
+        const countParams = params.slice();
 
-    const [list, count] = await Promise.all([
-      pool.query(listSql, listParams),
-      pool.query(countSql, countParams),
-    ]);
+        const [list, count] = await Promise.all([
+          pool.query(listSql, listParams),
+          pool.query(countSql, countParams),
+        ]);
 
-    const items = list.rows.map(r => ({
-      id: r.entity_key,
-      orgName: r.org_name || '',
-      address: r.addr_display || null,
-      walletAddress: r.wallet_address || null,
-      contactEmail: r.contact_email || null,
-      ownerEmail: r.owner_email || null,
+        const items = list.rows.map(r => ({
+          id: r.entity_key,
+          orgName: r.org_name || '',
+          address: r.addr_display || null,
+          walletAddress: r.wallet_address || null,
+          contactEmail: r.contact_email || null,
+          ownerEmail: r.owner_email || null,
 
-      ownerPhone: r.owner_phone || null,
-      ownerTelegramChatId: r.owner_telegram_chat_id || null,
-      ownerTelegramUsername: r.owner_telegram_username || null,
+          ownerPhone: r.owner_phone || null,
+          ownerTelegramChatId: r.owner_telegram_chat_id || null,
+          ownerTelegramUsername: r.owner_telegram_username || null,
 
-      proposalsCount: Number(r.proposals_count) || 0,
-      totalBudgetUSD: Number(r.total_budget_usd) || 0,
-      lastProposalAt: r.last_proposal_at ? new Date(r.last_proposal_at).toISOString() : null,
-      statusCounts: {
-        approved: Number(r.approved_count) || 0,
-        pending: Number(r.pending_count) || 0,
-        rejected: Number(r.rejected_count) || 0,
-        archived: Number(r.archived_count) || 0,
-      },
-    }));
+          proposalsCount: Number(r.proposals_count) || 0,
+          totalBudgetUSD: Number(r.total_budget_usd) || 0,
+          lastProposalAt: r.last_proposal_at ? new Date(r.last_proposal_at).toISOString() : null,
+          statusCounts: {
+            approved: Number(r.approved_count) || 0,
+            pending: Number(r.pending_count) || 0,
+            rejected: Number(r.rejected_count) || 0,
+            archived: Number(r.archived_count) || 0,
+          },
+        }));
 
-    res.json({ items, total: count.rows[0].cnt, page, pageSize: limit });
-  } catch (e) {
-    console.error('GET /admin/proposers error', e);
-    res.status(500).json({ error: 'Failed to list proposers' });
-  }
-});
+        res.json({ items, total: count.rows[0].cnt, page, pageSize: limit });
+      } catch (e) {
+        console.error('GET /admin/proposers error', e);
+        res.status(500).json({ error: 'Failed to list proposers' });
+      }
+    });
 
-app.post('/admin/vendors/:wallet/archive', adminGuard, async (req, res) => {
-  try {
-    const wallet = String(req.params.wallet || '').toLowerCase();
-    if (!wallet) return res.status(400).json({ error: 'wallet required' });
+    app.post('/admin/vendors/:wallet/archive', adminGuard, async (req, res) => {
+      try {
+        const wallet = String(req.params.wallet || '').toLowerCase();
+        if (!wallet) return res.status(400).json({ error: 'wallet required' });
 
-    // Ensure a row exists, then set archived=true
-    const { rows } = await pool.query(
-      `INSERT INTO vendor_profiles (wallet_address, vendor_name, archived, created_at, updated_at, tenant_id)
+        // Ensure a row exists, then set archived=true
+        const { rows } = await pool.query(
+          `INSERT INTO vendor_profiles (wallet_address, vendor_name, archived, created_at, updated_at, tenant_id)
          VALUES ($1, '', true, now(), now(), $2)
        ON CONFLICT (wallet_address) DO UPDATE SET
          archived = true,
          updated_at = now()
        RETURNING wallet_address, vendor_name, archived, updated_at`,
-      [wallet, req.tenantId]
-    );
+          [wallet, req.tenantId]
+        );
 
-    res.json({ ok: true, walletAddress: rows[0].wallet_address, archived: rows[0].archived });
-  } catch (e) {
-    console.error('POST /admin/vendors/:wallet/archive error', e);
-    res.status(500).json({ error: 'Failed to archive vendor' });
-  }
-});
+        res.json({ ok: true, walletAddress: rows[0].wallet_address, archived: rows[0].archived });
+      } catch (e) {
+        console.error('POST /admin/vendors/:wallet/archive error', e);
+        res.status(500).json({ error: 'Failed to archive vendor' });
+      }
+    });
 
-// Unarchive a vendor (admin)
-app.post('/admin/vendors/:wallet/unarchive', adminGuard, async (req, res) => {
-  try {
-    const wallet = String(req.params.wallet || '').toLowerCase();
-    if (!wallet) return res.status(400).json({ error: 'wallet required' });
-    const { rows } = await pool.query(
-      `UPDATE vendor_profiles
+    // Unarchive a vendor (admin)
+    app.post('/admin/vendors/:wallet/unarchive', adminGuard, async (req, res) => {
+      try {
+        const wallet = String(req.params.wallet || '').toLowerCase();
+        if (!wallet) return res.status(400).json({ error: 'wallet required' });
+        const { rows } = await pool.query(
+          `UPDATE vendor_profiles
          SET archived=false, updated_at=now()
        WHERE lower(wallet_address)=lower($1) AND tenant_id=$2
        RETURNING wallet_address, archived`,
-      [wallet, req.tenantId]
-    );
-    if (!rows.length) return res.status(404).json({ error: 'Vendor profile not found' });
-    res.json({ ok: true, walletAddress: rows[0].wallet_address, archived: rows[0].archived });
-  } catch (e) {
-    console.error('POST /admin/vendors/:wallet/unarchive error', e);
-    res.status(500).json({ error: 'Failed to unarchive vendor' });
-  }
-});
+          [wallet, req.tenantId]
+        );
+        if (!rows.length) return res.status(404).json({ error: 'Vendor profile not found' });
+        res.json({ ok: true, walletAddress: rows[0].wallet_address, archived: rows[0].archived });
+      } catch (e) {
+        console.error('POST /admin/vendors/:wallet/unarchive error', e);
+        res.status(500).json({ error: 'Failed to unarchive vendor' });
+      }
+    });
 
-// Approve a vendor (admin)
-app.post('/admin/vendors/:wallet/approve', adminGuard, async (req, res) => {
-  try {
-    const wallet = String(req.params.wallet || '').toLowerCase();
-    if (!wallet) return res.status(400).json({ error: 'wallet required' });
+    // Approve a vendor (admin)
+    app.post('/admin/vendors/:wallet/approve', adminGuard, async (req, res) => {
+      try {
+        const wallet = String(req.params.wallet || '').toLowerCase();
+        if (!wallet) return res.status(400).json({ error: 'wallet required' });
 
-    // ✅ UPSERT so a profile row is created if it doesn't exist
-    const { rows } = await pool.query(
-      `INSERT INTO vendor_profiles (wallet_address, status, updated_at, tenant_id)
+        // ✅ UPSERT so a profile row is created if it doesn't exist
+        const { rows } = await pool.query(
+          `INSERT INTO vendor_profiles (wallet_address, status, updated_at, tenant_id)
          VALUES ($1, 'approved', now(), $2)
        ON CONFLICT (wallet_address) DO UPDATE SET
          status='approved',
          updated_at=now()
        RETURNING wallet_address, vendor_name, email, phone, telegram_chat_id, status`,
-      [wallet, req.tenantId]
-    );
+          [wallet, req.tenantId]
+        );
 
-    const v = rows[0];
+        const v = rows[0];
 
-    // notify vendor (optional, fire-and-forget)
-    const walletStr = String(v.wallet_address || '');
-    const msg = `✅ Your LithiumX vendor account has been approved.
+        // notify vendor (optional, fire-and-forget)
+        const walletStr = String(v.wallet_address || '');
+        const msg = `✅ Your LithiumX vendor account has been approved.
 ✅ Tu cuenta de proveedor de LithiumX ha sido aprobada.
 Wallet / Cartera: ${walletStr}`;
 
-    Promise.allSettled([
-      v.telegram_chat_id ? sendTelegram([String(v.telegram_chat_id)], msg) : null,
-      v.email
-        ? (async () => {
-          const subject = 'Vendor account approved · Cuenta de proveedor aprobada';
-          const { text, html } = bi(msg, msg);
-          await sendEmail([v.email], subject, text, html);
-        })()
-        : null,
-    ]).catch(() => null);
+        Promise.allSettled([
+          v.telegram_chat_id ? sendTelegram([String(v.telegram_chat_id)], msg) : null,
+          v.email
+            ? (async () => {
+              const subject = 'Vendor account approved · Cuenta de proveedor aprobada';
+              const { text, html } = bi(msg, msg);
+              await sendEmail([v.email], subject, text, html);
+            })()
+            : null,
+        ]).catch(() => null);
 
-    res.json({ ok: true, walletAddress: v.wallet_address, status: v.status });
-  } catch (e) {
-    console.error('POST /admin/vendors/:wallet/approve error', e);
-    res.status(500).json({ error: 'Failed to approve vendor' });
-  }
-});
+        res.json({ ok: true, walletAddress: v.wallet_address, status: v.status });
+      } catch (e) {
+        console.error('POST /admin/vendors/:wallet/approve error', e);
+        res.status(500).json({ error: 'Failed to approve vendor' });
+      }
+    });
 
-// Reject a vendor (admin)
-app.post('/admin/vendors/:wallet/reject', adminGuard, async (req, res) => {
-  try {
-    const wallet = String(req.params.wallet || '').toLowerCase();
-    if (!wallet) return res.status(400).json({ error: 'wallet required' });
+    // Reject a vendor (admin)
+    app.post('/admin/vendors/:wallet/reject', adminGuard, async (req, res) => {
+      try {
+        const wallet = String(req.params.wallet || '').toLowerCase();
+        if (!wallet) return res.status(400).json({ error: 'wallet required' });
 
-    const reason = String(req.body?.reason || '').trim() || null;
+        const reason = String(req.body?.reason || '').trim() || null;
 
-    // ✅ UPSERT so a profile row is created if it doesn't exist
-    const { rows } = await pool.query(
-      `INSERT INTO vendor_profiles (wallet_address, status, updated_at, tenant_id)
+        // ✅ UPSERT so a profile row is created if it doesn't exist
+        const { rows } = await pool.query(
+          `INSERT INTO vendor_profiles (wallet_address, status, updated_at, tenant_id)
          VALUES ($1, 'rejected', now(), $2)
        ON CONFLICT (wallet_address) DO UPDATE SET
          status='rejected',
          updated_at=now()
        RETURNING wallet_address, vendor_name, email, phone, telegram_chat_id, status`,
-      [wallet, req.tenantId]
-    );
+          [wallet, req.tenantId]
+        );
 
-    const v = rows[0];
+        const v = rows[0];
 
-    // notify vendor (optional, fire-and-forget)
-    const msg = `❌ Your LithiumX vendor account was not approved.${reason ? `\nReason: ${reason}` : ''}\nWallet: ${v.wallet_address}`;
-    Promise.allSettled([
-      v.telegram_chat_id ? sendTelegram([String(v.telegram_chat_id)], msg) : null,
-      v.email ? (async () => {
-        const { text, html } = bi(msg, msg);
-        await sendEmail([v.email], 'Vendor account not approved', text, html);
-      })() : null,
-    ]).catch(() => null);
+        // notify vendor (optional, fire-and-forget)
+        const msg = `❌ Your LithiumX vendor account was not approved.${reason ? `\nReason: ${reason}` : ''}\nWallet: ${v.wallet_address}`;
+        Promise.allSettled([
+          v.telegram_chat_id ? sendTelegram([String(v.telegram_chat_id)], msg) : null,
+          v.email ? (async () => {
+            const { text, html } = bi(msg, msg);
+            await sendEmail([v.email], 'Vendor account not approved', text, html);
+          })() : null,
+        ]).catch(() => null);
 
-    res.json({ ok: true, walletAddress: v.wallet_address, status: v.status });
-  } catch (e) {
-    console.error('POST /admin/vendors/:wallet/reject error', e);
-    res.status(500).json({ error: 'Failed to reject vendor' });
-  }
-});
+        res.json({ ok: true, walletAddress: v.wallet_address, status: v.status });
+      } catch (e) {
+        console.error('POST /admin/vendors/:wallet/reject error', e);
+        res.status(500).json({ error: 'Failed to reject vendor' });
+      }
+    });
 
-/** ADMIN: Delete a vendor profile by wallet (bids remain) */
-app.delete('/admin/vendors/:wallet', adminGuard, async (req, res) => {
-  try {
-    const wallet = String(req.params.wallet || '').toLowerCase();
-    if (!wallet) return res.status(400).json({ error: 'wallet required' });
+    /** ADMIN: Delete a vendor profile by wallet (bids remain) */
+    app.delete('/admin/vendors/:wallet', adminGuard, async (req, res) => {
+      try {
+        const wallet = String(req.params.wallet || '').toLowerCase();
+        if (!wallet) return res.status(400).json({ error: 'wallet required' });
 
-    const { rowCount } = await pool.query(
-      `DELETE FROM vendor_profiles WHERE lower(wallet_address) = $1 AND tenant_id = $2`,
-      [wallet, req.tenantId]
-    );
-    if (rowCount === 0) return res.status(404).json({ error: 'Vendor profile not found' });
+        const { rowCount } = await pool.query(
+          `DELETE FROM vendor_profiles WHERE lower(wallet_address) = $1 AND tenant_id = $2`,
+          [wallet, req.tenantId]
+        );
+        if (rowCount === 0) return res.status(404).json({ error: 'Vendor profile not found' });
 
-    res.json({ success: true });
-  } catch (e) {
-    console.error('DELETE /admin/vendors/:wallet error', e);
-    res.status(500).json({ error: 'Failed to delete vendor' });
-  }
-});
+        res.json({ success: true });
+      } catch (e) {
+        console.error('DELETE /admin/vendors/:wallet error', e);
+        res.status(500).json({ error: 'Failed to delete vendor' });
+      }
+    });
 
-// /admin/vendors — normalized vendor list (profiles + bids)
-app.get('/admin/vendors', adminGuard, async (req, res) => {
-  try {
-    const includeArchived = ['true', '1', 'yes'].includes(String(req.query.includeArchived || '').toLowerCase());
+    // /admin/vendors — normalized vendor list (profiles + bids)
+    app.get('/admin/vendors', adminGuard, async (req, res) => {
+      try {
+        const includeArchived = ['true', '1', 'yes'].includes(String(req.query.includeArchived || '').toLowerCase());
 
-    const sqlCore = `
+        const sqlCore = `
       WITH a AS (
         SELECT
           LOWER(b.wallet_address)                                            AS wallet_address,
@@ -11565,160 +11587,160 @@ app.get('/admin/vendors', adminGuard, async (req, res) => {
       FULL OUTER JOIN vp ON vp.wallet_address = a.wallet_address
     `;
 
-    let sql = `SELECT * FROM (${sqlCore}) s`;
-    if (!includeArchived) {
-      sql += ` WHERE COALESCE(s.archived,false) = false`;
-    }
-    sql += ` ORDER BY s.last_bid_at DESC NULLS LAST, s.vendor_name ASC`;
-
-    const { rows } = await pool.query(sql, [req.tenantId]);
-
-    const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
-
-    const out = rows.map((r) => {
-      // Parse address_raw -> addrObj (supports jsonb or stringified JSON)
-      let addrObj = null;
-      const raw = r.address_raw;
-      if (raw && typeof raw === 'object') {
-        addrObj = raw;
-      } else if (typeof raw === 'string' && raw.trim().startsWith('{')) {
-        try { addrObj = JSON.parse(raw.trim()); } catch { }
-      }
-
-      // Build normalized address object + string
-      const parts = addrObj && typeof addrObj === 'object'
-        ? {
-          line1: norm(addrObj.line1),
-          city: norm(addrObj.city),
-          state: norm(addrObj.state),
-          postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code),
-          country: norm(addrObj.country),
+        let sql = `SELECT * FROM (${sqlCore}) s`;
+        if (!includeArchived) {
+          sql += ` WHERE COALESCE(s.archived,false) = false`;
         }
-        : {
-          line1: norm(raw),
-          city: null,
-          state: null,
-          postalCode: null,
-          country: null,
-        };
+        sql += ` ORDER BY s.last_bid_at DESC NULLS LAST, s.vendor_name ASC`;
 
-      const addressText = [parts.line1, parts.city, parts.postalCode, parts.country]
-        .filter(Boolean).join(', ') || null;
+        const { rows } = await pool.query(sql, [req.tenantId]);
 
-      const email = norm(r.email);
-      const phone = norm(r.phone);
-      const website = norm(r.website);
-      const tgId = norm(r.telegram_chat_id);
-      const tgUser = norm(r.telegram_username);
-      const whatsapp = norm(r.whatsapp);
+        const norm = (s) => (typeof s === 'string' && s.trim() !== '' ? s.trim() : null);
 
-      return {
-        // core
-        vendorName: r.profile_vendor_name || r.vendor_name || '',
-        walletAddress: r.wallet_address || '',
-        bidsCount: Number(r.bids_count) || 0,
-        lastBidAt: r.last_bid_at || null,
-        totalAwardedUSD: Number(r.total_awarded_usd) || 0,
+        const out = rows.map((r) => {
+          // Parse address_raw -> addrObj (supports jsonb or stringified JSON)
+          let addrObj = null;
+          const raw = r.address_raw;
+          if (raw && typeof raw === 'object') {
+            addrObj = raw;
+          } else if (typeof raw === 'string' && raw.trim().startsWith('{')) {
+            try { addrObj = JSON.parse(raw.trim()); } catch { }
+          }
 
-        // server-truth flags used by the UI
-        status: r.status || 'pending',
-        kycStatus: r.kyc_status || 'none',
+          // Build normalized address object + string
+          const parts = addrObj && typeof addrObj === 'object'
+            ? {
+              line1: norm(addrObj.line1),
+              city: norm(addrObj.city),
+              state: norm(addrObj.state),
+              postalCode: norm(addrObj.postalCode) || norm(addrObj.postal_code),
+              country: norm(addrObj.country),
+            }
+            : {
+              line1: norm(raw),
+              city: null,
+              state: null,
+              postalCode: null,
+              country: null,
+            };
 
-        // contact
-        email,
-        phone,
-        website,
+          const addressText = [parts.line1, parts.city, parts.postalCode, parts.country]
+            .filter(Boolean).join(', ') || null;
 
-        // explicit boolean for existing UIs
-        telegramConnected: !!(tgId || tgUser || whatsapp),
-        telegramChatId: tgId,
-        telegramUsername: tgUser,
-        whatsapp,
+          const email = norm(r.email);
+          const phone = norm(r.phone);
+          const website = norm(r.website);
+          const tgId = norm(r.telegram_chat_id);
+          const tgUser = norm(r.telegram_username);
+          const whatsapp = norm(r.whatsapp);
 
-        // back-compat: string address for existing tables/cells
-        address: addressText,
-        addressText,
-        // structured copy for new UI
-        addressObj: {
-          line1: parts.line1,
-          city: parts.city,
-          state: parts.state,
-          postalCode: parts.postalCode,
-          country: parts.country,
-          addressText,
-        },
+          return {
+            // core
+            vendorName: r.profile_vendor_name || r.vendor_name || '',
+            walletAddress: r.wallet_address || '',
+            bidsCount: Number(r.bids_count) || 0,
+            lastBidAt: r.last_bid_at || null,
+            totalAwardedUSD: Number(r.total_awarded_usd) || 0,
 
-        // legacy aliases some components might read
-        street: parts.line1 || null,
-        address1: parts.line1 || addressText,
-        addressLine1: parts.line1 || addressText,
-        city: parts.city,
-        state: parts.state,
-        postalCode: parts.postalCode,
-        country: parts.country,
+            // server-truth flags used by the UI
+            status: r.status || 'pending',
+            kycStatus: r.kyc_status || 'none',
 
-        // nested copies for components that deref profile.*
-        profile: {
-          companyName: r.profile_vendor_name ?? (r.vendor_name || null),
-          contactName: null,
-          email,
-          contactEmail: email,
-          phone,
-          website,
-          telegram_chat_id: tgId,
-          telegram_username: tgUser,
-          whatsapp,
-          address: addressText,
-          addressText,
-          addressObj: {
-            line1: parts.line1,
+            // contact
+            email,
+            phone,
+            website,
+
+            // explicit boolean for existing UIs
+            telegramConnected: !!(tgId || tgUser || whatsapp),
+            telegramChatId: tgId,
+            telegramUsername: tgUser,
+            whatsapp,
+
+            // back-compat: string address for existing tables/cells
+            address: addressText,
+            addressText,
+            // structured copy for new UI
+            addressObj: {
+              line1: parts.line1,
+              city: parts.city,
+              state: parts.state,
+              postalCode: parts.postalCode,
+              country: parts.country,
+              addressText,
+            },
+
+            // legacy aliases some components might read
+            street: parts.line1 || null,
+            address1: parts.line1 || addressText,
+            addressLine1: parts.line1 || addressText,
             city: parts.city,
             state: parts.state,
             postalCode: parts.postalCode,
             country: parts.country,
-            addressText,
-          },
-          street: parts.line1 || null,
-          address1: parts.line1 || addressText,
-          address2: null,
-          city: parts.city,
-          state: parts.state,
-          postalCode: parts.postalCode,
-          country: parts.country,
-          notes: null,
-        },
 
-        archived: !!r.archived,
-      };
+            // nested copies for components that deref profile.*
+            profile: {
+              companyName: r.profile_vendor_name ?? (r.vendor_name || null),
+              contactName: null,
+              email,
+              contactEmail: email,
+              phone,
+              website,
+              telegram_chat_id: tgId,
+              telegram_username: tgUser,
+              whatsapp,
+              address: addressText,
+              addressText,
+              addressObj: {
+                line1: parts.line1,
+                city: parts.city,
+                state: parts.state,
+                postalCode: parts.postalCode,
+                country: parts.country,
+                addressText,
+              },
+              street: parts.line1 || null,
+              address1: parts.line1 || addressText,
+              address2: null,
+              city: parts.city,
+              state: parts.state,
+              postalCode: parts.postalCode,
+              country: parts.country,
+              notes: null,
+            },
+
+            archived: !!r.archived,
+          };
+        });
+
+        // Hide admin wallets from the list
+        const outFiltered = out.filter(v => {
+          const w = String(v.walletAddress || '').toLowerCase();
+          return w && !isAdminAddress(w);
+        });
+
+        res.json(outFiltered);
+      } catch (e) {
+        console.error('GET /admin/vendors error', e);
+        res.status(500).json({ error: 'Failed to list vendors' });
+      }
     });
 
-    // Hide admin wallets from the list
-    const outFiltered = out.filter(v => {
-      const w = String(v.walletAddress || '').toLowerCase();
-      return w && !isAdminAddress(w);
-    });
+    // Try to find your pg client; change to match your variable if needed.
+    const __pool =
+      (typeof pool !== 'undefined' && pool) ||
+      (typeof db !== 'undefined' && db) ||
+      (typeof pgPool !== 'undefined' && pgPool) ||
+      null;
 
-    res.json(outFiltered);
-  } catch (e) {
-    console.error('GET /admin/vendors error', e);
-    res.status(500).json({ error: 'Failed to list vendors' });
-  }
-});
+    // ---- /admin/oversight/* routes (admin only) — FIXED ----
 
-// Try to find your pg client; change to match your variable if needed.
-const __pool =
-  (typeof pool !== 'undefined' && pool) ||
-  (typeof db !== 'undefined' && db) ||
-  (typeof pgPool !== 'undefined' && pgPool) ||
-  null;
-
-// ---- /admin/oversight/* routes (admin only) — FIXED ----
-
-// SUMMARY
-app.get('/admin/oversight/summary', adminGuard, async (req, res) => {
-  try {
-    const [proofs, payouts, p50, rev] = await Promise.all([
-      pool.query(`
+    // SUMMARY
+    app.get('/admin/oversight/summary', adminGuard, async (req, res) => {
+      try {
+        const [proofs, payouts, p50, rev] = await Promise.all([
+          pool.query(`
         SELECT
           COUNT(*) FILTER (WHERE status='pending') AS open_pending,
           COUNT(*) FILTER (WHERE status='pending'
@@ -11726,50 +11748,50 @@ app.get('/admin/oversight/summary', adminGuard, async (req, res) => {
         FROM proofs
         WHERE tenant_id = $1
       `, [req.tenantId]).catch(() => ({ rows: [{ open_pending: 0, breaching: 0 }] })),
-      pool.query(`
+          pool.query(`
         SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_usd),0) AS usd
         FROM milestone_payments mp
         JOIN bids b ON b.bid_id = mp.bid_id
         WHERE mp.status='pending' AND b.tenant_id = $1
       `, [req.tenantId]).catch(() => ({ rows: [{ cnt: 0, usd: 0 }] })),
-      pool.query(`
+          pool.query(`
         SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (
           ORDER BY EXTRACT(EPOCH FROM (updated_at - submitted_at))/3600.0
         ) AS p50h
         FROM proofs
         WHERE status='approved' AND submitted_at IS NOT NULL AND updated_at IS NOT NULL AND tenant_id = $1
       `, [req.tenantId]).catch(() => ({ rows: [{ p50h: 0 }] })),
-      pool.query(`
+          pool.query(`
         SELECT 
           COUNT(*) FILTER (WHERE status IN ('approved','rejected')) AS decided,
           COUNT(*) FILTER (WHERE status='rejected') AS rej
         FROM proofs
         WHERE tenant_id = $1
       `, [req.tenantId]).catch(() => ({ rows: [{ decided: 0, rej: 0 }] })),
-    ]);
+        ]);
 
-    res.json({
-      openProofs: Number(proofs.rows[0].open_pending || 0),
-      breachingSla: Number(proofs.rows[0].breaching || 0),
-      pendingPayouts: {
-        count: Number(payouts.rows[0].cnt || 0),
-        totalUSD: Number(payouts.rows[0].usd || 0),
-      },
-      p50CycleHours: Number(p50.rows[0].p50h || 0),
-      revisionRatePct: (Number(rev.rows[0].decided || 0)
-        ? Math.round(100 * Number(rev.rows[0].rej) / Number(rev.rows[0].decided))
-        : 0),
+        res.json({
+          openProofs: Number(proofs.rows[0].open_pending || 0),
+          breachingSla: Number(proofs.rows[0].breaching || 0),
+          pendingPayouts: {
+            count: Number(payouts.rows[0].cnt || 0),
+            totalUSD: Number(payouts.rows[0].usd || 0),
+          },
+          p50CycleHours: Number(p50.rows[0].p50h || 0),
+          revisionRatePct: (Number(rev.rows[0].decided || 0)
+            ? Math.round(100 * Number(rev.rows[0].rej) / Number(rev.rows[0].decided))
+            : 0),
+        });
+      } catch (e) {
+        console.error('oversight/summary error', e);
+        res.status(500).json({ error: 'summary_failed' });
+      }
     });
-  } catch (e) {
-    console.error('oversight/summary error', e);
-    res.status(500).json({ error: 'summary_failed' });
-  }
-});
 
-// QUEUE
-app.get('/admin/oversight/queue', adminGuard, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
+    // QUEUE
+    app.get('/admin/oversight/queue', adminGuard, async (req, res) => {
+      try {
+        const { rows } = await pool.query(`
       SELECT p.proof_id, p.bid_id, p.milestone_index, p.status,
              p.submitted_at, p.updated_at,
              b.vendor_name, b.wallet_address, b.proposal_id,
@@ -11781,28 +11803,28 @@ app.get('/admin/oversight/queue', adminGuard, async (req, res) => {
        ORDER BY p.submitted_at NULLS LAST, p.updated_at NULLS LAST
        LIMIT 100
     `, [req.tenantId]);
-    res.json(rows.map(r => ({
-      id: r.proof_id,                       // ← no “id” column, use proof_id
-      vendor: r.vendor_name || r.wallet_address,
-      project: r.project,
-      milestone: Number(r.milestone_index) + 1,
-      ageHours: r.submitted_at
-        ? Math.max(0, (Date.now() - new Date(r.submitted_at).getTime()) / 3600000)
-        : null,
-      status: r.status,
-      risk: (r.submitted_at && (Date.now() - new Date(r.submitted_at).getTime()) > 48 * 3600000) ? 'sla' : null,
-      actions: { bidId: r.bid_id, proposalId: r.proposal_id },
-    })));
-  } catch (e) {
-    console.error('oversight/queue error', e);
-    res.status(500).json({ error: 'queue_failed' });
-  }
-});
+        res.json(rows.map(r => ({
+          id: r.proof_id,                       // ← no “id” column, use proof_id
+          vendor: r.vendor_name || r.wallet_address,
+          project: r.project,
+          milestone: Number(r.milestone_index) + 1,
+          ageHours: r.submitted_at
+            ? Math.max(0, (Date.now() - new Date(r.submitted_at).getTime()) / 3600000)
+            : null,
+          status: r.status,
+          risk: (r.submitted_at && (Date.now() - new Date(r.submitted_at).getTime()) > 48 * 3600000) ? 'sla' : null,
+          actions: { bidId: r.bid_id, proposalId: r.proposal_id },
+        })));
+      } catch (e) {
+        console.error('oversight/queue error', e);
+        res.status(500).json({ error: 'queue_failed' });
+      }
+    });
 
-// VENDORS
-app.get('/admin/oversight/vendors', adminGuard, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
+    // VENDORS
+    app.get('/admin/oversight/vendors', adminGuard, async (req, res) => {
+      try {
+        const { rows } = await pool.query(`
       SELECT
         b.vendor_name,
         b.wallet_address,
@@ -11818,29 +11840,29 @@ app.get('/admin/oversight/vendors', adminGuard, async (req, res) => {
       ORDER BY proofs DESC NULLS LAST, vendor_name ASC
       LIMIT 200
     `, [req.tenantId]);
-    res.json(rows.map(r => ({
-      vendor: r.vendor_name || '(unnamed)',
-      wallet: r.wallet_address,
-      proofs: Number(r.proofs || 0),
-      approved: Number(r.approved || 0),
-      cr: Number(r.cr || 0),
-      approvalPct: Number(r.proofs || 0)
-        ? Math.round(100 * Number(r.approved || 0) / Number(r.proofs || 0))
-        : 0,
-      bids: Number(r.bids || 0),
-      lastActivity: r.last_activity
-    })));
-  } catch (e) {
-    console.error('oversight/vendors error', e);
-    res.status(500).json({ error: 'vendors_failed' });
-  }
-});
+        res.json(rows.map(r => ({
+          vendor: r.vendor_name || '(unnamed)',
+          wallet: r.wallet_address,
+          proofs: Number(r.proofs || 0),
+          approved: Number(r.approved || 0),
+          cr: Number(r.cr || 0),
+          approvalPct: Number(r.proofs || 0)
+            ? Math.round(100 * Number(r.approved || 0) / Number(r.proofs || 0))
+            : 0,
+          bids: Number(r.bids || 0),
+          lastActivity: r.last_activity
+        })));
+      } catch (e) {
+        console.error('oversight/vendors error', e);
+        res.status(500).json({ error: 'vendors_failed' });
+      }
+    });
 
-// PAYOUTS
-app.get('/admin/oversight/payouts', adminGuard, async (req, res) => {
-  try {
-    const [pend, rec] = await Promise.all([
-      pool.query(`
+    // PAYOUTS
+    app.get('/admin/oversight/payouts', adminGuard, async (req, res) => {
+      try {
+        const [pend, rec] = await Promise.all([
+          pool.query(`
         SELECT mp.id, mp.bid_id, mp.milestone_index, mp.amount_usd, mp.created_at
           FROM milestone_payments mp
           JOIN bids b ON b.bid_id = mp.bid_id
@@ -11848,7 +11870,7 @@ app.get('/admin/oversight/payouts', adminGuard, async (req, res) => {
          ORDER BY mp.created_at DESC
          LIMIT 50
       `, [req.tenantId]).catch(() => ({ rows: [] })),
-      pool.query(`
+          pool.query(`
         SELECT mp.id, mp.bid_id, mp.milestone_index, mp.amount_usd, mp.released_at, mp.tx_hash
           FROM milestone_payments mp
           JOIN bids b ON b.bid_id = mp.bid_id
@@ -11856,31 +11878,31 @@ app.get('/admin/oversight/payouts', adminGuard, async (req, res) => {
          ORDER BY mp.released_at DESC
          LIMIT 50
       `, [req.tenantId]).catch(() => ({ rows: [] })),
-    ]);
-    res.json({ pending: pend.rows, recent: rec.rows });
-  } catch (e) {
-    console.error('oversight/payouts error', e);
-    res.status(500).json({ error: 'payouts_failed' });
-  }
-});
+        ]);
+        res.json({ pending: pend.rows, recent: rec.rows });
+      } catch (e) {
+        console.error('oversight/payouts error', e);
+        res.status(500).json({ error: 'payouts_failed' });
+      }
+    });
 
-// ==============================
-// Admin — what's new feed (proposals, bids, proofs, decisions, payments)
-// ==============================
-app.get('/admin/whats-new', adminGuard, async (req, res) => {
-  try {
-    const since = req.query.since ? new Date(String(req.query.since)) : null;
-    const hasSince = since && !Number.isNaN(since.getTime());
-    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '50'), 10), 1), 200);
+    // ==============================
+    // Admin — what's new feed (proposals, bids, proofs, decisions, payments)
+    // ==============================
+    app.get('/admin/whats-new', adminGuard, async (req, res) => {
+      try {
+        const since = req.query.since ? new Date(String(req.query.since)) : null;
+        const hasSince = since && !Number.isNaN(since.getTime());
+        const limit = Math.min(Math.max(parseInt(String(req.query.limit || '50'), 10), 1), 200);
 
-    const params = [req.tenantId];
-    if (hasSince) params.push(since.toISOString());
-    params.push(limit);
+        const params = [req.tenantId];
+        if (hasSince) params.push(since.toISOString());
+        params.push(limit);
 
-    const where = hasSince ? 'WHERE ts > $2' : '';
-    const limPos = hasSince ? 3 : 2;
+        const where = hasSince ? 'WHERE ts > $2' : '';
+        const limPos = hasSince ? 3 : 2;
 
-    const sql = `
+        const sql = `
       WITH events AS (
         -- Proposals created
         SELECT p.created_at AS ts, 'proposal_submitted' AS type,
@@ -11934,34 +11956,34 @@ app.get('/admin/whats-new', adminGuard, async (req, res) => {
        LIMIT $${limPos};
     `;
 
-    const { rows } = await pool.query(sql, params);
-    res.json({ items: rows });
-  } catch (e) {
-    console.error('GET /admin/whats-new failed', e);
-    res.status(500).json({ error: 'Failed to build feed' });
-  }
-});
+        const { rows } = await pool.query(sql, params);
+        res.json({ items: rows });
+      } catch (e) {
+        console.error('GET /admin/whats-new failed', e);
+        res.status(500).json({ error: 'Failed to build feed' });
+      }
+    });
 
-// ==============================
-// Vendor — what's new (scoped to my wallet)
-// ==============================
-app.get('/me/whats-new', authRequired, async (req, res) => {
-  try {
-    const me = String(req.user?.sub || '').toLowerCase();
-    if (!me) return res.status(401).json({ error: 'unauthorized' });
+    // ==============================
+    // Vendor — what's new (scoped to my wallet)
+    // ==============================
+    app.get('/me/whats-new', authRequired, async (req, res) => {
+      try {
+        const me = String(req.user?.sub || '').toLowerCase();
+        if (!me) return res.status(401).json({ error: 'unauthorized' });
 
-    const since = req.query.since ? new Date(String(req.query.since)) : null;
-    const hasSince = since && !Number.isNaN(since.getTime());
-    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '50'), 10), 1), 200);
+        const since = req.query.since ? new Date(String(req.query.since)) : null;
+        const hasSince = since && !Number.isNaN(since.getTime());
+        const limit = Math.min(Math.max(parseInt(String(req.query.limit || '50'), 10), 1), 200);
 
-    const params = [me, req.tenantId];
-    if (hasSince) params.push(since.toISOString());
-    params.push(limit);
+        const params = [me, req.tenantId];
+        if (hasSince) params.push(since.toISOString());
+        params.push(limit);
 
-    const where = hasSince ? 'WHERE ts > $3' : '';
-    const limPos = hasSince ? 4 : 3;
+        const where = hasSince ? 'WHERE ts > $3' : '';
+        const limPos = hasSince ? 4 : 3;
 
-    const sql = `
+        const sql = `
       WITH events AS (
         -- Proposals I bid on
         SELECT p.created_at AS ts, 'proposal_submitted' AS type,
@@ -12031,135 +12053,135 @@ app.get('/me/whats-new', authRequired, async (req, res) => {
        LIMIT $${limPos};
     `;
 
-    const { rows } = await pool.query(sql, params);
-    res.json({ items: rows });
-  } catch (e) {
-    console.error('GET /me/whats-new failed', e);
-    res.status(500).json({ error: 'Failed to build feed' });
-  }
-});
+        const { rows } = await pool.query(sql, params);
+        res.json({ items: rows });
+      } catch (e) {
+        console.error('GET /me/whats-new failed', e);
+        res.status(500).json({ error: 'Failed to build feed' });
+      }
+    });
 
-// Alias for legacy widget path
-app.get('/agent/digest', authRequired, (req, res) => {
-  const role = String(req.user?.role || '').toLowerCase();
-  const target = role === 'admin' ? '/admin/whats-new' : '/me/whats-new';
+    // Alias for legacy widget path
+    app.get('/agent/digest', authRequired, (req, res) => {
+      const role = String(req.user?.role || '').toLowerCase();
+      const target = role === 'admin' ? '/admin/whats-new' : '/me/whats-new';
 
-  // Preserve query params like ?since=...&limit=...
-  const qs = new URLSearchParams();
-  if (req.query.since) qs.set('since', String(req.query.since));
-  if (req.query.limit) qs.set('limit', String(req.query.limit));
+      // Preserve query params like ?since=...&limit=...
+      const qs = new URLSearchParams();
+      if (req.query.since) qs.set('since', String(req.query.since));
+      if (req.query.limit) qs.set('limit', String(req.query.limit));
 
-  res.redirect(307, `${target}${qs.toString() ? `?${qs.toString()}` : ''}`);
-});
+      res.redirect(307, `${target}${qs.toString() ? `?${qs.toString()}` : ''}`);
+    });
 
-// ==============================
-// Vendor — persist/read "last seen" for the widget
-// ==============================
-app.get('/me/dashboard/last-seen', authRequired, async (req, res) => {
-  const me = String(req.user?.sub || '').toLowerCase();
-  if (!me) return res.status(401).json({ error: 'unauthorized' });
-  const { rows } = await pool.query(
-    `SELECT last_seen_digest FROM user_dashboard_state WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 LIMIT 1`,
-    [me, req.tenantId]
-  );
-  res.json({ lastSeen: rows[0]?.last_seen_digest || null });
-});
+    // ==============================
+    // Vendor — persist/read "last seen" for the widget
+    // ==============================
+    app.get('/me/dashboard/last-seen', authRequired, async (req, res) => {
+      const me = String(req.user?.sub || '').toLowerCase();
+      if (!me) return res.status(401).json({ error: 'unauthorized' });
+      const { rows } = await pool.query(
+        `SELECT last_seen_digest FROM user_dashboard_state WHERE lower(wallet_address)=lower($1) AND tenant_id=$2 LIMIT 1`,
+        [me, req.tenantId]
+      );
+      res.json({ lastSeen: rows[0]?.last_seen_digest || null });
+    });
 
-app.post('/me/dashboard/last-seen', authRequired, async (req, res) => {
-  const me = String(req.user?.sub || '').toLowerCase();
-  if (!me) return res.status(401).json({ error: 'unauthorized' });
-  const t = req.body?.timestamp ? new Date(String(req.body.timestamp)) : new Date();
-  if (Number.isNaN(t.getTime())) return res.status(400).json({ error: 'invalid timestamp' });
+    app.post('/me/dashboard/last-seen', authRequired, async (req, res) => {
+      const me = String(req.user?.sub || '').toLowerCase();
+      if (!me) return res.status(401).json({ error: 'unauthorized' });
+      const t = req.body?.timestamp ? new Date(String(req.body.timestamp)) : new Date();
+      if (Number.isNaN(t.getTime())) return res.status(400).json({ error: 'invalid timestamp' });
 
-  await pool.query(
-    `INSERT INTO user_dashboard_state (wallet_address, last_seen_digest, updated_at, tenant_id)
+      await pool.query(
+        `INSERT INTO user_dashboard_state (wallet_address, last_seen_digest, updated_at, tenant_id)
      VALUES ($1, $2, now(), $3)
      ON CONFLICT (wallet_address, tenant_id) DO UPDATE
        SET last_seen_digest = EXCLUDED.last_seen_digest, updated_at = now()`,
-    [me, t.toISOString(), req.tenantId]
-  );
-  res.json({ ok: true, lastSeen: t.toISOString() });
-});
-
-// ==============================
-// Projects Directory (list with aggregates)
-// ==============================
-app.get("/projects", requireApprovedVendorOrAdmin, async (req, res) => {
-  try {
-    // Pagination / filters / sorting
-    const page = Math.max(parseInt(req.query.page || '1', 10), 1);
-    const pageSize = Math.min(Math.max(parseInt(req.query.pageSize || '20', 10), 1), 100);
-    const offset = (page - 1) * pageSize;
-
-    const q = String(req.query.q || '').trim().toLowerCase();
-    const statuses = String(req.query.status || '')
-      .split(',').map(s => s.trim()).filter(Boolean);
-    const ownerWallet = String(req.query.ownerWallet || '').trim().toLowerCase();
-    const vendorWallet = String(req.query.vendorWallet || '').trim().toLowerCase();
-    const mineOnly = String(req.query.mineOnly || '') === 'true';
-    const sort = String(req.query.sort || 'activity');
-
-    // Current user (compatible with your JWT attach)  // :contentReference[oaicite:3]{index=3}
-    const user = req.user || null;
-    const isAdmin = String(user?.role || '').toLowerCase() === 'admin';
-    const myWallet = String(user?.sub || '').toLowerCase();
-
-    // Require admin OR approved vendor
-    if (!isAdmin) {
-      if (!myWallet) return res.status(401).json({ error: 'login_required' });
-      const { rows: st } = await pool.query(
-        `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-        [myWallet]
+        [me, t.toISOString(), req.tenantId]
       );
-      const status = (st[0]?.status || 'pending').toLowerCase();
-      if (status !== 'approved') {
-        return res.status(403).json({ error: 'vendor_not_approved' });
-      }
-    }
+      res.json({ ok: true, lastSeen: t.toISOString() });
+    });
 
-    const where = [];
-    const params = [];
+    // ==============================
+    // Projects Directory (list with aggregates)
+    // ==============================
+    app.get("/projects", requireApprovedVendorOrAdmin, async (req, res) => {
+      try {
+        // Pagination / filters / sorting
+        const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+        const pageSize = Math.min(Math.max(parseInt(req.query.pageSize || '20', 10), 1), 100);
+        const offset = (page - 1) * pageSize;
 
-    if (statuses.length) {
-      params.push(statuses);
-      where.push(`p.status = ANY($${params.length})`);
-    }
-    if (q) {
-      params.push(`%${q}%`);
-      where.push(`(LOWER(p.title) LIKE $${params.length} OR CAST(p.proposal_id AS TEXT) LIKE $${params.length})`);
-    }
-    if (ownerWallet || (mineOnly && myWallet)) {
-      params.push(ownerWallet || myWallet);
-      where.push(`LOWER(p.owner_wallet) = $${params.length}`);
-    }
-    if (vendorWallet) {
-      params.push(vendorWallet);
-      where.push(`EXISTS (SELECT 1 FROM bids b2 WHERE b2.proposal_id = p.proposal_id AND LOWER(b2.wallet_address) = $${params.length})`);
-    }
-    // Non-admin default: show my proposals if no other filter
-    if (!isAdmin && !ownerWallet && !mineOnly && !vendorWallet) {
-      params.push(myWallet || '__no_wallet__');
-      where.push(`LOWER(p.owner_wallet) = $${params.length}`);
-    }
+        const q = String(req.query.q || '').trim().toLowerCase();
+        const statuses = String(req.query.status || '')
+          .split(',').map(s => s.trim()).filter(Boolean);
+        const ownerWallet = String(req.query.ownerWallet || '').trim().toLowerCase();
+        const vendorWallet = String(req.query.vendorWallet || '').trim().toLowerCase();
+        const mineOnly = String(req.query.mineOnly || '') === 'true';
+        const sort = String(req.query.sort || 'activity');
 
-    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+        // Current user (compatible with your JWT attach)  // :contentReference[oaicite:3]{index=3}
+        const user = req.user || null;
+        const isAdmin = String(user?.role || '').toLowerCase() === 'admin';
+        const myWallet = String(user?.sub || '').toLowerCase();
 
-    const sortSql = {
-      latest: 'p.created_at DESC',
-      oldest: 'p.created_at ASC',
-      bids: 'agg_bids_total DESC NULLS LAST',
-      paid: 'agg_ms_paid DESC NULLS LAST',
-      activity: 'last_activity_at DESC NULLS LAST',
-    }[sort] || 'last_activity_at DESC NULLS LAST';
+        // Require admin OR approved vendor
+        if (!isAdmin) {
+          if (!myWallet) return res.status(401).json({ error: 'login_required' });
+          const { rows: st } = await pool.query(
+            `SELECT status FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+            [myWallet]
+          );
+          const status = (st[0]?.status || 'pending').toLowerCase();
+          if (status !== 'approved') {
+            return res.status(403).json({ error: 'vendor_not_approved' });
+          }
+        }
 
-    // Count
-    const { rows: [{ cnt }] } = await pool.query(
-      `SELECT COUNT(*)::int AS cnt FROM proposals p ${whereSql}`,
-      params
-    );
+        const where = [];
+        const params = [];
 
-    // List with aggregates (no new tables, use your existing schema)
-    const sql = `
+        if (statuses.length) {
+          params.push(statuses);
+          where.push(`p.status = ANY($${params.length})`);
+        }
+        if (q) {
+          params.push(`%${q}%`);
+          where.push(`(LOWER(p.title) LIKE $${params.length} OR CAST(p.proposal_id AS TEXT) LIKE $${params.length})`);
+        }
+        if (ownerWallet || (mineOnly && myWallet)) {
+          params.push(ownerWallet || myWallet);
+          where.push(`LOWER(p.owner_wallet) = $${params.length}`);
+        }
+        if (vendorWallet) {
+          params.push(vendorWallet);
+          where.push(`EXISTS (SELECT 1 FROM bids b2 WHERE b2.proposal_id = p.proposal_id AND LOWER(b2.wallet_address) = $${params.length})`);
+        }
+        // Non-admin default: show my proposals if no other filter
+        if (!isAdmin && !ownerWallet && !mineOnly && !vendorWallet) {
+          params.push(myWallet || '__no_wallet__');
+          where.push(`LOWER(p.owner_wallet) = $${params.length}`);
+        }
+
+        const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+        const sortSql = {
+          latest: 'p.created_at DESC',
+          oldest: 'p.created_at ASC',
+          bids: 'agg_bids_total DESC NULLS LAST',
+          paid: 'agg_ms_paid DESC NULLS LAST',
+          activity: 'last_activity_at DESC NULLS LAST',
+        }[sort] || 'last_activity_at DESC NULLS LAST';
+
+        // Count
+        const { rows: [{ cnt }] } = await pool.query(
+          `SELECT COUNT(*)::int AS cnt FROM proposals p ${whereSql}`,
+          params
+        );
+
+        // List with aggregates (no new tables, use your existing schema)
+        const sql = `
       SELECT
         p.proposal_id AS id,
         p.title,
@@ -12226,61 +12248,61 @@ app.get("/projects", requireApprovedVendorOrAdmin, async (req, res) => {
       LIMIT ${pageSize} OFFSET ${offset}
     `;
 
-    const { rows } = await pool.query(sql, params);
+        const { rows } = await pool.query(sql, params);
 
-    // Keep snake_case aggregates to avoid touching your UI; key names are explicit
-    res.json({
-      page, pageSize, total: cnt,
-      items: rows.map(r => ({
-        id: r.id,
-        title: r.title,
-        status: r.status,
-        owner_wallet: r.owner_wallet,
-        owner_email: r.owner_email,
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-        bids_total: Number(r.agg_bids_total || 0),
-        bids_approved: Number(r.agg_bids_approved || 0),
-        milestones_total: Number(r.agg_ms_total || 0),
-        milestones_completed: Number(r.agg_ms_completed || 0),
-        milestones_paid: Number(r.agg_ms_paid || 0),
-        last_activity_at: r.last_activity_at
-      }))
+        // Keep snake_case aggregates to avoid touching your UI; key names are explicit
+        res.json({
+          page, pageSize, total: cnt,
+          items: rows.map(r => ({
+            id: r.id,
+            title: r.title,
+            status: r.status,
+            owner_wallet: r.owner_wallet,
+            owner_email: r.owner_email,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            bids_total: Number(r.agg_bids_total || 0),
+            bids_approved: Number(r.agg_bids_approved || 0),
+            milestones_total: Number(r.agg_ms_total || 0),
+            milestones_completed: Number(r.agg_ms_completed || 0),
+            milestones_paid: Number(r.agg_ms_paid || 0),
+            last_activity_at: r.last_activity_at
+          }))
+        });
+      } catch (err) {
+        console.error("GET /projects error", err);
+        res.status(500).json({ error: "Server error" });
+      }
     });
-  } catch (err) {
-    console.error("GET /projects error", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
 
-// ==============================
-// Project Overview (single project “everything”)
-// ==============================
-app.get("/projects/:id/overview", requireApprovedVendorOrAdmin, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid project id" });
+    // ==============================
+    // Project Overview (single project “everything”)
+    // ==============================
+    app.get("/projects/:id/overview", requireApprovedVendorOrAdmin, async (req, res) => {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid project id" });
 
-  try {
-    // Load proposal (your PK is proposal_id)  // :contentReference[oaicite:4]{index=4}
-    const { rows: prjRows } = await pool.query(
-      `SELECT proposal_id, title, status, owner_wallet, owner_email, created_at, updated_at
+      try {
+        // Load proposal (your PK is proposal_id)  // :contentReference[oaicite:4]{index=4}
+        const { rows: prjRows } = await pool.query(
+          `SELECT proposal_id, title, status, owner_wallet, owner_email, created_at, updated_at
          FROM proposals
         WHERE proposal_id = $1`,
-      [id]
-    );
-    const prj = prjRows[0];
-    if (!prj) return res.status(404).json({ error: "Not found" });
+          [id]
+        );
+        const prj = prjRows[0];
+        if (!prj) return res.status(404).json({ error: "Not found" });
 
-    // Auth: admin OR proposal owner (reuse your JWT semantics)  // :contentReference[oaicite:5]{index=5}
-    const isAdmin = String(req.user?.role || '').toLowerCase() === 'admin';
-    const myWallet = String(req.user?.sub || '').toLowerCase();
-    if (!isAdmin && String(prj.owner_wallet || '').toLowerCase() !== myWallet) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
+        // Auth: admin OR proposal owner (reuse your JWT semantics)  // :contentReference[oaicite:5]{index=5}
+        const isAdmin = String(req.user?.role || '').toLowerCase() === 'admin';
+        const myWallet = String(req.user?.sub || '').toLowerCase();
+        if (!isAdmin && String(prj.owner_wallet || '').toLowerCase() !== myWallet) {
+          return res.status(403).json({ error: "Forbidden" });
+        }
 
-    // Bids for this proposal (include doc + files)
-    const { rows: bidRows } = await pool.query(
-      `SELECT bid_id,
+        // Bids for this proposal (include doc + files)
+        const { rows: bidRows } = await pool.query(
+          `SELECT bid_id,
           proposal_id,
           vendor_name,
           wallet_address,
@@ -12297,462 +12319,462 @@ app.get("/projects/:id/overview", requireApprovedVendorOrAdmin, async (req, res)
      FROM bids
     WHERE proposal_id = $1
     ORDER BY created_at ASC`,
-      [id]
-    );
+          [id]
+        );
 
-    // 2. INSERT THIS FIX: Hydrate bids with payment status (clears "Pending" if tx exists)
-    const hydratedBids = await Promise.all(
-      bidRows.map(b => overlayPaidFromMp(b, pool))
-    );
+        // 2. INSERT THIS FIX: Hydrate bids with payment status (clears "Pending" if tx exists)
+        const hydratedBids = await Promise.all(
+          bidRows.map(b => overlayPaidFromMp(b, pool))
+        );
 
-    // 3. Update the next line to use 'hydratedBids' instead of 'bidRows'
-    const bidsOut = hydratedBids.map(r => {
-      let doc = r.doc;
-      if (typeof doc === 'string') { try { doc = JSON.parse(doc); } catch { } }
+        // 3. Update the next line to use 'hydratedBids' instead of 'bidRows'
+        const bidsOut = hydratedBids.map(r => {
+          let doc = r.doc;
+          if (typeof doc === 'string') { try { doc = JSON.parse(doc); } catch { } }
 
-      let files = r.files;
-      if (typeof files === 'string') { try { files = JSON.parse(files); } catch { } }
-      if (!Array.isArray(files)) files = files ? [files] : [];
+          let files = r.files;
+          if (typeof files === 'string') { try { files = JSON.parse(files); } catch { } }
+          if (!Array.isArray(files)) files = files ? [files] : [];
 
-      return { ...r, doc: doc || null, files };
-    });
+          return { ...r, doc: doc || null, files };
+        });
 
-    const bidIds = bidsOut.map(b => b.bid_id);
+        const bidIds = bidsOut.map(b => b.bid_id);
 
-    // Load proofs for all bids of this project
-    let proofs = [];
-    if (bidIds.length) {
-      const { rows: proofRows } = await pool.query(
-        `SELECT proof_id, bid_id, milestone_index, title, description, status,
+        // Load proofs for all bids of this project
+        let proofs = [];
+        if (bidIds.length) {
+          const { rows: proofRows } = await pool.query(
+            `SELECT proof_id, bid_id, milestone_index, title, description, status,
             files, file_meta, gps_lat, gps_lon, capture_time, submitted_at, updated_at
        FROM proofs
       WHERE bid_id = ANY($1::bigint[])
       ORDER BY submitted_at ASC`,
-        [bidIds]
-      );
+            [bidIds]
+          );
 
-      // Sanitize + add safe geo (keeps submitted_at for your activity timeline)
-      proofs = await Promise.all(proofRows.map(async pr => ({
-        proof_id: pr.proof_id,
-        bid_id: pr.bid_id,
-        milestone_index: pr.milestone_index,
-        title: pr.title,
-        description: pr.description,
-        status: pr.status,
-        files: Array.isArray(pr.files)
-          ? pr.files
-          : (typeof pr.files === 'string' ? JSON.parse(pr.files || '[]') : []),
-        submitted_at: pr.submitted_at,
-        updated_at: pr.updated_at,
-        taken_at: pr.capture_time || null,          // EXIF-derived time you store
-        location: await buildSafeGeoForProof(pr)    // city/state/country + rounded coords
-      })));
-    }
+          // Sanitize + add safe geo (keeps submitted_at for your activity timeline)
+          proofs = await Promise.all(proofRows.map(async pr => ({
+            proof_id: pr.proof_id,
+            bid_id: pr.bid_id,
+            milestone_index: pr.milestone_index,
+            title: pr.title,
+            description: pr.description,
+            status: pr.status,
+            files: Array.isArray(pr.files)
+              ? pr.files
+              : (typeof pr.files === 'string' ? JSON.parse(pr.files || '[]') : []),
+            submitted_at: pr.submitted_at,
+            updated_at: pr.updated_at,
+            taken_at: pr.capture_time || null,          // EXIF-derived time you store
+            location: await buildSafeGeoForProof(pr)    // city/state/country + rounded coords
+          })));
+        }
 
-    // Build milestone list: combine bid.milestones JSON + proof status + payments (paymentTxHash)
-    const approvedProof = new Set(
-      proofs.filter(p => String(p.status).toLowerCase() === 'approved')
-        .map(p => `${p.bid_id}:${p.milestone_index}`)
-    );
+        // Build milestone list: combine bid.milestones JSON + proof status + payments (paymentTxHash)
+        const approvedProof = new Set(
+          proofs.filter(p => String(p.status).toLowerCase() === 'approved')
+            .map(p => `${p.bid_id}:${p.milestone_index}`)
+        );
 
-    const msItems = [];
-    const paymentsActivity = [];
-    for (const b of bidsOut) {
-      const arr = Array.isArray(b.milestones) ? b.milestones
-        : typeof b.milestones === 'string' ? JSON.parse(b.milestones || '[]')
-          : [];
-      arr.forEach((m, idx) => {
-        const key = `${b.bid_id}:${idx}`;
-        const paid = !!(m && m.paymentTxHash);
-        const completed = paid || approvedProof.has(key) || !!m?.completed;
-        if (paid && m.paymentDate) {
-          paymentsActivity.push({
-            type: 'milestone_paid',
-            at: m.paymentDate,
-            bid_id: b.bid_id,
-            milestone_index: idx,
-            amount_usd: m.amount ?? null,
-            tx_hash: m.paymentTxHash
+        const msItems = [];
+        const paymentsActivity = [];
+        for (const b of bidsOut) {
+          const arr = Array.isArray(b.milestones) ? b.milestones
+            : typeof b.milestones === 'string' ? JSON.parse(b.milestones || '[]')
+              : [];
+          arr.forEach((m, idx) => {
+            const key = `${b.bid_id}:${idx}`;
+            const paid = !!(m && m.paymentTxHash);
+            const completed = paid || approvedProof.has(key) || !!m?.completed;
+            if (paid && m.paymentDate) {
+              paymentsActivity.push({
+                type: 'milestone_paid',
+                at: m.paymentDate,
+                bid_id: b.bid_id,
+                milestone_index: idx,
+                amount_usd: m.amount ?? null,
+                tx_hash: m.paymentTxHash
+              });
+            }
+            msItems.push({
+              bid_id: b.bid_id,
+              index: idx,
+              title: m?.name || `Milestone ${idx + 1}`,
+              amount_usd: m?.amount ?? null,
+              status: paid ? 'paid' : (completed ? 'completed' : 'pending'),
+              submitted_proof_id: null, // linked below if we want
+              completed_at: m?.completionDate || null,
+              paid_at: paid ? (m?.paymentDate || null) : null,
+              tx_hash: paid ? (m?.paymentTxHash || null) : null
+            });
           });
         }
-        msItems.push({
-          bid_id: b.bid_id,
-          index: idx,
-          title: m?.name || `Milestone ${idx + 1}`,
-          amount_usd: m?.amount ?? null,
-          status: paid ? 'paid' : (completed ? 'completed' : 'pending'),
-          submitted_proof_id: null, // linked below if we want
-          completed_at: m?.completionDate || null,
-          paid_at: paid ? (m?.paymentDate || null) : null,
-          tx_hash: paid ? (m?.paymentTxHash || null) : null
+
+        const milestones = {
+          total: msItems.length,
+          completed: msItems.filter(x => x.status === 'completed' || x.status === 'paid').length,
+          paid: msItems.filter(x => x.status === 'paid').length,
+          items: msItems
+        };
+
+        // Activity (synthesized: created, bids, proofs, payments)
+        const activity = [
+          { type: 'proposal_created', at: prj.created_at, actor_role: 'owner' },
+          // You don't persist approved_at; status flip happens but no timestamp. We skip it here.  // :contentReference[oaicite:7]{index=7}
+          ...bidsOut.map(b => ({ type: 'bid_submitted', at: b.created_at, bid_id: b.bid_id, actor_role: 'vendor', vendor_name: b.vendor_name })),
+          ...proofs.map(p => ({ type: 'proof_submitted', at: p.submitted_at, proof_id: p.proof_id, bid_id: p.bid_id, milestone_index: p.milestone_index })),
+          ...paymentsActivity
+        ].filter(Boolean).sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+
+        return res.json({
+          proposal: {
+            id: prj.proposal_id,
+            title: prj.title,
+            status: prj.status,
+            owner_wallet: prj.owner_wallet,
+            owner_email: prj.owner_email,
+            created_at: prj.created_at,
+            updated_at: prj.updated_at
+          },
+          bids: {
+            total: bidsOut.length,
+            approved: bidsOut.filter(b => String(b.status).toLowerCase() === 'approved').length,
+            items: bidsOut
+          },
+          milestones,
+          proofs,
+          activity
         });
-      });
-    }
-
-    const milestones = {
-      total: msItems.length,
-      completed: msItems.filter(x => x.status === 'completed' || x.status === 'paid').length,
-      paid: msItems.filter(x => x.status === 'paid').length,
-      items: msItems
-    };
-
-    // Activity (synthesized: created, bids, proofs, payments)
-    const activity = [
-      { type: 'proposal_created', at: prj.created_at, actor_role: 'owner' },
-      // You don't persist approved_at; status flip happens but no timestamp. We skip it here.  // :contentReference[oaicite:7]{index=7}
-      ...bidsOut.map(b => ({ type: 'bid_submitted', at: b.created_at, bid_id: b.bid_id, actor_role: 'vendor', vendor_name: b.vendor_name })),
-      ...proofs.map(p => ({ type: 'proof_submitted', at: p.submitted_at, proof_id: p.proof_id, bid_id: p.bid_id, milestone_index: p.milestone_index })),
-      ...paymentsActivity
-    ].filter(Boolean).sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
-
-    return res.json({
-      proposal: {
-        id: prj.proposal_id,
-        title: prj.title,
-        status: prj.status,
-        owner_wallet: prj.owner_wallet,
-        owner_email: prj.owner_email,
-        created_at: prj.created_at,
-        updated_at: prj.updated_at
-      },
-      bids: {
-        total: bidsOut.length,
-        approved: bidsOut.filter(b => String(b.status).toLowerCase() === 'approved').length,
-        items: bidsOut
-      },
-      milestones,
-      proofs,
-      activity
-    });
-  } catch (err) {
-    console.error("GET /projects/:id/overview error", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// ==================================================================
-// ROBUST TOKEN ROUTE: Implements "Cache" + "Emergency Fallback"
-// This guarantees the frontend ALWAYS gets a token, even if Pinata is down/blocking.
-// ==================================================================
-// ==================================================================
-// ROBUST TOKEN ROUTE: Implements "Cache" + "Emergency Fallback"
-// This guarantees the frontend ALWAYS gets a token, even if Pinata is down/blocking.
-// ==================================================================
-const _cachedPinataTokens = {}; // tenantId -> { data, expiresAt }
-
-app.get("/auth/pinata-token", requireAuth, async (req, res) => {
-  try {
-    const tenantId = req.tenantId || 'global';
-
-    // 1. SERVE CACHE: If we have a valid key in memory, use it.
-    const cached = _cachedPinataTokens[tenantId];
-    if (cached && cached.expiresAt > Date.now()) {
-      return res.json(cached.data);
-    }
-
-    console.log(`Attempting to generate new Pinata Token for tenant ${tenantId}...`);
-
-    // Fetch tenant config
-    const tenantJwt = await tenantService.getTenantConfig(req.tenantId, 'pinata_jwt');
-    const jwtToUse = tenantJwt;
-
-    if (!jwtToUse) {
-      return res.status(500).json({ error: "Pinata not configured" });
-    }
-
-    const uuid = crypto.randomUUID();
-    const body = {
-      keyName: `upload_key_${uuid}`,
-      permissions: { admin: true }, // Force admin to avoid syntax errors
-      maxUses: 10000
-    };
-
-    const response = await fetch("https://api.pinata.cloud/users/generateApiKey", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${jwtToUse}`
-      },
-      body: JSON.stringify(body)
-    });
-
-    // 2. SUCCESS: If Pinata gives us a key, cache it and return it.
-    if (response.ok) {
-      const keyData = await response.json();
-
-      _cachedPinataTokens[tenantId] = {
-        data: keyData,
-        expiresAt: Date.now() + (24 * 60 * 60 * 1000) // 24 hours
-      };
-
-      return res.json(keyData);
-    }
-
-    // 3. EMERGENCY FALLBACK: If Pinata says "Rate Limited" (429) or fails
-    // We manually construct a token object using your SERVER'S existing JWT.
-    // This bypasses the "Generate" endpoint completely.
-    console.warn("⚠️ Pinata KeyGen Failed (Rate Limit). Using Emergency Fallback.");
-
-    const fallbackData = {
-      JWT: jwtToUse,               // Use the configured key so upload succeeds
-      pinata_api_key: "",          // Not needed for JWT auth
-      pinata_api_secret: ""        // Not needed for JWT auth
-    };
-
-    // Cache this fallback too, so we don't keep hitting the API error
-    _cachedPinataTokens[tenantId] = {
-      data: fallbackData,
-      expiresAt: Date.now() + (1 * 60 * 60 * 1000) // Cache fallback for 1 hour
-    };
-
-    return res.json(fallbackData);
-
-  } catch (err) {
-    console.error("Pinata Token Route Fatal Error:", err);
-    // Even on fatal crash, try to send the main JWT
-    // Fetch config again just in case (or use global fallback)
-    const tenantJwt = await tenantService.getTenantConfig(req.tenantId, 'pinata_jwt').catch(() => null);
-    res.json({ JWT: tenantJwt });
-  }
-});
-
-// ==============================
-// Routes — Payments (legacy)
-// ==============================
-app.post("/payments/release", adminGuard, async (req, res) => {
-  try {
-    const { bidId, milestoneIndex } = req.body;
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1 AND tenant_id=$2", [bidId, req.tenantId]);
-    if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
-
-    const bid = rows[0];
-    const milestones = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
-    if (!milestones[milestoneIndex]) return res.status(400).json({ error: "Invalid milestone" });
-
-    const ms = milestones[milestoneIndex];
-    if (!ms.completed) return res.status(400).json({ error: "Milestone not completed" });
-
-    const receipt = await blockchainService.sendToken(
-      bid.preferred_stablecoin,
-      bid.wallet_address,
-      ms.amount,
-      req.tenantId
-    );
-    res.json({ success: true, receipt });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Normalize client-provided milestones into the DB shape
-function normalizeMilestone(x) {
-  return {
-    name: String(x?.name || 'Milestone'),
-    amount: Number(x?.amount) || 0,
-    dueDate: new Date(x?.dueDate || Date.now()).toISOString(),
-    acceptance: Array.isArray(x?.acceptance) ? x.acceptance : [],
-    archived: !!x?.archived,
-  };
-}
-
-// ==============================
-// Routes — IPFS via Pinata
-// ==============================
-// -------------------------------------------------------
-// 1. GLOBAL QUEUE: Prevents parallel requests from crashing the server
-// -------------------------------------------------------
-let globalPinataQueue = Promise.resolve();
-
-app.post("/ipfs/upload-file", authGuard, async (req, res) => {
-  try {
-    if (!req.files || !req.files.file) return res.status(400).json({ error: "No file uploaded" });
-
-    const fileInput = req.files.file;
-    const files = Array.isArray(fileInput) ? fileInput : [fileInput];
-    const results = [];
-
-    // 2. QUEUEING LOGIC: Wait for previous uploads to finish before starting this batch
-    // This effectively locks the upload process to one-at-a-time across the whole server.
-    // 2. QUEUEING LOGIC: Wait for previous uploads to finish before starting this batch
-    const task = async () => {
-      for (const f of files) {
-        try {
-          // Upload
-          const result = await pinataUploadFile(f, req.tenantId);
-          results.push(result);
-
-          // 3. SAFETY DELAY: 1000ms is safer than 300ms for free/tier-1 plans
-          console.log(`[Pinata] Uploaded ${f.name}. Waiting...`);
-          await new Promise(r => setTimeout(r, 1500));
-        } catch (innerErr) {
-          console.error(`[Pinata] Failed to upload ${f.name}`, innerErr);
-          throw innerErr; // Stop this batch if a file fails
-        }
+      } catch (err) {
+        console.error("GET /projects/:id/overview error", err);
+        res.status(500).json({ error: "Server error" });
       }
-    };
+    });
 
-    // Chain to global queue, ensuring we catch errors to keep the queue alive
-    const nextPromise = globalPinataQueue.catch(() => { }).then(task);
+    // ==================================================================
+    // ROBUST TOKEN ROUTE: Implements "Cache" + "Emergency Fallback"
+    // This guarantees the frontend ALWAYS gets a token, even if Pinata is down/blocking.
+    // ==================================================================
+    // ==================================================================
+    // ROBUST TOKEN ROUTE: Implements "Cache" + "Emergency Fallback"
+    // This guarantees the frontend ALWAYS gets a token, even if Pinata is down/blocking.
+    // ==================================================================
+    const _cachedPinataTokens = {}; // tenantId -> { data, expiresAt }
 
-    // Update global queue immediately
-    globalPinataQueue = nextPromise;
+    app.get("/auth/pinata-token", requireAuth, async (req, res) => {
+      try {
+        const tenantId = req.tenantId || 'global';
 
-    // Wait for OUR result (and let it throw if it fails)
-    await nextPromise;
+        // 1. SERVE CACHE: If we have a valid key in memory, use it.
+        const cached = _cachedPinataTokens[tenantId];
+        if (cached && cached.expiresAt > Date.now()) {
+          return res.json(cached.data);
+        }
 
-    res.json(files.length === 1 ? results[0] : results);
-  } catch (err) {
-    console.error("Upload error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
+        console.log(`Attempting to generate new Pinata Token for tenant ${tenantId}...`);
 
-// ✅ QUEUE-PROTECTED JSON ROUTE
-// This prevents the "Proposal JSON" step from crashing due to rate limits
-app.post("/ipfs/upload-json", authGuard, async (req, res) => {
-  try {
-    // Add to the SAME global queue as the files
-    const task = async () => {
-      // 1. Attempt the upload
-      const result = await pinataUploadJson(req.body || {}, req.tenantId);
+        // Fetch tenant config
+        const tenantJwt = await tenantService.getTenantConfig(req.tenantId, 'pinata_jwt');
+        const jwtToUse = tenantJwt;
 
-      // 2. Safety delay: Cool down the API key after this upload
-      console.log(`[Pinata] Uploaded JSON Metadata. Waiting...`);
-      await new Promise(r => setTimeout(r, 2000));
+        if (!jwtToUse) {
+          return res.status(500).json({ error: "Pinata not configured" });
+        }
 
-      return result;
-    };
+        const uuid = crypto.randomUUID();
+        const body = {
+          keyName: `upload_key_${uuid}`,
+          permissions: { admin: true }, // Force admin to avoid syntax errors
+          maxUses: 10000
+        };
 
-    // Chain to global queue, ensuring we catch errors to keep the queue alive
-    const nextPromise = globalPinataQueue.catch(() => { }).then(task);
+        const response = await fetch("https://api.pinata.cloud/users/generateApiKey", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${jwtToUse}`
+          },
+          body: JSON.stringify(body)
+        });
 
-    // Update global queue immediately
-    globalPinataQueue = nextPromise;
+        // 2. SUCCESS: If Pinata gives us a key, cache it and return it.
+        if (response.ok) {
+          const keyData = await response.json();
 
-    // Wait for OUR result
-    const result = await nextPromise;
+          _cachedPinataTokens[tenantId] = {
+            data: keyData,
+            expiresAt: Date.now() + (24 * 60 * 60 * 1000) // 24 hours
+          };
 
-    // 3. Send response
-    res.json(result);
+          return res.json(keyData);
+        }
 
-  } catch (err) {
-    console.error("JSON Upload error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
+        // 3. EMERGENCY FALLBACK: If Pinata says "Rate Limited" (429) or fails
+        // We manually construct a token object using your SERVER'S existing JWT.
+        // This bypasses the "Generate" endpoint completely.
+        console.warn("⚠️ Pinata KeyGen Failed (Rate Limit). Using Emergency Fallback.");
 
-// POST /templates  (admin upsert)
-// Body: { slug, title, locale?, category?, summary?, default_currency?, milestones:[{idx,name,amount,days_offset,acceptance[]}] }
-app.post('/templates', adminGuard, async (req, res) => {
-  const c = req.body || {};
-  if (!c.slug || !c.title) return res.status(400).json({ error: 'slug_and_title_required' });
+        const fallbackData = {
+          JWT: jwtToUse,               // Use the configured key so upload succeeds
+          pinata_api_key: "",          // Not needed for JWT auth
+          pinata_api_secret: ""        // Not needed for JWT auth
+        };
 
-  try {
-    await pool.query('BEGIN');
+        // Cache this fallback too, so we don't keep hitting the API error
+        _cachedPinataTokens[tenantId] = {
+          data: fallbackData,
+          expiresAt: Date.now() + (1 * 60 * 60 * 1000) // Cache fallback for 1 hour
+        };
 
-    const { rows: t } = await pool.query(
-      `INSERT INTO templates (slug, title, locale, category, summary, default_currency, updated_at)
+        return res.json(fallbackData);
+
+      } catch (err) {
+        console.error("Pinata Token Route Fatal Error:", err);
+        // Even on fatal crash, try to send the main JWT
+        // Fetch config again just in case (or use global fallback)
+        const tenantJwt = await tenantService.getTenantConfig(req.tenantId, 'pinata_jwt').catch(() => null);
+        res.json({ JWT: tenantJwt });
+      }
+    });
+
+    // ==============================
+    // Routes — Payments (legacy)
+    // ==============================
+    app.post("/payments/release", adminGuard, async (req, res) => {
+      try {
+        const { bidId, milestoneIndex } = req.body;
+        const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1 AND tenant_id=$2", [bidId, req.tenantId]);
+        if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
+
+        const bid = rows[0];
+        const milestones = Array.isArray(bid.milestones) ? bid.milestones : JSON.parse(bid.milestones || "[]");
+        if (!milestones[milestoneIndex]) return res.status(400).json({ error: "Invalid milestone" });
+
+        const ms = milestones[milestoneIndex];
+        if (!ms.completed) return res.status(400).json({ error: "Milestone not completed" });
+
+        const receipt = await blockchainService.sendToken(
+          bid.preferred_stablecoin,
+          bid.wallet_address,
+          ms.amount,
+          req.tenantId
+        );
+        res.json({ success: true, receipt });
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // Normalize client-provided milestones into the DB shape
+    function normalizeMilestone(x) {
+      return {
+        name: String(x?.name || 'Milestone'),
+        amount: Number(x?.amount) || 0,
+        dueDate: new Date(x?.dueDate || Date.now()).toISOString(),
+        acceptance: Array.isArray(x?.acceptance) ? x.acceptance : [],
+        archived: !!x?.archived,
+      };
+    }
+
+    // ==============================
+    // Routes — IPFS via Pinata
+    // ==============================
+    // -------------------------------------------------------
+    // 1. GLOBAL QUEUE: Prevents parallel requests from crashing the server
+    // -------------------------------------------------------
+    let globalPinataQueue = Promise.resolve();
+
+    app.post("/ipfs/upload-file", authGuard, async (req, res) => {
+      try {
+        if (!req.files || !req.files.file) return res.status(400).json({ error: "No file uploaded" });
+
+        const fileInput = req.files.file;
+        const files = Array.isArray(fileInput) ? fileInput : [fileInput];
+        const results = [];
+
+        // 2. QUEUEING LOGIC: Wait for previous uploads to finish before starting this batch
+        // This effectively locks the upload process to one-at-a-time across the whole server.
+        // 2. QUEUEING LOGIC: Wait for previous uploads to finish before starting this batch
+        const task = async () => {
+          for (const f of files) {
+            try {
+              // Upload
+              const result = await pinataUploadFile(f, req.tenantId);
+              results.push(result);
+
+              // 3. SAFETY DELAY: 1000ms is safer than 300ms for free/tier-1 plans
+              console.log(`[Pinata] Uploaded ${f.name}. Waiting...`);
+              await new Promise(r => setTimeout(r, 1500));
+            } catch (innerErr) {
+              console.error(`[Pinata] Failed to upload ${f.name}`, innerErr);
+              throw innerErr; // Stop this batch if a file fails
+            }
+          }
+        };
+
+        // Chain to global queue, ensuring we catch errors to keep the queue alive
+        const nextPromise = globalPinataQueue.catch(() => { }).then(task);
+
+        // Update global queue immediately
+        globalPinataQueue = nextPromise;
+
+        // Wait for OUR result (and let it throw if it fails)
+        await nextPromise;
+
+        res.json(files.length === 1 ? results[0] : results);
+      } catch (err) {
+        console.error("Upload error:", err);
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // ✅ QUEUE-PROTECTED JSON ROUTE
+    // This prevents the "Proposal JSON" step from crashing due to rate limits
+    app.post("/ipfs/upload-json", authGuard, async (req, res) => {
+      try {
+        // Add to the SAME global queue as the files
+        const task = async () => {
+          // 1. Attempt the upload
+          const result = await pinataUploadJson(req.body || {}, req.tenantId);
+
+          // 2. Safety delay: Cool down the API key after this upload
+          console.log(`[Pinata] Uploaded JSON Metadata. Waiting...`);
+          await new Promise(r => setTimeout(r, 2000));
+
+          return result;
+        };
+
+        // Chain to global queue, ensuring we catch errors to keep the queue alive
+        const nextPromise = globalPinataQueue.catch(() => { }).then(task);
+
+        // Update global queue immediately
+        globalPinataQueue = nextPromise;
+
+        // Wait for OUR result
+        const result = await nextPromise;
+
+        // 3. Send response
+        res.json(result);
+
+      } catch (err) {
+        console.error("JSON Upload error:", err);
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // POST /templates  (admin upsert)
+    // Body: { slug, title, locale?, category?, summary?, default_currency?, milestones:[{idx,name,amount,days_offset,acceptance[]}] }
+    app.post('/templates', adminGuard, async (req, res) => {
+      const c = req.body || {};
+      if (!c.slug || !c.title) return res.status(400).json({ error: 'slug_and_title_required' });
+
+      try {
+        await pool.query('BEGIN');
+
+        const { rows: t } = await pool.query(
+          `INSERT INTO templates (slug, title, locale, category, summary, default_currency, updated_at)
        VALUES ($1,$2,$3,$4,$5,$6, now())
        ON CONFLICT (slug) DO UPDATE SET
          title=EXCLUDED.title, locale=EXCLUDED.locale, category=EXCLUDED.category,
          summary=EXCLUDED.summary, default_currency=EXCLUDED.default_currency, updated_at=now()
        RETURNING template_id`,
-      [c.slug, c.title, c.locale || 'en', c.category || null, c.summary || null, c.default_currency || 'USD']
-    );
+          [c.slug, c.title, c.locale || 'en', c.category || null, c.summary || null, c.default_currency || 'USD']
+        );
 
-    const tid = t[0].template_id;
-    await pool.query(`DELETE FROM template_milestones WHERE template_id=$1`, [tid]);
+        const tid = t[0].template_id;
+        await pool.query(`DELETE FROM template_milestones WHERE template_id=$1`, [tid]);
 
-    const ms = Array.isArray(c.milestones) ? c.milestones : [];
-    for (const m of ms) {
-      await pool.query(
-        `INSERT INTO template_milestones (template_id, idx, name, amount, days_offset, acceptance)
+        const ms = Array.isArray(c.milestones) ? c.milestones : [];
+        for (const m of ms) {
+          await pool.query(
+            `INSERT INTO template_milestones (template_id, idx, name, amount, days_offset, acceptance)
          VALUES ($1,$2,$3,$4,$5,$6)`,
-        [tid, m.idx, m.name, Number(m.amount) || 0, Number(m.days_offset) || 0, JSON.stringify(m.acceptance || [])]
-      );
-    }
+            [tid, m.idx, m.name, Number(m.amount) || 0, Number(m.days_offset) || 0, JSON.stringify(m.acceptance || [])]
+          );
+        }
 
-    await pool.query('COMMIT');
-    res.json({ ok: true, templateId: tid });
-  } catch (e) {
-    await pool.query('ROLLBACK');
-    res.status(500).json({ error: 'create_or_update_template_failed' });
-  }
-});
+        await pool.query('COMMIT');
+        res.json({ ok: true, templateId: tid });
+      } catch (e) {
+        await pool.query('ROLLBACK');
+        res.status(500).json({ error: 'create_or_update_template_failed' });
+      }
+    });
 
-// POST /bids/from-template  (vendor/admin)
-// Body: { slug? | templateId?, proposalId, vendorName, walletAddress, preferredStablecoin?, files?: string[], milestones?: [...] }
-// Notes: If milestones are provided, they override the template; otherwise build from template days_offset.
-app.post('/bids/from-template', requireApprovedVendorOrAdmin, async (req, res) => {
-  try {
-    const b = req.body || {};
-    const selector = b.templateId ?? b.slug;
-    if (!selector) return res.status(400).json({ error: 'template_required' });
-    if (!b.proposalId) return res.status(400).json({ error: 'proposalId_required' });
-    if (!b.vendorName) return res.status(400).json({ error: 'vendorName_required' });
-    if (!/^0x[a-fA-F0-9]{40}$/.test(String(b.walletAddress || '')))
-      return res.status(400).json({ error: 'wallet_invalid' });
+    // POST /bids/from-template  (vendor/admin)
+    // Body: { slug? | templateId?, proposalId, vendorName, walletAddress, preferredStablecoin?, files?: string[], milestones?: [...] }
+    // Notes: If milestones are provided, they override the template; otherwise build from template days_offset.
+    app.post('/bids/from-template', requireApprovedVendorOrAdmin, async (req, res) => {
+      try {
+        const b = req.body || {};
+        const selector = b.templateId ?? b.slug;
+        if (!selector) return res.status(400).json({ error: 'template_required' });
+        if (!b.proposalId) return res.status(400).json({ error: 'proposalId_required' });
+        if (!b.vendorName) return res.status(400).json({ error: 'vendorName_required' });
+        if (!/^0x[a-fA-F0-9]{40}$/.test(String(b.walletAddress || '')))
+          return res.status(400).json({ error: 'wallet_invalid' });
 
-    const isId = /^\d+$/.test(String(selector));
-    const { rows: t } = await pool.query(
-      `SELECT template_id, title FROM templates WHERE ${isId ? 'template_id' : 'slug'}=$1 LIMIT 1`,
-      [isId ? Number(selector) : String(selector)]
-    );
-    if (!t[0]) return res.status(404).json({ error: 'template_not_found' });
+        const isId = /^\d+$/.test(String(selector));
+        const { rows: t } = await pool.query(
+          `SELECT template_id, title FROM templates WHERE ${isId ? 'template_id' : 'slug'}=$1 LIMIT 1`,
+          [isId ? Number(selector) : String(selector)]
+        );
+        if (!t[0]) return res.status(404).json({ error: 'template_not_found' });
 
-    const tid = t[0].template_id;
-    const { rows: msRows } = await pool.query(
-      `SELECT idx, name, amount, days_offset, acceptance
+        const tid = t[0].template_id;
+        const { rows: msRows } = await pool.query(
+          `SELECT idx, name, amount, days_offset, acceptance
          FROM template_milestones
         WHERE template_id=$1
         ORDER BY idx ASC`,
-      [tid]
-    );
+          [tid]
+        );
 
-    const now = Date.now();
+        const now = Date.now();
 
-    // Prefer client-provided milestones; fallback to template-based
-    const ms = Array.isArray(b.milestones) && b.milestones.length
-      ? b.milestones.map(x => normalizeMilestone(x))
-      : msRows.map(r => ({
-        name: r.name,
-        amount: Number(r.amount) || 0,
-        dueDate: new Date(now + (Number(r.days_offset) || 0) * 86400 * 1000).toISOString(),
-        acceptance: r.acceptance || [],
-        archived: false,
-      }));
+        // Prefer client-provided milestones; fallback to template-based
+        const ms = Array.isArray(b.milestones) && b.milestones.length
+          ? b.milestones.map(x => normalizeMilestone(x))
+          : msRows.map(r => ({
+            name: r.name,
+            amount: Number(r.amount) || 0,
+            dueDate: new Date(now + (Number(r.days_offset) || 0) * 86400 * 1000).toISOString(),
+            acceptance: r.acceptance || [],
+            archived: false,
+          }));
 
-    // Totals/duration
-    const priceUSD = ms.reduce((a, m) => a + (Number(m.amount) || 0), 0);
-    const days = Math.max(
-      0,
-      ...ms.map(m => {
-        const ts = Date.parse(m.dueDate);
-        return Number.isFinite(ts) ? Math.ceil((ts - now) / (86400 * 1000)) : 0;
-      })
-    );
+        // Totals/duration
+        const priceUSD = ms.reduce((a, m) => a + (Number(m.amount) || 0), 0);
+        const days = Math.max(
+          0,
+          ...ms.map(m => {
+            const ts = Date.parse(m.dueDate);
+            return Number.isFinite(ts) ? Math.ceil((ts - now) / (86400 * 1000)) : 0;
+          })
+        );
 
-    const notes = b.notes || `Created from template "${t[0].title}"`;
-    const preferred = String(b.preferredStablecoin || 'USDT').toUpperCase() === 'USDC' ? 'USDC' : 'USDT';
-    const files = Array.isArray(b.files)
-      ? b.files
-        .map(x =>
-          typeof x === 'string'
-            ? { url: x }
-            : {
-              url: String(x?.url || ''),
-              name: x?.name || (String(x?.url || '').split('/').pop() || 'file'),
-              cid: x?.cid ?? null,
-              mimetype: x?.mimetype || x?.contentType || null,
-            }
-        )
-        .filter(f => f.url)
-      : [];
+        const notes = b.notes || `Created from template "${t[0].title}"`;
+        const preferred = String(b.preferredStablecoin || 'USDT').toUpperCase() === 'USDC' ? 'USDC' : 'USDT';
+        const files = Array.isArray(b.files)
+          ? b.files
+            .map(x =>
+              typeof x === 'string'
+                ? { url: x }
+                : {
+                  url: String(x?.url || ''),
+                  name: x?.name || (String(x?.url || '').split('/').pop() || 'file'),
+                  cid: x?.cid ?? null,
+                  mimetype: x?.mimetype || x?.contentType || null,
+                }
+            )
+            .filter(f => f.url)
+          : [];
 
-    const doc = files.length > 0 ? files[0] : null;
+        const doc = files.length > 0 ? files[0] : null;
 
-    // --- insert same shape as /bids route ---
-    const insertQ = `
+        // --- insert same shape as /bids route ---
+        const insertQ = `
       INSERT INTO bids (
         proposal_id,
         vendor_name,
@@ -12771,465 +12793,465 @@ app.post('/bids/from-template', requireApprovedVendorOrAdmin, async (req, res) =
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending', NOW(), $11)
       RETURNING *`;
 
-    const insertVals = [
-      Number(b.proposalId),
-      String(b.vendorName),
-      priceUSD,
-      days,
-      notes,
-      String(b.walletAddress),
-      preferred,
-      JSON.stringify(ms),
-      JSON.stringify(doc),
-      JSON.stringify(files),
-      req.tenantId
-    ];
+        const insertVals = [
+          Number(b.proposalId),
+          String(b.vendorName),
+          priceUSD,
+          days,
+          notes,
+          String(b.walletAddress),
+          preferred,
+          JSON.stringify(ms),
+          JSON.stringify(doc),
+          JSON.stringify(files),
+          req.tenantId
+        ];
 
-    const { rows } = await pool.query(insertQ, insertVals);
-    const inserted = rows[0];
+        const { rows } = await pool.query(insertQ, insertVals);
+        const inserted = rows[0];
 
-    try {
-      const actorWallet = (req.user && (req.user.address || req.user.sub)) || null;
-      const actorRole = (req.user && req.user.role) || "vendor";
+        try {
+          const actorWallet = (req.user && (req.user.address || req.user.sub)) || null;
+          const actorRole = (req.user && req.user.role) || "vendor";
 
-      const ins = await pool.query(
-        `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
+          const ins = await pool.query(
+            `INSERT INTO bid_audits (bid_id, actor_wallet, actor_role, changes)
      VALUES ($1,$2,$3,$4)
      RETURNING audit_id`,
-        [Number(inserted.bid_id), actorWallet, actorRole, { created: true, source: 'template' }]
-      );
-      if (typeof enrichAuditRow === "function") {
-        enrichAuditRow(pool, ins.rows[0].audit_id, pinataUploadFile).catch(() => null);
+            [Number(inserted.bid_id), actorWallet, actorRole, { created: true, source: 'template' }]
+          );
+          if (typeof enrichAuditRow === "function") {
+            enrichAuditRow(pool, ins.rows[0].audit_id, pinataUploadFile).catch(() => null);
+          }
+        } catch (e) {
+          console.error("Template bid audit failed:", e);
+        }
+
+        // Inline Agent2 analysis (same behavior as /bids)
+        const { rows: pr } = await pool.query(`SELECT * FROM proposals WHERE proposal_id=$1`, [inserted.proposal_id]);
+        const prop = pr[0] || null;
+
+        const INLINE_ANALYSIS_DEADLINE_MS = Number(process.env.AGENT2_INLINE_TIMEOUT_MS || 12000);
+        const analysis = await withTimeout(
+          prop
+            ? runAgent2OnBid(inserted, prop, { tenantId: req.tenantId })
+            : Promise.resolve({
+              status: 'error',
+              summary: 'Proposal not found for analysis.',
+              risks: [],
+              fit: 'low',
+              milestoneNotes: [],
+              confidence: 0,
+              pdfUsed: false,
+            }),
+          INLINE_ANALYSIS_DEADLINE_MS,
+          {
+            status: 'timeout',
+            summary: 'Analysis timed out.',
+            risks: [],
+            fit: 'low',
+            milestoneNotes: [],
+            confidence: 0,
+            pdfUsed: false,
+          }
+        );
+
+        await pool.query(`UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2`, [
+          JSON.stringify(analysis),
+          inserted.bid_id,
+        ]);
+
+        res.json({ ok: true, bidId: inserted.bid_id });
+      } catch (e) {
+        res.status(500).json({ error: 'failed_create_bid_from_template' });
       }
-    } catch (e) {
-      console.error("Template bid audit failed:", e);
-    }
+    });
 
-    // Inline Agent2 analysis (same behavior as /bids)
-    const { rows: pr } = await pool.query(`SELECT * FROM proposals WHERE proposal_id=$1`, [inserted.proposal_id]);
-    const prop = pr[0] || null;
+    /// ==============================
+    // Sally Uyuni App Routes
+    // ==============================
 
-    const INLINE_ANALYSIS_DEADLINE_MS = Number(process.env.AGENT2_INLINE_TIMEOUT_MS || 12000);
-    const analysis = await withTimeout(
-      prop
-        ? runAgent2OnBid(inserted, prop, { tenantId: req.tenantId })
-        : Promise.resolve({
-          status: 'error',
-          summary: 'Proposal not found for analysis.',
-          risks: [],
-          fit: 'low',
-          milestoneNotes: [],
-          confidence: 0,
-          pdfUsed: false,
-        }),
-      INLINE_ANALYSIS_DEADLINE_MS,
-      {
-        status: 'timeout',
-        summary: 'Analysis timed out.',
-        risks: [],
-        fit: 'low',
-        milestoneNotes: [],
-        confidence: 0,
-        pdfUsed: false,
-      }
-    );
-
-    await pool.query(`UPDATE bids SET ai_analysis=$1 WHERE bid_id=$2`, [
-      JSON.stringify(analysis),
-      inserted.bid_id,
-    ]);
-
-    res.json({ ok: true, bidId: inserted.bid_id });
-  } catch (e) {
-    res.status(500).json({ error: 'failed_create_bid_from_template' });
-  }
-});
-
-/// ==============================
-// Sally Uyuni App Routes
-// ==============================
-
-// --- 0. DB MIGRATION: Ensure reports have status columns ---
-(async () => {
-  try {
-    await pool.query(`
+    // --- 0. DB MIGRATION: Ensure reports have status columns ---
+    (async () => {
+      try {
+        await pool.query(`
       ALTER TABLE school_reports
       ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending',
       ADD COLUMN IF NOT EXISTS tx_hash TEXT;
     `);
-    console.log('[db] Verified status columns on school_reports');
-  } catch (e) {
-    console.error('[db] Failed to migrate school_reports:', e);
-  }
-})();
-
-// --- 1. HELPER: Calculate Distance (Haversine Formula) ---
-function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
-  const R = 6371; // Radius of the earth in km
-  const dLat = deg2rad(lat2 - lat1);
-  const dLon = deg2rad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  const d = R * c; // Distance in km
-  return d;
-}
-
-function deg2rad(deg) {
-  return deg * (Math.PI / 180);
-}
-
-// --- 2. GET ROUTE: Fetch Reports (Missing Piece!) ---
-app.get('/api/reports', async (req, res) => {
-  try {
-    // 1. Check Auth (Admin or explicit role)
-    // Relaxed for this demo, but ideally verify req.user
-
-    // 2. Parse Filters
-    const statusParam = String(req.query.status || 'all').toLowerCase();
-
-    let query = "SELECT * FROM school_reports";
-    const params = [req.tenantId];
-    const conditions = ["tenant_id = $1"];
-
-    // Filter Logic
-    if (statusParam !== 'all') {
-      if (statusParam === 'completed' || statusParam === 'paid') {
-        // Frontend 'completed' maps to DB 'paid'
-        conditions.push("(status = 'paid' OR status = 'completed')");
-      } else {
-        params.push(statusParam);
-        conditions.push(`status = $${params.length}`);
+        console.log('[db] Verified status columns on school_reports');
+      } catch (e) {
+        console.error('[db] Failed to migrate school_reports:', e);
       }
+    })();
+
+    // --- 1. HELPER: Calculate Distance (Haversine Formula) ---
+    function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
+      const R = 6371; // Radius of the earth in km
+      const dLat = deg2rad(lat2 - lat1);
+      const dLon = deg2rad(lon2 - lon1);
+      const a =
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      const d = R * c; // Distance in km
+      return d;
     }
 
-    if (conditions.length > 0) {
-      query += " WHERE " + conditions.join(" AND ");
+    function deg2rad(deg) {
+      return deg * (Math.PI / 180);
     }
 
-    query += " ORDER BY created_at DESC";
-
-    const { rows } = await pool.query(query, params);
-    res.json(rows);
-
-  } catch (err) {
-    console.error("GET /api/reports error:", err);
-    res.status(500).json({ error: "Failed to fetch reports" });
-  }
-});
-
-// --- 3. ROUTE: Submit Report & Pay Reward (SPLIT LOGIC) ---
-app.post('/api/reports', authRequired, async (req, res) => {
-  try {
-    const {
-      id,
-      category, // 'food' or 'infrastructure'
-      schoolName,
-      description,
-      rating,
-      imageCid,
-      imageUrl,
-      aiAnalysis = {},
-      location // Device location
-    } = req.body;
-
-    const wallet = String(req.user?.sub || "").toLowerCase();
-
-    // ============================================================
-    // STEP 1: PREPARE LOCATIONS (Normalize Data)
-    // ============================================================
-
-    // Helper: Normalize Coords
-    const normalizeCoords = (loc) => {
-      if (!loc) return null;
-      let obj = loc;
-      if (typeof loc === 'string') { try { obj = JSON.parse(loc); } catch { return null; } }
-      if (typeof obj !== 'object') return null;
-
-      const lat = obj.lat ?? obj.latitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[1] : null);
-      const lon = obj.lng ?? obj.lon ?? obj.longitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[0] : null);
-
-      if (lat != null && lon != null && !isNaN(Number(lat)) && Number(lat) !== 0) {
-        return { lat: Number(lat), lon: Number(lon) };
-      }
-      return null;
-    };
-
-    // A. Get Device Location
-    let reportLoc = normalizeCoords(location);
-    let imageLoc = null;
-
-    // B. Extract Image EXIF (Security Check)
-    if (imageUrl) {
+    // --- 2. GET ROUTE: Fetch Reports (Missing Piece!) ---
+    app.get('/api/reports', async (req, res) => {
       try {
-        const meta = await extractFileMetaFromUrl({ url: imageUrl });
-        if (meta?.exif?.gpsLatitude) {
-          imageLoc = { lat: meta.exif.gpsLatitude, lon: meta.exif.gpsLongitude };
+        // 1. Check Auth (Admin or explicit role)
+        // Relaxed for this demo, but ideally verify req.user
 
-          // Add to analysis
-          aiAnalysis.geo = {
-            lat: meta.exif.gpsLatitude,
-            lon: meta.exif.gpsLongitude,
-            source: "image_exif"
-          };
+        // 2. Parse Filters
+        const statusParam = String(req.query.status || 'all').toLowerCase();
 
-          // Trust Image GPS over Device GPS if available
-          reportLoc = imageLoc;
+        let query = "SELECT * FROM school_reports";
+        const params = [req.tenantId];
+        const conditions = ["tenant_id = $1"];
+
+        // Filter Logic
+        if (statusParam !== 'all') {
+          if (statusParam === 'completed' || statusParam === 'paid') {
+            // Frontend 'completed' maps to DB 'paid'
+            conditions.push("(status = 'paid' OR status = 'completed')");
+          } else {
+            params.push(statusParam);
+            conditions.push(`status = $${params.length}`);
+          }
         }
-      } catch (exifErr) { console.warn("EXIF skipped:", exifErr.message); }
-    }
 
-    let finalAnalysis = { ...aiAnalysis };
-    let proposalMatch = null;
+        if (conditions.length > 0) {
+          query += " WHERE " + conditions.join(" AND ");
+        }
 
-    // ============================================================
-    // STEP 2: CATEGORY-SPECIFIC VERIFICATION
-    // ============================================================
+        query += " ORDER BY created_at DESC";
 
-    if (category === 'infrastructure') {
-      // --- LOGIC A: INFRASTRUCTURE (No Proposal Check) ---
-      finalAnalysis.vendor = "N/A (Infrastructure)";
+        const { rows } = await pool.query(query, params);
+        res.json(rows);
 
-      // Validation: Must have valid GPS data
-      if (reportLoc) {
-        finalAnalysis.verification = "verified_gps_only";
-        finalAnalysis.location_status = "gps_present";
-        finalAnalysis.highlights = [...(finalAnalysis.highlights || []), "Location Data Present"];
-      } else {
-        finalAnalysis.verification = "missing_gps";
-        finalAnalysis.location_status = "no_gps_data";
+      } catch (err) {
+        console.error("GET /api/reports error:", err);
+        res.status(500).json({ error: "Failed to fetch reports" });
       }
+    });
 
-    } else {
-      // --- LOGIC B: FOOD (Strict Proposal Match) ---
+    // --- 3. ROUTE: Submit Report & Pay Reward (SPLIT LOGIC) ---
+    app.post('/api/reports', authRequired, async (req, res) => {
+      try {
+        const {
+          id,
+          category, // 'food' or 'infrastructure'
+          schoolName,
+          description,
+          rating,
+          imageCid,
+          imageUrl,
+          aiAnalysis = {},
+          location // Device location
+        } = req.body;
 
-      // 1. Fetch Active Food Proposals (Include tenant_id)
-      const { rows: candidates } = await pool.query(`
+        const wallet = String(req.user?.sub || "").toLowerCase();
+
+        // ============================================================
+        // STEP 1: PREPARE LOCATIONS (Normalize Data)
+        // ============================================================
+
+        // Helper: Normalize Coords
+        const normalizeCoords = (loc) => {
+          if (!loc) return null;
+          let obj = loc;
+          if (typeof loc === 'string') { try { obj = JSON.parse(loc); } catch { return null; } }
+          if (typeof obj !== 'object') return null;
+
+          const lat = obj.lat ?? obj.latitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[1] : null);
+          const lon = obj.lng ?? obj.lon ?? obj.longitude ?? (Array.isArray(obj.coordinates) ? obj.coordinates[0] : null);
+
+          if (lat != null && lon != null && !isNaN(Number(lat)) && Number(lat) !== 0) {
+            return { lat: Number(lat), lon: Number(lon) };
+          }
+          return null;
+        };
+
+        // A. Get Device Location
+        let reportLoc = normalizeCoords(location);
+        let imageLoc = null;
+
+        // B. Extract Image EXIF (Security Check)
+        if (imageUrl) {
+          try {
+            const meta = await extractFileMetaFromUrl({ url: imageUrl });
+            if (meta?.exif?.gpsLatitude) {
+              imageLoc = { lat: meta.exif.gpsLatitude, lon: meta.exif.gpsLongitude };
+
+              // Add to analysis
+              aiAnalysis.geo = {
+                lat: meta.exif.gpsLatitude,
+                lon: meta.exif.gpsLongitude,
+                source: "image_exif"
+              };
+
+              // Trust Image GPS over Device GPS if available
+              reportLoc = imageLoc;
+            }
+          } catch (exifErr) { console.warn("EXIF skipped:", exifErr.message); }
+        }
+
+        let finalAnalysis = { ...aiAnalysis };
+        let proposalMatch = null;
+
+        // ============================================================
+        // STEP 2: CATEGORY-SPECIFIC VERIFICATION
+        // ============================================================
+
+        if (category === 'infrastructure') {
+          // --- LOGIC A: INFRASTRUCTURE (No Proposal Check) ---
+          finalAnalysis.vendor = "N/A (Infrastructure)";
+
+          // Validation: Must have valid GPS data
+          if (reportLoc) {
+            finalAnalysis.verification = "verified_gps_only";
+            finalAnalysis.location_status = "gps_present";
+            finalAnalysis.highlights = [...(finalAnalysis.highlights || []), "Location Data Present"];
+          } else {
+            finalAnalysis.verification = "missing_gps";
+            finalAnalysis.location_status = "no_gps_data";
+          }
+
+        } else {
+          // --- LOGIC B: FOOD (Strict Proposal Match) ---
+
+          // 1. Fetch Active Food Proposals (Include tenant_id)
+          const { rows: candidates } = await pool.query(`
           SELECT p.proposal_id, p.org_name, p.title, p.location, p.tenant_id, b.vendor_name
           FROM proposals p
           JOIN bids b ON b.proposal_id = p.proposal_id
           WHERE LOWER(b.status) IN ('approved', 'completed', 'paid', 'funded')
         `);
 
-      // 2. Fuzzy Match School Name
-      const normalizeStr = (str) => (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
-      const targetName = normalizeStr(schoolName);
+          // 2. Fuzzy Match School Name
+          const normalizeStr = (str) => (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+          const targetName = normalizeStr(schoolName);
 
-      proposalMatch = candidates.find(c => {
-        const rawDb = normalizeStr(c.org_name + " " + c.title);
-        return rawDb.includes(targetName) || targetName.includes(rawDb);
-      });
+          proposalMatch = candidates.find(c => {
+            const rawDb = normalizeStr(c.org_name + " " + c.title);
+            return rawDb.includes(targetName) || targetName.includes(rawDb);
+          });
 
-      // 3. Verify Distance
-      const proposalLoc = proposalMatch ? normalizeCoords(proposalMatch.location) : null;
+          // 3. Verify Distance
+          const proposalLoc = proposalMatch ? normalizeCoords(proposalMatch.location) : null;
 
-      if (proposalMatch) {
-        finalAnalysis.vendor = proposalMatch.vendor_name;
-        finalAnalysis.proposal_id = proposalMatch.proposal_id;
-        // Capture tenant ID from the matched proposal
-        req.tenantId = proposalMatch.tenant_id;
+          if (proposalMatch) {
+            finalAnalysis.vendor = proposalMatch.vendor_name;
+            finalAnalysis.proposal_id = proposalMatch.proposal_id;
+            // Capture tenant ID from the matched proposal
+            req.tenantId = proposalMatch.tenant_id;
 
-        if (proposalLoc && reportLoc) {
-          const dist = getDistanceFromLatLonInKm(reportLoc.lat, reportLoc.lon, proposalLoc.lat, proposalLoc.lon);
-          finalAnalysis.distance_km = dist.toFixed(3);
+            if (proposalLoc && reportLoc) {
+              const dist = getDistanceFromLatLonInKm(reportLoc.lat, reportLoc.lon, proposalLoc.lat, proposalLoc.lon);
+              finalAnalysis.distance_km = dist.toFixed(3);
 
-          if (dist <= 0.5) {
-            finalAnalysis.verification = "verified_match"; // Success
-            finalAnalysis.location_status = "match";
+              if (dist <= 0.5) {
+                finalAnalysis.verification = "verified_match"; // Success
+                finalAnalysis.location_status = "match";
+              } else {
+                finalAnalysis.verification = "flagged_distance"; // Fail
+                finalAnalysis.location_status = "mismatch";
+              }
+            } else {
+              finalAnalysis.verification = "unknown_gps";
+            }
           } else {
-            finalAnalysis.verification = "flagged_distance"; // Fail
-            finalAnalysis.location_status = "mismatch";
+            finalAnalysis.vendor = "Unknown Vendor";
+            finalAnalysis.verification = "proposal_not_found";
           }
-        } else {
-          finalAnalysis.verification = "unknown_gps";
         }
-      } else {
-        finalAnalysis.vendor = "Unknown Vendor";
-        finalAnalysis.verification = "proposal_not_found";
-      }
-    }
 
-    // ============================================================
-    // STEP 3: SAVE REPORT
-    // ============================================================
-    // Fallback to default tenant if not matched (e.g. infrastructure or failed match)
-    const targetTenantId = req.tenantId || '00000000-0000-0000-0000-000000000000';
+        // ============================================================
+        // STEP 3: SAVE REPORT
+        // ============================================================
+        // Fallback to default tenant if not matched (e.g. infrastructure or failed match)
+        const targetTenantId = req.tenantId || '00000000-0000-0000-0000-000000000000';
 
-    await pool.query(
-      `INSERT INTO school_reports 
+        await pool.query(
+          `INSERT INTO school_reports 
        (report_id, school_name, description, rating, image_cid, image_url, ai_analysis, location, wallet_address, status, created_at, tenant_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', NOW(), $10)
        ON CONFLICT (report_id) DO NOTHING`,
-      [
-        id, schoolName, description, rating, imageCid || null, imageUrl || null,
-        JSON.stringify(finalAnalysis), JSON.stringify(location || {}), wallet, targetTenantId
-      ]
-    );
+          [
+            id, schoolName, description, rating, imageCid || null, imageUrl || null,
+            JSON.stringify(finalAnalysis), JSON.stringify(location || {}), wallet, targetTenantId
+          ]
+        );
 
-    // ============================================================
-    // STEP 4: PAYMENT GATING
-    // ============================================================
+        // ============================================================
+        // STEP 4: PAYMENT GATING
+        // ============================================================
 
-    let isPayable = false;
-    let rejectReason = "";
+        let isPayable = false;
+        let rejectReason = "";
 
-    // CHECK 1: CATEGORY SPECIFIC CONTENT
-    let contentValid = false;
-    if (category === 'infrastructure') {
-      // Needs Severity > 0
-      if (finalAnalysis.severity > 0) contentValid = true;
-      else rejectReason = "no_damage_detected";
-    } else {
-      // Needs Food Score > 0
-      if (finalAnalysis.score > 0 || finalAnalysis.isFood === true) contentValid = true;
-      else rejectReason = "no_food_detected";
-    }
+        // CHECK 1: CATEGORY SPECIFIC CONTENT
+        let contentValid = false;
+        if (category === 'infrastructure') {
+          // Needs Severity > 0
+          if (finalAnalysis.severity > 0) contentValid = true;
+          else rejectReason = "no_damage_detected";
+        } else {
+          // Needs Food Score > 0
+          if (finalAnalysis.score > 0 || finalAnalysis.isFood === true) contentValid = true;
+          else rejectReason = "no_food_detected";
+        }
 
-    // CHECK 2: LOCATION VERIFICATION
-    let locationValid = false;
-    if (category === 'infrastructure') {
-      // Infra: Just needs valid GPS data (Since no proposal to match)
-      if (finalAnalysis.verification === 'verified_gps_only') locationValid = true;
-      else rejectReason = "missing_gps_data";
-    } else {
-      // Food: Must match DB Proposal
-      if (finalAnalysis.verification === 'verified_match') locationValid = true;
-      else rejectReason = `location_verification_failed (${finalAnalysis.verification})`;
-    }
+        // CHECK 2: LOCATION VERIFICATION
+        let locationValid = false;
+        if (category === 'infrastructure') {
+          // Infra: Just needs valid GPS data (Since no proposal to match)
+          if (finalAnalysis.verification === 'verified_gps_only') locationValid = true;
+          else rejectReason = "missing_gps_data";
+        } else {
+          // Food: Must match DB Proposal
+          if (finalAnalysis.verification === 'verified_match') locationValid = true;
+          else rejectReason = `location_verification_failed (${finalAnalysis.verification})`;
+        }
 
-    // FINAL DECISION
-    if (contentValid && locationValid) {
-      isPayable = true;
-    }
+        // FINAL DECISION
+        if (contentValid && locationValid) {
+          isPayable = true;
+        }
 
-    let txHash = null;
-    let finalStatus = rejectReason || 'pending';
+        let txHash = null;
+        let finalStatus = rejectReason || 'pending';
 
-    if (isPayable) {
-      try {
-        console.log(`[Reward] Sending 0.05 USDT to ${wallet} for ${category} report.`);
-        const receipt = await blockchainService.sendToken("USDT", wallet, 0.05, req.tenantId);
-        txHash = receipt.hash;
-        finalStatus = 'paid';
-      } catch (payErr) {
-        console.error(`[Reward] Payment failed:`, payErr.message);
-        finalStatus = 'payment_failed';
+        if (isPayable) {
+          try {
+            console.log(`[Reward] Sending 0.05 USDT to ${wallet} for ${category} report.`);
+            const receipt = await blockchainService.sendToken("USDT", wallet, 0.05, req.tenantId);
+            txHash = receipt.hash;
+            finalStatus = 'paid';
+          } catch (payErr) {
+            console.error(`[Reward] Payment failed:`, payErr.message);
+            finalStatus = 'payment_failed';
+          }
+        } else {
+          console.log(`[Reward] Skipped. Category: ${category}, Reason: ${rejectReason}`);
+        }
+
+        // Update Status
+        await pool.query(
+          `UPDATE school_reports SET status = $1, tx_hash = $2 WHERE report_id = $3 AND tenant_id = $4`,
+          [finalStatus, txHash, id, req.tenantId]
+        );
+
+        res.json({
+          success: true,
+          rewardTx: txHash,
+          status: finalStatus,
+          identifiedVendor: finalAnalysis.vendor,
+          verification: finalAnalysis.verification
+        });
+
+      } catch (err) {
+        console.error("POST /api/reports error:", err);
+        res.status(500).json({ error: "Failed to submit report" });
       }
-    } else {
-      console.log(`[Reward] Skipped. Category: ${category}, Reason: ${rejectReason}`);
-    }
-
-    // Update Status
-    await pool.query(
-      `UPDATE school_reports SET status = $1, tx_hash = $2 WHERE report_id = $3 AND tenant_id = $4`,
-      [finalStatus, txHash, id, req.tenantId]
-    );
-
-    res.json({
-      success: true,
-      rewardTx: txHash,
-      status: finalStatus,
-      identifiedVendor: finalAnalysis.vendor,
-      verification: finalAnalysis.verification
     });
 
-  } catch (err) {
-    console.error("POST /api/reports error:", err);
-    res.status(500).json({ error: "Failed to submit report" });
-  }
-});
+    // --- 4. DELETE ROUTE: Permanently remove a report ---
+    app.delete('/api/reports/:id', authRequired, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const wallet = String(req.user?.sub || "").toLowerCase();
 
-// --- 4. DELETE ROUTE: Permanently remove a report ---
-app.delete('/api/reports/:id', authRequired, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const wallet = String(req.user?.sub || "").toLowerCase();
+        // Check if Admin
+        const isAdmin = (req.user?.role === 'admin') || isAdminAddress(wallet);
 
-    // Check if Admin
-    const isAdmin = (req.user?.role === 'admin') || isAdminAddress(wallet);
+        let query;
+        let params;
 
-    let query;
-    let params;
+        if (isAdmin) {
+          // Admin can delete ANY report
+          query = 'DELETE FROM school_reports WHERE report_id = $1 AND tenant_id = $2';
+          params = [id, req.tenantId];
+        } else {
+          // Users can only delete THEIR OWN reports
+          query = 'DELETE FROM school_reports WHERE report_id = $1 AND lower(wallet_address) = lower($2) AND tenant_id = $3';
+          params = [id, wallet, req.tenantId];
+        }
 
-    if (isAdmin) {
-      // Admin can delete ANY report
-      query = 'DELETE FROM school_reports WHERE report_id = $1 AND tenant_id = $2';
-      params = [id, req.tenantId];
-    } else {
-      // Users can only delete THEIR OWN reports
-      query = 'DELETE FROM school_reports WHERE report_id = $1 AND lower(wallet_address) = lower($2) AND tenant_id = $3';
-      params = [id, wallet, req.tenantId];
-    }
+        const { rowCount } = await pool.query(query, params);
 
-    const { rowCount } = await pool.query(query, params);
+        if (rowCount === 0) {
+          return res.status(404).json({ error: "Report not found or unauthorized" });
+        }
 
-    if (rowCount === 0) {
-      return res.status(404).json({ error: "Report not found or unauthorized" });
-    }
+        res.json({ success: true, deletedId: id });
 
-    res.json({ success: true, deletedId: id });
+      } catch (err) {
+        console.error("DELETE /api/reports error:", err);
+        res.status(500).json({ error: "Failed to delete report" });
+      }
+    });
 
-  } catch (err) {
-    console.error("DELETE /api/reports error:", err);
-    res.status(500).json({ error: "Failed to delete report" });
-  }
-});
+    // --- 5. ARCHIVE ROUTE: Mark as archived (Soft Delete) ---
+    app.put('/api/reports/:id/archive', authRequired, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const wallet = String(req.user?.sub || "").toLowerCase();
+        const isAdmin = (req.user?.role === 'admin') || isAdminAddress(wallet);
 
-// --- 5. ARCHIVE ROUTE: Mark as archived (Soft Delete) ---
-app.put('/api/reports/:id/archive', authRequired, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const wallet = String(req.user?.sub || "").toLowerCase();
-    const isAdmin = (req.user?.role === 'admin') || isAdminAddress(wallet);
+        let query;
+        let params;
 
-    let query;
-    let params;
+        if (isAdmin) {
+          query = "UPDATE school_reports SET status = 'archived' WHERE report_id = $1 AND tenant_id = $2";
+          params = [id, req.tenantId];
+        } else {
+          query = "UPDATE school_reports SET status = 'archived' WHERE report_id = $1 AND lower(wallet_address) = lower($2) AND tenant_id = $3";
+          params = [id, wallet, req.tenantId];
+        }
 
-    if (isAdmin) {
-      query = "UPDATE school_reports SET status = 'archived' WHERE report_id = $1 AND tenant_id = $2";
-      params = [id, req.tenantId];
-    } else {
-      query = "UPDATE school_reports SET status = 'archived' WHERE report_id = $1 AND lower(wallet_address) = lower($2) AND tenant_id = $3";
-      params = [id, wallet, req.tenantId];
-    }
+        const { rowCount } = await pool.query(query, params);
 
-    const { rowCount } = await pool.query(query, params);
+        if (rowCount === 0) {
+          return res.status(404).json({ error: "Report not found or unauthorized" });
+        }
 
-    if (rowCount === 0) {
-      return res.status(404).json({ error: "Report not found or unauthorized" });
-    }
+        res.json({ success: true, id, status: 'archived' });
 
-    res.json({ success: true, id, status: 'archived' });
+      } catch (err) {
+        console.error("ARCHIVE /api/reports error:", err);
+        res.status(500).json({ error: "Failed to archive report" });
+      }
+    });
 
-  } catch (err) {
-    console.error("ARCHIVE /api/reports error:", err);
-    res.status(500).json({ error: "Failed to archive report" });
-  }
-});
+    // ==============================
+    // Start server
+    // ==============================
+    app.listen(PORT, () => {
+      console.log(`[api] Listening on :${PORT}`);
+      console.log(`[api] Admin enforcement: ${ENFORCE_JWT_ADMIN ? "ON" : "OFF"}`);
+      console.log(`[api] Vendor scoping:    ${SCOPE_BIDS_FOR_VENDOR ? "ON" : "OFF"}`);
+    });
 
-// ==============================
-// Start server
-// ==============================
-app.listen(PORT, () => {
-  console.log(`[api] Listening on :${PORT}`);
-  console.log(`[api] Admin enforcement: ${ENFORCE_JWT_ADMIN ? "ON" : "OFF"}`);
-  console.log(`[api] Vendor scoping:    ${SCOPE_BIDS_FOR_VENDOR ? "ON" : "OFF"}`);
-});
-
-// ==============================
-// Start blockchain event sync (viem)
-// ==============================
-(async () => {
-  try {
-    if (process.env.ENABLE_EVENT_SYNC !== 'false') {
-      const { startEventSync } = await import('./services/eventSync.mjs');
-      await startEventSync();
-      console.log('[eventSync] started');
-    } else {
-      console.log('[eventSync] disabled via ENABLE_EVENT_SYNC=false');
-    }
-  } catch (err) {
-    console.error('[eventSync] failed to start:', err?.message || err);
-  }
-})();
+    // ==============================
+    // Start blockchain event sync (viem)
+    // ==============================
+    (async () => {
+      try {
+        if (process.env.ENABLE_EVENT_SYNC !== 'false') {
+          const { startEventSync } = await import('./services/eventSync.mjs');
+          await startEventSync();
+          console.log('[eventSync] started');
+        } else {
+          console.log('[eventSync] disabled via ENABLE_EVENT_SYNC=false');
+        }
+      } catch (err) {
+        console.error('[eventSync] failed to start:', err?.message || err);
+      }
+    })();
