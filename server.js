@@ -4437,14 +4437,26 @@ app.post("/api/tenants/config", authGuard, adminGuard, async (req, res) => {
 });
 
 // Get Tenant Config (Admin Only)
-app.get("/api/tenants/config/:key", authGuard, adminGuard, async (req, res) => {
+// Get Tenant Config (Admin Only, except Pinata for Vendors)
+app.get("/api/tenants/config/:key", authGuard, async (req, res) => {
   try {
     const { key } = req.params;
+    const role = (req.user?.role || '').toLowerCase();
+    const isAdmin = role === 'admin';
+    const isVendor = role === 'vendor';
 
     // Allowlist of permitted keys
     const ALLOWED_KEYS = ['pinata_jwt', 'pinata_gateway', 'pinata_gateway_token', 'payment_address', 'payment_stablecoin', 'safe_chain_id', 'safe_rpc_url', 'safe_owner_key', 'safe_service_url', 'safe_api_key', 'safe_reconcile_minutes', 'safe_threshold_usd', 'safe_address', 'ETH_PRIVATE_KEY', 'ETH_RPC_URL', 'ANCHOR_RPC_URL', 'ANCHOR_CHAIN_ID', 'ANCHOR_CONTRACT', 'ANCHOR_PRIVATE_KEY'];
     if (!ALLOWED_KEYS.includes(key)) {
       return res.status(400).json({ error: "Invalid config key" });
+    }
+
+    // Access Control:
+    // - Admins can read everything
+    // - Vendors can read Pinata config (needed for file uploads)
+    const isPinata = key.startsWith('pinata_');
+    if (!isAdmin && !(isVendor && isPinata)) {
+      return res.status(403).json({ error: "Forbidden" });
     }
 
     const val = await tenantService.getTenantConfig(req.tenantId, key);
