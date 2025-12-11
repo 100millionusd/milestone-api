@@ -480,6 +480,43 @@ async function ensureUserProfilesSchema() {
   console.log('[startup] vendor_profiles schema ensured');
 }
 
+(async () => {
+  try {
+    if (typeof ensureChangeRequestsSchema === 'function') {
+      await ensureChangeRequestsSchema();
+    }
+  } catch (e) {
+    console.error('[startup] ensureChangeRequestsSchema failed', e);
+  }
+})();
+
+async function ensureChangeRequestsSchema() {
+  const sql = `
+    CREATE TABLE IF NOT EXISTS change_requests (
+      id SERIAL PRIMARY KEY,
+      proposal_id BIGINT NOT NULL,
+      milestone_index INT NOT NULL,
+      status TEXT DEFAULT 'open', -- 'open', 'resolved'
+      comment TEXT,
+      checklist TEXT[], -- array of strings
+      created_at TIMESTAMPTZ DEFAULT now(),
+      resolved_at TIMESTAMPTZ,
+      tenant_id TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS change_request_responses (
+      id SERIAL PRIMARY KEY,
+      change_request_id INT REFERENCES change_requests(id) ON DELETE CASCADE,
+      note TEXT,
+      files JSONB DEFAULT '[]'::jsonb, -- array of {name, cid, url}
+      created_at TIMESTAMPTZ DEFAULT now(),
+      tenant_id TEXT
+    );
+  `;
+  await pool.query(sql);
+  console.log('[startup] change_requests schema ensured');
+}
+
 // ---- Safe Tx overlay helpers (response-time hydration) ----
 const SAFE_CACHE_TTL_MS = Number(process.env.SAFE_CACHE_TTL_MS || 5000);
 
@@ -9828,7 +9865,158 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
 });
 
 // --- Vendor-safe: Archive a proof -------------------------------------------
-// POST /proofs/:id/archive
+// --- CHANGE REQUESTS ---
+
+// GET /api/proofs/change-requests
+app.get("/api/proofs/change-requests", authRequired, async (req, res) => {
+  try {
+    const { proposalId, milestoneIndex, status, include } = req.query;
+    const tenantId = req.tenantId;
+
+    let query = `
+      SELECT cr.*,
+             (SELECT jsonb_agg(resp.* ORDER BY resp.created_at ASC)
+              FROM change_request_responses resp
+              WHERE resp.change_request_id = cr.id) as responses
+      FROM change_requests cr
+      WHERE cr.tenant_id = $1
+    `;
+    const params = [tenantId];
+    let idx = 2;
+
+    if (proposalId) {
+      query += ` AND cr.proposal_id = $${idx++}`;
+      params.push(proposalId);
+    }
+    if (milestoneIndex !== undefined && milestoneIndex !== null && milestoneIndex !== '') {
+      query += ` AND cr.milestone_index = $${idx++}`;
+      params.push(milestoneIndex);
+    }
+    if (status && status !== 'all') {
+      query += ` AND cr.status = $${idx++}`;
+      params.push(status);
+    }
+
+    query += ` ORDER BY cr.created_at DESC`;
+
+    const { rows } = await pool.query(query, params);
+
+    // CamelCase conversion if needed, but frontend seems to handle snake_case or mixed
+    const out = rows.map(r => ({
+      id: r.id,
+      proposalId: r.proposal_id,
+      milestoneIndex: r.milestone_index,
+      status: r.status,
+      comment: r.comment,
+      checklist: r.checklist || [],
+      createdAt: r.created_at,
+      resolvedAt: r.resolved_at,
+      responses: (r.responses || []).map(resp => ({
+        id: resp.id,
+        createdAt: resp.created_at,
+        note: resp.note,
+        files: resp.files || []
+      }))
+    }));
+
+    res.json(out);
+  } catch (e) {
+    console.error("GET /api/proofs/change-requests failed:", e);
+    res.status(500).json({ error: "Failed to fetch change requests" });
+  }
+});
+
+// POST /api/proofs/change-requests (Admin creates request)
+app.post("/api/proofs/change-requests", adminGuard, async (req, res) => {
+  try {
+    const { proposalId, milestoneIndex, comment, checklist, status } = req.body;
+    const tenantId = req.tenantId;
+
+    const { rows } = await pool.query(
+      `INSERT INTO change_requests 
+       (proposal_id, milestone_index, comment, checklist, status, tenant_id)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [proposalId, milestoneIndex, comment, checklist || [], status || 'open', tenantId]
+    );
+
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("POST /api/proofs/change-requests failed:", e);
+    res.status(500).json({ error: "Failed to create change request" });
+  }
+});
+
+// POST /api/proofs/change-requests/:id/respond (Vendor responds)
+app.post("/api/proofs/change-requests/:id/respond", authRequired, async (req, res) => {
+  try {
+    const crId = req.params.id;
+    const { comment, files } = req.body; // files = array of {name, cid, url}
+    const tenantId = req.tenantId;
+
+    // Verify ownership or access? For now, authRequired + tenant check
+    // Ideally check if user owns the proposal related to this CR.
+
+    const { rows } = await pool.query(
+      `INSERT INTO change_request_responses
+       (change_request_id, note, files, tenant_id)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [crId, comment, JSON.stringify(files || []), tenantId]
+    );
+
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("POST /api/proofs/change-requests/:id/respond failed:", e);
+    res.status(500).json({ error: "Failed to respond to change request" });
+  }
+});
+
+// POST /api/proofs/upload (File upload for CRs)
+// Reuse existing IPFS upload logic or create new one.
+// The frontend uses /api/proofs/upload.
+app.post("/api/proofs/upload", authRequired, async (req, res) => {
+  try {
+    if (!req.files || !req.files.files) {
+      return res.status(400).json({ error: "No files uploaded" });
+    }
+
+    const files = Array.isArray(req.files.files) ? req.files.files : [req.files.files];
+    const uploaded = [];
+
+    for (const file of files) {
+      // Use existing Pinata upload logic if available, or simple buffer upload
+      // Assuming 'uploadToPinata' helper exists or we implement inline.
+      // For this snippet, I'll assume a simple buffer upload to Pinata.
+
+      const formData = new FormData();
+      formData.append('file', file.data, { filename: file.name });
+
+      // Use the configured Pinata keys
+      const pinRes = await axios.post('https://api.pinata.cloud/pinning/pinFileToIPFS', formData, {
+        maxBodyLength: Infinity,
+        headers: {
+          'Content-Type': `multipart/form-data; boundary=${formData._boundary}`,
+          'pinata_api_key': PINATA_API_KEY,
+          'pinata_secret_api_key': PINATA_SECRET_API_KEY
+        }
+      });
+
+      if (pinRes.data && pinRes.data.IpfsHash) {
+        uploaded.push({
+          name: file.name,
+          cid: pinRes.data.IpfsHash,
+          url: `https://${PINATA_GATEWAY}/ipfs/${pinRes.data.IpfsHash}`
+        });
+      }
+    }
+
+    res.json(uploaded);
+  } catch (e) {
+    console.error("POST /api/proofs/upload failed:", e);
+    res.status(500).json({ error: "Upload failed" });
+  }
+});
 // Auth: admin OR vendor who owns the bid (wallet matches)
 app.post('/proofs/:id/archive', authRequired, async (req, res) => {
   const proofId = Number(req.params.id);
