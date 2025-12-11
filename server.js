@@ -621,9 +621,9 @@ async function overlayPaidFromMp(bid, pool) {
     `SELECT DISTINCT ON (milestone_index)
             milestone_index, status, proof_id, rejection_reason
        FROM proofs
-      WHERE bid_id = $1 AND tenant_id = $2
+      WHERE bid_id = $1
       ORDER BY milestone_index, proof_id DESC`,
-    [bidId, bid.tenant_id]
+    [bidId]
   );
   const proofsByIdx = new Map(proofRows.map(r => [Number(r.milestone_index), r]));
 
