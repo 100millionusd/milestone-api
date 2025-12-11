@@ -619,7 +619,7 @@ async function overlayPaidFromMp(bid, pool) {
   // FIX: Also fetch latest proofs to overlay approval status
   const { rows: proofRows } = await pool.query(
     `SELECT DISTINCT ON (milestone_index)
-            milestone_index, status, proof_id
+            milestone_index, status, proof_id, rejection_reason
        FROM proofs
       WHERE bid_id = $1 AND tenant_id = $2
       ORDER BY milestone_index, proof_id DESC`,
@@ -633,11 +633,17 @@ async function overlayPaidFromMp(bid, pool) {
   // Pass 1: Rebuild status based strictly on milestone_payments table
   for (let i = 0; i < msArr.length; i++) {
     const r = byIdx.get(i);
+    const p = proofsByIdx.get(i); // Get proof for this index
 
     // If no payment row exists in DB, clear any stuck "Pending" flag from the JSON
     if (!r) {
       if (msArr[i].paymentPending) {
         msArr[i] = { ...msArr[i], paymentPending: false };
+      }
+      // But still overlay proof status if exists
+      if (p) {
+        msArr[i].status = p.status;
+        msArr[i].rejectionReason = p.rejection_reason;
       }
       continue;
     }
@@ -658,22 +664,23 @@ async function overlayPaidFromMp(bid, pool) {
         safePaymentTxHash: msArr[i]?.safePaymentTxHash || r.safe_tx_hash || null,
         paymentDate: msArr[i]?.paymentDate || paidIso,
         paidAt: msArr[i]?.paidAt || paidIso,
-        paymentPending: false, // <--- FORCE CLEAR
+        paymentPending: false,
         status: 'paid',
+        rejectionReason: null
       };
     } else if (s === 'pending') {
       // It is genuinely pending in the DB (no tx hash yet)
       msArr[i].paymentPending = true;
+      // If payment is pending, we might still want to show proof status if it's approved?
+      // Usually payment pending implies approved, but let's be safe.
     }
 
-    // FIX: Overlay Proof Status
-    const p = proofsByIdx.get(i);
-    if (p) {
-      msArr[i].proofStatus = p.status; // 'approved', 'pending', 'rejected'
+    // Overlay Proof Status (if not paid)
+    if (msArr[i].status !== 'paid' && p) {
+      msArr[i].status = p.status; // 'approved', 'pending', 'rejected'
+      msArr[i].rejectionReason = p.rejection_reason;
 
-      // If proof is approved and payment hasn't happened yet, show "Approved"
-      if (p.status === 'approved' && msArr[i].status !== 'paid') {
-        msArr[i].status = 'approved';
+      if (p.status === 'approved') {
         msArr[i].completed = true;
       }
     }
@@ -1174,6 +1181,12 @@ async function attachPaymentState(bids) {
         ADD COLUMN IF NOT EXISTS tenant_id UUID REFERENCES tenants(id);
       `);
     }
+
+    // 4b. Add rejection_reason to proofs
+    await pool.query(`
+      ALTER TABLE proofs
+      ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+    `);
 
     // 5. Create Default Tenant (if none exists) & Migrate Data
     // We use a specific UUID for the default tenant to make migration idempotent
@@ -7965,12 +7978,13 @@ app.post("/proofs/:id/reject", adminGuard, async (req, res) => {
     if (!proof) return res.status(404).json({ error: "Proof not found" });
 
     // 2. Update using the proof's actual tenant_id
+    // 2. Update using the proof's actual tenant_id
     const { rows: upd } = await pool.query(
       `UPDATE proofs
-          SET status='rejected', updated_at=NOW()
+          SET status='rejected', rejection_reason=$3, updated_at=NOW()
         WHERE proof_id=$1 AND tenant_id=$2
       RETURNING *`,
-      [id, proof.tenant_id]
+      [id, proof.tenant_id, reason]
     );
 
     await writeAudit(Number(proof.bid_id), req, {
@@ -9222,17 +9236,12 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) =
       return res.status(400).json({ error: "Invalid bidId or milestoneIndex" });
     }
 
-    // 1. Resolve the correct tenant_id from the bid itself
-    const { rows: bids } = await pool.query('SELECT tenant_id FROM bids WHERE bid_id = $1', [bidId]);
-    if (!bids[0]) return res.status(404).json({ error: "Bid not found" });
-    const targetTenantId = bids[0].tenant_id;
-
-    // Flip the LATEST proof for this (bid, milestone) to rejected
+    // Flip the LATEST proof for this (bid, milestone) to rejected (ignoring tenant_id)
     const { rows } = await pool.query(`
       WITH latest AS (
         SELECT proof_id
           FROM proofs
-         WHERE bid_id = $1 AND milestone_index = $2 AND tenant_id = $3
+         WHERE bid_id = $1 AND milestone_index = $2
          ORDER BY submitted_at DESC NULLS LAST,
                   updated_at  DESC NULLS LAST,
                   proof_id    DESC
@@ -9240,13 +9249,14 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) =
       ), upd AS (
         UPDATE proofs p
            SET status = 'rejected',
+               rejection_reason = $3,
                updated_at = NOW()
           FROM latest l
          WHERE p.proof_id = l.proof_id
          RETURNING p.*
       )
       SELECT * FROM upd;
-    `, [bidId, idx, targetTenantId]);
+    `, [bidId, idx, reason]);
 
     const updated = rows[0];
     await writeAudit(bidId, req, { proof_rejected: { index: idx, proofId: updated.proof_id, reason } });
@@ -9746,18 +9756,13 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
       return res.status(400).json({ error: "bad bidId or milestone index" });
     }
 
-    // 1. Resolve the correct tenant_id from the bid itself
-    const { rows: bids } = await pool.query('SELECT tenant_id FROM bids WHERE bid_id = $1', [bidId]);
-    if (!bids[0]) return res.status(404).json({ error: "Bid not found" });
-    const targetTenantId = bids[0].tenant_id;
-
-    // Find the most recent proof for this milestone (using the BID's tenant)
+    // Find the most recent proof for this milestone (ignoring tenant_id to handle legacy/mismatched data)
     const { rows: proofs } = await pool.query(
-      `SELECT proof_id FROM proofs
-         WHERE bid_id = $1 AND milestone_index = $2 AND tenant_id = $3
+      `SELECT proof_id, tenant_id FROM proofs
+         WHERE bid_id = $1 AND milestone_index = $2
          ORDER BY submitted_at DESC NULLS LAST, updated_at DESC NULLS LAST
          LIMIT 1`,
-      [bidId, idx, targetTenantId]
+      [bidId, idx]
     );
     if (!proofs.length) return res.status(404).json({ error: "No proof found for this milestone" });
 
@@ -9766,10 +9771,10 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
     // Mark as rejected
     const { rows } = await pool.query(
       `UPDATE proofs
-         SET status = 'rejected', updated_at = NOW()
-       WHERE proof_id = $1 AND tenant_id = $2
+         SET status = 'rejected', rejection_reason = $2, updated_at = NOW()
+       WHERE proof_id = $1
        RETURNING proof_id, bid_id, milestone_index, status, updated_at`,
-      [proofId, targetTenantId]
+      [proofId, reason]
     );
 
     // Notify
