@@ -8881,7 +8881,12 @@ app.post("/proofs", authRequired, async (req, res) => {
     title: Joi.string().allow("").optional(),
     description: Joi.string().allow("").optional(),
     files: Joi.array()
-      .items(Joi.object({ name: Joi.string().allow(""), url: Joi.string().uri().required() }))
+      .items(Joi.object({
+        name: Joi.string().allow(""),
+        url: Joi.string().uri().required(),
+        gpsLatitude: Joi.number().optional(),
+        gpsLongitude: Joi.number().optional()
+      }))
       .default([])
       .optional(),
     prompt: Joi.string().allow("").optional(),
@@ -8949,6 +8954,13 @@ app.post("/proofs", authRequired, async (req, res) => {
 
     // helpers
     function findFirstGps(arr = []) {
+      // 1. Check explicit GPS from frontend (in fileMeta or original files)
+      for (const f of files) {
+        if (Number.isFinite(f.gpsLatitude) && Number.isFinite(f.gpsLongitude)) {
+          return { lat: f.gpsLatitude, lon: f.gpsLongitude, alt: null };
+        }
+      }
+      // 2. Check EXIF
       for (const m of arr) {
         const lat = Number(m?.exif?.gpsLatitude);
         const lon = Number(m?.exif?.gpsLongitude);
@@ -9728,8 +9740,8 @@ app.post('/proofs/:id/analyze', adminGuard, async (req, res) => {
     const capNote = captureIso
       ? `First capture time (EXIF, ISO8601): ${captureIso}`
       : 'No capture time in EXIF.';
-    const gpsNote = gpsCount
-      ? `GPS present in ${gpsCount} file(s). First fix: ${firstGps.lat}, ${firstGps.lon}${firstGps.alt != null ? ` • alt ${firstGps.alt}m` : ''}`
+    const gpsNote = (gpsCount || (Number.isFinite(lat) && Number.isFinite(lon)))
+      ? `GPS present. Fix: ${lat}, ${lon}`
       : 'No GPS in submitted media.';
 
     // Milestone info for this proof
