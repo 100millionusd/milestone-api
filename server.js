@@ -144,8 +144,19 @@ async function safeFetchRL(url, opts = {}, attempt = 0) {
 // 🔐 auth utilities
 const cookieParser = require("cookie-parser");
 const jwt = require("jsonwebtoken");
+const webPush = require("web-push"); // NEW: Push Notifications
 
 let __vendorSeedGuard = 0;
+
+// ==== VAPID KEYS (Generated for Push Notifications) ====
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "BLh7VW3nB5_hJQzhdSoRKWzdEKbjD0BWLoEPKmrxz_7lPNuq5LWw3Rhbf-vMvO5J7zjEgHQTMcf-DNrQDRCBeUE";
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "llk91ret6ezDRGEPQpTpISbGvy4J2ij1T_xhF6WPjZ8";
+
+webPush.setVapidDetails(
+  "mailto:admin@milestonex.io",
+  VAPID_PUBLIC_KEY,
+  VAPID_PRIVATE_KEY
+);
 
 // ==== JWT helpers (put near top of server.js) ====
 
@@ -2108,6 +2119,15 @@ async function createNotification({ tenantId, wallet, type, title, message, data
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [tenantId, wallet, type, title, message, data || {}]
     );
+
+    // Send Push Notification
+    sendPushNotification(wallet, {
+      title,
+      body: message,
+      icon: '/android-chrome-192x192.png',
+      data: { url: '/' } // Default to home, can be enhanced
+    }).catch(err => console.error("Push send failed:", err));
+
   } catch (e) {
     console.warn('[Notifications] createNotification failed:', e);
   }
@@ -13458,6 +13478,81 @@ app.post("/api/notifications/:id/read", authRequired, async (req, res) => {
 // ==============================
 // Start server
 // ==============================
+// ==============================
+// Push Notifications Endpoints
+// ==============================
+
+// 1. Get Public Key
+app.get("/api/notifications/vapid-public-key", (req, res) => {
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+// 2. Subscribe
+app.post("/api/notifications/subscribe", softAuth, async (req, res) => {
+  try {
+    const { subscription, wallet } = req.body;
+    const userWallet = req.user?.sub || wallet; // Prefer auth token, fallback to body
+
+    if (!subscription || !subscription.endpoint) {
+      return res.status(400).json({ error: "Invalid subscription" });
+    }
+
+    if (!userWallet) {
+      return res.status(400).json({ error: "Wallet address required" });
+    }
+
+    // Save subscription to DB
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id SERIAL PRIMARY KEY,
+        wallet_address TEXT NOT NULL,
+        subscription JSONB NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(wallet_address, subscription)
+      );
+    `);
+
+    await pool.query(
+      `INSERT INTO push_subscriptions (wallet_address, subscription)
+       VALUES ($1, $2)
+       ON CONFLICT (wallet_address, subscription) DO NOTHING`,
+      [userWallet, subscription]
+    );
+
+    res.status(201).json({ message: "Subscribed successfully" });
+  } catch (error) {
+    console.error("Subscribe error:", error);
+    res.status(500).json({ error: "Failed to subscribe" });
+  }
+});
+
+// Helper to send push
+async function sendPushNotification(wallet, payload) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT subscription FROM push_subscriptions WHERE lower(wallet_address) = lower($1)`,
+      [wallet]
+    );
+
+    const notifications = rows.map(row => {
+      return webPush.sendNotification(row.subscription, JSON.stringify(payload))
+        .catch(err => {
+          if (err.statusCode === 410 || err.statusCode === 404) {
+            // Subscription is gone, delete it
+            console.log("Subscription expired, deleting...", row.subscription.endpoint);
+            pool.query(`DELETE FROM push_subscriptions WHERE subscription->>'endpoint' = $1`, [row.subscription.endpoint]);
+          } else {
+            console.error("Push error:", err);
+          }
+        });
+    });
+
+    await Promise.all(notifications);
+  } catch (error) {
+    console.error("Failed to send push notifications:", error);
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`[api] Listening on :${PORT}`);
   console.log(`[api] Admin enforcement: ${ENFORCE_JWT_ADMIN ? "ON" : "OFF"}`);
