@@ -3597,6 +3597,8 @@ app.use(
       if (origin.endsWith('.lithiumx.netlify.app')) return cb(null, true);
       // Allow sallyuyuni.com
       if (origin === 'https://sallyuyuni.com' || origin.endsWith('.sallyuyuni.com')) return cb(null, true);
+      // Allow milestonex-uyuni.com
+      if (origin === 'https://milestonex-uyuni.com' || origin.endsWith('.milestonex-uyuni.com')) return cb(null, true);
 
       return cb(new Error("Not allowed by CORS"));
     },
