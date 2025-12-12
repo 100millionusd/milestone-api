@@ -11,6 +11,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@pinata/sdk": "^2.1.0",
     "@safe-global/api-kit": "^4.0.0",
     "axios": "^1.12.2",
     "cookie-parser": "^1.4.7",
