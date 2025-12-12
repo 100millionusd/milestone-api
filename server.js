@@ -4218,6 +4218,61 @@ app.post("/auth/login", async (req, res) => {
 
   // Decide role from durable roles + button intent
   console.log('[Auth] Login request:', { address, roleIntent, tenantId: req.tenantId });
+
+  // FIX: If tenantId is default, try to find the user's tenant from their profile (Sync with /auth/verify)
+  if (req.tenantId === '00000000-0000-0000-0000-000000000000') {
+    try {
+      // 1. Try vendor_profiles
+      let { rows } = await pool.query(
+        `SELECT tenant_id FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+        [address]
+      );
+
+      // 2. Fallback: Try bids table
+      if (rows.length === 0) {
+        const bidsRes = await pool.query(
+          `SELECT tenant_id FROM bids WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+          [address]
+        );
+        rows = bidsRes.rows;
+      }
+
+      // 3. Fallback: Try tenant_members
+      if (rows.length === 0) {
+        const tmRes = await pool.query(
+          `SELECT tenant_id FROM tenant_members WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+          [address]
+        );
+        rows = tmRes.rows;
+      }
+
+      // 4. Fallback: Try proposals
+      if (rows.length === 0) {
+        const propRes = await pool.query(
+          `SELECT tenant_id FROM proposals WHERE lower(owner_wallet)=lower($1) LIMIT 1`,
+          [address]
+        );
+        rows = propRes.rows;
+      }
+
+      // 5. Fallback: Try proposer_profiles
+      if (rows.length === 0) {
+        const ppRes = await pool.query(
+          `SELECT tenant_id FROM proposer_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+          [address]
+        );
+        rows = ppRes.rows;
+      }
+
+      if (rows.length > 0 && rows[0].tenant_id) {
+        req.tenantId = rows[0].tenant_id;
+        console.log(`[Auth] Resolved tenant for ${address}: ${req.tenantId}`);
+      }
+    } catch (e) {
+      console.error('Error looking up tenant for wallet:', e);
+    }
+  }
+
   let roles = await durableRolesForAddress(address, req.tenantId);
   console.log('[Auth] Durable roles found:', roles);
   let role = roleFromDurableOrIntent(roles, roleIntent);
