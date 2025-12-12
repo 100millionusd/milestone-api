@@ -2474,7 +2474,7 @@ const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECR
 // Helper: Wait with jitter (randomness) to prevent synchronized retries
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function pinataUploadFile(file, tenantId = null) {
+async function pinataUploadFile(file, tenantId = null, keyValues = {}) {
   let pKey = process.env.PINATA_API_KEY;
   let pSecret = process.env.PINATA_SECRET_API_KEY;
   let pJwt = process.env.PINATA_JWT; // Fallback env JWT
@@ -2523,7 +2523,10 @@ async function pinataUploadFile(file, tenantId = null) {
       stream.path = file.name;
 
       const options = {
-        pinataMetadata: { name: file.name },
+        pinataMetadata: {
+          name: file.name,
+          keyvalues: keyValues
+        },
         pinataOptions: { cidVersion: 0 }
       };
 
@@ -2945,20 +2948,25 @@ async function extractFileMetaFromUrl(file) {
     try { await fs.unlink(tmp); } catch { }
 
     const size = buf.length;
-    const exif = tags ? {
-      make: tags.Make || null,
-      model: tags.Model || null,
-      software: tags.Software || tags.ProcessingSoftware || null,
-      mimeType: tags.MIMEType || tags.MimeType || null,
-      imageWidth: tags.ImageWidth || tags.SourceImageWidth || null,
-      imageHeight: tags.ImageHeight || tags.SourceImageHeight || null,
-      megapixels: tags.Megapixels || null,
-      createDate: tags.DateTimeOriginal || tags.CreateDate || tags.MediaCreateDate || null,
-      modifyDate: tags.ModifyDate || null,
-      gpsLatitude: Number.isFinite(tags.GPSLatitude) ? Number(tags.GPSLatitude) : null,
-      gpsLongitude: Number.isFinite(tags.GPSLongitude) ? Number(tags.GPSLongitude) : null,
-      gpsAltitude: tags.GPSAltitude ?? null,
-      orientation: tags.Orientation || null,
+
+    // Prefer explicit GPS from frontend/Pinata if available
+    const lat = file.gpsLatitude || (Number.isFinite(tags?.GPSLatitude) ? Number(tags.GPSLatitude) : null);
+    const lon = file.gpsLongitude || (Number.isFinite(tags?.GPSLongitude) ? Number(tags.GPSLongitude) : null);
+
+    const exif = tags || (lat && lon) ? {
+      make: tags?.Make || null,
+      model: tags?.Model || null,
+      software: tags?.Software || tags?.ProcessingSoftware || null,
+      mimeType: tags?.MIMEType || tags?.MimeType || null,
+      imageWidth: tags?.ImageWidth || tags?.SourceImageWidth || null,
+      imageHeight: tags?.ImageHeight || tags?.SourceImageHeight || null,
+      megapixels: tags?.Megapixels || null,
+      createDate: tags?.DateTimeOriginal || tags?.CreateDate || tags?.MediaCreateDate || null,
+      modifyDate: tags?.ModifyDate || null,
+      gpsLatitude: lat,
+      gpsLongitude: lon,
+      gpsAltitude: tags?.GPSAltitude ?? null,
+      orientation: tags?.Orientation || null,
     } : null;
 
     const suspectEdits = /photoshop|lightroom|gimp|snapseed|facetune|luminar|picsart|canva|after effects|premiere/i
@@ -4218,61 +4226,6 @@ app.post("/auth/login", async (req, res) => {
 
   // Decide role from durable roles + button intent
   console.log('[Auth] Login request:', { address, roleIntent, tenantId: req.tenantId });
-
-  // FIX: If tenantId is default, try to find the user's tenant from their profile (Sync with /auth/verify)
-  if (req.tenantId === '00000000-0000-0000-0000-000000000000') {
-    try {
-      // 1. Try vendor_profiles
-      let { rows } = await pool.query(
-        `SELECT tenant_id FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-        [address]
-      );
-
-      // 2. Fallback: Try bids table
-      if (rows.length === 0) {
-        const bidsRes = await pool.query(
-          `SELECT tenant_id FROM bids WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-          [address]
-        );
-        rows = bidsRes.rows;
-      }
-
-      // 3. Fallback: Try tenant_members
-      if (rows.length === 0) {
-        const tmRes = await pool.query(
-          `SELECT tenant_id FROM tenant_members WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-          [address]
-        );
-        rows = tmRes.rows;
-      }
-
-      // 4. Fallback: Try proposals
-      if (rows.length === 0) {
-        const propRes = await pool.query(
-          `SELECT tenant_id FROM proposals WHERE lower(owner_wallet)=lower($1) LIMIT 1`,
-          [address]
-        );
-        rows = propRes.rows;
-      }
-
-      // 5. Fallback: Try proposer_profiles
-      if (rows.length === 0) {
-        const ppRes = await pool.query(
-          `SELECT tenant_id FROM proposer_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
-          [address]
-        );
-        rows = ppRes.rows;
-      }
-
-      if (rows.length > 0 && rows[0].tenant_id) {
-        req.tenantId = rows[0].tenant_id;
-        console.log(`[Auth] Resolved tenant for ${address}: ${req.tenantId}`);
-      }
-    } catch (e) {
-      console.error('Error looking up tenant for wallet:', e);
-    }
-  }
-
   let roles = await durableRolesForAddress(address, req.tenantId);
   console.log('[Auth] Durable roles found:', roles);
   let role = roleFromDurableOrIntent(roles, roleIntent);
@@ -12854,14 +12807,24 @@ app.post("/ipfs/upload-file", authGuard, async (req, res) => {
     const files = Array.isArray(fileInput) ? fileInput : [fileInput];
     const results = [];
 
+    // Extract GPS if provided
+    const keyValues = {};
+    if (req.body.latitude && req.body.longitude) {
+      keyValues.latitude = req.body.latitude;
+      keyValues.longitude = req.body.longitude;
+    }
+
     // 2. QUEUEING LOGIC: Wait for previous uploads to finish before starting this batch
     // This effectively locks the upload process to one-at-a-time across the whole server.
-    // 2. QUEUEING LOGIC: Wait for previous uploads to finish before starting this batch
     const task = async () => {
       for (const f of files) {
         try {
           // Upload
-          const result = await pinataUploadFile(f, req.tenantId);
+          const result = await pinataUploadFile(f, req.tenantId, keyValues);
+          // Return the GPS data back so frontend can use it
+          if (keyValues.latitude) result.latitude = keyValues.latitude;
+          if (keyValues.longitude) result.longitude = keyValues.longitude;
+
           results.push(result);
 
           // 3. SAFETY DELAY: 1000ms is safer than 300ms for free/tier-1 plans
