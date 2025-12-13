@@ -4633,10 +4633,12 @@ app.get("/proposals", softAuth, async (req, res) => {
     const statusParam = (req.query.status || "").toLowerCase().trim();
     const includeArchived = String(req.query.includeArchived || "").toLowerCase();
 
+    console.log('[DEBUG] /proposals req.tenantId:', req.tenantId);
+
     let q = `
-      SELECT p.*, tc.value as gateway 
+      SELECT p.*, 
+      (SELECT value FROM tenant_configs WHERE tenant_id::text = p.tenant_id::text AND key = 'pinata_gateway') as gateway
       FROM proposals p
-      LEFT JOIN tenant_configs tc ON p.tenant_id = tc.tenant_id AND tc.key = 'pinata_gateway'
     `;
     const params = [req.tenantId];
     const conditions = ["p.tenant_id = $1"];
@@ -4674,6 +4676,7 @@ app.get("/proposals", softAuth, async (req, res) => {
     q += " ORDER BY p.created_at DESC";
 
     const { rows } = await pool.query(q, params);
+    console.log('[DEBUG] /proposals gateway check:', rows.map(r => ({ id: r.id, tenant: r.tenant_id, gateway: r.gateway })));
     res.json(mapRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
