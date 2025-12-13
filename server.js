@@ -5773,7 +5773,12 @@ app.get("/bids/:id", async (req, res) => {
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
 
   try {
-    const { rows } = await pool.query("SELECT * FROM bids WHERE bid_id=$1 AND tenant_id=$2", [id, req.tenantId]);
+    const { rows } = await pool.query(`
+      SELECT b.*,
+      (SELECT value FROM tenant_configs WHERE tenant_id::text = b.tenant_id::text AND key = 'pinata_gateway') as gateway
+      FROM bids b
+      WHERE bid_id=$1 AND tenant_id=$2
+    `, [id, req.tenantId]);
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
 
     const bid = rows[0];
