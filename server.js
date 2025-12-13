@@ -12702,7 +12702,11 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
 
     // Fetch tenant config
     const tenantJwt = await tenantService.getTenantConfig(req.tenantId, 'pinata_jwt');
+    const tenantGateway = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway');
+
     const jwtToUse = tenantJwt;
+    // Use tenant gateway if available, otherwise fallback to server env var
+    const gatewayToUse = tenantGateway || PINATA_GATEWAY;
 
     if (!jwtToUse) {
       return res.status(500).json({ error: "Pinata not configured" });
@@ -12728,12 +12732,15 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
     if (response.ok) {
       const keyData = await response.json();
 
+      // Inject the gateway into the response
+      const finalData = { ...keyData, gateway: gatewayToUse };
+
       _cachedPinataTokens[tenantId] = {
-        data: keyData,
+        data: finalData,
         expiresAt: Date.now() + (24 * 60 * 60 * 1000) // 24 hours
       };
 
-      return res.json(keyData);
+      return res.json(finalData);
     }
 
     // 3. EMERGENCY FALLBACK: If Pinata says "Rate Limited" (429) or fails
@@ -12744,7 +12751,8 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
     const fallbackData = {
       JWT: jwtToUse,               // Use the configured key so upload succeeds
       pinata_api_key: "",          // Not needed for JWT auth
-      pinata_api_secret: ""        // Not needed for JWT auth
+      pinata_api_secret: "",       // Not needed for JWT auth
+      gateway: gatewayToUse        // ✅ Return the correct gateway
     };
 
     // Cache this fallback too, so we don't keep hitting the API error
