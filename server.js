@@ -9619,8 +9619,9 @@ app.get("/public/projects/:id", async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT b.*,
-      (SELECT value FROM tenant_configs WHERE tenant_id::text = b.tenant_id::text AND key = 'pinata_gateway') as gateway
+      (SELECT value FROM tenant_configs WHERE tenant_id::text = p.tenant_id::text AND key = 'pinata_gateway') as gateway
       FROM bids b
+      JOIN proposals p ON b.proposal_id = p.id
       WHERE b.bid_id = $1
     `, [id]);
 
