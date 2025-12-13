@@ -9631,6 +9631,8 @@ app.get("/public/projects/:id", async (req, res) => {
     // But strictly, we should join proposals and check is_public.
 
     const bid = rows[0];
+    console.log('[DEBUG] /public/projects/:id gateway:', { bidId: id, gateway: bid.gateway });
+
     // Hydrate payment info
     const hydrated = await overlayPaidFromMp(bid, pool);
 
