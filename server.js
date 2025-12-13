@@ -5782,6 +5782,7 @@ app.get("/bids/:id", async (req, res) => {
     if (!rows[0]) return res.status(404).json({ error: "Bid not found" });
 
     const bid = rows[0];
+    console.log('[DEBUG] /bids/:id gateway check:', { bidId: id, tenant: req.tenantId, gateway: bid.gateway });
 
     // enforce ownership when flag ON and not admin
     const role = (req.user?.role || "guest").toLowerCase();
