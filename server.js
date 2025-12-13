@@ -4633,9 +4633,13 @@ app.get("/proposals", softAuth, async (req, res) => {
     const statusParam = (req.query.status || "").toLowerCase().trim();
     const includeArchived = String(req.query.includeArchived || "").toLowerCase();
 
-    let q = "SELECT * FROM proposals";
+    let q = `
+      SELECT p.*, tc.value as gateway 
+      FROM proposals p
+      LEFT JOIN tenant_configs tc ON p.tenant_id = tc.tenant_id AND tc.key = 'pinata_gateway'
+    `;
     const params = [req.tenantId];
-    const conditions = ["tenant_id = $1"];
+    const conditions = ["p.tenant_id = $1"];
 
     // GLOBAL VIEW: If on Default Tenant (0000...), show ALL public proposals from ALL tenants
     if (req.tenantId === '00000000-0000-0000-0000-000000000000') {
@@ -4647,19 +4651,19 @@ app.get("/proposals", softAuth, async (req, res) => {
     // 3. Apply Filtering Logic
     if (!isAdmin) {
       // 🔒 SECURITY: Non-admins (Public/Guests/Vendors) see ONLY approved/funded/completed
-      conditions.push("LOWER(status) IN ('approved', 'funded', 'completed')");
+      conditions.push("LOWER(p.status) IN ('approved', 'funded', 'completed')");
 
       // Public users ONLY see public projects. Vendors see ALL (even private).
       if (!isVendor) {
-        conditions.push("is_public = TRUE");
+        conditions.push("p.is_public = TRUE");
       }
     } else {
       // 🔓 ADMIN: Can filter by specific status, otherwise sees all non-archived
       if (statusParam) {
         params.push(statusParam);
-        conditions.push(`status = $${params.length}`);
+        conditions.push(`p.status = $${params.length}`);
       } else if (!["true", "1", "yes"].includes(includeArchived)) {
-        conditions.push("status != 'archived'");
+        conditions.push("p.status != 'archived'");
       }
     }
 
@@ -4667,7 +4671,7 @@ app.get("/proposals", softAuth, async (req, res) => {
     if (conditions.length > 0) {
       q += " WHERE " + conditions.join(" AND ");
     }
-    q += " ORDER BY created_at DESC";
+    q += " ORDER BY p.created_at DESC";
 
     const { rows } = await pool.query(q, params);
     res.json(mapRows(rows));
