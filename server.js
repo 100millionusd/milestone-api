@@ -12706,7 +12706,11 @@ app.get("/auth/pinata-token", requireAuth, async (req, res) => {
 
     const jwtToUse = tenantJwt;
     // Use tenant gateway if available, otherwise fallback to server env var
-    const gatewayToUse = tenantGateway || PINATA_GATEWAY;
+    // FIX: Strip protocol to avoid double https:// in frontend
+    let gatewayToUse = tenantGateway || PINATA_GATEWAY;
+    if (gatewayToUse) {
+      gatewayToUse = gatewayToUse.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+    }
 
     if (!jwtToUse) {
       return res.status(500).json({ error: "Pinata not configured" });
