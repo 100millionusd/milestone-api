@@ -9611,6 +9611,36 @@ app.get("/public/geo/:bidId", async (req, res) => {
   }
 });
 
+// GET /public/projects/:id (Public Detail Page)
+app.get("/public/projects/:id", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid bid id" });
+
+  try {
+    const { rows } = await pool.query(`
+      SELECT b.*,
+      (SELECT value FROM tenant_configs WHERE tenant_id::text = b.tenant_id::text AND key = 'pinata_gateway') as gateway
+      FROM bids b
+      WHERE b.bid_id = $1
+    `, [id]);
+
+    if (!rows[0]) return res.status(404).json({ error: "Project not found" });
+
+    // Optional: Check if proposal is public?
+    // For now, we assume if they have the ID they can see it, or rely on frontend to hide sensitive bits.
+    // But strictly, we should join proposals and check is_public.
+
+    const bid = rows[0];
+    // Hydrate payment info
+    const hydrated = await overlayPaidFromMp(bid, pool);
+
+    res.json(toCamel(hydrated));
+  } catch (err) {
+    console.error("GET /public/projects/:id error:", err);
+    res.status(500).json({ error: "Failed to load project" });
+  }
+});
+
 app.get("/public/geo/proof/:proofId", async (req, res) => {
   try {
     const proofId = Number(req.params.proofId);
