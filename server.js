@@ -13545,7 +13545,7 @@ app.get("/api/notifications", authRequired, async (req, res) => {
     const wallet = req.user.sub || req.user.address;
     const { rows } = await pool.query(
       `SELECT * FROM notifications
-       WHERE recipient_wallet = $1 AND tenant_id = $2
+       WHERE LOWER(recipient_wallet) = LOWER($1) AND tenant_id = $2
        ORDER BY created_at DESC
        LIMIT 50`,
       [wallet, req.tenantId]
@@ -13564,7 +13564,7 @@ app.post("/api/notifications/:id/read", authRequired, async (req, res) => {
     const { id } = req.params;
     await pool.query(
       `UPDATE notifications SET is_read = TRUE
-       WHERE id = $1 AND recipient_wallet = $2 AND tenant_id = $3`,
+       WHERE id = $1 AND LOWER(recipient_wallet) = LOWER($2) AND tenant_id = $3`,
       [id, wallet, req.tenantId]
     );
     res.json({ success: true });
