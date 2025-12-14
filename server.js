@@ -8205,6 +8205,23 @@ app.post("/proofs/:id/reject", adminGuard, async (req, res) => {
     });
 
     res.json(toCamel(upd[0]));
+
+    // Notify Vendor
+    try {
+      const { rows: [bid] } = await pool.query('SELECT wallet_address, title FROM bids JOIN proposals ON bids.proposal_id = proposals.proposal_id WHERE bid_id=$1', [proof.bid_id]);
+      if (bid) {
+        await createNotification({
+          tenantId: proof.tenant_id,
+          wallet: bid.wallet_address,
+          type: 'proof_rejected',
+          title: 'Proof Rejected',
+          message: `Your proof for ${bid.title} (Milestone ${Number(proof.milestone_index) + 1}) was rejected: ${reason || 'No reason provided'}`,
+          data: { proofId: id, bidId: proof.bid_id }
+        });
+      }
+    } catch (err) {
+      console.warn('Failed to notify proof rejection:', err);
+    }
   } catch (e) {
     console.error("POST /proofs/:id/reject failed:", e);
     res.status(500).json({ error: "Failed to reject proof" });
@@ -9400,6 +9417,23 @@ app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) =
       SELECT * FROM upd;
     `, [bidId, idx, reason]);
 
+    // Notify Vendor
+    try {
+      const { rows: [bid] } = await pool.query('SELECT wallet_address, title, tenant_id FROM bids JOIN proposals ON bids.proposal_id = proposals.proposal_id WHERE bid_id=$1', [bidId]);
+      if (bid) {
+        await createNotification({
+          tenantId: bid.tenant_id, // Use bid's tenant_id as fallback if proof's is tricky to get here (though we could fetch it)
+          wallet: bid.wallet_address,
+          type: 'proof_rejected',
+          title: 'Proof Rejected',
+          message: `Your proof for ${bid.title} (Milestone ${idx + 1}) was rejected: ${reason || 'No reason provided'}`,
+          data: { bidId, milestoneIndex: idx }
+        });
+      }
+    } catch (err) {
+      console.warn('Failed to notify proof rejection (clean):', err);
+    }
+
     const updated = rows[0];
     await writeAudit(bidId, req, { proof_rejected: { index: idx, proofId: updated.proof_id, reason } });
     if (!updated) {
@@ -10114,6 +10148,32 @@ app.post("/api/proofs/change-requests", adminGuard, async (req, res) => {
     );
 
     res.json(rows[0]);
+
+    // Notify Vendor
+    try {
+      // Find the accepted bid for this proposal to get the vendor's wallet
+      const { rows: [bid] } = await pool.query(
+        `SELECT b.wallet_address, p.title, b.tenant_id 
+         FROM bids b
+         JOIN proposals p ON b.proposal_id = p.proposal_id
+         WHERE b.proposal_id = $1 AND b.status = 'approved'
+         LIMIT 1`,
+        [proposalId]
+      );
+
+      if (bid) {
+        await createNotification({
+          tenantId: bid.tenant_id, // Use bid's tenant_id
+          wallet: bid.wallet_address,
+          type: 'change_requested',
+          title: 'Changes Requested',
+          message: `Changes requested for ${bid.title} (Milestone ${Number(milestoneIndex) + 1}): ${comment || 'Check checklist'}`,
+          data: { proposalId, milestoneIndex, requestId: rows[0].id }
+        });
+      }
+    } catch (err) {
+      console.warn('Failed to notify change request:', err);
+    }
   } catch (e) {
     console.error("POST /api/proofs/change-requests failed:", e);
     res.status(500).json({ error: "Failed to create change request" });
@@ -13586,6 +13646,8 @@ app.get("/api/notifications/vapid-public-key", (req, res) => {
   res.json({ publicKey: VAPID_PUBLIC_KEY });
 });
 
+
+
 // 2. Subscribe
 app.post("/api/notifications/subscribe", softAuth, async (req, res) => {
   try {
@@ -13611,6 +13673,7 @@ app.post("/api/notifications/subscribe", softAuth, async (req, res) => {
       );
     `);
 
+    console.log(`[subscribe] Registering push for ${userWallet}`);
     await pool.query(
       `INSERT INTO push_subscriptions (wallet_address, subscription)
        VALUES ($1, $2)
@@ -13632,6 +13695,7 @@ async function sendPushNotification(wallet, payload) {
       `SELECT subscription FROM push_subscriptions WHERE lower(wallet_address) = lower($1)`,
       [wallet]
     );
+    console.log(`[sendPushNotification] Found ${rows.length} subscriptions for ${wallet}`);
 
     const notifications = rows.map(row => {
       return webPush.sendNotification(row.subscription, JSON.stringify(payload))
