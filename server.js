@@ -10086,6 +10086,21 @@ app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => 
               : null,
           ].filter(Boolean)
         );
+
+        // [NEW] Also send In-App + Push Notification (using the same proven logic)
+        try {
+          console.log('[ProofReject] Sending In-App/Push to wallet:', bid.wallet_address);
+          await createNotification({
+            tenantId: bid.tenant_id,
+            wallet: bid.wallet_address,
+            type: 'proof_rejected',
+            title: 'Proof Rejected',
+            message: `Your proof for ${proposal?.title || 'Project'} (Milestone ${Number(idx) + 1}) was rejected: ${reason || 'No reason provided'}`,
+            data: { bidId, milestoneIndex: idx }
+          });
+        } catch (err) {
+          console.warn('[ProofReject] Failed to create in-app notification:', err);
+        }
       }
     } catch (e) {
       console.warn("notify-on-reject failed (non-fatal):", String(e).slice(0, 200));
