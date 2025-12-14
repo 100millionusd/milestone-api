@@ -3628,11 +3628,13 @@ app.use(
       // Allow milestonex-uyuni.com
       if (origin === 'https://milestonex-uyuni.com' || origin.endsWith('.milestonex-uyuni.com')) return cb(null, true);
 
+      console.log('[CORS] Blocked origin:', origin);
       return cb(new Error("Not allowed by CORS"));
     },
-    credentials: true,
+    credentials: true, // Required for cookies/auth headers
   })
 );
+app.options('*', cors()); // Enable preflight for all routes
 app.use(helmet());
 app.use(express.json({ limit: "20mb" }));
 app.use(cookieParser()); // 🔐 parse JWT cookie
