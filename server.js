@@ -5328,7 +5328,35 @@ app.delete("/proposals/:id", adminGuard, async (req, res) => {
       `DELETE FROM proposals WHERE proposal_id=$1 AND tenant_id=$2`,
       [id, req.tenantId]
     );
-    if (rowCount === 0) return res.status(404).json({ error: "Proposal not found" });
+    if (rowCount === 0) return res.status(404).json({ error: "Proposal not found" });        // Notify Vendor (New Logic)
+    try {
+      console.log('[ProofReject] Finding vendor for bid:', bidId);
+      const { rows: [bidInfo] } = await pool.query(
+        `SELECT b.wallet_address, p.title, b.tenant_id 
+             FROM bids b
+             JOIN proposals p ON b.proposal_id = p.proposal_id
+             WHERE b.bid_id = $1`,
+        [bidId]
+      );
+
+      if (bidInfo) {
+        console.log('[ProofReject] Found vendor:', bidInfo.wallet_address);
+        await createNotification({
+          tenantId: bidInfo.tenant_id,
+          wallet: bidInfo.wallet_address,
+          type: 'proof_rejected',
+          title: 'Proof Rejected',
+          message: `Your proof for ${bidInfo.title} (Milestone ${Number(idx) + 1}) was rejected: ${reason || 'No reason provided'}`,
+          data: { bidId, milestoneIndex: idx }
+        });
+        console.log('[ProofReject] Notification created');
+      } else {
+        console.warn('[ProofReject] No bid info found for bid:', bidId);
+      }
+    } catch (err) {
+      console.warn('Failed to notify proof rejection (milestone route):', err);
+    }
+
     res.json({ success: true });
   } catch (err) {
     console.error("Error deleting proposal:", err);
@@ -13642,25 +13670,7 @@ app.post("/api/notifications/:id/read", authRequired, async (req, res) => {
       [id, wallet, req.tenantId]
     );
 
-    // Notify Vendor
-    try {
-      // NOTE: bidId, idx, reason, and createNotification are not defined in this scope.
-      // This code snippet seems intended for a different endpoint (e.g., milestone rejection).
-      // Inserting as per instruction, but it will cause runtime errors due to undefined variables.
-      const { rows: [bid] } = await pool.query('SELECT wallet_address, title, tenant_id FROM bids JOIN proposals ON bids.proposal_id = proposals.proposal_id WHERE bid_id=$1', [bidId]);
-      if (bid) {
-        await createNotification({
-          tenantId: bid.tenant_id,
-          wallet: bid.wallet_address,
-          type: 'proof_rejected',
-          title: 'Proof Rejected',
-          message: `Your proof for ${bid.title} (Milestone ${Number(idx) + 1}) was rejected: ${reason || 'No reason provided'}`,
-          data: { bidId, milestoneIndex: idx }
-        });
-      }
-    } catch (err) {
-      console.warn('Failed to notify proof rejection (milestone route):', err);
-    }
+
 
     res.json({ success: true });
   } catch (e) {
