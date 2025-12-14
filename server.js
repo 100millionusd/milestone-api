@@ -1982,6 +1982,7 @@ async function notifyProofApproved({ proof, bid, proposal, msIndex }) {
     ].filter(Boolean));
 
     // In-App Notification
+    console.log(`[notifyProofApproved] Creating notification for wallet: ${bid.wallet_address}, Tenant: ${bid.tenant_id}`);
     await createNotification({
       tenantId: bid.tenant_id,
       wallet: bid.wallet_address,
@@ -2057,6 +2058,7 @@ async function notifyPaymentReleased({ bid, proposal, msIndex, amount, txHash })
   ].filter(Boolean));
 
   // In-App Notification
+  console.log(`[notifyPaymentReleased] Creating notification for wallet: ${bid.wallet_address}, Tenant: ${bid.tenant_id}`);
   await createNotification({
     tenantId: bid.tenant_id,
     wallet: bid.wallet_address,
@@ -9045,14 +9047,15 @@ app.post("/proofs", authRequired, async (req, res) => {
       }
     });
 
+    // --- NOTIFICATION: Proof Submitted (to Proposal Owner) ---
+    // (Reverted based on user feedback)
+
 
     // 6) (Best-effort) Agent2 analysis + notify
     try {
       if (openai && (vendorPrompt || description || files.length)) {
-        const { rows: prj } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [
-          bid.proposal_id || bid.proposalId,
-        ]);
-        const proposal = prj[0] || null;
+        // Proposal already fetched above, reuse it
+        const proposal = proposalRow;
 
         const metaBlock = summarizeMeta(fileMeta);
         const gpsCount = fileMeta.filter(m =>
