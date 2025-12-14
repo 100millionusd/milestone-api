@@ -612,7 +612,7 @@ async function _findExecutedByNonce(nonce) {
 async function _finalizePaidInDb({ bidId, milestoneIndex, txHash, safeTxHash, tenantId }) {
   try {
     // Update milestone JSON
-    const { rows: b } = await pool.query('SELECT milestones FROM bids WHERE bid_id=$1 AND tenant_id=$2', [bidId, tenantId]);
+    const { rows: b } = await pool.query('SELECT milestones, wallet_address, proposal_id, vendor_name FROM bids WHERE bid_id=$1 AND tenant_id=$2', [bidId, tenantId]);
     if (!b[0]) return;
     const arr = Array.isArray(b[0].milestones) ? b[0].milestones : JSON.parse(b[0].milestones || '[]');
     const ms = { ...(arr[milestoneIndex] || {}) };
@@ -638,6 +638,27 @@ async function _finalizePaidInDb({ bidId, milestoneIndex, txHash, safeTxHash, te
        WHERE bid_id=$1 AND milestone_index=$2 AND tenant_id=$5`,
       [bidId, milestoneIndex, txHash || null, safeTxHash || null, tenantId]
     );
+
+    // [NEW] Notify Vendor of Payment Release
+    try {
+      const bid = b[0];
+      if (bid && bid.wallet_address) {
+        const { rows: p } = await pool.query('SELECT title FROM proposals WHERE proposal_id=$1', [bid.proposal_id]);
+        const proposalTitle = p[0]?.title || 'Project';
+
+        console.log(`[SafePay] Notifying ${bid.wallet_address} of payment for milestone ${milestoneIndex}`);
+        await createNotification({
+          tenantId,
+          wallet: bid.wallet_address,
+          type: 'payment_released',
+          title: 'Payment Released',
+          message: `Payment released for ${proposalTitle} (Milestone ${Number(milestoneIndex) + 1})`,
+          data: { bidId, milestoneIndex, txHash: txHash || safeTxHash }
+        });
+      }
+    } catch (err) {
+      console.warn('[SafePay] Failed to notify payment release:', err);
+    }
   } catch (e) {
     console.warn('[overlay finalize] DB finalize failed', e?.message || e);
   }
@@ -2058,15 +2079,28 @@ async function notifyPaymentReleased({ bid, proposal, msIndex, amount, txHash })
   ].filter(Boolean));
 
   // In-App Notification
-  console.log(`[notifyPaymentReleased] Creating notification for wallet: ${bid.wallet_address}, Tenant: ${bid.tenant_id}`);
-  await createNotification({
-    tenantId: bid.tenant_id,
-    wallet: bid.wallet_address,
-    type: 'payment_released',
-    title: 'Payment Released',
-    message: `Payment for Milestone #${msIndex} of "${proposal?.title || 'Project'}" has been released.`,
-    data: { bidId: bid.bid_id, milestoneIndex: msIndex - 1, txHash }
-  });
+  const notifWallet = bid.wallet_address;
+  const notifTenant = bid.tenant_id;
+
+  console.log(`[notifyPaymentReleased] Attempting notification. Wallet: ${notifWallet}, Tenant: ${notifTenant}`);
+
+  if (notifWallet) {
+    try {
+      await createNotification({
+        tenantId: notifTenant,
+        wallet: notifWallet,
+        type: 'payment_released',
+        title: 'Payment Released',
+        message: `Payment for Milestone #${msIndex} of "${proposal?.title || 'Project'}" has been released.`,
+        data: { bidId: bid.bid_id, milestoneIndex: msIndex - 1, txHash }
+      });
+      console.log('[notifyPaymentReleased] Notification created successfully');
+    } catch (err) {
+      console.error('[notifyPaymentReleased] createNotification failed:', err);
+    }
+  } else {
+    console.warn('[notifyPaymentReleased] No wallet address found for notification');
+  }
 }
 
 async function notifyIpfsMissing({ bid, proposal, cid, where, proofId = null, url = null }) {
