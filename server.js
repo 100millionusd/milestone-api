@@ -2125,7 +2125,7 @@ async function createNotification({ tenantId, wallet, type, title, message, data
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [tenantId, wallet, type, title, message, data || {}]
     );
-    console.log('[createNotification] DB insert success');
+    console.log('[createNotification] DB insert success. Attempting Push...');
 
     // Send Push Notification
     sendPushNotification(wallet, {
@@ -2133,7 +2133,9 @@ async function createNotification({ tenantId, wallet, type, title, message, data
       body: message,
       icon: '/android-chrome-192x192.png',
       data: { url: '/' } // Default to home, can be enhanced
-    }).catch(err => console.error("Push send failed:", err));
+    })
+      .then(() => console.log('[createNotification] Push sent successfully'))
+      .catch(err => console.error("[createNotification] Push send failed:", err));
 
   } catch (e) {
     console.warn('[Notifications] createNotification failed:', e);
@@ -10194,7 +10196,8 @@ app.post("/api/proofs/change-requests", adminGuard, async (req, res) => {
         `SELECT b.wallet_address, p.title, b.tenant_id 
          FROM bids b
          JOIN proposals p ON b.proposal_id = p.proposal_id
-         WHERE b.proposal_id = $1 AND b.status = 'approved'
+         WHERE b.proposal_id = $1 AND (b.status = 'approved' OR b.status = 'completed')
+         ORDER BY b.created_at DESC
          LIMIT 1`,
         [proposalId]
       );
