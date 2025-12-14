@@ -9016,6 +9016,9 @@ app.post("/proofs", authRequired, async (req, res) => {
     if (!bids[0]) return res.status(404).json({ error: "Bid not found" });
     const bid = bids[0];
 
+    const { rows: proposals } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [bid.proposal_id]);
+    const proposalRow = proposals[0];
+
     const caller = String(req.user?.sub || "").toLowerCase();
     const isAdmin = String(req.user?.role || "").toLowerCase() === "admin";
     if (!isAdmin && caller !== String(bid.wallet_address || "").toLowerCase()) {
