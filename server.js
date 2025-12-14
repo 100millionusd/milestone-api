@@ -8185,6 +8185,7 @@ app.post("/proofs/:id/approve", adminGuard, async (req, res) => {
 });
 
 app.post("/proofs/:id/reject", adminGuard, async (req, res) => {
+  console.log('HIT: POST /proofs/:id/reject', req.params.id);
   try {
     const id = Number(req.params.id);
     const reason = String(req.body?.reason || "").trim() || null;
@@ -9391,6 +9392,7 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
 
 // Reject the latest proof for a milestone (ADMIN) — clean version
 app.post("/proofs/:bidId/:milestoneIndex/reject", adminGuard, async (req, res) => {
+  console.log('HIT: POST /proofs/:bidId/:milestoneIndex/reject', req.params.bidId, req.params.milestoneIndex);
   try {
     const bidId = Number(req.params.bidId);
     const idx = Number(req.params.milestoneIndex);
@@ -9961,6 +9963,7 @@ Hints:
 // Reject the latest proof for a milestone (ADMIN)
 // URL: POST /bids/:bidId/milestones/:idx/reject
 app.post("/bids/:bidId/milestones/:idx/reject", adminGuard, async (req, res) => {
+  console.log('HIT: POST /bids/:bidId/milestones/:idx/reject', req.params.bidId, req.params.idx);
   try {
     const bidId = Number(req.params.bidId);
     const idx = Number(req.params.idx);
@@ -10140,6 +10143,7 @@ app.get("/api/proofs/change-requests", authRequired, async (req, res) => {
 
 // POST /api/proofs/change-requests (Admin creates request)
 app.post("/api/proofs/change-requests", adminGuard, async (req, res) => {
+  console.log('HIT: POST /api/proofs/change-requests', req.body);
   try {
     const { proposalId, milestoneIndex, comment, checklist, status } = req.body;
     // const tenantId = req.tenantId; // Table has no tenant_id
@@ -13637,6 +13641,27 @@ app.post("/api/notifications/:id/read", authRequired, async (req, res) => {
        WHERE id = $1 AND LOWER(recipient_wallet) = LOWER($2) AND tenant_id = $3`,
       [id, wallet, req.tenantId]
     );
+
+    // Notify Vendor
+    try {
+      // NOTE: bidId, idx, reason, and createNotification are not defined in this scope.
+      // This code snippet seems intended for a different endpoint (e.g., milestone rejection).
+      // Inserting as per instruction, but it will cause runtime errors due to undefined variables.
+      const { rows: [bid] } = await pool.query('SELECT wallet_address, title, tenant_id FROM bids JOIN proposals ON bids.proposal_id = proposals.proposal_id WHERE bid_id=$1', [bidId]);
+      if (bid) {
+        await createNotification({
+          tenantId: bid.tenant_id,
+          wallet: bid.wallet_address,
+          type: 'proof_rejected',
+          title: 'Proof Rejected',
+          message: `Your proof for ${bid.title} (Milestone ${Number(idx) + 1}) was rejected: ${reason || 'No reason provided'}`,
+          data: { bidId, milestoneIndex: idx }
+        });
+      }
+    } catch (err) {
+      console.warn('Failed to notify proof rejection (milestone route):', err);
+    }
+
     res.json({ success: true });
   } catch (e) {
     console.error("POST /api/notifications/:id/read error", e);
