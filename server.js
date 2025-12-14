@@ -7479,9 +7479,12 @@ async function autoReconcileSafeTransactionsOnce() {
             'SELECT * FROM proposals WHERE proposal_id=(SELECT proposal_id FROM bids WHERE bid_id=$1)',
             [row.bid_id]
           );
-          if (proposal && typeof notifyPaymentReleased === "function") {
+          // FIX: Fetch full bid to get wallet_address for notification
+          const { rows: [fullBid] } = await pool.query('SELECT * FROM bids WHERE bid_id=$1', [row.bid_id]);
+
+          if (proposal && fullBid && typeof notifyPaymentReleased === "function") {
             await notifyPaymentReleased({
-              bid: { bid_id: row.bid_id }, // minimal payload is fine
+              bid: fullBid,
               proposal,
               msIndex: row.milestone_index + 1,
               amount: row.amount_usd,
@@ -8163,7 +8166,10 @@ app.post("/proofs/:id/approve", adminGuard, async (req, res) => {
     if (typeof notifyProofApproved === "function") {
       const bid = bRows[0]; const proposal = pRows[0];
       const msIndex = Number(updated.milestone_index) + 1;
-      notifyProofApproved({ proof: updated, bid, proposal, msIndex }).catch(() => { });
+      console.log(`[POST /proofs/:id/approve] Calling notifyProofApproved for bid ${bid?.bid_id}, wallet ${bid?.wallet_address}`);
+      notifyProofApproved({ proof: updated, bid, proposal, msIndex }).catch((err) => {
+        console.error("[POST /proofs/:id/approve] notifyProofApproved failed:", err);
+      });
     }
 
     res.json(toCamel(updated));
@@ -9340,7 +9346,7 @@ app.post("/proofs/:bidId/:milestoneIndex/approve", adminGuard, async (req, res) 
             [bid.proposal_id]
           );
           if (proposal && typeof notifyProofApproved === "function") {
-            console.log("[notify] approve about to send", { bidId, ms: idx + 1, proofId: updated.proof_id });
+            console.log("[notify] approve about to send", { bidId, ms: idx + 1, proofId: updated.proof_id, wallet: bid.wallet_address });
             await notifyProofApproved({
               proof: updated,
               bid,
