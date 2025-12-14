@@ -2115,12 +2115,17 @@ async function notifyIpfsMissing({ bid, proposal, cid, where, proofId = null, ur
 // ==============================
 async function createNotification({ tenantId, wallet, type, title, message, data }) {
   try {
-    if (!wallet) return;
+    console.log(`[createNotification] Starting for ${wallet} type=${type}`);
+    if (!wallet) {
+      console.warn('[createNotification] No wallet provided');
+      return;
+    }
     await pool.query(
       `INSERT INTO notifications (tenant_id, recipient_wallet, type, title, message, data)
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [tenantId, wallet, type, title, message, data || {}]
     );
+    console.log('[createNotification] DB insert success');
 
     // Send Push Notification
     sendPushNotification(wallet, {
@@ -10151,6 +10156,7 @@ app.post("/api/proofs/change-requests", adminGuard, async (req, res) => {
 
     // Notify Vendor
     try {
+      console.log('[ChangeRequest] Finding vendor for proposal:', proposalId);
       // Find the accepted bid for this proposal to get the vendor's wallet
       const { rows: [bid] } = await pool.query(
         `SELECT b.wallet_address, p.title, b.tenant_id 
@@ -10162,6 +10168,7 @@ app.post("/api/proofs/change-requests", adminGuard, async (req, res) => {
       );
 
       if (bid) {
+        console.log('[ChangeRequest] Found vendor:', bid.wallet_address);
         await createNotification({
           tenantId: bid.tenant_id, // Use bid's tenant_id
           wallet: bid.wallet_address,
@@ -10170,6 +10177,9 @@ app.post("/api/proofs/change-requests", adminGuard, async (req, res) => {
           message: `Changes requested for ${bid.title} (Milestone ${Number(milestoneIndex) + 1}): ${comment || 'Check checklist'}`,
           data: { proposalId, milestoneIndex, requestId: rows[0].id }
         });
+        console.log('[ChangeRequest] Notification created');
+      } else {
+        console.warn('[ChangeRequest] No approved bid found for proposal:', proposalId);
       }
     } catch (err) {
       console.warn('Failed to notify change request:', err);
