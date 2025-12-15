@@ -1263,13 +1263,18 @@ async function attachPaymentState(bids) {
     `);
 
     // 2) Enforce "only one PENDING per (bid_id, milestone_index)" going forward.
+    // FIX: Drop the old strict index that blocked Controller Reports.
+    await pool.query(`DROP INDEX IF EXISTS ux_proofs_pending;`);
+
+    // Create a new index that ONLY enforces uniqueness for Vendor Proofs (standard).
+    // Controller reports are allowed to coexist with pending vendor proofs.
     await pool.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS ux_proofs_pending
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_proofs_pending_vendor
         ON proofs (bid_id, milestone_index)
-      WHERE status = 'pending';
+      WHERE status = 'pending' AND (subtype IS NULL OR subtype = 'standard');
     `);
 
-    console.log('[db] duplicate pending proofs cleaned; unique index ready');
+    console.log('[db] duplicate pending proofs cleaned; unique index updated (allows controller reports)');
   } catch (e) {
     console.error('DB cleanup/index for proofs failed:', e);
   }
