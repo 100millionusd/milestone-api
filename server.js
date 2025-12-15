@@ -8234,7 +8234,7 @@ app.get("/proofs", async (req, res) => {
         mp.status AS payment_status,
         mp.released_at AS paid_at
       FROM proofs p
-      JOIN bids b ON b.bid_id = p.bid_id
+      LEFT JOIN bids b ON b.bid_id = p.bid_id
       LEFT JOIN milestone_payments mp
         ON mp.bid_id = p.bid_id
         AND mp.milestone_index = p.milestone_index
@@ -8272,7 +8272,7 @@ app.get("/proofs", async (req, res) => {
             mp.status AS payment_status,
             mp.released_at AS paid_at
           FROM proofs p
-          JOIN bids b ON b.bid_id = p.bid_id
+          LEFT JOIN bids b ON b.bid_id = p.bid_id
           LEFT JOIN milestone_payments mp
             ON mp.bid_id = p.bid_id
             AND mp.milestone_index = p.milestone_index
