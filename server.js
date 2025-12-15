@@ -734,15 +734,15 @@ async function overlayPaidFromMp(bid, pool) {
     // Priority: subtype > role > address mismatch
     let isController = false;
 
-    const vendorWallet = String(bid.wallet_address || '').toLowerCase();
-    const submitter = String(p.submitter_address || '').toLowerCase();
+    // FIX: Harden subtype check. Handle null/undefined explicitly.
+    const subtype = p.subtype || '';
 
-    if (p.subtype === 'controller_report') {
+    if (subtype === 'controller_report') {
       isController = true;
-    } else if (p.subtype === 'standard') {
+    } else if (subtype === 'standard') {
       isController = false;
     } else {
-      // Legacy / Fallback
+      // Legacy / Fallback (only if subtype is missing/unknown)
       if (p.submitter_role === 'controller') isController = true;
       else if (p.submitter_role === 'vendor') isController = false;
       else if (submitter && vendorWallet && submitter !== vendorWallet) isController = true;
@@ -8288,7 +8288,7 @@ app.get("/proofs", async (req, res) => {
         q += ` AND p.tenant_id = $2`;
         params.push(req.tenantId);
       }
-      q += ` ORDER BY p.proof_id ASC`;
+      q += ` ORDER BY p.proof_id DESC`;
       ({ rows } = await pool.query(q, params));
     } else {
       let q = `${selectSql}
@@ -8299,7 +8299,7 @@ app.get("/proofs", async (req, res) => {
         q += ` AND b.tenant_id = $2`;
         params.push(req.tenantId);
       }
-      q += ` ORDER BY p.proof_id ASC`;
+      q += ` ORDER BY p.proof_id DESC`;
       ({ rows } = await pool.query(q, params));
     }
 
@@ -9235,6 +9235,10 @@ app.post("/proofs", authRequired, async (req, res) => {
     const title = (value.title || `Proof for Milestone ${milestoneIndex + 1}`).trim();
     const vendorPrompt = (value.vendorPrompt || value.prompt || "").trim();
 
+    // FIX: Harden subtype logic. Default to 'standard' unless explicitly 'controller_report'.
+    const rawSubtype = value.subtype;
+    const subtype = rawSubtype === 'controller_report' ? 'controller_report' : 'standard';
+
     // 5) Insert proof row
     const insertQ = `
       INSERT INTO proofs
@@ -9262,7 +9266,7 @@ app.post("/proofs", authRequired, async (req, res) => {
       req.tenantId,
       caller,           // $15 submitter_address
       role,             // $16 submitter_role
-      value.subtype || 'standard' // $17 subtype
+      subtype           // $17 subtype (hardened)
     ];
     const { rows: pr } = await pool.query(insertQ, insertVals);
     let proofRow = pr[0];
