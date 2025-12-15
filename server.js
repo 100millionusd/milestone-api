@@ -731,17 +731,24 @@ async function overlayPaidFromMp(bid, pool) {
     const group = proofsByIndex.get(idx);
 
     // Robust Controller Detection:
-    // 1. Explicit subtype/role (new reports)
-    // 2. Address mismatch (legacy reports): ONLY if subtype is not explicitly 'standard'
+    // Priority: subtype > role > address mismatch
+    let isController = false;
+
     const vendorWallet = String(bid.wallet_address || '').toLowerCase();
     const submitter = String(p.submitter_address || '').toLowerCase();
 
-    const isExplicitStandard = p.subtype === 'standard' || p.submitter_role === 'vendor';
-    const isExplicitController = p.subtype === 'controller_report' || p.submitter_role === 'controller';
+    if (p.subtype === 'controller_report') {
+      isController = true;
+    } else if (p.subtype === 'standard') {
+      isController = false;
+    } else {
+      // Legacy / Fallback
+      if (p.submitter_role === 'controller') isController = true;
+      else if (p.submitter_role === 'vendor') isController = false;
+      else if (submitter && vendorWallet && submitter !== vendorWallet) isController = true;
+    }
 
-    const isController =
-      isExplicitController ||
-      (!isExplicitStandard && submitter && vendorWallet && submitter !== vendorWallet);
+    // console.log(`[DEBUG] overlayPaidFromMp - Proof ${p.proof_id}: Subtype=${p.subtype}, Role=${p.submitter_role}, Addr=${submitter}, Vendor=${vendorWallet} => IsController? ${isController}`);
 
     if (isController) {
       group.controller = p;
@@ -9386,6 +9393,8 @@ Hints:
 
     // 7) Stamp a simple proof note back to milestones for quick view (VENDOR ONLY)
     // If this is a controller report, DO NOT overwrite the vendor's proof in the bids table.
+    console.log(`[DEBUG] POST /proofs - Role: ${role}, Subtype: ${subtype}, Updating Bids? ${role !== 'controller' && subtype !== 'controller_report'}`);
+
     if (role !== 'controller' && subtype !== 'controller_report') {
       const ms = milestones;
       ms[milestoneIndex] = {
