@@ -14069,6 +14069,9 @@ async function sendPushNotification(wallet, payload) {
   }
 }
 
+// Ensure DB columns exist (Controller support)
+ensureProofsColumns(pool).catch(err => console.error("Failed to ensure proofs columns:", err));
+
 app.listen(PORT, () => {
   console.log(`[api] Listening on :${PORT}`);
   console.log(`[api] Admin enforcement: ${ENFORCE_JWT_ADMIN ? "ON" : "OFF"}`);
