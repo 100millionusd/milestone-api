@@ -9039,6 +9039,7 @@ app.post("/proofs", authRequired, async (req, res) => {
       .optional(),
     prompt: Joi.string().allow("").optional(),
     vendorPrompt: Joi.string().allow("").optional(),
+    subtype: Joi.string().allow("").optional(),
   }).or("proof", "description").messages({
     "object.missing": "Must provide either proof (legacy) or description (new format)",
   });
