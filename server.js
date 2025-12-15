@@ -767,6 +767,10 @@ async function overlayPaidFromMp(bid, pool) {
     const vendorProof = group?.vendor;
     const controllerReport = group?.controller;
 
+    if (group) {
+      console.log(`[DEBUG] overlayPaidFromMp [Ms ${i}] - VendorProof: ${vendorProof?.proof_id} (${vendorProof?.status}), ControllerReport: ${controllerReport?.proof_id} (${controllerReport?.status})`);
+    }
+
     // Attach Controller Report if exists (supplementary info)
     if (controllerReport) {
       msArr[i].controllerReport = {
