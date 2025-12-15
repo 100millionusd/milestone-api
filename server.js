@@ -194,7 +194,7 @@ const softAuth = (req, res, next) => {
 };
 
 // === ROLE HELPERS (paste once, under auth utilities; do NOT redeclare JWT_SECRET) =========
-const VALID_ROLES = ['vendor', 'proposer', 'admin', 'reporter']; // ✅ Added 'reporter'
+const VALID_ROLES = ['vendor', 'proposer', 'admin', 'reporter', 'controller']; // ✅ Added 'controller'
 
 /** normalize role intent from query/body */
 function normalizeRoleIntent(v) {
@@ -206,8 +206,8 @@ function roleFromDurableOrIntent(roles, intent) {
   if (!Array.isArray(roles)) roles = [];
   // if they already only have one durable role and no intent, use it
   if (roles.length === 1 && !intent) return roles[0];
-  // explicit intent wins (only allow vendor/proposer/reporter here)
-  if (intent === 'vendor' || intent === 'proposer' || intent === 'reporter') return intent;
+  // explicit intent wins (only allow vendor/proposer/reporter/controller here)
+  if (intent === 'vendor' || intent === 'proposer' || intent === 'reporter' || intent === 'controller') return intent;
   // 🛑 FIX: Allow admin intent ONLY if they actually have the admin role
   if (intent === 'admin' && roles.includes('admin')) return 'admin';
   // if there’s a single non-admin durable role, pick it
@@ -526,6 +526,26 @@ async function ensureChangeRequestsSchema() {
   `;
   await pool.query(sql);
   console.log('[startup] change_requests schema ensured');
+}
+
+(async () => {
+  try {
+    if (typeof ensureProofsColumns === 'function') {
+      await ensureProofsColumns();
+    }
+  } catch (e) {
+    console.error('[startup] ensureProofsColumns failed', e);
+  }
+})();
+
+async function ensureProofsColumns() {
+  const sql = `
+    ALTER TABLE proofs ADD COLUMN IF NOT EXISTS submitter_address TEXT;
+    ALTER TABLE proofs ADD COLUMN IF NOT EXISTS submitter_role TEXT;
+    ALTER TABLE proofs ADD COLUMN IF NOT EXISTS subtype TEXT DEFAULT 'standard';
+  `;
+  await pool.query(sql);
+  console.log('[startup] proofs columns ensured');
 }
 
 // ---- Safe Tx overlay helpers (response-time hydration) ----
@@ -5800,6 +5820,16 @@ app.get("/bids", async (req, res) => {
       return res.json(out);
     }
 
+    // --- CONTROLLER (view all bids, read-only list) ---
+    if (role === 'controller') {
+      // Controllers see all bids for the tenant (like admin, but maybe read-only intent)
+      // We can reuse the admin logic or a scoped version.
+      // For now, let's give them all bids in the tenant.
+      const { rows } = await pool.query("SELECT * FROM bids WHERE tenant_id=$1 ORDER BY bid_id DESC", [req.tenantId]);
+      const hydrated = await Promise.all(rows.map(r => overlayPaidFromMp(r, pool)));
+      return res.json(mapRows(hydrated));
+    }
+
     // --- VENDOR-SCOPED (non-admin) ---
     if (SCOPE_BIDS_FOR_VENDOR && role !== "admin") {
       if (!caller) return res.status(401).json({ error: "Unauthorized" });
@@ -9020,8 +9050,11 @@ app.post("/proofs", authRequired, async (req, res) => {
     const proposalRow = proposals[0];
 
     const caller = String(req.user?.sub || "").toLowerCase();
-    const isAdmin = String(req.user?.role || "").toLowerCase() === "admin";
-    if (!isAdmin && caller !== String(bid.wallet_address || "").toLowerCase()) {
+    const role = String(req.user?.role || "").toLowerCase();
+    const isAdmin = role === "admin";
+    const isController = role === "controller";
+
+    if (!isAdmin && !isController && caller !== String(bid.wallet_address || "").toLowerCase()) {
       return res.status(403).json({ error: "Forbidden" });
     }
 
@@ -9113,11 +9146,13 @@ app.post("/proofs", authRequired, async (req, res) => {
       INSERT INTO proofs
         (bid_id, milestone_index, vendor_name, wallet_address, title, description,
          files, file_meta, gps_lat, gps_lon, gps_alt, capture_time,
-         status, submitted_at, vendor_prompt, updated_at, tenant_id)
+         status, submitted_at, vendor_prompt, updated_at, tenant_id,
+         submitter_address, submitter_role, subtype)
        VALUES
          ($1,$2,$3,$4,$5,$6,
           $7,$8,$9,$10,$11,$12,
-          'pending', NOW(), $13, NOW(), $14)
+          'pending', NOW(), $13, NOW(), $14,
+          $15, $16, $17)
        RETURNING *`;
     const insertVals = [
       bidId,
@@ -9130,7 +9165,10 @@ app.post("/proofs", authRequired, async (req, res) => {
       JSON.stringify(fileMeta || []),
       gpsLat, gpsLon, gpsAlt, captureIso,
       vendorPrompt || "",
-      req.tenantId
+      req.tenantId,
+      caller,           // $15 submitter_address
+      role,             // $16 submitter_role
+      value.subtype || 'standard' // $17 subtype
     ];
     const { rows: pr } = await pool.query(insertQ, insertVals);
     let proofRow = pr[0];
@@ -13689,6 +13727,105 @@ app.put('/api/reports/:id/archive', authRequired, async (req, res) => {
   } catch (err) {
     console.error("ARCHIVE /api/reports error:", err);
     res.status(500).json({ error: "Failed to archive report" });
+  }
+});
+
+// ==============================
+// ADMIN TEAM MANAGEMENT
+// ==============================
+
+// GET /api/admin/members - List all members for this tenant
+app.get('/api/admin/members', authRequired, async (req, res) => {
+  try {
+    const role = (req.user?.role || '').toLowerCase();
+    const wallet = (req.user?.sub || '').toLowerCase();
+
+    // Only admins can list members
+    if (role !== 'admin' && !isAdminAddress(wallet)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT wallet_address, role, created_at 
+       FROM tenant_members 
+       WHERE tenant_id = $1 
+       ORDER BY created_at DESC`,
+      [req.tenantId]
+    );
+
+    res.json(rows);
+  } catch (err) {
+    console.error("GET /api/admin/members error:", err);
+    res.status(500).json({ error: "Failed to fetch members" });
+  }
+});
+
+// POST /api/admin/members - Add a new member
+app.post('/api/admin/members', authRequired, async (req, res) => {
+  try {
+    const role = (req.user?.role || '').toLowerCase();
+    const wallet = (req.user?.sub || '').toLowerCase();
+
+    if (role !== 'admin' && !isAdminAddress(wallet)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const schema = Joi.object({
+      walletAddress: Joi.string().required(),
+      role: Joi.string().valid('admin', 'controller', 'viewer').required()
+    });
+
+    const { error, value } = schema.validate(req.body);
+    if (error) return res.status(400).json({ error: error.message });
+
+    const targetWallet = value.walletAddress.toLowerCase();
+
+    await pool.query(
+      `INSERT INTO tenant_members (tenant_id, wallet_address, role, created_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (tenant_id, wallet_address) 
+       DO UPDATE SET role = EXCLUDED.role`,
+      [req.tenantId, targetWallet, value.role]
+    );
+
+    res.json({ success: true, wallet: targetWallet, role: value.role });
+  } catch (err) {
+    console.error("POST /api/admin/members error:", err);
+    res.status(500).json({ error: "Failed to add member" });
+  }
+});
+
+// DELETE /api/admin/members/:address - Remove a member
+app.delete('/api/admin/members/:address', authRequired, async (req, res) => {
+  try {
+    const role = (req.user?.role || '').toLowerCase();
+    const wallet = (req.user?.sub || '').toLowerCase();
+
+    if (role !== 'admin' && !isAdminAddress(wallet)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const targetWallet = req.params.address.toLowerCase();
+
+    // Prevent removing yourself
+    if (targetWallet === wallet) {
+      return res.status(400).json({ error: "Cannot remove yourself" });
+    }
+
+    const { rowCount } = await pool.query(
+      `DELETE FROM tenant_members 
+       WHERE tenant_id = $1 AND lower(wallet_address) = $2`,
+      [req.tenantId, targetWallet]
+    );
+
+    if (rowCount === 0) {
+      return res.status(404).json({ error: "Member not found" });
+    }
+
+    res.json({ success: true, deleted: targetWallet });
+  } catch (err) {
+    console.error("DELETE /api/admin/members error:", err);
+    res.status(500).json({ error: "Failed to remove member" });
   }
 });
 
