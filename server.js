@@ -9424,7 +9424,7 @@ Hints:
     console.error("POST /proofs error:", err);
     return res
       .status(400)
-      .json({ error: "Invalid /proofs request. Check bidId, milestoneIndex, and payload format." });
+      .json({ error: `Invalid /proofs request: ${err.message}` });
   }
 });
 
