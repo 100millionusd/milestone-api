@@ -8263,76 +8263,77 @@ app.get("/proofs", async (req, res) => {
       if (isAdmin) {
         // Robust Query: Join bids to ensure we see proofs for our tenant's bids, 
         // even if proof.tenant_id is mismatched (e.g. created in global context).
-        SELECT
-        p.*,
-          b.wallet_address AS vendor_wallet,
+        let q = `
+          SELECT
+            p.*,
+            b.wallet_address AS vendor_wallet,
             mp.tx_hash AS payment_tx_hash,
-              mp.safe_tx_hash AS safe_payment_tx_hash,
-                mp.status AS payment_status,
-                  mp.released_at AS paid_at
+            mp.safe_tx_hash AS safe_payment_tx_hash,
+            mp.status AS payment_status,
+            mp.released_at AS paid_at
           FROM proofs p
           JOIN bids b ON b.bid_id = p.bid_id
           LEFT JOIN milestone_payments mp
             ON mp.bid_id = p.bid_id
             AND mp.milestone_index = p.milestone_index
-          `;
-    const params = [];
-    // Filter by tenant ONLY if not Global Admin
-    if (req.tenantId !== DEFAULT_TENANT_ID) {
-      q += ` WHERE b.tenant_id = $1`;
-      params.push(req.tenantId);
-    }
-    q += ` ORDER BY p.proof_id DESC`;
-    const { rows: allRows } = await pool.query(q, params);
-    rows = allRows;
-  } else {
-    return res.status(400).json({ error: "Provide bidId or proposalId" });
-  }
-} else if (Number.isFinite(bidId)) {
-  let q = `${ selectSql } WHERE p.bid_id = $1`;
-  const params = [bidId];
-  if (req.tenantId !== DEFAULT_TENANT_ID) {
-    q += ` AND p.tenant_id = $2`;
-    params.push(req.tenantId);
-  }
-  q += ` ORDER BY p.proof_id DESC`;
-  ({ rows } = await pool.query(q, params));
-} else {
-  let q = `${ selectSql }
+        `;
+        const params = [];
+        // Filter by tenant ONLY if not Global Admin
+        if (req.tenantId !== DEFAULT_TENANT_ID) {
+          q += ` WHERE b.tenant_id = $1`;
+          params.push(req.tenantId);
+        }
+        q += ` ORDER BY p.proof_id DESC`;
+        const { rows: allRows } = await pool.query(q, params);
+        rows = allRows;
+      } else {
+        return res.status(400).json({ error: "Provide bidId or proposalId" });
+      }
+    } else if (Number.isFinite(bidId)) {
+      let q = `${selectSql} WHERE p.bid_id = $1`;
+      const params = [bidId];
+      if (req.tenantId !== DEFAULT_TENANT_ID) {
+        q += ` AND p.tenant_id = $2`;
+        params.push(req.tenantId);
+      }
+      q += ` ORDER BY p.proof_id DESC`;
+      ({ rows } = await pool.query(q, params));
+    } else {
+      let q = `${selectSql}
          JOIN bids b ON b.bid_id = p.bid_id
          WHERE b.proposal_id = $1`;
-  const params = [proposalId];
-  if (req.tenantId !== DEFAULT_TENANT_ID) {
-    q += ` AND b.tenant_id = $2`;
-    params.push(req.tenantId);
-  }
-  q += ` ORDER BY p.proof_id DESC`;
-  ({ rows } = await pool.query(q, params));
-}
+      const params = [proposalId];
+      if (req.tenantId !== DEFAULT_TENANT_ID) {
+        q += ` AND b.tenant_id = $2`;
+        params.push(req.tenantId);
+      }
+      q += ` ORDER BY p.proof_id DESC`;
+      ({ rows } = await pool.query(q, params));
+    }
 
-// normalize for the frontend
-const out = await Promise.all(rows.map(async r => {
-  const o = toCamel(r);
-  o.files = coerceJson(o.files) || [];
-  o.fileMeta = coerceJson(o.fileMeta) || [];
-  o.aiAnalysis = coerceJson(o.aiAnalysis) || null;
-  o.geo = await buildSafeGeoForProof(o);
+    // normalize for the frontend
+    const out = await Promise.all(rows.map(async r => {
+      const o = toCamel(r);
+      o.files = coerceJson(o.files) || [];
+      o.fileMeta = coerceJson(o.fileMeta) || [];
+      o.aiAnalysis = coerceJson(o.aiAnalysis) || null;
+      o.geo = await buildSafeGeoForProof(o);
 
-  // FIX: Explicitly set 'paid' flag if we found a hash or 'released' status
-  if (o.paymentTxHash || o.paymentStatus === 'released') {
-    o.paid = true;
-    // Ensure tx hash is visible even if only found in mp table
-    o.paymentTxHash = o.paymentTxHash || r.payment_tx_hash;
-  }
+      // FIX: Explicitly set 'paid' flag if we found a hash or 'released' status
+      if (o.paymentTxHash || o.paymentStatus === 'released') {
+        o.paid = true;
+        // Ensure tx hash is visible even if only found in mp table
+        o.paymentTxHash = o.paymentTxHash || r.payment_tx_hash;
+      }
 
-  return o;
-}));
+      return o;
+    }));
 
-res.json(out);
+    res.json(out);
   } catch (e) {
-  console.error("GET /proofs failed:", e);
-  res.status(500).json({ error: "Failed to load proofs" });
-}
+    console.error("GET /proofs failed:", e);
+    res.status(500).json({ error: "Failed to load proofs" });
+  }
 });
 
 app.post("/proofs/:id/approve", adminGuard, async (req, res) => {
@@ -8365,7 +8366,7 @@ app.post("/proofs/:id/approve", adminGuard, async (req, res) => {
     if (typeof notifyProofApproved === "function") {
       const bid = bRows[0]; const proposal = pRows[0];
       const msIndex = Number(updated.milestone_index) + 1;
-      console.log(`[POST / proofs /: id / approve] Calling notifyProofApproved for bid ${ bid?.bid_id }, wallet ${ bid?.wallet_address } `);
+      console.log(`[POST / proofs /: id / approve] Calling notifyProofApproved for bid ${bid?.bid_id}, wallet ${bid?.wallet_address} `);
       notifyProofApproved({ proof: updated, bid, proposal, msIndex }).catch((err) => {
         console.error("[POST /proofs/:id/approve] notifyProofApproved failed:", err);
       });
@@ -8415,7 +8416,7 @@ RETURNING * `,
           wallet: bid.wallet_address,
           type: 'proof_rejected',
           title: 'Proof Rejected',
-          message: `Your proof for ${ bid.title }(Milestone ${ Number(proof.milestone_index) + 1}) was rejected: ${ reason || 'No reason provided' } `,
+          message: `Your proof for ${bid.title}(Milestone ${Number(proof.milestone_index) + 1}) was rejected: ${reason || 'No reason provided'} `,
           data: { proofId: id, bidId: proof.bid_id }
         });
       }
@@ -8722,7 +8723,7 @@ VALUES($1, $2, $3, 'pending', NOW(), $4)
             // 1) pick a Safe owner key from env or tenant config
             const rawKeys = (tKey || process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
               .split(",").map(s => s.trim()).filter(Boolean)
-              .map(k => (k.startsWith("0x") ? k : `0x${ k } `));
+              .map(k => (k.startsWith("0x") ? k : `0x${k} `));
             if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured");
 
             // 2) verify signer is an owner
@@ -8734,7 +8735,7 @@ VALUES($1, $2, $3, 'pending', NOW(), $4)
               const w = new ethers.Wallet(k, provider);
               if (ownersLc.includes(w.address.toLowerCase())) { signerWallet = w; break; }
             }
-            if (!signerWallet) throw new Error(`None of the provided keys is a Safe owner.Owners: ${ ownersLc.join(", ") } `);
+            if (!signerWallet) throw new Error(`None of the provided keys is a Safe owner.Owners: ${ownersLc.join(", ")} `);
             const senderAddr = await signerWallet.getAddress();
             console.log("[SAFE] using signer (owner):", senderAddr);
 
@@ -8742,7 +8743,7 @@ VALUES($1, $2, $3, 'pending', NOW(), $4)
             const tokenMeta = (TOKENS && TOKENS[token]) || {};
             const tokenAddr = tokenMeta.address;
             const tokenDec = Number.isInteger(tokenMeta.decimals) ? tokenMeta.decimals : 6;
-            if (!tokenAddr) throw new Error(`Unknown token ${ token } (no address in TOKENS)`);
+            if (!tokenAddr) throw new Error(`Unknown token ${token} (no address in TOKENS)`);
 
             const amountUnits = typeof toTokenUnits === "function"
               ? await toTokenUnits(token, msAmountUSD)
@@ -8792,7 +8793,7 @@ VALUES($1, $2, $3, 'pending', NOW(), $4)
             const signatureRaw = await signerWallet._signTypedData(domain, types, value); // 65-byte sig
             const recovered = ethers.utils.verifyTypedData(domain, types, value, signatureRaw);
             if (recovered.toLowerCase() !== senderAddr.toLowerCase()) {
-              throw new Error(`[SAFE] EIP - 712 signature mismatch BEFORE POST: recovered ${ recovered }, expected ${ senderAddr } `);
+              throw new Error(`[SAFE] EIP - 712 signature mismatch BEFORE POST: recovered ${recovered}, expected ${senderAddr} `);
             }
 
             // 7) compute the contractTransactionHash (REQUIRED by Tx-Service)
@@ -8801,310 +8802,310 @@ VALUES($1, $2, $3, 'pending', NOW(), $4)
             // Tx-Service expects EIP-712 signatures with type suffix "02"
             const hexNoPrefix = signatureRaw.slice(2);
             if (hexNoPrefix.length !== 130) {
-              throw new Error(`[SAFE] unexpected EIP - 712 signature length = ${ hexNoPrefix.length } (expected 130)`);
+              throw new Error(`[SAFE] unexpected EIP - 712 signature length = ${hexNoPrefix.length} (expected 130)`);
             }
             const senderSignature = signatureRaw + "02";
 
             // 8) DIRECT POST to Safe Tx-Service (checksummed address; 'sep' base)
             console.log("[SAFE] using DIRECT POST path");
-            console.log("[SAFE] POST", `${ TX_SERVICE_BASE } /api/v2 / safes / ${ SAFE_ADDRESS_CS } /multisig-transactions/`);
+            console.log("[SAFE] POST", `${TX_SERVICE_BASE} /api/v2 / safes / ${SAFE_ADDRESS_CS} /multisig-transactions/`);
 
             // optional: early info check for clearer error
             {
-              const info = await fetch(`${ TX_SERVICE_BASE } /api/v1 / safes / ${ SAFE_ADDRESS_CS }/`, {
-headers: { "Authorization": `Bearer ${SAFE_API_KEY}` }
+              const info = await fetch(`${TX_SERVICE_BASE} /api/v1 / safes / ${SAFE_ADDRESS_CS}/`, {
+                headers: { "Authorization": `Bearer ${SAFE_API_KEY}` }
               });
-if (!info.ok) {
-  const msg = await info.text().catch(() => "");
-  throw new Error(`[SAFE info] ${info.status} ${msg || info.statusText}`);
-}
+              if (!info.ok) {
+                const msg = await info.text().catch(() => "");
+                throw new Error(`[SAFE info] ${info.status} ${msg || info.statusText}`);
+              }
             }
 
-const body = {
-  to: tokenAddr,
-  value: "0",
-  data,
-  operation: 0,
-  gasToken: ZERO,
-  safeTxGas: 0,
-  baseGas: 0,
-  gasPrice: "0",
-  refundReceiver: ZERO,
-  nonce,
-  contractTransactionHash,          // <-- REQUIRED (this fixes the 422)
-  sender: senderAddr,
-  signature: senderSignature,       // EIP-712 + "02"
-  origin: "milestone-pay"
-};
+            const body = {
+              to: tokenAddr,
+              value: "0",
+              data,
+              operation: 0,
+              gasToken: ZERO,
+              safeTxGas: 0,
+              baseGas: 0,
+              gasPrice: "0",
+              refundReceiver: ZERO,
+              nonce,
+              contractTransactionHash,          // <-- REQUIRED (this fixes the 422)
+              sender: senderAddr,
+              signature: senderSignature,       // EIP-712 + "02"
+              origin: "milestone-pay"
+            };
 
-const resp = await fetch(`${TX_SERVICE_BASE}/api/v2/safes/${SAFE_ADDRESS_CS}/multisig-transactions/`, {
-  method: "POST",
-  headers: {
-    "content-type": "application/json",
-    "Authorization": `Bearer ${SAFE_API_KEY}`
-  },
-  body: JSON.stringify(body)
-});
+            const resp = await fetch(`${TX_SERVICE_BASE}/api/v2/safes/${SAFE_ADDRESS_CS}/multisig-transactions/`, {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "Authorization": `Bearer ${SAFE_API_KEY}`
+              },
+              body: JSON.stringify(body)
+            });
 
-if (!resp.ok) {
-  const txt = await resp.text().catch(() => "");
-  throw new Error(`TxService propose failed [${resp.status}] ${txt || resp.statusText}`);
-}
+            if (!resp.ok) {
+              const txt = await resp.text().catch(() => "");
+              throw new Error(`TxService propose failed [${resp.status}] ${txt || resp.statusText}`);
+            }
 
-// 9) store the tx hash + nonce (use the typed-data hash)
-await pool.query(
-  `UPDATE milestone_payments
+            // 9) store the tx hash + nonce (use the typed-data hash)
+            await pool.query(
+              `UPDATE milestone_payments
      SET safe_tx_hash=$3, safe_nonce=$4
    WHERE bid_id=$1 AND milestone_index=$2`,
-  [bidId, milestoneIndex, contractTransactionHash, nonce]
-);
+              [bidId, milestoneIndex, contractTransactionHash, nonce]
+            );
 
-// === A) Write in-flight markers into bids.milestones so UI hides buttons & can poll ===
-try {
-  const { rows } = await pool.query(
-    'SELECT milestones FROM bids WHERE bid_id=$1 LIMIT 1',
-    [bidId]
-  );
-  const milestonesJson = rows?.[0]?.milestones;
-  const milestonesArr = Array.isArray(milestonesJson)
-    ? milestonesJson
-    : JSON.parse(milestonesJson || '[]');
+            // === A) Write in-flight markers into bids.milestones so UI hides buttons & can poll ===
+            try {
+              const { rows } = await pool.query(
+                'SELECT milestones FROM bids WHERE bid_id=$1 LIMIT 1',
+                [bidId]
+              );
+              const milestonesJson = rows?.[0]?.milestones;
+              const milestonesArr = Array.isArray(milestonesJson)
+                ? milestonesJson
+                : JSON.parse(milestonesJson || '[]');
 
-  const ms = { ...(milestonesArr[milestoneIndex] || {}) };
+              const ms = { ...(milestonesArr[milestoneIndex] || {}) };
 
-  // Markers the UI looks for to treat as "in-flight"
-  ms.safePaymentTxHash = contractTransactionHash;      // Client polls /safe/tx/:hash with this
-  ms.safeTxHash = ms.safeTxHash || contractTransactionHash;
-  ms.safeNonce = nonce;
-  ms.safeStatus = 'submitted';
-  ms.paymentPending = true;
-  if (!ms.status || ms.status === 'approved') ms.status = 'pending';
+              // Markers the UI looks for to treat as "in-flight"
+              ms.safePaymentTxHash = contractTransactionHash;      // Client polls /safe/tx/:hash with this
+              ms.safeTxHash = ms.safeTxHash || contractTransactionHash;
+              ms.safeNonce = nonce;
+              ms.safeStatus = 'submitted';
+              ms.paymentPending = true;
+              if (!ms.status || ms.status === 'approved') ms.status = 'pending';
 
-  milestonesArr[milestoneIndex] = ms;
+              milestonesArr[milestoneIndex] = ms;
 
-  await pool.query(
-    'UPDATE bids SET milestones=$1 WHERE bid_id=$2',
-    [JSON.stringify(milestonesArr), bidId]
-  );
-} catch (e) {
-  console.warn('Failed to persist in-flight markers to milestones JSON', e?.message || e);
-}
+              await pool.query(
+                'UPDATE bids SET milestones=$1 WHERE bid_id=$2',
+                [JSON.stringify(milestonesArr), bidId]
+              );
+            } catch (e) {
+              console.warn('Failed to persist in-flight markers to milestones JSON', e?.message || e);
+            }
 
-// === B) Immediate executed check: if already executed -> mark as PAID now ===
-{
-  // Use rate-limited fetch if available; otherwise fall back to fetch
-  const _safeFetch = (typeof safeFetchRL === 'function') ? safeFetchRL : fetch;
+            // === B) Immediate executed check: if already executed -> mark as PAID now ===
+            {
+              // Use rate-limited fetch if available; otherwise fall back to fetch
+              const _safeFetch = (typeof safeFetchRL === 'function') ? safeFetchRL : fetch;
 
-  try {
-    const url = `${TX_SERVICE_BASE}/api/v1/multisig-transactions/${contractTransactionHash}`;
-    const r = await _safeFetch(url);
+              try {
+                const url = `${TX_SERVICE_BASE}/api/v1/multisig-transactions/${contractTransactionHash}`;
+                const r = await _safeFetch(url);
 
-    if (r.ok) {
-      const t = await r.json().catch(() => null);
+                if (r.ok) {
+                  const t = await r.json().catch(() => null);
 
-      // Robust execution detection across Safe API variants
-      const statusStr = String(t?.tx_status || t?.status || "").toLowerCase();
-      const executed =
-        !!t?.is_executed ||
-        !!t?.isExecuted ||
-        !!t?.execution_date ||
-        !!t?.executionDate ||
-        !!t?.transaction_hash ||
-        !!t?.transactionHash ||
-        statusStr === "success" ||
-        statusStr === "executed" ||
-        statusStr === "successful";
+                  // Robust execution detection across Safe API variants
+                  const statusStr = String(t?.tx_status || t?.status || "").toLowerCase();
+                  const executed =
+                    !!t?.is_executed ||
+                    !!t?.isExecuted ||
+                    !!t?.execution_date ||
+                    !!t?.executionDate ||
+                    !!t?.transaction_hash ||
+                    !!t?.transactionHash ||
+                    statusStr === "success" ||
+                    statusStr === "executed" ||
+                    statusStr === "successful";
 
-      if (executed) {
-        const finalTxHash =
-          t?.transaction_hash || t?.transactionHash || t?.tx_hash || t?.txHash || contractTransactionHash;
+                  if (executed) {
+                    const finalTxHash =
+                      t?.transaction_hash || t?.transactionHash || t?.tx_hash || t?.txHash || contractTransactionHash;
 
-        // milestone_payments → mark released now
-        await pool.query(
-          `UPDATE milestone_payments
+                    // milestone_payments → mark released now
+                    await pool.query(
+                      `UPDATE milestone_payments
              SET status='released', tx_hash=$3, released_at=NOW()
            WHERE bid_id=$1 AND milestone_index=$2`,
-          [bidId, milestoneIndex, finalTxHash]
-        );
+                      [bidId, milestoneIndex, finalTxHash]
+                    );
 
-        // bids.milestones → fields the FE's isPaid() relies on
-        const iso = new Date().toISOString();
-        await upsertMilestoneFields(bidId, milestoneIndex, {
-          paymentTxHash: finalTxHash,
-          paymentDate: iso,
-          paidAt: iso,
-          paid: true,
-          status: 'paid',
-          paymentPending: false,
-        });
+                    // bids.milestones → fields the FE's isPaid() relies on
+                    const iso = new Date().toISOString();
+                    await upsertMilestoneFields(bidId, milestoneIndex, {
+                      paymentTxHash: finalTxHash,
+                      paymentDate: iso,
+                      paidAt: iso,
+                      paid: true,
+                      status: 'paid',
+                      paymentPending: false,
+                    });
 
-        // best-effort notify (ignore failures)
-        if (proposal && typeof notifyPaymentReleased === 'function') {
-          try {
-            await notifyPaymentReleased({
-              bid,
-              proposal,
-              msIndex: milestoneIndex + 1,
-              amount: msAmountUSD,
-              txHash: finalTxHash,
-            });
-          } catch { }
-        }
+                    // best-effort notify (ignore failures)
+                    if (proposal && typeof notifyPaymentReleased === 'function') {
+                      try {
+                        await notifyPaymentReleased({
+                          bid,
+                          proposal,
+                          msIndex: milestoneIndex + 1,
+                          amount: msAmountUSD,
+                          txHash: finalTxHash,
+                        });
+                      } catch { }
+                    }
 
-        return res.json({ ok: true, status: 'released', txHash: finalTxHash });
-      }
-      // Not executed yet → fall through to pending below
-    } else {
-      const txt = await r.text().catch(() => '');
-      console.warn('Immediate Safe check HTTP failed', r.status, txt || r.statusText);
-      // fall through to pending
-    }
-  } catch (e) {
-    console.warn('Immediate Safe execution check failed, proceeding with pending', e?.message || e);
-    // fall through to pending
-  }
-}
+                    return res.json({ ok: true, status: 'released', txHash: finalTxHash });
+                  }
+                  // Not executed yet → fall through to pending below
+                } else {
+                  const txt = await r.text().catch(() => '');
+                  console.warn('Immediate Safe check HTTP failed', r.status, txt || r.statusText);
+                  // fall through to pending
+                }
+              } catch (e) {
+                console.warn('Immediate Safe execution check failed, proceeding with pending', e?.message || e);
+                // fall through to pending
+              }
+            }
 
-// 10) notify
-try {
-  const { rows: [proposal] } = await pool.query(
-    "SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1",
-    [bid.proposal_id]
-  );
-  if (proposal && typeof notifyPaymentPending === "function") {
-    await notifyPaymentPending({
-      bid,
-      proposal,
-      msIndex: milestoneIndex + 1,
-      amount: msAmountUSD,
-      method: "safe",
-      txRef: contractTransactionHash
-    });
-  }
-} catch (e) {
-  console.warn("notifyPaymentPending (post-safe-hash) failed", e?.message || e);
-}
+            // 10) notify
+            try {
+              const { rows: [proposal] } = await pool.query(
+                "SELECT proposal_id, title, org_name FROM proposals WHERE proposal_id=$1",
+                [bid.proposal_id]
+              );
+              if (proposal && typeof notifyPaymentPending === "function") {
+                await notifyPaymentPending({
+                  bid,
+                  proposal,
+                  msIndex: milestoneIndex + 1,
+                  amount: msAmountUSD,
+                  method: "safe",
+                  txRef: contractTransactionHash
+                });
+              }
+            } catch (e) {
+              console.warn("notifyPaymentPending (post-safe-hash) failed", e?.message || e);
+            }
 
-return;
+            return;
           } catch (safeErr) {
-  console.error("SAFE propose failed; leaving pending", safeErr?.message || safeErr);
-  return;
-}
+            console.error("SAFE propose failed; leaving pending", safeErr?.message || safeErr);
+            return;
+          }
         }
 
-// ---------- MANUAL/EOA PATH ----------
-let txHash;
-if (blockchainService?.transferSubmit) {
-  const r = await blockchainService.transferSubmit(token, bid.wallet_address, msAmountUSD);
-  txHash = r?.hash;
-} else if (blockchainService?.sendToken) {
-  const r = await blockchainService.sendToken(token, bid.wallet_address, msAmountUSD, bid.tenant_id);
-  txHash = r?.hash;
-} else {
-  txHash = "dev_" + crypto.randomBytes(8).toString("hex");
-}
+        // ---------- MANUAL/EOA PATH ----------
+        let txHash;
+        if (blockchainService?.transferSubmit) {
+          const r = await blockchainService.transferSubmit(token, bid.wallet_address, msAmountUSD);
+          txHash = r?.hash;
+        } else if (blockchainService?.sendToken) {
+          const r = await blockchainService.sendToken(token, bid.wallet_address, msAmountUSD, bid.tenant_id);
+          txHash = r?.hash;
+        } else {
+          txHash = "dev_" + crypto.randomBytes(8).toString("hex");
+        }
 
-// --- FALLBACK: recover tx hash from chain logs if wrapper returned none ---
-if (!txHash) {
-  const rpcUrl =
-    process.env.PAYOUT_RPC_URL ||
-    process.env.ANCHOR_RPC_URL ||
-    process.env.SEPOLIA_RPC_URL; // make sure this matches the CHAIN you paid on
-  const tokenKeyOrAddr = (TOKENS[token]?.address) ? TOKENS[token].address : token; // "USDT" -> TOKENS.USDT.address, or 0x...
-  try {
-    const recovered = await salvageTxHashViaLogs(
-      rpcUrl,
-      tokenKeyOrAddr,
-      bid.wallet_address,
-      msAmountUSD
-    );
-    if (recovered) {
-      txHash = recovered;
-      console.log('[SALVAGE] recovered txHash:', txHash);
-    }
-  } catch (e) {
-    console.warn('[SALVAGE] error:', e?.message || e);
-  }
-}
+        // --- FALLBACK: recover tx hash from chain logs if wrapper returned none ---
+        if (!txHash) {
+          const rpcUrl =
+            process.env.PAYOUT_RPC_URL ||
+            process.env.ANCHOR_RPC_URL ||
+            process.env.SEPOLIA_RPC_URL; // make sure this matches the CHAIN you paid on
+          const tokenKeyOrAddr = (TOKENS[token]?.address) ? TOKENS[token].address : token; // "USDT" -> TOKENS.USDT.address, or 0x...
+          try {
+            const recovered = await salvageTxHashViaLogs(
+              rpcUrl,
+              tokenKeyOrAddr,
+              bid.wallet_address,
+              msAmountUSD
+            );
+            if (recovered) {
+              txHash = recovered;
+              console.log('[SALVAGE] recovered txHash:', txHash);
+            }
+          } catch (e) {
+            console.warn('[SALVAGE] error:', e?.message || e);
+          }
+        }
 
-if (txHash) {
-  await pool.query(
-    `UPDATE milestone_payments SET tx_hash=$3 WHERE bid_id=$1 AND milestone_index=$2`,
-    [bidId, milestoneIndex, txHash]
-  );
-}
+        if (txHash) {
+          await pool.query(
+            `UPDATE milestone_payments SET tx_hash=$3 WHERE bid_id=$1 AND milestone_index=$2`,
+            [bidId, milestoneIndex, txHash]
+          );
+        }
 
-// Optional confirm (1 conf). MUST NOT block the HTTP response.
-try {
-  if (blockchainService?.waitForConfirm && txHash && !txHash.startsWith("dev_")) {
-    await blockchainService.waitForConfirm(txHash, 1);
-  }
-} catch (e) {
-  console.warn("waitForConfirm failed (left as pending)", e?.message || e);
-  return;
-}
+        // Optional confirm (1 conf). MUST NOT block the HTTP response.
+        try {
+          if (blockchainService?.waitForConfirm && txHash && !txHash.startsWith("dev_")) {
+            await blockchainService.waitForConfirm(txHash, 1);
+          }
+        } catch (e) {
+          console.warn("waitForConfirm failed (left as pending)", e?.message || e);
+          return;
+        }
 
-// 4) Mark released + legacy JSON fields
-ms.paymentTxHash = txHash || ms.paymentTxHash || null;
-ms.paymentDate = new Date().toISOString();
-ms.paymentPending = false;
-ms.status = "paid";
-milestones[milestoneIndex] = ms;
+        // 4) Mark released + legacy JSON fields
+        ms.paymentTxHash = txHash || ms.paymentTxHash || null;
+        ms.paymentDate = new Date().toISOString();
+        ms.paymentPending = false;
+        ms.status = "paid";
+        milestones[milestoneIndex] = ms;
 
-await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
-await pool.query(
-  `UPDATE milestone_payments
+        await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(milestones), bidId]);
+        await pool.query(
+          `UPDATE milestone_payments
      SET status='released', tx_hash=COALESCE(tx_hash,$3), released_at=NOW(), amount_usd=COALESCE(amount_usd,$4)
    WHERE bid_id=$1 AND milestone_index=$2`,
-  [bidId, milestoneIndex, txHash || null, msAmountUSD]
-);
+          [bidId, milestoneIndex, txHash || null, msAmountUSD]
+        );
 
-// 5) Notify best-effort
-try {
-  const { rows: [proposal] } = await pool.query(
-    "SELECT * FROM proposals WHERE proposal_id=$1",
-    [bid.proposal_id]
-  );
-  if (proposal && typeof notifyPaymentReleased === "function") {
-    await notifyPaymentReleased({
-      bid, proposal,
-      msIndex: milestoneIndex + 1,
-      amount: msAmountUSD,
-      txHash: txHash || null
-    });
-  }
-} catch (e) {
-  console.warn("notifyPaymentReleased failed", e?.message || e);
-}
+        // 5) Notify best-effort
+        try {
+          const { rows: [proposal] } = await pool.query(
+            "SELECT * FROM proposals WHERE proposal_id=$1",
+            [bid.proposal_id]
+          );
+          if (proposal && typeof notifyPaymentReleased === "function") {
+            await notifyPaymentReleased({
+              bid, proposal,
+              msIndex: milestoneIndex + 1,
+              amount: msAmountUSD,
+              txHash: txHash || null
+            });
+          }
+        } catch (e) {
+          console.warn("notifyPaymentReleased failed", e?.message || e);
+        }
 
-// Optional: audit
-try {
-  await writeAudit(bidId, req, {
-    payment_released: {
-      milestone_index: milestoneIndex,
-      amount_usd: msAmountUSD,
-      tx: txHash || null
-    }
-  });
-} catch { }
+        // Optional: audit
+        try {
+          await writeAudit(bidId, req, {
+            payment_released: {
+              milestone_index: milestoneIndex,
+              amount_usd: msAmountUSD,
+              tx: txHash || null
+            }
+          });
+        } catch { }
       } catch (e) {
-  console.error("Background pay-milestone failed (left pending)", e);
-}
+        console.error("Background pay-milestone failed (left pending)", e);
+      }
     });
 
-// 5) Return immediately to avoid proxy 502s on slow confirmations
-return res.status(202).json({
-  ok: true,
-  status: "pending",
-  bidId,
-  milestoneIndex,
-});
+    // 5) Return immediately to avoid proxy 502s on slow confirmations
+    return res.status(202).json({
+      ok: true,
+      status: "pending",
+      bidId,
+      milestoneIndex,
+    });
 
   } catch (err) {
-  console.error("pay-milestone error", err);
-  const msg = err?.shortMessage || err?.reason || err?.message || "Internal error paying milestone";
-  return res.status(500).json({ ok: false, error: msg });
-}
+    console.error("pay-milestone error", err);
+    const msg = err?.shortMessage || err?.reason || err?.message || "Internal error paying milestone";
+    return res.status(500).json({ ok: false, error: msg });
+  }
 });
 
 // ==============================
