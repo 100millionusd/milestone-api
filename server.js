@@ -729,7 +729,17 @@ async function overlayPaidFromMp(bid, pool) {
     if (!proofsByIndex.has(idx)) proofsByIndex.set(idx, { vendor: null, controller: null });
 
     const group = proofsByIndex.get(idx);
-    const isController = p.subtype === 'controller_report' || p.submitter_role === 'controller';
+
+    // Robust Controller Detection:
+    // 1. Explicit subtype/role (new reports)
+    // 2. Address mismatch (legacy reports): if submitter exists and != vendor wallet
+    const vendorWallet = String(bid.wallet_address || '').toLowerCase();
+    const submitter = String(p.submitter_address || '').toLowerCase();
+
+    const isController =
+      p.subtype === 'controller_report' ||
+      p.submitter_role === 'controller' ||
+      (submitter && vendorWallet && submitter !== vendorWallet);
 
     if (isController) {
       group.controller = p;
@@ -9416,7 +9426,8 @@ app.get("/proofs", async (req, res) => {
          p.gps_lon,
          p.subtype,
          p.submitter_role,
-         p.submitter_address
+         p.submitter_address,
+         b.wallet_address as vendor_wallet
        FROM proofs p
        JOIN bids b ON b.bid_id = p.bid_id
       WHERE b.proposal_id = $1 AND b.tenant_id = $2
@@ -9444,7 +9455,8 @@ app.get("/proofs", async (req, res) => {
           location: safeGeo,            // <-- used by <PublicGeoBadge geo={p.location} ... />
           subtype: r.subtype,
           submitterRole: r.submitter_role,
-          submitterAddress: r.submitter_address
+          submitterAddress: r.submitter_address,
+          vendorWallet: r.vendor_wallet
         };
       })
     );
