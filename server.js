@@ -9349,15 +9349,18 @@ Hints:
       console.warn("Agent2 analysis skipped:", String(e).slice(0, 200));
     }
 
-    // 7) Stamp a simple proof note back to milestones for quick view
-    const ms = milestones;
-    ms[milestoneIndex] = {
-      ...(ms[milestoneIndex] || {}),
-      proof: description || (files.length ? `Files:\n${files.map((f) => f.url).join("\n")}` : "") || legacyText,
-      status: 'pending',       // <--- FIX: Reset status to pending
-      rejectionReason: null,   // <--- FIX: Clear previous rejection reason
-    };
-    await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(ms), bidId]);
+    // 7) Stamp a simple proof note back to milestones for quick view (VENDOR ONLY)
+    // If this is a controller report, DO NOT overwrite the vendor's proof in the bids table.
+    if (role !== 'controller' && subtype !== 'controller_report') {
+      const ms = milestones;
+      ms[milestoneIndex] = {
+        ...(ms[milestoneIndex] || {}),
+        proof: description || (files.length ? `Files:\n${files.map((f) => f.url).join("\n")}` : "") || legacyText,
+        status: 'pending',       // Reset status to pending for new vendor proofs
+        rejectionReason: null,   // Clear previous rejection reason
+      };
+      await pool.query("UPDATE bids SET milestones=$1 WHERE bid_id=$2", [JSON.stringify(ms), bidId]);
+    }
 
     // 8) Done
     return res.status(201).json(toCamel(proofRow));
