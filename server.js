@@ -756,6 +756,29 @@ async function overlayPaidFromMp(bid, pool) {
         submittedAt: controllerReport.submitted_at || controllerReport.created_at,
         submitter: controllerReport.submitter_address
       };
+
+      // DEDUPLICATION FIX:
+      // If we have a controller report but NO explicit vendor proof from the proofs table,
+      // check if the legacy/bids-table proof is identical to this controller report.
+      // This fixes the "dirty data" issue where previous controller submissions overwrote the vendor proof.
+      if (!vendorProof && msArr[i].proof) {
+        let legacyDesc = '';
+        try {
+          const p = JSON.parse(msArr[i].proof);
+          legacyDesc = p.description || '';
+        } catch {
+          legacyDesc = String(msArr[i].proof);
+        }
+
+        // If descriptions match, assume it's a duplicate and hide the "vendor" proof
+        if (legacyDesc && legacyDesc === controllerReport.description) {
+          msArr[i].proof = null;
+          // Also reset status if it looks like it came from the controller
+          if (msArr[i].status === controllerReport.status) {
+            msArr[i].status = 'pending';
+          }
+        }
+      }
     }
 
     // If no payment row exists in DB, clear any stuck "Pending" flag from the JSON
