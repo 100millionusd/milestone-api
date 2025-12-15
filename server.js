@@ -204,16 +204,24 @@ function normalizeRoleIntent(v) {
 /** decide effective role given durable roles + optional explicit intent */
 function roleFromDurableOrIntent(roles, intent) {
   if (!Array.isArray(roles)) roles = [];
-  // if they already only have one durable role and no intent, use it
+
+  // 1. Admin always wins
+  if (roles.includes('admin')) return 'admin';
+
+  // 2. Controller always wins (over vendor/proposer)
+  if (roles.includes('controller')) return 'controller';
+
+  // 3. If they already only have one durable role and no intent, use it
   if (roles.length === 1 && !intent) return roles[0];
-  // explicit intent wins (only allow vendor/proposer/reporter/controller here)
-  if (intent === 'vendor' || intent === 'proposer' || intent === 'reporter' || intent === 'controller') return intent;
-  // 🛑 FIX: Allow admin intent ONLY if they actually have the admin role
-  if (intent === 'admin' && roles.includes('admin')) return 'admin';
-  // if there’s a single non-admin durable role, pick it
-  const nonAdmin = roles.filter(r => r !== 'admin');
+
+  // 4. Explicit intent wins (only allow vendor/proposer/reporter here)
+  if (intent === 'vendor' || intent === 'proposer' || intent === 'reporter') return intent;
+
+  // 5. If there’s a single non-admin durable role, pick it
+  const nonAdmin = roles.filter(r => r !== 'admin' && r !== 'controller');
   if (nonAdmin.length === 1) return nonAdmin[0];
-  // otherwise force the client to choose
+
+  // 6. Otherwise force the client to choose
   return null;
 }
 
