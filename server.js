@@ -9386,7 +9386,11 @@ app.get("/proofs", async (req, res) => {
          p.files,
          p.capture_time,
          p.gps_lat,
-         p.gps_lon
+         p.gps_lat,
+         p.gps_lon,
+         p.subtype,
+         p.submitter_role,
+         p.submitter_address
        FROM proofs p
        JOIN bids b ON b.bid_id = p.bid_id
       WHERE b.proposal_id = $1 AND b.tenant_id = $2
@@ -9412,6 +9416,9 @@ app.get("/proofs", async (req, res) => {
           files,
           takenAt: r.capture_time || null,
           location: safeGeo,            // <-- used by <PublicGeoBadge geo={p.location} ... />
+          subtype: r.subtype,
+          submitterRole: r.submitter_role,
+          submitterAddress: r.submitter_address
         };
       })
     );
