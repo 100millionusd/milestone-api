@@ -8225,18 +8225,19 @@ app.get("/proofs", async (req, res) => {
   try {
     // FIX: Added LEFT JOIN to milestone_payments (mp) to fetch payment status and tx_hash
     // We coalesce payment_tx_hash: prefer the one in milestone_payments, fallback to proof/bid logic if needed
-    const selectSql = `
-      SELECT
-        p.*,
+    SELECT
+    p.*,
+      b.wallet_address AS vendor_wallet,
         mp.tx_hash AS payment_tx_hash,
-        mp.safe_tx_hash AS safe_payment_tx_hash,
-        mp.status AS payment_status,
-        mp.released_at AS paid_at
+          mp.safe_tx_hash AS safe_payment_tx_hash,
+            mp.status AS payment_status,
+              mp.released_at AS paid_at
       FROM proofs p
+      JOIN bids b ON b.bid_id = p.bid_id
       LEFT JOIN milestone_payments mp
         ON mp.bid_id = p.bid_id
         AND mp.milestone_index = p.milestone_index
-    `;
+      `;
 
     const bidId = Number(req.query.bidId);
     const proposalId = Number(req.query.proposalId);
@@ -8261,9 +8262,9 @@ app.get("/proofs", async (req, res) => {
       if (isAdmin) {
         // Robust Query: Join bids to ensure we see proofs for our tenant's bids, 
         // even if proof.tenant_id is mismatched (e.g. created in global context).
-        let q = `
           SELECT
             p.*,
+            b.wallet_address AS vendor_wallet,
             mp.tx_hash AS payment_tx_hash,
             mp.safe_tx_hash AS safe_payment_tx_hash,
             mp.status AS payment_status,
@@ -8274,63 +8275,63 @@ app.get("/proofs", async (req, res) => {
             ON mp.bid_id = p.bid_id
             AND mp.milestone_index = p.milestone_index
         `;
-        const params = [];
-        // Filter by tenant ONLY if not Global Admin
-        if (req.tenantId !== DEFAULT_TENANT_ID) {
-          q += ` WHERE b.tenant_id = $1`;
-          params.push(req.tenantId);
-        }
-        q += ` ORDER BY p.proof_id DESC`;
-        const { rows: allRows } = await pool.query(q, params);
-        rows = allRows;
-      } else {
-        return res.status(400).json({ error: "Provide bidId or proposalId" });
-      }
-    } else if (Number.isFinite(bidId)) {
-      let q = `${selectSql} WHERE p.bid_id = $1`;
-      const params = [bidId];
-      if (req.tenantId !== DEFAULT_TENANT_ID) {
-        q += ` AND p.tenant_id = $2`;
-        params.push(req.tenantId);
-      }
-      q += ` ORDER BY p.proof_id DESC`;
-      ({ rows } = await pool.query(q, params));
-    } else {
-      let q = `${selectSql}
+    const params = [];
+    // Filter by tenant ONLY if not Global Admin
+    if (req.tenantId !== DEFAULT_TENANT_ID) {
+      q += ` WHERE b.tenant_id = $1`;
+      params.push(req.tenantId);
+    }
+    q += ` ORDER BY p.proof_id DESC`;
+    const { rows: allRows } = await pool.query(q, params);
+    rows = allRows;
+  } else {
+    return res.status(400).json({ error: "Provide bidId or proposalId" });
+  }
+} else if (Number.isFinite(bidId)) {
+  let q = `${selectSql} WHERE p.bid_id = $1`;
+  const params = [bidId];
+  if (req.tenantId !== DEFAULT_TENANT_ID) {
+    q += ` AND p.tenant_id = $2`;
+    params.push(req.tenantId);
+  }
+  q += ` ORDER BY p.proof_id DESC`;
+  ({ rows } = await pool.query(q, params));
+} else {
+  let q = `${selectSql}
          JOIN bids b ON b.bid_id = p.bid_id
          WHERE b.proposal_id = $1`;
-      const params = [proposalId];
-      if (req.tenantId !== DEFAULT_TENANT_ID) {
-        q += ` AND b.tenant_id = $2`;
-        params.push(req.tenantId);
-      }
-      q += ` ORDER BY p.proof_id DESC`;
-      ({ rows } = await pool.query(q, params));
-    }
-
-    // normalize for the frontend
-    const out = await Promise.all(rows.map(async r => {
-      const o = toCamel(r);
-      o.files = coerceJson(o.files) || [];
-      o.fileMeta = coerceJson(o.fileMeta) || [];
-      o.aiAnalysis = coerceJson(o.aiAnalysis) || null;
-      o.geo = await buildSafeGeoForProof(o);
-
-      // FIX: Explicitly set 'paid' flag if we found a hash or 'released' status
-      if (o.paymentTxHash || o.paymentStatus === 'released') {
-        o.paid = true;
-        // Ensure tx hash is visible even if only found in mp table
-        o.paymentTxHash = o.paymentTxHash || r.payment_tx_hash;
-      }
-
-      return o;
-    }));
-
-    res.json(out);
-  } catch (e) {
-    console.error("GET /proofs failed:", e);
-    res.status(500).json({ error: "Failed to load proofs" });
+  const params = [proposalId];
+  if (req.tenantId !== DEFAULT_TENANT_ID) {
+    q += ` AND b.tenant_id = $2`;
+    params.push(req.tenantId);
   }
+  q += ` ORDER BY p.proof_id DESC`;
+  ({ rows } = await pool.query(q, params));
+}
+
+// normalize for the frontend
+const out = await Promise.all(rows.map(async r => {
+  const o = toCamel(r);
+  o.files = coerceJson(o.files) || [];
+  o.fileMeta = coerceJson(o.fileMeta) || [];
+  o.aiAnalysis = coerceJson(o.aiAnalysis) || null;
+  o.geo = await buildSafeGeoForProof(o);
+
+  // FIX: Explicitly set 'paid' flag if we found a hash or 'released' status
+  if (o.paymentTxHash || o.paymentStatus === 'released') {
+    o.paid = true;
+    // Ensure tx hash is visible even if only found in mp table
+    o.paymentTxHash = o.paymentTxHash || r.payment_tx_hash;
+  }
+
+  return o;
+}));
+
+res.json(out);
+  } catch (e) {
+  console.error("GET /proofs failed:", e);
+  res.status(500).json({ error: "Failed to load proofs" });
+}
 });
 
 app.post("/proofs/:id/approve", adminGuard, async (req, res) => {
