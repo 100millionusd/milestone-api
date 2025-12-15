@@ -9160,8 +9160,13 @@ app.post("/proofs", authRequired, async (req, res) => {
       return res.status(400).json({ error: "Invalid milestoneIndex for this bid" });
     }
 
+    // FIX: Harden subtype logic. Default to 'standard' unless explicitly 'controller_report'.
+    const rawSubtype = value.subtype;
+    const subtype = rawSubtype === 'controller_report' ? 'controller_report' : 'standard';
+
     // 3) Duplicate guards
     // FIX: Only check the LATEST proof. If an older proof is stuck in 'pending' (zombie), ignore it.
+    // EXCEPTION: Controller Reports can be submitted anytime (they don't block/conflict with vendor proofs).
     const { rows: latestProof } = await pool.query(
       `SELECT status FROM proofs
         WHERE bid_id=$1 AND milestone_index=$2 AND tenant_id=$3
@@ -9170,7 +9175,7 @@ app.post("/proofs", authRequired, async (req, res) => {
       [bidId, milestoneIndex, req.tenantId]
     );
 
-    if (latestProof.length > 0 && latestProof[0].status === 'pending') {
+    if (latestProof.length > 0 && latestProof[0].status === 'pending' && subtype !== 'controller_report') {
       return res.status(409).json({ error: "A proof is already pending review for this milestone." });
     }
     const { rows: lastRows } = await pool.query(
@@ -9236,8 +9241,7 @@ app.post("/proofs", authRequired, async (req, res) => {
     const vendorPrompt = (value.vendorPrompt || value.prompt || "").trim();
 
     // FIX: Harden subtype logic. Default to 'standard' unless explicitly 'controller_report'.
-    const rawSubtype = value.subtype;
-    const subtype = rawSubtype === 'controller_report' ? 'controller_report' : 'standard';
+    // (Moved up to line 9160)
 
     // 5) Insert proof row
     const insertQ = `
