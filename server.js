@@ -713,34 +713,67 @@ async function overlayPaidFromMp(bid, pool) {
     [bidId, bid.tenant_id]
   );
 
-  // FIX: Also fetch latest proofs to overlay approval status
-  const { rows: proofRows } = await pool.query(
-    `SELECT DISTINCT ON (milestone_index)
-            milestone_index, status, proof_id, rejection_reason
+  // FIX: Fetch ALL proofs to separate Vendor Proofs vs Controller Reports
+  const { rows: allProofs } = await pool.query(
+    `SELECT milestone_index, status, proof_id, rejection_reason, description, files, subtype, submitter_role, submitted_at, created_at, submitter_address
        FROM proofs
       WHERE bid_id = $1
-      ORDER BY milestone_index, proof_id DESC`,
+      ORDER BY proof_id ASC`, // Oldest to newest
     [bidId]
   );
-  const proofsByIdx = new Map(proofRows.map(r => [Number(r.milestone_index), r]));
 
-  // Create a map for O(1) lookup
+  // Group by milestone index
+  const proofsByIndex = new Map(); // index -> { vendor: ProofRow, controller: ProofRow }
+  for (const p of allProofs) {
+    const idx = Number(p.milestone_index);
+    if (!proofsByIndex.has(idx)) proofsByIndex.set(idx, { vendor: null, controller: null });
+
+    const group = proofsByIndex.get(idx);
+    const isController = p.subtype === 'controller_report' || p.submitter_role === 'controller';
+
+    if (isController) {
+      group.controller = p;
+    } else {
+      group.vendor = p;
+    }
+  }
+
+  // Create a map for O(1) lookup of payments
   const byIdx = new Map(mpRows.map(r => [Number(r.milestone_index), r]));
 
   // Pass 1: Rebuild status based strictly on milestone_payments table
   for (let i = 0; i < msArr.length; i++) {
     const r = byIdx.get(i);
-    const p = proofsByIdx.get(i); // Get proof for this index
+    const group = proofsByIndex.get(i);
+    const vendorProof = group?.vendor;
+    const controllerReport = group?.controller;
+
+    // Attach Controller Report if exists (supplementary info)
+    if (controllerReport) {
+      msArr[i].controllerReport = {
+        description: controllerReport.description || '',
+        files: controllerReport.files || [],
+        submittedAt: controllerReport.submitted_at || controllerReport.created_at,
+        submitter: controllerReport.submitter_address
+      };
+    }
 
     // If no payment row exists in DB, clear any stuck "Pending" flag from the JSON
     if (!r) {
       if (msArr[i].paymentPending) {
         msArr[i] = { ...msArr[i], paymentPending: false };
       }
-      // But still overlay proof status if exists
-      if (p) {
-        msArr[i].status = p.status;
-        msArr[i].rejectionReason = p.rejection_reason;
+      // Overlay VENDOR proof status/content if exists
+      if (vendorProof) {
+        msArr[i].status = vendorProof.status;
+        msArr[i].rejectionReason = vendorProof.rejection_reason;
+        // Overlay content so it's visible in UI
+        if (vendorProof.description || vendorProof.files) {
+          msArr[i].proof = JSON.stringify({
+            description: vendorProof.description || '',
+            files: vendorProof.files || []
+          });
+        }
       }
       continue;
     }
@@ -768,16 +801,22 @@ async function overlayPaidFromMp(bid, pool) {
     } else if (s === 'pending') {
       // It is genuinely pending in the DB (no tx hash yet)
       msArr[i].paymentPending = true;
-      // If payment is pending, we might still want to show proof status if it's approved?
-      // Usually payment pending implies approved, but let's be safe.
     }
 
-    // Overlay Proof Status (if not paid)
-    if (msArr[i].status !== 'paid' && p) {
-      msArr[i].status = p.status; // 'approved', 'pending', 'rejected'
-      msArr[i].rejectionReason = p.rejection_reason;
+    // Overlay Vendor Proof Status (if not paid)
+    if (msArr[i].status !== 'paid' && vendorProof) {
+      msArr[i].status = vendorProof.status; // 'approved', 'pending', 'rejected'
+      msArr[i].rejectionReason = vendorProof.rejection_reason;
 
-      if (p.status === 'approved') {
+      // Overlay content so it's visible in UI
+      if (vendorProof.description || vendorProof.files) {
+        msArr[i].proof = JSON.stringify({
+          description: vendorProof.description || '',
+          files: vendorProof.files || []
+        });
+      }
+
+      if (vendorProof.status === 'approved') {
         msArr[i].completed = true;
       }
     }
