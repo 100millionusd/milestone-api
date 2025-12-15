@@ -732,14 +732,16 @@ async function overlayPaidFromMp(bid, pool) {
 
     // Robust Controller Detection:
     // 1. Explicit subtype/role (new reports)
-    // 2. Address mismatch (legacy reports): if submitter exists and != vendor wallet
+    // 2. Address mismatch (legacy reports): ONLY if subtype is not explicitly 'standard'
     const vendorWallet = String(bid.wallet_address || '').toLowerCase();
     const submitter = String(p.submitter_address || '').toLowerCase();
 
+    const isExplicitStandard = p.subtype === 'standard' || p.submitter_role === 'vendor';
+    const isExplicitController = p.subtype === 'controller_report' || p.submitter_role === 'controller';
+
     const isController =
-      p.subtype === 'controller_report' ||
-      p.submitter_role === 'controller' ||
-      (submitter && vendorWallet && submitter !== vendorWallet);
+      isExplicitController ||
+      (!isExplicitStandard && submitter && vendorWallet && submitter !== vendorWallet);
 
     if (isController) {
       group.controller = p;
