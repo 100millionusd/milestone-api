@@ -11667,19 +11667,35 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
       // But 'files' ARE selected (line 10900).
 
       let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
-      if (!gatewayToken && req.tenantId) {
+      let gatewayDomain = process.env.PINATA_GATEWAY_DOMAIN;
+
+      if (req.tenantId) {
         try {
-          gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+          // ALWAYS try to fetch tenant config to override global env vars
+          const tToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+          if (tToken) gatewayToken = tToken;
+          const tGw = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway');
+          if (tGw) gatewayDomain = tGw.replace(/^https?:\/\//, '').replace(/\/+$/, '');
         } catch (e) { }
       }
 
-      if (gatewayToken && Array.isArray(files)) {
+      if (Array.isArray(files)) {
         files = files.map(f => {
-          if (f.url && f.url.includes('.mypinata.cloud') && !f.url.includes('token=')) {
-            const separator = f.url.includes('?') ? '&' : '?';
-            return { ...f, url: `${f.url}${separator}token=${gatewayToken}` };
+          let url = f.url;
+          if (!url) return f;
+
+          // 1. Replace public gateway with dedicated
+          if (gatewayDomain && url.includes('gateway.pinata.cloud')) {
+            url = url.replace('gateway.pinata.cloud', gatewayDomain);
           }
-          return f;
+
+          // 2. Append token
+          if (gatewayToken && url.includes('.mypinata.cloud') && !url.includes('token=')) {
+            const separator = url.includes('?') ? '&' : '?';
+            url = `${url}${separator}token=${gatewayToken}`;
+          }
+
+          return { ...f, url };
         });
       }
 
@@ -11742,23 +11758,42 @@ app.get('/admin/proofs-bids', adminGuard, async (req, res) => {
         );
 
       // 🛡️ FIX: Ensure private gateway URLs in the 'proof' string have the token
+      // 🛡️ FIX: Ensure private gateway URLs in the 'proof' string have the token
       let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
-      if (!gatewayToken && req.tenantId) {
+      let gatewayDomain = process.env.PINATA_GATEWAY_DOMAIN;
+
+      if (req.tenantId) {
         try {
-          gatewayToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+          // ALWAYS try to fetch tenant config to override global env vars
+          const tToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+          if (tToken) gatewayToken = tToken;
+
+          const tGw = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway');
+          if (tGw) gatewayDomain = tGw.replace(/^https?:\/\//, '').replace(/\/+$/, '');
         } catch (e) { }
       }
 
-      if (gatewayToken) {
+      if (gatewayToken || gatewayDomain) {
         milestones = milestones.map(m => {
-          if (typeof m?.proof === 'string' && m.proof.includes('.mypinata.cloud') && !m.proof.includes('token=')) {
-            // Regex to find the URL and append token
-            const newProof = m.proof.replace(/(https:\/\/[^ ]+\.mypinata\.cloud\/ipfs\/[^ \n]+)/g, (match) => {
-              if (match.includes('token=')) return match;
-              const separator = match.includes('?') ? '&' : '?';
-              return `${match}${separator}token=${gatewayToken}`;
-            });
-            return { ...m, proof: newProof };
+          if (typeof m?.proof === 'string') {
+            let newProof = m.proof;
+
+            // 1. Replace public gateway with dedicated (if configured)
+            if (gatewayDomain && newProof.includes('gateway.pinata.cloud')) {
+              newProof = newProof.replace(/gateway\.pinata\.cloud/g, gatewayDomain);
+            }
+
+            // 2. Append token to dedicated gateway URLs
+            if (gatewayToken && newProof.includes('.mypinata.cloud') && !newProof.includes('token=')) {
+              // Regex to find the URL and append token
+              newProof = newProof.replace(/(https:\/\/[^ ]+\.mypinata\.cloud\/ipfs\/[^ \n"']+)/g, (match) => {
+                if (match.includes('token=')) return match;
+                const separator = match.includes('?') ? '&' : '?';
+                return `${match}${separator}token=${gatewayToken}`;
+              });
+            }
+
+            if (newProof !== m.proof) return { ...m, proof: newProof };
           }
           return m;
         });
