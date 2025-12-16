@@ -2627,10 +2627,12 @@ async function waitForPdfInfoFromDoc(doc, { maxMs = 12000, stepMs = 1500 } = {},
 // Pinata / IPFS
 // ==============================
 const { Readable } = require('stream');
-const pinataSDK = require('@pinata/sdk');
+const { PinataSDK } = require("pinata-web3");
+const { Blob, File } = require("buffer"); // Ensure availability
 
-// Initialize SDK
-const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECRET_API_KEY);
+// Initialize SDK (Placeholder - we init per request usually, but can keep a global if needed)
+// const pinata = new PinataSDK({ pinataJwt: process.env.PINATA_JWT, pinataGateway: "gateway.pinata.cloud" });
+
 
 // Helper: Wait with jitter (randomness) to prevent synchronized retries
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -2668,9 +2670,14 @@ async function pinataUploadFile(file, tenantId = null, keyValues = {}) {
 
   let localPinata;
   if (pJwt) {
-    localPinata = new pinataSDK({ pinataJWTKey: pJwt });
+    localPinata = new PinataSDK({ pinataJwt: pJwt, pinataGateway: process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud" });
   } else {
-    localPinata = new pinataSDK(pKey, pSecret);
+    // Attempt to use keys if supported, or throw
+    // pinata-web3 requires JWT. We can try to construct it if the user has one, 
+    // but we can't use API Key/Secret directly in the constructor in the same way.
+    // However, for migration safety, if we only have keys, we must fail or warn.
+    console.error("[Pinata] ERROR: pinata-web3 requires PINATA_JWT. API Keys are no longer supported directly.");
+    throw new Error("Pinata Web3 SDK requires PINATA_JWT. Please configure it.");
   }
 
   // Increase max retries to 5 to be very safe
@@ -2679,20 +2686,19 @@ async function pinataUploadFile(file, tenantId = null, keyValues = {}) {
 
   while (attempt < maxRetries) {
     try {
-      // 1. Create fresh stream for this attempt
-      const stream = Readable.from(file.data);
-      stream.path = file.name;
-
-      const options = {
-        pinataMetadata: {
-          name: file.name,
-          keyvalues: keyValues
-        },
-        pinataOptions: { cidVersion: 0 }
-      };
+      // 1. Create File object
+      const blob = new Blob([file.data]);
+      const fileObj = new File([blob], file.name, { type: file.mimetype });
 
       // 2. Try Upload
-      const result = await localPinata.pinFileToIPFS(stream, options);
+      const upload = await localPinata.upload.file(fileObj).addMetadata({
+        name: file.name,
+        keyValues: keyValues
+      });
+
+      // Map result to expected format (pinata-web3 returns IpfsHash in the object)
+      const result = upload;
+
 
       // Use configured gateway or fallback
       let gateway = "https://gateway.pinata.cloud";
@@ -2788,7 +2794,17 @@ async function pinataUploadJson(jsonData, tenantId = null) {
     throw new Error("Pinata not configured");
   }
 
-  const localPinata = new pinataSDK(pKey, pSecret);
+  let localPinata;
+  if (tKey && tSecret) {
+    // Legacy keys - not supported in pinata-web3
+    console.error("[Pinata] ERROR: pinata-web3 requires PINATA_JWT. API Keys are no longer supported directly.");
+    throw new Error("Pinata Web3 SDK requires PINATA_JWT. Please configure it.");
+  } else {
+    // Assume env JWT or throw
+    const jwt = process.env.PINATA_JWT;
+    if (!jwt) throw new Error("Pinata not configured (No JWT)");
+    localPinata = new PinataSDK({ pinataJwt: jwt, pinataGateway: process.env.PINATA_GATEWAY_DOMAIN || "gateway.pinata.cloud" });
+  }
 
   // Safety: Ensure we have an object
   const body = (typeof jsonData === 'string') ? JSON.parse(jsonData) : jsonData;
@@ -2799,17 +2815,12 @@ async function pinataUploadJson(jsonData, tenantId = null) {
 
   while (attempt < maxRetries) {
     try {
-      const options = {
-        pinataMetadata: {
-          name: body.name || `json_${Date.now()}`, // Fallback name
-        },
-        pinataOptions: {
-          cidVersion: 0
-        }
-      };
-
       // Perform the upload
-      const result = await localPinata.pinJSONToIPFS(body, options);
+      const upload = await localPinata.upload.json(body).addMetadata({
+        name: body.name || `json_${Date.now()}`,
+      });
+      const result = upload;
+
 
       // Resolve Gateway URL with fallback
       let gateway = "https://gateway.pinata.cloud";
