@@ -8243,7 +8243,8 @@ app.get("/proofs", async (req, res) => {
         mp.tx_hash AS payment_tx_hash,
         mp.safe_tx_hash AS safe_payment_tx_hash,
         mp.status AS payment_status,
-        mp.released_at AS paid_at
+        mp.released_at AS paid_at,
+        b.tenant_id  -- Ensure we have the tenant_id from the bid
       FROM proofs p
       LEFT JOIN bids b ON b.bid_id = p.bid_id
       LEFT JOIN milestone_payments mp
@@ -8281,7 +8282,8 @@ app.get("/proofs", async (req, res) => {
             mp.tx_hash AS payment_tx_hash,
             mp.safe_tx_hash AS safe_payment_tx_hash,
             mp.status AS payment_status,
-            mp.released_at AS paid_at
+            mp.released_at AS paid_at,
+            b.tenant_id  -- Ensure we have the tenant_id from the bid
           FROM proofs p
           LEFT JOIN bids b ON b.bid_id = p.bid_id
           LEFT JOIN milestone_payments mp
@@ -8323,22 +8325,41 @@ app.get("/proofs", async (req, res) => {
     }
 
     // normalize for the frontend
-    // 🛡️ FIX: Ensure private gateway URLs have the token
-    let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
-    let gatewayDomain = process.env.PINATA_GATEWAY_DOMAIN;
+    // Cache for tenant configs to avoid N+1 lookups
+    const tenantConfigCache = new Map();
 
-    if (req.tenantId) {
+    const getTenantConfigCached = async (tId, key) => {
+      if (!tId) return null;
+      const cacheKey = `${tId}:${key}`;
+      if (tenantConfigCache.has(cacheKey)) return tenantConfigCache.get(cacheKey);
+
       try {
-        const tToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
-        if (tToken) gatewayToken = tToken;
-        const tGw = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway');
-        if (tGw) gatewayDomain = tGw.replace(/^https?:\/\//, '').replace(/\/+$/, '');
-      } catch (e) { }
-    }
+        const val = await tenantService.getTenantConfig(tId, key);
+        tenantConfigCache.set(cacheKey, val);
+        return val;
+      } catch (e) {
+        tenantConfigCache.set(cacheKey, null);
+        return null;
+      }
+    };
 
     const out = await Promise.all(rows.map(async r => {
       const o = toCamel(r);
       o.files = coerceJson(o.files) || [];
+
+      // Determine Tenant ID for this row (prefer row's tenant_id, fallback to req.tenantId)
+      const rowTenantId = r.tenant_id || req.tenantId;
+
+      // Fetch Gateway Config for THIS tenant
+      let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+      let gatewayDomain = process.env.PINATA_GATEWAY_DOMAIN;
+
+      if (rowTenantId) {
+        const tToken = await getTenantConfigCached(rowTenantId, 'pinata_gateway_token');
+        if (tToken) gatewayToken = tToken;
+        const tGw = await getTenantConfigCached(rowTenantId, 'pinata_gateway');
+        if (tGw) gatewayDomain = tGw.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+      }
 
       // 1. Replace public gateway with dedicated (if configured)
       if (gatewayDomain) {
