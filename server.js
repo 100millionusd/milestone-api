@@ -8283,7 +8283,7 @@ app.get("/proofs", async (req, res) => {
             mp.safe_tx_hash AS safe_payment_tx_hash,
             mp.status AS payment_status,
             mp.released_at AS paid_at,
-            b.tenant_id  -- Ensure we have the tenant_id from the bid
+            b.tenant_id -- Ensure we have the tenant_id from the bid for Admin view
           FROM proofs p
           LEFT JOIN bids b ON b.bid_id = p.bid_id
           LEFT JOIN milestone_payments mp
