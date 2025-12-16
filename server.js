@@ -8323,9 +8323,43 @@ app.get("/proofs", async (req, res) => {
     }
 
     // normalize for the frontend
+    // 🛡️ FIX: Ensure private gateway URLs have the token
+    let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
+    let gatewayDomain = process.env.PINATA_GATEWAY_DOMAIN;
+
+    if (req.tenantId) {
+      try {
+        const tToken = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway_token');
+        if (tToken) gatewayToken = tToken;
+        const tGw = await tenantService.getTenantConfig(req.tenantId, 'pinata_gateway');
+        if (tGw) gatewayDomain = tGw.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+      } catch (e) { }
+    }
+
     const out = await Promise.all(rows.map(async r => {
       const o = toCamel(r);
       o.files = coerceJson(o.files) || [];
+
+      // 1. Replace public gateway with dedicated (if configured)
+      if (gatewayDomain) {
+        o.files = o.files.map(f => {
+          if (f.url && f.url.includes('gateway.pinata.cloud')) {
+            return { ...f, url: f.url.replace('gateway.pinata.cloud', gatewayDomain) };
+          }
+          return f;
+        });
+      }
+
+      // 2. Append token to dedicated gateway URLs
+      if (gatewayToken) {
+        o.files = o.files.map(f => {
+          if (f.url && f.url.includes('.mypinata.cloud') && !f.url.includes('token=')) {
+            const separator = f.url.includes('?') ? '&' : '?';
+            return { ...f, url: `${f.url}${separator}token=${gatewayToken}` };
+          }
+          return f;
+        });
+      }
       o.fileMeta = coerceJson(o.fileMeta) || [];
       o.aiAnalysis = coerceJson(o.aiAnalysis) || null;
       o.geo = await buildSafeGeoForProof(o);
