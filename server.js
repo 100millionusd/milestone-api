@@ -3103,7 +3103,7 @@ async function extractFileMetaFromUrl(file) {
     if (!file?.url) return null;
 
     // Reuse your existing fetchAsBuffer helper
-    const buf = await fetchAsBuffer(toPublicGateway(file.url));
+    const buf = await fetchAsBuffer(file.url);
     const sha256 = crypto.createHash("sha256").update(buf).digest("hex");
 
     // Write to temp for exiftool
