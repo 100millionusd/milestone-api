@@ -8361,11 +8361,32 @@ app.get("/proofs", async (req, res) => {
         if (tGw) gatewayDomain = tGw.replace(/^https?:\/\//, '').replace(/\/+$/, '');
       }
 
-      // 1. Replace public gateway with dedicated (if configured)
+      // 1. Force Tenant Gateway for ALL IPFS content (CIDs or URLs)
       if (gatewayDomain) {
         o.files = o.files.map(f => {
-          if (f.url && f.url.includes('gateway.pinata.cloud')) {
-            return { ...f, url: f.url.replace('gateway.pinata.cloud', gatewayDomain) };
+          let url = f.url;
+          const cid = f.cid;
+
+          // Case A: No URL, but has CID -> Construct URL
+          if (!url && cid) {
+            url = `https://${gatewayDomain}/ipfs/${cid}`;
+          }
+          // Case B: Has URL
+          else if (url) {
+            // If it's a bare CID in the URL field
+            if (/^[a-zA-Z0-9]{46,}$/.test(url)) {
+              url = `https://${gatewayDomain}/ipfs/${url}`;
+            }
+            // If it's a standard IPFS URL (gateway.pinata.cloud, ipfs.io, etc.)
+            else if (url.includes('/ipfs/')) {
+              // Replace the domain part with our dedicated gateway
+              // This handles https://gateway.pinata.cloud/ipfs/Qm... -> https://my-gw.mypinata.cloud/ipfs/Qm...
+              url = url.replace(/^https?:\/\/[^/]+\/ipfs\//, `https://${gatewayDomain}/ipfs/`);
+            }
+          }
+
+          if (url) {
+            return { ...f, url };
           }
           return f;
         });
