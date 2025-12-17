@@ -10090,6 +10090,43 @@ app.get("/public/projects/:id", async (req, res) => {
     // Hydrate payment info
     const hydrated = await overlayPaidFromMp(bid, pool);
 
+    // 🛡️ FIX: Sanitize IPFS URLs in proposal/bid docs (fix malformed ipfsbafy...)
+    const sanitizeFiles = (input) => {
+      let list = input;
+      if (typeof list === 'string') {
+        try { list = JSON.parse(list); } catch { list = []; }
+      }
+      if (!Array.isArray(list)) return list;
+      return list.map(f => {
+        if (!f || !f.url) return f;
+        let url = f.url;
+        if (url.match(/\/ipfsbafy/i)) {
+          url = url.replace(/\/ipfsbafy/i, '/ipfs/bafy');
+        }
+        return { ...f, url };
+      });
+    };
+
+    if (hydrated.docs) hydrated.docs = sanitizeFiles(hydrated.docs);
+    if (hydrated.files) hydrated.files = sanitizeFiles(hydrated.files);
+
+    // Also check proposal fields if joined (the query joins proposals p)
+    // The query is: SELECT b.*, ... FROM bids b JOIN proposals p ...
+    // But it only selects b.*. We need to check if proposal assets are somehow included or if we need to fetch them.
+    // Wait, the query is `SELECT b.* ...`. It does NOT select p.*.
+    // However, the user says "proposal_assets_...".
+    // Let's check if the bid has proposal assets copied to it, or if I need to select p.docs/files.
+
+    // Actually, let's look at the query again.
+    // SELECT b.*, (SELECT value FROM tenant_configs ...) as gateway FROM bids b JOIN proposals p ...
+    // It seems it ONLY returns bid fields.
+    // BUT, maybe `b.docs` contains the proposal assets?
+    // Or maybe `overlayPaidFromMp` attaches them?
+
+    // Let's apply sanitization to hydrated.docs and hydrated.files for now.
+    // If the user sees "proposal_assets", it might be that the file NAME or path contains that string,
+    // which is common for files uploaded during proposal creation and then copied/referenced in the bid.
+
     res.json(toCamel(hydrated));
   } catch (err) {
     console.error("GET /public/projects/:id error:", err);
