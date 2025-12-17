@@ -8852,7 +8852,7 @@ VALUES($1, $2, $3, 'pending', NOW(), $4)
             // 1) pick a Safe owner key from env or tenant config
             const rawKeys = (tKey || process.env.SAFE_OWNER_KEYS || process.env.PRIVATE_KEYS || "")
               .split(",").map(s => s.trim()).filter(Boolean)
-              .map(k => (k.startsWith("0x") ? k : `0x${k} `));
+              .map(k => (k.startsWith("0x") ? k : `0x${k}`));
             if (!rawKeys.length) throw new Error("No SAFE_OWNER_KEYS/PRIVATE_KEYS configured");
 
             // 2) verify signer is an owner
