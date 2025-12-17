@@ -726,6 +726,21 @@ async function overlayPaidFromMp(bid, pool) {
     [bidId]
   );
 
+  // 🛡️ FIX: Sanitize IPFS URLs in proofs (fix malformed ipfsbafy...)
+  for (const p of allProofs) {
+    if (Array.isArray(p.files)) {
+      p.files = p.files.map(f => {
+        let url = f.url;
+        if (!url) return f;
+        // Fix missing slash: .../ipfsbafy... -> .../ipfs/bafy...
+        if (url.match(/\/ipfsbafy/i)) {
+          url = url.replace(/\/ipfsbafy/i, '/ipfs/bafy');
+        }
+        return { ...f, url };
+      });
+    }
+  }
+
   // Group by milestone index
   const proofsByIndex = new Map(); // index -> { vendor: ProofRow, controller: ProofRow }
   for (const p of allProofs) {
@@ -8369,7 +8384,7 @@ app.get("/proofs", async (req, res) => {
         if (t || d) {
           return {
             token: t,
-            domain: d ? d.replace(/^https?:\/\//, '').replace(/\/+$/, '') : null
+            domain: d ? d.replace(/^https?:\/\//, '').replace(/\/+$/, '').replace(/\/ipfs\/?$/, '') : null
           };
         }
         return null;
