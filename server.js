@@ -8366,7 +8366,15 @@ app.get("/proofs", async (req, res) => {
         if (!tid) return null;
         const t = await getTenantConfigCached(tid, 'pinata_gateway_token');
         const d = await getTenantConfigCached(tid, 'pinata_gateway');
-        if (d) return { token: t, domain: d.replace(/^https?:\/\//, '').replace(/\/+$/, '') };
+
+        // Return if EITHER is present. 
+        // This allows "Token from DB" + "Domain from Env" (Mix & Match)
+        if (t || d) {
+          return {
+            token: t,
+            domain: d ? d.replace(/^https?:\/\//, '').replace(/\/+$/, '') : null
+          };
+        }
         return null;
       };
 
@@ -8381,8 +8389,10 @@ app.get("/proofs", async (req, res) => {
 
       // Apply if found
       if (gwConfig) {
-        if (gwConfig.token) gatewayToken = gwConfig.token;
-        if (gwConfig.domain) gatewayDomain = gwConfig.domain;
+        // If we found a tenant config, we MUST use it strictly.
+        // We cannot mix a Tenant Token with the Environment Domain.
+        gatewayToken = gwConfig.token;
+        gatewayDomain = gwConfig.domain;
       }
 
       // 1. Force Tenant Gateway for ALL IPFS content (CIDs or URLs)
