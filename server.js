@@ -8248,9 +8248,11 @@ app.get("/proofs", async (req, res) => {
         mp.safe_tx_hash AS safe_payment_tx_hash,
         mp.status AS payment_status,
         mp.released_at AS paid_at,
-        b.tenant_id  -- Ensure we have the tenant_id from the bid
+        mp.released_at AS paid_at,
+        pr.tenant_id  -- Use Proposal's tenant_id as the authoritative source (Organization)
       FROM proofs p
       LEFT JOIN bids b ON b.bid_id = p.bid_id
+      LEFT JOIN proposals pr ON pr.proposal_id = b.proposal_id
       LEFT JOIN milestone_payments mp
         ON mp.bid_id = p.bid_id
         AND mp.milestone_index = p.milestone_index
@@ -8350,18 +8352,36 @@ app.get("/proofs", async (req, res) => {
       const o = toCamel(r);
       o.files = coerceJson(o.files) || [];
 
-      // Determine Tenant ID for this row (prefer row's tenant_id, fallback to req.tenantId)
-      const rowTenantId = r.tenant_id || req.tenantId;
+      // Fetch Gateway Config
+      // Priority: 
+      // 1. Proof's Tenant (rowTenantId)
+      // 2. Viewer's Tenant (req.tenantId) - e.g. Admin viewing a vendor's proof
+      // 3. Environment Variables (Fallback)
 
-      // Fetch Gateway Config for THIS tenant
       let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
       let gatewayDomain = process.env.PINATA_GATEWAY_DOMAIN;
 
-      if (rowTenantId) {
-        const tToken = await getTenantConfigCached(rowTenantId, 'pinata_gateway_token');
-        if (tToken) gatewayToken = tToken;
-        const tGw = await getTenantConfigCached(rowTenantId, 'pinata_gateway');
-        if (tGw) gatewayDomain = tGw.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+      // Helper to fetch config for a specific tenant
+      const fetchTenantGw = async (tid) => {
+        if (!tid) return null;
+        const t = await getTenantConfigCached(tid, 'pinata_gateway_token');
+        const d = await getTenantConfigCached(tid, 'pinata_gateway');
+        if (d) return { token: t, domain: d.replace(/^https?:\/\//, '').replace(/\/+$/, '') };
+        return null;
+      };
+
+      // 1. Try Row Tenant
+      let gwConfig = await fetchTenantGw(r.tenant_id);
+
+      // 2. If not found, and viewer is different, try Viewer Tenant
+      if (!gwConfig && req.tenantId && req.tenantId !== r.tenant_id) {
+        gwConfig = await fetchTenantGw(req.tenantId);
+      }
+
+      // Apply if found
+      if (gwConfig) {
+        if (gwConfig.token) gatewayToken = gwConfig.token;
+        if (gwConfig.domain) gatewayDomain = gwConfig.domain;
       }
 
       // 1. Force Tenant Gateway for ALL IPFS content (CIDs or URLs)
