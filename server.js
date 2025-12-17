@@ -8937,11 +8937,11 @@ VALUES($1, $2, $3, 'pending', NOW(), $4)
 
             // 8) DIRECT POST to Safe Tx-Service (checksummed address; 'sep' base)
             console.log("[SAFE] using DIRECT POST path");
-            console.log("[SAFE] POST", `${TX_SERVICE_BASE} /api/v2 / safes / ${SAFE_ADDRESS_CS} /multisig-transactions/`);
+            console.log("[SAFE] POST", `${TX_SERVICE_BASE}/api/v2/safes/${SAFE_ADDRESS_CS}/multisig-transactions/`);
 
             // optional: early info check for clearer error
             {
-              const info = await fetch(`${TX_SERVICE_BASE} /api/v1 / safes / ${SAFE_ADDRESS_CS}/`, {
+              const info = await fetch(`${TX_SERVICE_BASE}/api/v1/safes/${SAFE_ADDRESS_CS}/`, {
                 headers: { "Authorization": `Bearer ${SAFE_API_KEY}` }
               });
               if (!info.ok) {
