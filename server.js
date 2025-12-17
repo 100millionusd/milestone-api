@@ -974,8 +974,9 @@ async function overlayPaidFromMp(bid, pool) {
     return list.map(f => {
       if (!f || !f.url) return f;
       let url = f.url;
-      if (url.match(/\/ipfsbafy/i)) {
-        url = url.replace(/\/ipfsbafy/i, '/ipfs/bafy');
+      if (url.match(/ipfsbafy/i)) {
+        console.log(`[DEBUG] Fixing malformed URL in bid/proof: ${url}`);
+        url = url.replace(/ipfsbafy/i, 'ipfs/bafy');
       }
       return { ...f, url };
     });
@@ -5329,8 +5330,9 @@ app.get("/proposals/:id", async (req, res) => {
         p.docs = docs.map(f => {
           if (!f || !f.url) return f;
           let url = f.url;
-          if (url.match(/\/ipfsbafy/i)) {
-            url = url.replace(/\/ipfsbafy/i, '/ipfs/bafy');
+          if (url.match(/ipfsbafy/i)) {
+            console.log(`[DEBUG] Fixing malformed URL in proposal ${id}: ${url}`);
+            url = url.replace(/ipfsbafy/i, 'ipfs/bafy');
           }
           return { ...f, url };
         });
@@ -9683,8 +9685,8 @@ app.get("/proofs", async (req, res) => {
         files = files.map(f => {
           if (!f || !f.url) return f;
           let url = f.url;
-          if (url.match(/\/ipfsbafy/i)) {
-            url = url.replace(/\/ipfsbafy/i, '/ipfs/bafy');
+          if (url.match(/ipfsbafy/i)) {
+            url = url.replace(/ipfsbafy/i, 'ipfs/bafy');
           }
           return { ...f, url };
         });
@@ -9755,8 +9757,8 @@ app.get("/proofs/:bidId", adminOrBidOwnerGuard, async (req, res) => {
         camel.files = camel.files.map(f => {
           if (!f || !f.url) return f;
           let url = f.url;
-          if (url.match(/\/ipfsbafy/i)) {
-            url = url.replace(/\/ipfsbafy/i, '/ipfs/bafy');
+          if (url.match(/ipfsbafy/i)) {
+            url = url.replace(/ipfsbafy/i, 'ipfs/bafy');
           }
           return { ...f, url };
         });
