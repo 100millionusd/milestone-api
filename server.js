@@ -771,9 +771,7 @@ async function overlayPaidFromMp(bid, pool) {
     const vendorProof = group?.vendor;
     const controllerReport = group?.controller;
 
-    if (group) {
-      console.log(`[DEBUG] overlayPaidFromMp [Ms ${i}] - VendorProof: ${vendorProof?.proof_id} (${vendorProof?.status}), ControllerReport: ${controllerReport?.proof_id} (${controllerReport?.status})`);
-    }
+
 
     // Attach Controller Report if exists (supplementary info)
     if (controllerReport) {
@@ -4285,7 +4283,7 @@ app.post("/auth/verify", async (req, res) => {
 
       if (rows.length > 0 && rows[0].tenant_id) {
         req.tenantId = rows[0].tenant_id;
-        console.log(`[Auth] Resolved tenant for ${address}: ${req.tenantId}`);
+
       } else {
         console.log(`[Auth] No tenant found for ${address} in any table.`);
       }
@@ -14225,7 +14223,7 @@ app.post("/api/notifications/subscribe", softAuth, async (req, res) => {
       );
     `);
 
-    console.log(`[subscribe] Registering push for ${userWallet}`);
+
     await pool.query(
       `INSERT INTO push_subscriptions (wallet_address, subscription)
        VALUES ($1, $2)
