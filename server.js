@@ -2984,9 +2984,9 @@ async function fetchAsBuffer(urlStr, jwt, tenantId = null) {
     let dedicated = "gateway.pinata.cloud"; // Default fallback to public
     if (tenantId) {
       const tGw = await tenantService.getTenantConfig(tenantId, 'pinata_gateway');
-      if (tGw) dedicated = tGw.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+      if (tGw) dedicated = tGw.replace(/^https?:\/\//, '').replace(/\/+$/, '').replace(/\/ipfs\/?$/, '');
     } else if (process.env.PINATA_GATEWAY_DOMAIN) {
-      dedicated = process.env.PINATA_GATEWAY_DOMAIN;
+      dedicated = process.env.PINATA_GATEWAY_DOMAIN.replace(/^https?:\/\//, '').replace(/\/+$/, '').replace(/\/ipfs\/?$/, '');
     }
     orig = orig.replace("gateway.pinata.cloud", dedicated);
   }
@@ -11805,7 +11805,8 @@ app.get('/admin/bids', adminGuard, async (req, res) => {
 
           // 1. Replace public gateway with dedicated
           if (gatewayDomain && url.includes('gateway.pinata.cloud')) {
-            url = url.replace('gateway.pinata.cloud', gatewayDomain);
+            const cleanDomain = gatewayDomain.replace(/^https?:\/\//, '').replace(/\/+$/, '').replace(/\/ipfs\/?$/, '');
+            url = url.replace('gateway.pinata.cloud', cleanDomain);
           }
 
           // 2. Append token
@@ -11899,7 +11900,8 @@ app.get('/admin/proofs-bids', adminGuard, async (req, res) => {
 
             // 1. Replace public gateway with dedicated (if configured)
             if (gatewayDomain && newProof.includes('gateway.pinata.cloud')) {
-              newProof = newProof.replace(/gateway\.pinata\.cloud/g, gatewayDomain);
+              const cleanDomain = gatewayDomain.replace(/^https?:\/\//, '').replace(/\/+$/, '').replace(/\/ipfs\/?$/, '');
+              newProof = newProof.replace(/gateway\.pinata\.cloud/g, cleanDomain);
             }
 
             // 2. Append token to dedicated gateway URLs
