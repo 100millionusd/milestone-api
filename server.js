@@ -728,6 +728,11 @@ async function overlayPaidFromMp(bid, pool) {
 
   // 🛡️ FIX: Sanitize IPFS URLs in proofs (fix malformed ipfsbafy...)
   for (const p of allProofs) {
+    // Ensure files is an array (handle JSON string from DB)
+    if (typeof p.files === 'string') {
+      try { p.files = JSON.parse(p.files); } catch { p.files = []; }
+    }
+
     if (Array.isArray(p.files)) {
       p.files = p.files.map(f => {
         let url = f.url;
