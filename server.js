@@ -14225,7 +14225,7 @@ app.post("/api/parse-proposal-pdf", async (req, res) => {
     }
 
     // Call Gemini
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-002" });
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
     const prompt = `
       Extract the following fields from the proposal text below and return ONLY a JSON object.
       Do not include markdown formatting (like \`\`\`json).
