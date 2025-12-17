@@ -972,6 +972,10 @@ async function overlayPaidFromMp(bid, pool) {
     }
     if (!Array.isArray(list)) return list;
     return list.map(f => {
+      if (typeof f === 'string') {
+        if (f.match(/ipfsbafy/i)) return f.replace(/ipfsbafy/i, 'ipfs/bafy');
+        return f;
+      }
       if (!f || !f.url) return f;
       let url = f.url;
       if (url.match(/ipfsbafy/i)) {
@@ -5328,6 +5332,10 @@ app.get("/proposals/:id", async (req, res) => {
       }
       if (Array.isArray(docs)) {
         p.docs = docs.map(f => {
+          if (typeof f === 'string') {
+            if (f.match(/ipfsbafy/i)) return f.replace(/ipfsbafy/i, 'ipfs/bafy');
+            return f;
+          }
           if (!f || !f.url) return f;
           let url = f.url;
           if (url.match(/ipfsbafy/i)) {
@@ -9683,6 +9691,10 @@ app.get("/proofs", async (req, res) => {
 
         // 🛡️ FIX: Sanitize IPFS URLs (fix malformed ipfsbafy...)
         files = files.map(f => {
+          if (typeof f === 'string') {
+            if (f.match(/ipfsbafy/i)) return f.replace(/ipfsbafy/i, 'ipfs/bafy');
+            return f;
+          }
           if (!f || !f.url) return f;
           let url = f.url;
           if (url.match(/ipfsbafy/i)) {
@@ -9755,6 +9767,10 @@ app.get("/proofs/:bidId", adminOrBidOwnerGuard, async (req, res) => {
       // 🛡️ FIX: Sanitize IPFS URLs (fix malformed ipfsbafy...)
       if (Array.isArray(camel.files)) {
         camel.files = camel.files.map(f => {
+          if (typeof f === 'string') {
+            if (f.match(/ipfsbafy/i)) return f.replace(/ipfsbafy/i, 'ipfs/bafy');
+            return f;
+          }
           if (!f || !f.url) return f;
           let url = f.url;
           if (url.match(/ipfsbafy/i)) {
