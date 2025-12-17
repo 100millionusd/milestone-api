@@ -9216,7 +9216,8 @@ app.post("/proofs", authRequired, async (req, res) => {
         name: Joi.string().allow(""),
         url: Joi.string().uri().required(),
         gpsLatitude: Joi.number().optional(),
-        gpsLongitude: Joi.number().optional()
+        gpsLongitude: Joi.number().optional(),
+        captureTime: Joi.string().optional()
       }))
       .default([])
       .optional(),
@@ -13332,43 +13333,67 @@ app.post("/ipfs/upload-file", authGuard, async (req, res) => {
     const files = Array.isArray(fileInput) ? fileInput : [fileInput];
     const results = [];
 
-    // Extract GPS if provided
+    // Extract GPS if provided (from browser geolocation)
     const keyValues = {};
     if (req.body.latitude && req.body.longitude) {
       keyValues.latitude = req.body.latitude;
       keyValues.longitude = req.body.longitude;
     }
 
-    // 2. QUEUEING LOGIC: Wait for previous uploads to finish before starting this batch
-    // This effectively locks the upload process to one-at-a-time across the whole server.
+    // 2. QUEUEING LOGIC
     const task = async () => {
       for (const f of files) {
         try {
+          // --- EXIF EXTRACTION START ---
+          let exifData = {};
+          try {
+            const tempPath = path.join(os.tmpdir(), `upload_${Date.now()}_${f.name}`);
+            await fs.writeFile(tempPath, f.data);
+
+            const tags = await exiftool.read(tempPath);
+
+            if (tags) {
+              if (tags.GPSLatitude) exifData.latitude = tags.GPSLatitude;
+              if (tags.GPSLongitude) exifData.longitude = tags.GPSLongitude;
+              if (tags.DateTimeOriginal) exifData.captureTime = tags.DateTimeOriginal.toString();
+              else if (tags.CreateDate) exifData.captureTime = tags.CreateDate.toString();
+            }
+
+            await fs.unlink(tempPath).catch(() => { }); // Cleanup
+          } catch (exifErr) {
+            console.warn("[EXIF] Failed to extract metadata:", exifErr);
+          }
+          // --- EXIF EXTRACTION END ---
+
+          // Merge EXIF data with browser data (browser takes precedence if provided, otherwise use EXIF)
+          // Actually, usually EXIF is more accurate for "proof of work" than upload location.
+          // But let's keep existing behavior: if browser loc provided, use it? 
+          // Or maybe return BOTH? 
+          // For now, let's fill in gaps.
+          if (!keyValues.latitude && exifData.latitude) keyValues.latitude = exifData.latitude;
+          if (!keyValues.longitude && exifData.longitude) keyValues.longitude = exifData.longitude;
+
           // Upload
           const result = await pinataUploadFile(f, req.tenantId, keyValues);
+
           // Return the GPS data back so frontend can use it
           if (keyValues.latitude) result.latitude = keyValues.latitude;
           if (keyValues.longitude) result.longitude = keyValues.longitude;
+          if (exifData.captureTime) result.captureTime = exifData.captureTime; // Return capture time
 
           results.push(result);
 
-          // 3. SAFETY DELAY: 1000ms is safer than 300ms for free/tier-1 plans
           console.log(`[Pinata] Uploaded ${f.name}. Waiting...`);
           await new Promise(r => setTimeout(r, 1500));
         } catch (innerErr) {
           console.error(`[Pinata] Failed to upload ${f.name}`, innerErr);
-          throw innerErr; // Stop this batch if a file fails
+          throw innerErr;
         }
       }
     };
 
-    // Chain to global queue, ensuring we catch errors to keep the queue alive
     const nextPromise = globalPinataQueue.catch(() => { }).then(task);
-
-    // Update global queue immediately
     globalPinataQueue = nextPromise;
-
-    // Wait for OUR result (and let it throw if it fails)
     await nextPromise;
 
     res.json(files.length === 1 ? results[0] : results);
