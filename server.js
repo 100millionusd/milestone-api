@@ -8356,10 +8356,10 @@ app.get("/proofs", async (req, res) => {
       // Priority: 
       // 1. Proposal's Tenant (Organization) - The owner of the work
       // 2. Viewer's Tenant (req.tenantId) - e.g. Admin viewing
-      // 3. Environment Variables (Fallback)
 
-      let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
-      let gatewayDomain = process.env.PINATA_GATEWAY_DOMAIN;
+      // STRICT MODE: Start with null. Do NOT fallback to Railway Env Vars by default.
+      let gatewayToken = null;
+      let gatewayDomain = null;
 
       // Helper to fetch config for a specific tenant
       const fetchTenantGw = async (tid) => {
@@ -8368,7 +8368,6 @@ app.get("/proofs", async (req, res) => {
         const d = await getTenantConfigCached(tid, 'pinata_gateway');
 
         // Return if EITHER is present. 
-        // This allows "Token from DB" + "Domain from Env" (Mix & Match)
         if (t || d) {
           return {
             token: t,
@@ -8389,10 +8388,13 @@ app.get("/proofs", async (req, res) => {
 
       // Apply if found
       if (gwConfig) {
-        // If we found a tenant config, we MUST use it strictly.
-        // We cannot mix a Tenant Token with the Environment Domain.
         gatewayToken = gwConfig.token;
         gatewayDomain = gwConfig.domain;
+      }
+
+      // Debug Logging
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`[Proof ${r.proof_id}] Tenant: ${r.proposal_tenant_id}, GW: ${gatewayDomain}, Token: ${gatewayToken ? 'Yes' : 'No'}`);
       }
 
       // 1. Force Tenant Gateway for ALL IPFS content (CIDs or URLs)
@@ -8413,9 +8415,13 @@ app.get("/proofs", async (req, res) => {
             }
             // If it's a standard IPFS URL (gateway.pinata.cloud, ipfs.io, etc.)
             else if (url.includes('/ipfs/')) {
-              // Replace the domain part with our dedicated gateway
-              // This handles https://gateway.pinata.cloud/ipfs/Qm... -> https://my-gw.mypinata.cloud/ipfs/Qm...
-              url = url.replace(/^https?:\/\/[^/]+\/ipfs\//, `https://${gatewayDomain}/ipfs/`);
+              // Robust Replacement: Split and Rejoin
+              // This avoids regex issues and ensures the slash is present
+              const parts = url.split('/ipfs/');
+              if (parts.length > 1) {
+                const path = parts.slice(1).join('/ipfs/'); // Handle multiple /ipfs/ if any
+                url = `https://${gatewayDomain}/ipfs/${path}`;
+              }
             }
           }
 
