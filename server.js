@@ -9726,6 +9726,23 @@ app.get("/proofs/:bidId", adminOrBidOwnerGuard, async (req, res) => {
         }
       }
 
+      // 🛡️ FIX: Parse JSON if string
+      if (typeof camel.files === 'string') {
+        try { camel.files = JSON.parse(camel.files); } catch { camel.files = []; }
+      }
+
+      // 🛡️ FIX: Sanitize IPFS URLs (fix malformed ipfsbafy...)
+      if (Array.isArray(camel.files)) {
+        camel.files = camel.files.map(f => {
+          if (!f || !f.url) return f;
+          let url = f.url;
+          if (url.match(/\/ipfsbafy/i)) {
+            url = url.replace(/\/ipfsbafy/i, '/ipfs/bafy');
+          }
+          return { ...f, url };
+        });
+      }
+
       if (gatewayToken && Array.isArray(camel.files)) {
         camel.files = camel.files.map(f => {
           if (f.url && f.url.includes('.mypinata.cloud') && !f.url.includes('token=')) {
