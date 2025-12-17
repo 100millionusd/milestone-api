@@ -2964,7 +2964,7 @@ async function checkCidAlive(cid, jwt) {
 
   // 2) public fallbacks (Added your Dedicated Gateway at the top)
   const fallbacks = [
-    `https://sapphire-given-snake-741.mypinata.cloud/ipfs/${cid}`, // ⚡ Fastest
+    // `https://sapphire-given-snake-741.mypinata.cloud/ipfs/${cid}`, // REMOVED: Causing 403 errors for other tenants
     `https://cf-ipfs.com/ipfs/${cid}`,                             // Fast public
     `${(PINATA_PUBLIC_GATEWAY || 'https://gateway.pinata.cloud/ipfs/').replace(/\/+$/, '/')}${cid}`,
     `https://ipfs.io/ipfs/${cid}`,
@@ -2983,7 +2983,7 @@ async function fetchAsBuffer(urlStr, jwt, tenantId = null) {
   // 2. ⚡ HIJACK: If URL is using the slow public gateway, force swap to your FAST Dedicated Gateway
   // This prevents waiting 15s for a timeout before trying the good link.
   if (orig.includes("gateway.pinata.cloud")) {
-    let dedicated = "sapphire-given-snake-741.mypinata.cloud"; // Default fallback
+    let dedicated = "gateway.pinata.cloud"; // Default fallback to public
     if (tenantId) {
       const tGw = await tenantService.getTenantConfig(tenantId, 'pinata_gateway');
       if (tGw) dedicated = tGw.replace(/^https?:\/\//, '').replace(/\/+$/, '');
