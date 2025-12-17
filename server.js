@@ -8397,7 +8397,15 @@ app.get("/proofs", async (req, res) => {
         console.log(`[Proof ${r.proof_id}] Tenant: ${r.proposal_tenant_id}, GW: ${gatewayDomain}, Token: ${gatewayToken ? 'Yes' : 'No'}`);
       }
 
-      // 1. Force Tenant Gateway for ALL IPFS content (CIDs or URLs)
+      // 3. Fallback to Public Gateway if no Tenant Gateway found
+      // This is crucial to scrub "wrong" private gateways (e.g. from Railway env vars during upload)
+      // from the URL if the current viewer/tenant doesn't have the correct config.
+      if (!gatewayDomain) {
+        gatewayDomain = 'gateway.pinata.cloud';
+      }
+
+      // 1. Force Gateway for ALL IPFS content (CIDs or URLs)
+      // We always run this to ensure we use the selected gateway (Tenant or Public)
       if (gatewayDomain) {
         o.files = o.files.map(f => {
           let url = f.url;
@@ -8416,10 +8424,9 @@ app.get("/proofs", async (req, res) => {
             // If it's a standard IPFS URL (gateway.pinata.cloud, ipfs.io, etc.)
             else if (url.includes('/ipfs/')) {
               // Robust Replacement: Split and Rejoin
-              // This avoids regex issues and ensures the slash is present
               const parts = url.split('/ipfs/');
               if (parts.length > 1) {
-                const path = parts.slice(1).join('/ipfs/'); // Handle multiple /ipfs/ if any
+                const path = parts.slice(1).join('/ipfs/');
                 url = `https://${gatewayDomain}/ipfs/${path}`;
               }
             }
