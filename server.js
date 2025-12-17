@@ -49,6 +49,7 @@ const path = require("path");
 const crypto = require("crypto");
 const pdfParse = require("pdf-parse");
 const OpenAI = require("openai");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { enrichAuditRow } = require('./services/auditPinata');
 
 // --- robust tx-hash extractor (handles strings, fields, functions, nested, promises) ---
@@ -377,6 +378,9 @@ const openai = (() => {
     organization: process.env.OPENAI_ORG || undefined,
   });
 })();
+
+// Gemini Client
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
 
 // Blockchain
 const SEPOLIA_RPC_URL = process.env.SEPOLIA_RPC_URL || "https://ethereum-sepolia.publicnode.com";
@@ -14201,6 +14205,68 @@ async function sendPushNotification(wallet, payload) {
 
 // Ensure DB columns exist (Controller support)
 ensureProofsColumns(pool).catch(err => console.error("Failed to ensure proofs columns:", err));
+
+// --- Gemini PDF Parsing Endpoint ---
+app.post("/api/parse-proposal-pdf", async (req, res) => {
+  try {
+    if (!req.files || !req.files.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    const file = req.files.file;
+    const pdfBuffer = file.data;
+
+    // Extract text from PDF
+    const pdfData = await pdfParse(pdfBuffer);
+    const text = pdfData.text;
+
+    if (!text || text.trim().length === 0) {
+      return res.status(400).json({ error: "Could not extract text from PDF" });
+    }
+
+    // Call Gemini
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const prompt = `
+      Extract the following fields from the proposal text below and return ONLY a JSON object.
+      Do not include markdown formatting (like \`\`\`json).
+      
+      Fields to extract:
+      - orgName (Organization Name)
+      - title (Project Title)
+      - summary (Project Summary - keep it concise but complete)
+      - contact (Contact Email)
+      - address (Street Address)
+      - city
+      - country
+      - amountUSD (Budget/Total Amount in USD number)
+      - ownerPhone (Phone number)
+
+      If a field is not found, use null or an empty string.
+      
+      Proposal Text:
+      ${text.substring(0, 30000)} // Limit context if needed
+    `;
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const textResponse = response.text();
+
+    // Clean up response if it contains markdown
+    const jsonStr = textResponse.replace(/```json/g, '').replace(/```/g, '').trim();
+
+    try {
+      const data = JSON.parse(jsonStr);
+      res.json(data);
+    } catch (e) {
+      console.error("Failed to parse Gemini response:", textResponse);
+      res.status(500).json({ error: "Failed to parse AI response", raw: textResponse });
+    }
+
+  } catch (error) {
+    console.error("Error parsing PDF:", error);
+    res.status(500).json({ error: "Internal server error during PDF parsing" });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`[api] Listening on :${PORT}`);
