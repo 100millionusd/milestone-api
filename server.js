@@ -8365,6 +8365,18 @@ app.get("/proofs", async (req, res) => {
       const o = toCamel(r);
       o.files = coerceJson(o.files) || [];
 
+      // 🛡️ FIX: Sanitize IPFS URLs (fix malformed ipfsbafy...)
+      if (Array.isArray(o.files)) {
+        o.files = o.files.map(f => {
+          if (!f || !f.url) return f;
+          let url = f.url;
+          if (url.match(/\/ipfsbafy/i)) {
+            url = url.replace(/\/ipfsbafy/i, '/ipfs/bafy');
+          }
+          return { ...f, url };
+        });
+      }
+
       // Fetch Gateway Config
       // Priority: 
       // 1. Proposal's Tenant (Organization) - The owner of the work
@@ -9613,9 +9625,19 @@ app.get("/proofs", async (req, res) => {
 
     const out = await Promise.all(
       rows.map(async (r) => {
-        const files = Array.isArray(r.files)
+        let files = Array.isArray(r.files)
           ? r.files
           : (typeof r.files === "string" ? JSON.parse(r.files || "[]") : []);
+
+        // 🛡️ FIX: Sanitize IPFS URLs (fix malformed ipfsbafy...)
+        files = files.map(f => {
+          if (!f || !f.url) return f;
+          let url = f.url;
+          if (url.match(/\/ipfsbafy/i)) {
+            url = url.replace(/\/ipfsbafy/i, '/ipfs/bafy');
+          }
+          return { ...f, url };
+        });
         // Safe city/state/country + rounded coords (or null if no GPS)
         const safeGeo = await buildSafeGeoForProof(r);
 
