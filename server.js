@@ -4873,6 +4873,9 @@ app.get("/proposals", softAuth, async (req, res) => {
 
     const { rows } = await pool.query(q, params);
     console.log('[DEBUG] /proposals gateway check:', rows.map(r => ({ id: r.id, tenant: r.tenant_id, gateway: r.gateway })));
+
+
+
     res.json(mapRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -5271,6 +5274,9 @@ app.get("/proposals/mine", authRequired, async (req, res) => {
     q += ` ORDER BY created_at DESC`;
 
     const { rows } = await pool.query(q, params);
+
+
+
     res.json(mapRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -5292,7 +5298,27 @@ app.get("/proposals/:id", async (req, res) => {
 
     const { rows } = await pool.query(q, params);
     if (!rows[0]) return res.status(404).json({ error: "not found" });
-    res.json(toCamel(rows[0]));
+
+    // 🛡️ FIX: Sanitize IPFS URLs in proposal docs (fix malformed ipfsbafy...)
+    const p = rows[0];
+    if (p.docs) {
+      let docs = p.docs;
+      if (typeof docs === 'string') {
+        try { docs = JSON.parse(docs); } catch { docs = []; }
+      }
+      if (Array.isArray(docs)) {
+        p.docs = docs.map(f => {
+          if (!f || !f.url) return f;
+          let url = f.url;
+          if (url.match(/\/ipfsbafy/i)) {
+            url = url.replace(/\/ipfsbafy/i, '/ipfs/bafy');
+          }
+          return { ...f, url };
+        });
+      }
+    }
+
+    res.json(toCamel(p));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
