@@ -8248,8 +8248,7 @@ app.get("/proofs", async (req, res) => {
         mp.safe_tx_hash AS safe_payment_tx_hash,
         mp.status AS payment_status,
         mp.released_at AS paid_at,
-        mp.released_at AS paid_at,
-        pr.tenant_id  -- Use Proposal's tenant_id as the authoritative source (Organization)
+        pr.tenant_id AS proposal_tenant_id -- Explicit alias to avoid overwriting ambiguity
       FROM proofs p
       LEFT JOIN bids b ON b.bid_id = p.bid_id
       LEFT JOIN proposals pr ON pr.proposal_id = b.proposal_id
@@ -8289,9 +8288,10 @@ app.get("/proofs", async (req, res) => {
             mp.safe_tx_hash AS safe_payment_tx_hash,
             mp.status AS payment_status,
             mp.released_at AS paid_at,
-            b.tenant_id -- Ensure we have the tenant_id from the bid for Admin view
+            pr.tenant_id AS proposal_tenant_id -- Explicit alias
           FROM proofs p
           LEFT JOIN bids b ON b.bid_id = p.bid_id
+          LEFT JOIN proposals pr ON pr.proposal_id = b.proposal_id
           LEFT JOIN milestone_payments mp
             ON mp.bid_id = p.bid_id
             AND mp.milestone_index = p.milestone_index
@@ -8299,7 +8299,7 @@ app.get("/proofs", async (req, res) => {
         const params = [];
         // Filter by tenant ONLY if not Global Admin
         if (req.tenantId !== DEFAULT_TENANT_ID) {
-          q += ` WHERE b.tenant_id = $1`;
+          q += ` WHERE pr.tenant_id = $1`;
           params.push(req.tenantId);
         }
         q += ` ORDER BY p.proof_id DESC`;
@@ -8312,7 +8312,7 @@ app.get("/proofs", async (req, res) => {
       let q = `${selectSql} WHERE p.bid_id = $1`;
       const params = [bidId];
       if (req.tenantId !== DEFAULT_TENANT_ID) {
-        q += ` AND p.tenant_id = $2`;
+        q += ` AND pr.tenant_id = $2`;
         params.push(req.tenantId);
       }
       q += ` ORDER BY p.proof_id DESC`;
@@ -8322,7 +8322,7 @@ app.get("/proofs", async (req, res) => {
          WHERE b.proposal_id = $1`;
       const params = [proposalId];
       if (req.tenantId !== DEFAULT_TENANT_ID) {
-        q += ` AND b.tenant_id = $2`;
+        q += ` AND pr.tenant_id = $2`;
         params.push(req.tenantId);
       }
       q += ` ORDER BY p.proof_id DESC`;
@@ -8354,8 +8354,8 @@ app.get("/proofs", async (req, res) => {
 
       // Fetch Gateway Config
       // Priority: 
-      // 1. Proof's Tenant (rowTenantId)
-      // 2. Viewer's Tenant (req.tenantId) - e.g. Admin viewing a vendor's proof
+      // 1. Proposal's Tenant (Organization) - The owner of the work
+      // 2. Viewer's Tenant (req.tenantId) - e.g. Admin viewing
       // 3. Environment Variables (Fallback)
 
       let gatewayToken = process.env.PINATA_GATEWAY_TOKEN;
@@ -8370,11 +8370,12 @@ app.get("/proofs", async (req, res) => {
         return null;
       };
 
-      // 1. Try Row Tenant
-      let gwConfig = await fetchTenantGw(r.tenant_id);
+      // 1. Try Proposal Tenant (Organization)
+      // Note: r.proposal_tenant_id comes from the query alias
+      let gwConfig = await fetchTenantGw(r.proposal_tenant_id);
 
-      // 2. If not found, and viewer is different, try Viewer Tenant
-      if (!gwConfig && req.tenantId && req.tenantId !== r.tenant_id) {
+      // 2. If not found, try Viewer Tenant
+      if (!gwConfig && req.tenantId && req.tenantId !== r.proposal_tenant_id) {
         gwConfig = await fetchTenantGw(req.tenantId);
       }
 
