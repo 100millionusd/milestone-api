@@ -965,6 +965,25 @@ async function overlayPaidFromMp(bid, pool) {
 
   if (tasks.length) await Promise.all(tasks);
 
+  // 🛡️ FIX: Sanitize IPFS URLs in bid docs/files (fix malformed ipfsbafy...)
+  const sanitizeList = (list) => {
+    if (typeof list === 'string') {
+      try { list = JSON.parse(list); } catch { list = []; }
+    }
+    if (!Array.isArray(list)) return list;
+    return list.map(f => {
+      if (!f || !f.url) return f;
+      let url = f.url;
+      if (url.match(/\/ipfsbafy/i)) {
+        url = url.replace(/\/ipfsbafy/i, '/ipfs/bafy');
+      }
+      return { ...f, url };
+    });
+  };
+
+  if (bid.docs) bid.docs = sanitizeList(bid.docs);
+  if (bid.files) bid.files = sanitizeList(bid.files);
+
   return { ...bid, milestones: msArr };
 }
 
