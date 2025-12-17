@@ -8388,19 +8388,14 @@ app.get("/proofs", async (req, res) => {
             }
           }
 
+          // Append token if it's a private gateway (mypinata.cloud) and token is missing
+          if (url && gatewayToken && url.includes('.mypinata.cloud') && !url.includes('token=')) {
+            const separator = url.includes('?') ? '&' : '?';
+            url = `${url}${separator}token=${gatewayToken}`;
+          }
+
           if (url) {
             return { ...f, url };
-          }
-          return f;
-        });
-      }
-
-      // 2. Append token to dedicated gateway URLs
-      if (gatewayToken) {
-        o.files = o.files.map(f => {
-          if (f.url && f.url.includes('.mypinata.cloud') && !f.url.includes('token=')) {
-            const separator = f.url.includes('?') ? '&' : '?';
-            return { ...f, url: `${f.url}${separator}token=${gatewayToken}` };
           }
           return f;
         });
