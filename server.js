@@ -9254,9 +9254,9 @@ app.post("/proofs", authRequired, async (req, res) => {
       .items(Joi.object({
         name: Joi.string().allow(""),
         url: Joi.string().uri().required(),
-        gpsLatitude: Joi.number().optional(),
-        gpsLongitude: Joi.number().optional(),
-        captureTime: Joi.string().optional()
+        gpsLatitude: Joi.number().allow(null).optional(),
+        gpsLongitude: Joi.number().allow(null).optional(),
+        captureTime: Joi.string().allow(null).optional()
       }))
       .default([])
       .optional(),
@@ -9425,121 +9425,123 @@ app.post("/proofs", authRequired, async (req, res) => {
     // (Reverted based on user feedback)
 
 
-    // 6) (Best-effort) Agent2 analysis + notify
-    try {
-      if (openai && (vendorPrompt || description || files.length)) {
-        // Proposal already fetched above, reuse it
-        const proposal = proposalRow;
+    // 6) (Best-effort) Agent2 analysis + notify (BACKGROUND)
+    (async () => {
+      try {
+        if (openai && (vendorPrompt || description || files.length)) {
+          // Proposal already fetched above, reuse it
+          const proposal = proposalRow;
 
-        const metaBlock = summarizeMeta(fileMeta);
-        const gpsCount = fileMeta.filter(m =>
-          Number.isFinite(m?.exif?.gpsLatitude) && Number.isFinite(m?.exif?.gpsLongitude)
-        ).length;
-        const firstFix = fileMeta.find(m =>
-          Number.isFinite(m?.exif?.gpsLatitude) && Number.isFinite(m?.exif?.gpsLongitude)
-        );
-        const firstGps = firstFix
-          ? {
-            lat: Number(firstFix.exif.gpsLatitude),
-            lon: Number(firstFix.exif.gpsLongitude),
-            alt: Number.isFinite(Number(firstFix?.exif?.gpsAltitude))
-              ? Number(firstFix.exif.gpsAltitude)
-              : null,
-          }
-          : { lat: null, lon: null, alt: null };
+          const metaBlock = summarizeMeta(fileMeta);
+          const gpsCount = fileMeta.filter(m =>
+            Number.isFinite(m?.exif?.gpsLatitude) && Number.isFinite(m?.exif?.gpsLongitude)
+          ).length;
+          const firstFix = fileMeta.find(m =>
+            Number.isFinite(m?.exif?.gpsLatitude) && Number.isFinite(m?.exif?.gpsLongitude)
+          );
+          const firstGps = firstFix
+            ? {
+              lat: Number(firstFix.exif.gpsLatitude),
+              lon: Number(firstFix.exif.gpsLongitude),
+              alt: Number.isFinite(Number(firstFix?.exif?.gpsAltitude))
+                ? Number(firstFix.exif.gpsAltitude)
+                : null,
+            }
+            : { lat: null, lon: null, alt: null };
 
-        const capNote = captureIso ? `First capture time (EXIF, ISO8601): ${captureIso}` : "No capture time in EXIF.";
-        const gpsNote = gpsCount
-          ? `GPS present in ${gpsCount} file(s). First fix: ${firstGps.lat}, ${firstGps.lon}${firstGps.alt != null ? ` • alt ${firstGps.alt}m` : ""}`
-          : "No GPS in submitted media.";
+          const capNote = captureIso ? `First capture time (EXIF, ISO8601): ${captureIso}` : "No capture time in EXIF.";
+          const gpsNote = gpsCount
+            ? `GPS present in ${gpsCount} file(s). First fix: ${firstGps.lat}, ${firstGps.lon}${firstGps.alt != null ? ` • alt ${firstGps.alt}m` : ""}`
+            : "No GPS in submitted media.";
 
-        const basePrompt = `
-You are Agent2. Evaluate a vendor's submitted proof for a specific milestone.
-
-Return strict JSON:
-{
-  "summary": string,
-  "evidence": string[],
-  "gaps": string[],
-  "fit": "low" | "medium" | "high",
-  "confidence": number,
-  "geo": {
-    "gpsCount": number,
-    "firstFix": { "lat": number|null, "lon": number|null, "alt": number|null },
-    "captureTime": string|null
-  }
-}
-
-Context:
-- Proposal: ${proposal?.title || "(unknown)"} (${proposal?.org_name || "(unknown)"})
-- Milestone: ${milestones[milestoneIndex]?.name || "(unknown)"} — $${milestones[milestoneIndex]?.amount ?? "?"}
-- Vendor: ${bid.vendor_name || bid.vendorName || "(unknown)"}
-
-Proof title: ${title}
-Proof description (truncated):
-"""${description.slice(0, 2000)}"""
-
-Files:
-${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
-
-MEDIA METADATA (EXIF/GPS summary):
-${metaBlock}
-
-Hints:
-- ${gpsNote}
-- ${capNote}
-`.trim();
-
-        const fullPrompt = vendorPrompt ? `${vendorPrompt}\n\n---\n${basePrompt}` : basePrompt;
-
-        const resp = await openai.chat.completions.create({
-          model: "gpt-4o-mini",
-          temperature: 0.2,
-          messages: [{ role: "user", content: fullPrompt }],
-          response_format: { type: "json_object" },
-        });
-
-        let analysis;
-        try {
-          const raw = resp.choices?.[0]?.message?.content || "{}";
-          analysis = JSON.parse(raw);
-        } catch {
-          analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
-        }
-        if (!analysis.geo) {
-          analysis.geo = { gpsCount, firstFix: firstGps, captureTime: captureIso || null };
-        }
-
-        await pool.query(
-          "UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2",
-          [JSON.stringify(analysis), proofRow.proof_id]
-        );
-        proofRow.ai_analysis = analysis;
-        await writeAudit(bidId, req, {
-          proof_analyzed: {
-            index: milestoneIndex,
-            proofId: proofRow.proof_id,
-            fit: analysis?.fit,
-            confidence: analysis?.confidence
-          }
-        });
-
-        // notify if suspicious
-        if (shouldNotify(analysis)) {
-          try {
-            const { rows: prj2 } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [
-              bid.proposal_id || bid.proposalId,
-            ]);
-            const proposal2 = prj2[0] || null;
-            await notifyProofFlag({ proof: proofRow, bid, proposal: proposal2, analysis });
-          } catch (e) {
-            console.warn("notifyProofFlag failed (non-fatal):", String(e).slice(0, 200));
-          }
-        }
-      }
-    } catch (e) {
-      console.warn("Agent2 analysis skipped:", String(e).slice(0, 200));
+          const basePrompt = `
+  You are Agent2. Evaluate a vendor's submitted proof for a specific milestone.
+  
+  Return strict JSON:
+  {
+    "summary": string,
+    "evidence": string[],
+    "gaps": string[],
+    "fit": "low" | "medium" | "high",
+    "confidence": number,
+    "geo": {
+      "gpsCount": number,
+      "firstFix": { "lat": number|null, "lon": number|null, "alt": number|null },
+      "captureTime": string|null
     }
+  }
+  
+  Context:
+  - Proposal: ${proposal?.title || "(unknown)"} (${proposal?.org_name || "(unknown)"})
+  - Milestone: ${milestones[milestoneIndex]?.name || "(unknown)"} — $${milestones[milestoneIndex]?.amount ?? "?"}
+  - Vendor: ${bid.vendor_name || bid.vendorName || "(unknown)"}
+  
+  Proof title: ${title}
+  Proof description (truncated):
+  """${description.slice(0, 2000)}"""
+  
+  Files:
+  ${files.map((f) => `- ${f.name || "file"}: ${f.url}`).join("\n") || "(none)"}
+  
+  MEDIA METADATA (EXIF/GPS summary):
+  ${metaBlock}
+  
+  Hints:
+  - ${gpsNote}
+  - ${capNote}
+  `.trim();
+
+          const fullPrompt = vendorPrompt ? `${vendorPrompt}\n\n---\n${basePrompt}` : basePrompt;
+
+          const resp = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            temperature: 0.2,
+            messages: [{ role: "user", content: fullPrompt }],
+            response_format: { type: "json_object" },
+          });
+
+          let analysis;
+          try {
+            const raw = resp.choices?.[0]?.message?.content || "{}";
+            analysis = JSON.parse(raw);
+          } catch {
+            analysis = { summary: "Agent2 returned non-JSON.", evidence: [], gaps: [], fit: "low", confidence: 0 };
+          }
+          if (!analysis.geo) {
+            analysis.geo = { gpsCount, firstFix: firstGps, captureTime: captureIso || null };
+          }
+
+          await pool.query(
+            "UPDATE proofs SET ai_analysis=$1, updated_at=NOW() WHERE proof_id=$2",
+            [JSON.stringify(analysis), proofRow.proof_id]
+          );
+          proofRow.ai_analysis = analysis;
+          await writeAudit(bidId, req, {
+            proof_analyzed: {
+              index: milestoneIndex,
+              proofId: proofRow.proof_id,
+              fit: analysis?.fit,
+              confidence: analysis?.confidence
+            }
+          });
+
+          // notify if suspicious
+          if (shouldNotify(analysis)) {
+            try {
+              const { rows: prj2 } = await pool.query("SELECT * FROM proposals WHERE proposal_id=$1", [
+                bid.proposal_id || bid.proposalId,
+              ]);
+              const proposal2 = prj2[0] || null;
+              await notifyProofFlag({ proof: proofRow, bid, proposal: proposal2, analysis });
+            } catch (e) {
+              console.warn("notifyProofFlag failed (non-fatal):", String(e).slice(0, 200));
+            }
+          }
+        }
+      } catch (e) {
+        console.warn("Agent2 analysis skipped:", String(e).slice(0, 200));
+      }
+    })();
 
     // 7) Stamp a simple proof note back to milestones for quick view (VENDOR ONLY)
     // If this is a controller report, DO NOT overwrite the vendor's proof in the bids table.
