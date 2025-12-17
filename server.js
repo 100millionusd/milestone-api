@@ -8317,7 +8317,6 @@ app.get("/proofs", async (req, res) => {
       ({ rows } = await pool.query(q, params));
     } else {
       let q = `${selectSql}
-         JOIN bids b ON b.bid_id = p.bid_id
          WHERE b.proposal_id = $1`;
       const params = [proposalId];
       if (req.tenantId !== DEFAULT_TENANT_ID) {
