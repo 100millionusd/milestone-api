@@ -14492,6 +14492,64 @@ app.post("/api/parse-proposal-pdf", async (req, res) => {
   }
 });
 
+// --- Gemini Bid PDF Parsing Endpoint ---
+app.post("/api/parse-bid-pdf", async (req, res) => {
+  try {
+    if (!req.files || !req.files.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    const file = req.files.file;
+    const pdfBuffer = file.data;
+
+    // Extract text from PDF
+    const pdfData = await pdfParse(pdfBuffer);
+    const text = pdfData.text;
+
+    if (!text || text.trim().length === 0) {
+      return res.status(400).json({ error: "Could not extract text from PDF" });
+    }
+
+    // Call Gemini
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+    const prompt = `
+      Extract the following fields from the bid/proposal text below and return ONLY a JSON object.
+      Do not include markdown formatting (like \`\`\`json).
+      
+      Fields to extract:
+      - priceUSD (Total Bid Amount in USD number)
+      - days (Estimated Completion Days as a number)
+      - notes (Bid Description/Proposal Details - keep it concise but complete)
+      - milestones (Array of objects with: name, amount, dueDate (ISO string or YYYY-MM-DD))
+
+      If a field is not found, use null or an empty string.
+      For milestones, try to infer them from the text. If not found, return an empty array.
+      
+      Bid Text:
+      ${text.substring(0, 30000)} // Limit context if needed
+    `;
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const textResponse = response.text();
+
+    // Clean up response if it contains markdown
+    const jsonStr = textResponse.replace(/```json/g, '').replace(/```/g, '').trim();
+
+    try {
+      const data = JSON.parse(jsonStr);
+      res.json(data);
+    } catch (e) {
+      console.error("Failed to parse Gemini response:", textResponse);
+      res.status(500).json({ error: "Failed to parse AI response", raw: textResponse });
+    }
+
+  } catch (error) {
+    console.error("Error parsing Bid PDF:", error);
+    res.status(500).json({ error: "Internal server error during PDF parsing" });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`[api] Listening on :${PORT}`);
   console.log(`[api] Admin enforcement: ${ENFORCE_JWT_ADMIN ? "ON" : "OFF"}`);
