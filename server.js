@@ -369,6 +369,10 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || DEF
 CORS_ORIGINS.push("https://sally-uyuni-855007491806.us-west1.run.app");
 CORS_ORIGINS.push("https://vendor-842701335150.us-west1.run.app");
 CORS_ORIGINS.push("https://vendor-842701335150.europe-west1.run.app");
+CORS_ORIGINS.push("https://milestonex.io");
+CORS_ORIGINS.push("https://www.milestonex.io");
+CORS_ORIGINS.push("https://milestone-api-production.up.railway.app"); // 👈 Add this!
+
 
 const PINATA_API_KEY = (process.env.PINATA_API_KEY || "").trim();
 const PINATA_SECRET_API_KEY = (process.env.PINATA_SECRET_API_KEY || "").trim();
