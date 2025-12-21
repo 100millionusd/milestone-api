@@ -3091,6 +3091,8 @@ async function fetchAsBuffer(urlStr, jwt, tenantId = null) {
   if (isDedicated) {
     if (jwt) headers["Authorization"] = `Bearer ${jwt}`;
     if (PINATA_GATEWAY_TOKEN) headers["x-pinata-gateway-token"] = PINATA_GATEWAY_TOKEN;
+    // SPOOF ORIGIN to pass Gateway Access Controls
+    headers["Origin"] = "https://milestonex.io";
   }
 
   // 4. Try the FAST URL first
