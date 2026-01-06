@@ -706,22 +706,18 @@ app.get('/api/voting/projects', async (req, res) => {
   try {
     const tenantId = req.headers['x-tenant-id'] || 'default';
 
-    // Get all active projects (matching tenant OR global/default)
+    // Get all active projects (GLOBAL - No tenant filter)
     const { rows: projects } = await pool.query(
       `SELECT * FROM voting_projects 
        WHERE status='active' 
-         AND (tenant_id=$1 OR tenant_id IS NULL OR tenant_id='default') 
-       ORDER BY created_at DESC`,
-      [tenantId]
+       ORDER BY created_at DESC`
     );
 
     // Get vote counts for these projects
     const { rows: counts } = await pool.query(
       `SELECT project_id, COUNT(*) as vote_count 
          FROM votes 
-         WHERE (tenant_id=$1 OR tenant_id IS NULL OR tenant_id='default') 
-         GROUP BY project_id`,
-      [tenantId]
+         GROUP BY project_id`
     );
 
     // Merge counts
@@ -759,8 +755,8 @@ app.post('/api/voting/vote', softAuth, async (req, res) => {
 
     // 3. Cast Vote
     await pool.query(
-      `INSERT INTO votes (project_id, voter_wallet, location_lat, location_lng, tenant_id)
-       VALUES ($1, $2, $3, $4, $5)`,
+      `INSERT INTO votes(project_id, voter_wallet, location_lat, location_lng, tenant_id)
+       VALUES($1, $2, $3, $4, $5)`,
       [projectId, userWallet, lat, lng, tenantId]
     );
 
@@ -790,7 +786,7 @@ async function _getSafeTxStatus(safeTxHash) {
   const cached = _safeStatusCache.get(safeTxHash);
   if (cached && now - cached.at < SAFE_CACHE_TTL_MS) return cached;
 
-  const url = `${_safeTxUrlBase}/api/v1/multisig-transactions/${safeTxHash}`;
+  const url = `${_safeTxUrlBase} / api / v1 / multisig - transactions / ${safeTxHash}`;
   const headers = process.env.SAFE_API_KEY ? { Authorization: `Bearer ${process.env.SAFE_API_KEY}` } : {};
   const fetcher = (typeof safeFetchRL === 'function') ? safeFetchRL : fetch;
 
@@ -827,7 +823,7 @@ async function _findExecutedByNonce(nonce) {
   const SAFE_ADDRESS = (process.env.SAFE_ADDRESS || process.env.SAFE_WALLET || '').trim();
   if (!SAFE_ADDRESS) return null;
 
-  const url = `${_safeTxUrlBase}/api/v1/safes/${SAFE_ADDRESS}/multisig-transactions/?nonce=${Number(nonce)}&ordering=-submissionDate&limit=10`;
+  const url = `${_safeTxUrlBase} / api / v1 / safes / ${SAFE_ADDRESS} / multisig - transactions /? nonce = ${Number(nonce)} & ordering=-submissionDate & limit=10`;
   const headers = process.env.SAFE_API_KEY ? { Authorization: `Bearer ${process.env.SAFE_API_KEY}` } : {};
   const fetcher = (typeof safeFetchRL === 'function') ? safeFetchRL : fetch;
 
@@ -874,11 +870,11 @@ async function _finalizePaidInDb({ bidId, milestoneIndex, txHash, safeTxHash, te
     // Update milestone_payments (also switch to the new safe_tx_hash if the hash changed)
     await pool.query(
       `UPDATE milestone_payments
-         SET status='released',
-             safe_tx_hash = COALESCE($4, safe_tx_hash),
-             tx_hash=COALESCE($3, tx_hash),
-             released_at=COALESCE(released_at, NOW())
-       WHERE bid_id=$1 AND milestone_index=$2 AND tenant_id=$5`,
+         SET status = 'released',
+      safe_tx_hash = COALESCE($4, safe_tx_hash),
+      tx_hash = COALESCE($3, tx_hash),
+      released_at = COALESCE(released_at, NOW())
+       WHERE bid_id = $1 AND milestone_index = $2 AND tenant_id = $5`,
       [bidId, milestoneIndex, txHash || null, safeTxHash || null, tenantId]
     );
 
@@ -895,7 +891,7 @@ async function _finalizePaidInDb({ bidId, milestoneIndex, txHash, safeTxHash, te
           wallet: bid.wallet_address,
           type: 'payment_released',
           title: 'Payment Released',
-          message: `Payment released for ${proposalTitle} (Milestone ${Number(milestoneIndex) + 1})`,
+          message: `Payment released for ${proposalTitle}(Milestone ${Number(milestoneIndex) + 1})`,
           data: { bidId, milestoneIndex, txHash: txHash || safeTxHash }
         });
       }
@@ -920,8 +916,8 @@ async function overlayPaidFromMp(bid, pool) {
 
   // get the newest row per milestone_index
   const { rows: mpRows } = await pool.query(
-    `SELECT DISTINCT ON (milestone_index)
-           milestone_index, status, tx_hash, safe_tx_hash, released_at, safe_nonce, created_at, id
+    `SELECT DISTINCT ON(milestone_index)
+milestone_index, status, tx_hash, safe_tx_hash, released_at, safe_nonce, created_at, id
        FROM milestone_payments
       WHERE bid_id = $1 AND tenant_id = $2
       ORDER BY milestone_index, created_at DESC, id DESC`,
@@ -983,7 +979,7 @@ async function overlayPaidFromMp(bid, pool) {
       else if (submitter && vendorWallet && submitter !== vendorWallet) isController = true;
     }
 
-    // console.log(`[DEBUG] overlayPaidFromMp - Proof ${p.proof_id}: Subtype=${p.subtype}, Role=${p.submitter_role}, Addr=${submitter}, Vendor=${vendorWallet} => IsController? ${isController}`);
+    // console.log(`[DEBUG] overlayPaidFromMp - Proof ${ p.proof_id }: Subtype = ${ p.subtype }, Role = ${ p.submitter_role }, Addr = ${ submitter }, Vendor = ${ vendorWallet } => IsController ? ${ isController } `);
 
     if (isController) {
       group.controller = p;
@@ -1190,7 +1186,7 @@ async function overlayPaidFromMp(bid, pool) {
       if (!f || !f.url) return f;
       let url = f.url;
       if (url.match(/ipfsbafy/i)) {
-        console.log(`[DEBUG] Fixing malformed URL in bid/proof: ${url}`);
+        console.log(`[DEBUG] Fixing malformed URL in bid / proof: ${url} `);
         url = url.replace(/ipfsbafy/i, 'ipfs/bafy');
       }
       return { ...f, url };
@@ -1217,13 +1213,13 @@ async function attachPaymentState(bids) {
   const { rows: payRows } = await pool.query(
     `SELECT bid_id, milestone_index, status, tx_hash
        FROM milestone_payments
-      WHERE bid_id = ANY($1::bigint[]) AND tenant_id = $2`,
+      WHERE bid_id = ANY($1:: bigint[]) AND tenant_id = $2`,
     [bidIds, bids[0].tenant_id]
   );
 
   const byKey = new Map();
   for (const r of payRows) {
-    byKey.set(`${Number(r.bid_id)}:${Number(r.milestone_index)}`, r);
+    byKey.set(`${Number(r.bid_id)}:${Number(r.milestone_index)} `, r);
   }
 
   return bids.map(b => {
@@ -1233,7 +1229,7 @@ async function attachPaymentState(bids) {
       : JSON.parse(b.milestones || '[]');
 
     milestones = milestones.map((m, i) => {
-      const hit = byKey.get(`${bidId}:${i}`);
+      const hit = byKey.get(`${bidId}:${i} `);
       if (!hit) return m;
 
       // FIX: Check if tx_hash is missing. If a hash exists, treat it as released/paid.
@@ -1266,29 +1262,29 @@ async function attachPaymentState(bids) {
 (async () => {
   try {
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS vendor_profiles (
-        wallet_address   text PRIMARY KEY,
-        vendor_name      text NOT NULL,
-        email            text,
-        phone            text,
-        address          text,
-        website          text,
-        archived         boolean NOT NULL DEFAULT false,  -- NEW
-        telegram_chat_id text,                            -- NEW
+      CREATE TABLE IF NOT EXISTS vendor_profiles(
+  wallet_address   text PRIMARY KEY,
+  vendor_name      text NOT NULL,
+  email            text,
+  phone            text,
+  address          text,
+  website          text,
+  archived         boolean NOT NULL DEFAULT false, --NEW
+        telegram_chat_id text, --NEW
         created_at       timestamptz NOT NULL DEFAULT now(),
-        updated_at       timestamptz NOT NULL DEFAULT now()
-      );
-    `);
+  updated_at       timestamptz NOT NULL DEFAULT now()
+);
+`);
 
     // In case the table already existed without the columns
-    await pool.query(`ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS archived boolean NOT NULL DEFAULT false;`);
-    await pool.query(`ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS telegram_chat_id text;`);
+    await pool.query(`ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS archived boolean NOT NULL DEFAULT false; `);
+    await pool.query(`ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS telegram_chat_id text; `);
 
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_vendor_profiles_name
-      ON vendor_profiles (lower(vendor_name));
-    `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_vendor_profiles_archived ON vendor_profiles (archived);`);
+      ON vendor_profiles(lower(vendor_name));
+`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_vendor_profiles_archived ON vendor_profiles(archived); `);
 
     console.log('[db] vendor_profiles ready');
   } catch (e) {
@@ -1302,56 +1298,56 @@ async function attachPaymentState(bids) {
 
     // Generic user profile (shared fields before picking a role)
     await pool.query(`
-  CREATE TABLE IF NOT EXISTS user_profiles (
-    wallet_address TEXT PRIMARY KEY,
-    display_name   TEXT,
-    email          TEXT,
-    phone          TEXT,
-    website        TEXT,
-    address        TEXT,
-    city           TEXT,
-    country        TEXT,
-    telegram_chat_id TEXT,
-    whatsapp       TEXT,
-    updated_at     TIMESTAMP DEFAULT NOW()
-  );
+  CREATE TABLE IF NOT EXISTS user_profiles(
+  wallet_address TEXT PRIMARY KEY,
+  display_name   TEXT,
+  email          TEXT,
+  phone          TEXT,
+  website        TEXT,
+  address        TEXT,
+  city           TEXT,
+  country        TEXT,
+  telegram_chat_id TEXT,
+  whatsapp       TEXT,
+  updated_at     TIMESTAMP DEFAULT NOW()
+);
 `);
     console.log('[db] user_profiles ready');
 
     await pool.query(`
-  CREATE TABLE IF NOT EXISTS proposer_profiles (
-    wallet_address   TEXT PRIMARY KEY,
-    org_name         TEXT,
-    contact_email    TEXT,
-    phone            TEXT,
-    website          TEXT,
-    address          TEXT,
-    city             TEXT,
-    country          TEXT,
-    telegram_chat_id TEXT,
-    whatsapp         TEXT,
-    status           TEXT DEFAULT 'active',  -- active|archived
+  CREATE TABLE IF NOT EXISTS proposer_profiles(
+  wallet_address   TEXT PRIMARY KEY,
+  org_name         TEXT,
+  contact_email    TEXT,
+  phone            TEXT,
+  website          TEXT,
+  address          TEXT,
+  city             TEXT,
+  country          TEXT,
+  telegram_chat_id TEXT,
+  whatsapp         TEXT,
+  status           TEXT DEFAULT 'active', --active | archived
     created_at       TIMESTAMP DEFAULT NOW(),
-    updated_at       TIMESTAMP DEFAULT NOW()
-  );
+  updated_at       TIMESTAMP DEFAULT NOW()
+);
 `);
 
     await pool.query(`ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS vendor_name TEXT`);
     // --- INSERT START: Sally Uyuni App Tables ---
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS school_reports (
-        report_id      TEXT PRIMARY KEY,
-        school_name    TEXT,
-        description    TEXT,
-        rating         INTEGER,
-        image_cid      TEXT,
-        image_url      TEXT,
-        ai_analysis    JSONB,
-        location       JSONB,
-        wallet_address TEXT,
-        created_at     TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
+      CREATE TABLE IF NOT EXISTS school_reports(
+  report_id      TEXT PRIMARY KEY,
+  school_name    TEXT,
+  description    TEXT,
+  rating         INTEGER,
+  image_cid      TEXT,
+  image_url      TEXT,
+  ai_analysis    JSONB,
+  location       JSONB,
+  wallet_address TEXT,
+  created_at     TIMESTAMPTZ DEFAULT NOW()
+);
+`);
     console.log('[db] school_reports ready');
     // --- INSERT END ---
     await pool.query(`ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS telegram_username TEXT`);
@@ -1372,17 +1368,17 @@ async function attachPaymentState(bids) {
     await pool.query(`
       ALTER TABLE proposals
         ADD COLUMN IF NOT EXISTS owner_wallet              text,
-        ADD COLUMN IF NOT EXISTS owner_email               text,
-        ADD COLUMN IF NOT EXISTS owner_phone               text,               -- NEW
-        ADD COLUMN IF NOT EXISTS owner_telegram_chat_id    text,               -- NEW
+  ADD COLUMN IF NOT EXISTS owner_email               text,
+    ADD COLUMN IF NOT EXISTS owner_phone               text, --NEW
+        ADD COLUMN IF NOT EXISTS owner_telegram_chat_id    text, --NEW
         ADD COLUMN IF NOT EXISTS updated_at                timestamptz NOT NULL DEFAULT now();
-    `);
+`);
 
     // Helpful index for "my proposals"
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_proposals_owner_wallet
-      ON proposals (lower(owner_wallet));
-    `);
+      ON proposals(lower(owner_wallet));
+`);
 
     console.log('[db] proposals owner fields ready');
   } catch (e) {
@@ -1396,7 +1392,7 @@ async function attachPaymentState(bids) {
     await pool.query(`
       ALTER TABLE proposals
       ADD COLUMN IF NOT EXISTS location JSONB;
-    `);
+`);
     console.log('[db] Successfully added "location" column to proposals table');
   } catch (e) {
     console.error('[db] Failed to add location column:', e);
@@ -1408,16 +1404,16 @@ async function attachPaymentState(bids) {
 (async () => {
   try {
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS bid_audits (
-        id            bigserial PRIMARY KEY,
-        bid_id        bigint NOT NULL,
-        actor_wallet  text,
-        actor_role    text,
-        changes       jsonb NOT NULL,
-        created_at    timestamptz NOT NULL DEFAULT now()
-      );
-    `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bid_audits_bid ON bid_audits (bid_id);`);
+      CREATE TABLE IF NOT EXISTS bid_audits(
+  id            bigserial PRIMARY KEY,
+  bid_id        bigint NOT NULL,
+  actor_wallet  text,
+  actor_role    text,
+  changes       jsonb NOT NULL,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bid_audits_bid ON bid_audits(bid_id); `);
     console.log('[db] bid_audits ready');
   } catch (e) {
     console.error('bid_audits init failed:', e);
@@ -1432,18 +1428,18 @@ async function attachPaymentState(bids) {
     await pool.query(`
       ALTER TABLE proofs
         ADD COLUMN IF NOT EXISTS file_meta     jsonb,
-        ADD COLUMN IF NOT EXISTS gps_lat       double precision,
-        ADD COLUMN IF NOT EXISTS gps_lon       double precision,
-        ADD COLUMN IF NOT EXISTS gps_alt       double precision,
+  ADD COLUMN IF NOT EXISTS gps_lat       double precision,
+    ADD COLUMN IF NOT EXISTS gps_lon       double precision,
+      ADD COLUMN IF NOT EXISTS gps_alt       double precision,
         ADD COLUMN IF NOT EXISTS capture_time  timestamptz,
-        ADD COLUMN IF NOT EXISTS vendor_prompt text,
-        ADD COLUMN IF NOT EXISTS updated_at    timestamptz NOT NULL DEFAULT now();
-    `);
+          ADD COLUMN IF NOT EXISTS vendor_prompt text,
+            ADD COLUMN IF NOT EXISTS updated_at    timestamptz NOT NULL DEFAULT now();
+`);
     await pool.query(`
       ALTER TABLE bids
         ADD COLUMN IF NOT EXISTS updated_at    timestamptz NOT NULL DEFAULT now(),
-        ADD COLUMN IF NOT EXISTS files         jsonb;
-    `);
+  ADD COLUMN IF NOT EXISTS files         jsonb;
+`);
     console.log('[db] proofs/bids columns ready');
   } catch (e) {
     console.error('proofs/bids columns init failed:', e);
@@ -1458,11 +1454,11 @@ async function attachPaymentState(bids) {
     await pool.query(`
       ALTER TABLE proofs
         ADD COLUMN IF NOT EXISTS approved_at   timestamptz,
-        ADD COLUMN IF NOT EXISTS approved_by   text,
-        ADD COLUMN IF NOT EXISTS rejected_at   timestamptz,
-        ADD COLUMN IF NOT EXISTS rejected_by   text,
+  ADD COLUMN IF NOT EXISTS approved_by   text,
+    ADD COLUMN IF NOT EXISTS rejected_at   timestamptz,
+      ADD COLUMN IF NOT EXISTS rejected_by   text,
         ADD COLUMN IF NOT EXISTS decision_note text
-    `);
+          `);
     console.log('[db] proofs decision columns ready');
   } catch (e) {
     console.error('proofs decision cols init failed:', e);
@@ -1475,16 +1471,16 @@ async function attachPaymentState(bids) {
 (async () => {
   try {
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS user_dashboard_state (
-        wallet_address   text PRIMARY KEY,
-        last_seen_digest timestamptz NOT NULL DEFAULT now(),
-        updated_at       timestamptz NOT NULL DEFAULT now()
-      );
-    `);
+      CREATE TABLE IF NOT EXISTS user_dashboard_state(
+            wallet_address   text PRIMARY KEY,
+            last_seen_digest timestamptz NOT NULL DEFAULT now(),
+            updated_at       timestamptz NOT NULL DEFAULT now()
+          );
+`);
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_user_dash_updated
-      ON user_dashboard_state (updated_at DESC);
-    `);
+      ON user_dashboard_state(updated_at DESC);
+`);
     console.log('[db] user_dashboard_state ready');
   } catch (e) {
     console.error('user_dashboard_state init failed:', e);
@@ -1500,36 +1496,36 @@ async function attachPaymentState(bids) {
     // 1) If there are multiple PENDING proofs for the same milestone,
     //    keep the latest and mark the rest REJECTED.
     await pool.query(`
-      WITH ranked AS (
-        SELECT proof_id,
-               ROW_NUMBER() OVER (
-                 PARTITION BY bid_id, milestone_index
+      WITH ranked AS(
+  SELECT proof_id,
+  ROW_NUMBER() OVER(
+    PARTITION BY bid_id, milestone_index
                  ORDER BY submitted_at DESC NULLS LAST,
-                          updated_at  DESC NULLS LAST,
-                          proof_id    DESC
-               ) AS rn
+    updated_at  DESC NULLS LAST,
+    proof_id    DESC
+  ) AS rn
         FROM proofs
         WHERE status = 'pending'
-      )
+)
       UPDATE proofs p
          SET status = 'rejected',
-             updated_at = NOW()
+  updated_at = NOW()
       FROM ranked r
       WHERE p.proof_id = r.proof_id
         AND r.rn > 1
-    `);
+  `);
 
     // 2) Enforce "only one PENDING per (bid_id, milestone_index)" going forward.
     // FIX: Drop the old strict index that blocked Controller Reports.
-    await pool.query(`DROP INDEX IF EXISTS ux_proofs_pending;`);
+    await pool.query(`DROP INDEX IF EXISTS ux_proofs_pending; `);
 
     // Create a new index that ONLY enforces uniqueness for Vendor Proofs (standard).
     // Controller reports are allowed to coexist with pending vendor proofs.
     await pool.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS ux_proofs_pending_vendor
-        ON proofs (bid_id, milestone_index)
-      WHERE status = 'pending' AND (subtype IS NULL OR subtype = 'standard');
-    `);
+        ON proofs(bid_id, milestone_index)
+      WHERE status = 'pending' AND(subtype IS NULL OR subtype = 'standard');
+`);
 
     console.log('[db] duplicate pending proofs cleaned; unique index updated (allows controller reports)');
   } catch (e) {
@@ -1543,32 +1539,32 @@ async function attachPaymentState(bids) {
 (async () => {
   try {
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS templates (
-        template_id       bigserial PRIMARY KEY,
-        slug              text UNIQUE NOT NULL,
-        title             text NOT NULL,
-        locale            text DEFAULT 'en',
-        category          text,
-        summary           text,
-        default_currency  text DEFAULT 'USD',
-        created_at        timestamptz NOT NULL DEFAULT now(),
-        updated_at        timestamptz NOT NULL DEFAULT now()
-      );
-    `);
+      CREATE TABLE IF NOT EXISTS templates(
+  template_id       bigserial PRIMARY KEY,
+  slug              text UNIQUE NOT NULL,
+  title             text NOT NULL,
+  locale            text DEFAULT 'en',
+  category          text,
+  summary           text,
+  default_currency  text DEFAULT 'USD',
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  updated_at        timestamptz NOT NULL DEFAULT now()
+);
+`);
 
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS template_milestones (
-        id           bigserial PRIMARY KEY,
-        template_id  bigint NOT NULL REFERENCES templates(template_id) ON DELETE CASCADE,
-        idx          integer NOT NULL,
-        name         text NOT NULL,
-        amount       numeric NOT NULL DEFAULT 0,
-        days_offset  integer NOT NULL DEFAULT 30,
-        acceptance   jsonb DEFAULT '[]'::jsonb
-      );
-    `);
+      CREATE TABLE IF NOT EXISTS template_milestones(
+  id           bigserial PRIMARY KEY,
+  template_id  bigint NOT NULL REFERENCES templates(template_id) ON DELETE CASCADE,
+  idx          integer NOT NULL,
+  name         text NOT NULL,
+  amount       numeric NOT NULL DEFAULT 0,
+  days_offset  integer NOT NULL DEFAULT 30,
+  acceptance   jsonb DEFAULT '[]':: jsonb
+);
+`);
 
-    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_template_ms ON template_milestones(template_id, idx);`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_template_ms ON template_milestones(template_id, idx); `);
     console.log('[db] templates ready');
   } catch (e) {
     console.error('templates init failed:', e?.message || e);
@@ -1582,40 +1578,40 @@ async function attachPaymentState(bids) {
   try {
     // 1. Tenants Table
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS tenants (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        name TEXT NOT NULL,
-        slug TEXT UNIQUE NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
+      CREATE TABLE IF NOT EXISTS tenants(
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  slug TEXT UNIQUE NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+`);
 
     // 2. Tenant Configs (Encrypted Credentials)
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS tenant_configs (
-        id SERIAL PRIMARY KEY,
-        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        key TEXT NOT NULL,
-        value TEXT NOT NULL,
-        is_encrypted BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE(tenant_id, key)
-      );
-    `);
+      CREATE TABLE IF NOT EXISTS tenant_configs(
+  id SERIAL PRIMARY KEY,
+  tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  is_encrypted BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(tenant_id, key)
+);
+`);
 
     // 3. Tenant Members (User Roles within a Tenant)
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS tenant_members (
-        id SERIAL PRIMARY KEY,
-        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        wallet_address TEXT NOT NULL,
-        role TEXT NOT NULL, -- 'admin', 'vendor', 'proposer'
+      CREATE TABLE IF NOT EXISTS tenant_members(
+  id SERIAL PRIMARY KEY,
+  tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  wallet_address TEXT NOT NULL,
+  role TEXT NOT NULL, -- 'admin', 'vendor', 'proposer'
         created_at TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE(tenant_id, wallet_address)
-      );
-    `);
+  UNIQUE(tenant_id, wallet_address)
+);
+`);
 
     // 4. Add tenant_id to existing tables
     const tables = ['proposals', 'bids', 'proofs', 'vendor_profiles', 'proposer_profiles', 'school_reports', 'user_dashboard_state', 'milestone_payments'];
@@ -1623,30 +1619,30 @@ async function attachPaymentState(bids) {
       await pool.query(`
         ALTER TABLE ${table}
         ADD COLUMN IF NOT EXISTS tenant_id UUID REFERENCES tenants(id);
-      `);
+`);
     }
 
     // 4b. Add rejection_reason to proofs
     await pool.query(`
       ALTER TABLE proofs
       ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
-    `);
+`);
 
     // 4c. Add Notifications Table
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS notifications (
-        id SERIAL PRIMARY KEY,
-        tenant_id UUID REFERENCES tenants(id),
-        recipient_wallet TEXT NOT NULL,
-        type TEXT NOT NULL, -- 'milestone_approved', 'payment_released', 'bid_awarded'
+      CREATE TABLE IF NOT EXISTS notifications(
+  id SERIAL PRIMARY KEY,
+  tenant_id UUID REFERENCES tenants(id),
+  recipient_wallet TEXT NOT NULL,
+  type TEXT NOT NULL, -- 'milestone_approved', 'payment_released', 'bid_awarded'
         title TEXT,
-        message TEXT,
-        data JSONB DEFAULT '{}'::jsonb,
-        is_read BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
+  message TEXT,
+  data JSONB DEFAULT '{}':: jsonb,
+  is_read BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
       CREATE INDEX IF NOT EXISTS idx_notifications_recipient ON notifications(recipient_wallet);
-    `);
+`);
 
     // 5. Create Default Tenant (if none exists) & Migrate Data
     // We use a specific UUID for the default tenant to make migration idempotent
@@ -1654,10 +1650,10 @@ async function attachPaymentState(bids) {
 
     // Insert default tenant if not exists
     await pool.query(`
-      INSERT INTO tenants (id, name, slug)
-      VALUES ($1, 'Global', 'default')
-      ON CONFLICT (id) DO NOTHING;
-    `, [defaultTenantId]);
+      INSERT INTO tenants(id, name, slug)
+VALUES($1, 'Global', 'default')
+      ON CONFLICT(id) DO NOTHING;
+`, [defaultTenantId]);
 
     // Backfill NULL tenant_ids with default tenant
     for (const table of tables) {
@@ -1665,17 +1661,17 @@ async function attachPaymentState(bids) {
         UPDATE ${table}
         SET tenant_id = $1
         WHERE tenant_id IS NULL;
-      `, [defaultTenantId]);
+`, [defaultTenantId]);
     }
 
     // 6. Special Handling: user_dashboard_state PK update
     // (Safe to run after backfill because tenant_id is now populated)
     await pool.query(`
       ALTER TABLE user_dashboard_state DROP CONSTRAINT IF EXISTS user_dashboard_state_pkey;
-    `);
+`);
     await pool.query(`
-      ALTER TABLE user_dashboard_state ADD PRIMARY KEY (wallet_address, tenant_id);
-    `);
+      ALTER TABLE user_dashboard_state ADD PRIMARY KEY(wallet_address, tenant_id);
+`);
 
     console.log('[db] multi-tenancy schema ready & migrated');
   } catch (e) {
@@ -1749,7 +1745,7 @@ function toE164(raw) {
   if (!raw) return null;
   const s = String(raw).replace(/[^\d+]/g, "");
   if (s.startsWith("+")) return s;
-  return `${WA_DEFAULT_COUNTRY}${s}`;
+  return `${WA_DEFAULT_COUNTRY}${s} `;
 }
 
 // Determine role from address: admin > vendor (has vendor_profile) > entity (has proposals) > user
@@ -1758,14 +1754,14 @@ async function roleForAddress(address) {
 
   // vendor if has a vendor profile
   const { rows: vp } = await pool.query(
-    `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address)=lower($1) LIMIT 1`,
+    `SELECT 1 FROM vendor_profiles WHERE lower(wallet_address) = lower($1) LIMIT 1`,
     [address]
   );
   if (vp[0]) return 'vendor';
 
   // entity if has at least one proposal they own
   const { rows: ep } = await pool.query(
-    `SELECT 1 FROM proposals WHERE lower(owner_wallet)=lower($1) LIMIT 1`,
+    `SELECT 1 FROM proposals WHERE lower(owner_wallet) = lower($1) LIMIT 1`,
     [address]
   );
   if (ep[0]) return 'entity';
