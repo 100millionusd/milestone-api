@@ -733,6 +733,33 @@ app.get('/api/voting/projects', async (req, res) => {
   }
 });
 
+// [ADMIN] List ALL Voting Projects (Active + Archived)
+app.get('/api/admin/voting/projects', authGuard, adminGuard, async (req, res) => {
+  try {
+    // Get ALL projects (No status filter)
+    const { rows: projects } = await pool.query(
+      `SELECT * FROM voting_projects 
+       ORDER BY created_at DESC`
+    );
+
+    const { rows: counts } = await pool.query(
+      `SELECT project_id, COUNT(*) as vote_count 
+         FROM votes 
+         GROUP BY project_id`
+    );
+
+    const result = projects.map(p => {
+      const c = counts.find(x => x.project_id === p.id);
+      return { ...p, vote_count: c ? parseInt(c.vote_count) : 0 };
+    });
+
+    res.json(result);
+  } catch (e) {
+    console.error('Admin list projects error:', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // [ADMIN] Archive Voting Project
 app.put('/api/voting/projects/:id/archive', authGuard, adminGuard, async (req, res) => {
   try {
