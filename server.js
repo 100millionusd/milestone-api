@@ -677,7 +677,8 @@ async function ensureVotingSchema() {
 // ... existing routes ...
 
 // [ADMIN] Create Voting Project
-app.post('/api/voting/projects', requireAdmin, async (req, res) => {
+// [ADMIN] Create Voting Project
+app.post('/api/voting/projects', authGuard, adminGuard, async (req, res) => {
   try {
     const { title, description, imageCid, imageUrl, department } = req.body;
     const tenantId = req.headers['x-tenant-id'] || 'default';
