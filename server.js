@@ -579,6 +579,158 @@ async function ensureProofsColumns() {
 // ---- Safe Tx overlay helpers (response-time hydration) ----
 const SAFE_CACHE_TTL_MS = Number(process.env.SAFE_CACHE_TTL_MS || 5000);
 
+
+// ==============================
+// Voting & Geofencing Logic
+// ==============================
+
+// Approximate bounding box for Department of Potosi, Bolivia
+function isLocationInPotosi(lat, lng) {
+  if (!lat || !lng) return false;
+  // Bounds: North -17.8, South -22.9, West -68.8, East -65.2
+  return (lat <= -17.8 && lat >= -22.9 && lng >= -68.8 && lng <= -65.2);
+}
+
+// Ensure Voting Schemas
+(async () => {
+  try {
+    await ensureVotingSchema();
+  } catch (e) {
+    console.error('[startup] ensureVotingSchema failed', e);
+  }
+})();
+
+async function ensureVotingSchema() {
+  const sql = `
+    CREATE TABLE IF NOT EXISTS voting_projects (
+      id SERIAL PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT,
+      image_cid TEXT, -- IPFS CID
+      image_url TEXT,
+      status TEXT DEFAULT 'active', -- 'active', 'archived'
+      department TEXT DEFAULT 'Potosi',
+      created_by TEXT, -- Admin wallet
+      created_at TIMESTAMPTZ DEFAULT now(),
+      tenant_id TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS votes (
+      id SERIAL PRIMARY KEY,
+      project_id INT REFERENCES voting_projects(id),
+      voter_wallet TEXT NOT NULL,
+      location_lat FLOAT,
+      location_lng FLOAT,
+      timestamp TIMESTAMPTZ DEFAULT now(),
+      tenant_id TEXT,
+      UNIQUE(project_id, voter_wallet) -- One vote per project per person
+    );
+  `;
+  await pool.query(sql);
+  console.log('[startup] voting schema ensured');
+}
+
+
+// ==============================
+// Start Server
+// ==============================
+
+// ... existing routes ...
+
+// [ADMIN] Create Voting Project
+app.post('/api/voting/projects', requireAdmin, async (req, res) => {
+  try {
+    const { title, description, imageCid, imageUrl, department } = req.body;
+    const tenantId = req.headers['x-tenant-id'] || 'default';
+    const adminWallet = req.user.sub;
+
+    if (!title) return res.status(400).json({ error: 'Title required' });
+
+    const { rows } = await pool.query(
+      `INSERT INTO voting_projects 
+         (title, description, image_cid, image_url, department, created_by, tenant_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [title, description, imageCid, imageUrl, department || 'Potosi', adminWallet, tenantId]
+    );
+
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('Create voting project error:', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// [PUBLIC] List Voting Projects
+app.get('/api/voting/projects', async (req, res) => {
+  try {
+    const tenantId = req.headers['x-tenant-id'] || 'default';
+    
+    // Get all active projects
+    const { rows: projects } = await pool.query(
+      `SELECT * FROM voting_projects WHERE status='active' AND tenant_id=$1 ORDER BY created_at DESC`,
+      [tenantId]
+    );
+
+    // Get vote counts for these projects
+    const { rows: counts } = await pool.query(
+        `SELECT project_id, COUNT(*) as vote_count 
+         FROM votes 
+         WHERE tenant_id=$1 
+         GROUP BY project_id`,
+        [tenantId]
+    );
+
+    // Merge counts
+    const result = projects.map(p => {
+        const c = counts.find(x => x.project_id === p.id);
+        return { ...p, vote_count: c ? parseInt(c.vote_count) : 0 };
+    });
+
+    res.json(result);
+  } catch (e) {
+    console.error('List voting projects error:', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// [AUTH] Cast Vote
+app.post('/api/voting/vote', softAuth, async (req, res) => {
+  try {
+    const { projectId, lat, lng } = req.body;
+    const tenantId = req.headers['x-tenant-id'] || 'default';
+    const userWallet = req.user?.sub;
+
+    if (!userWallet) return res.status(401).json({ error: 'Authentication required' });
+    if (!projectId) return res.status(400).json({ error: 'Project ID required' });
+    if (!lat || !lng) return res.status(400).json({ error: 'Location required' });
+
+    // 1. Geofence Check
+    if (!isLocationInPotosi(lat, lng)) {
+        return res.status(403).json({ error: 'You must be in the Department of Potosi to vote.' });
+    }
+
+    // 2. Check Project
+    const projRes = await pool.query('SELECT * FROM voting_projects WHERE id=$1 AND status=\'active\'', [projectId]);
+    if (projRes.rowCount === 0) return res.status(404).json({ error: 'Project not found or inactive' });
+
+    // 3. Cast Vote
+    await pool.query(
+      `INSERT INTO votes (project_id, voter_wallet, location_lat, location_lng, tenant_id)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [projectId, userWallet, lat, lng, tenantId]
+    );
+
+    res.json({ success: true });
+  } catch (e) {
+    if (e.code === '23505') { // Unique violation
+        return res.status(409).json({ error: 'You have already voted for this project.' });
+    }
+    console.error('Vote error:', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 const SAFE_LOOKUPS_PER_REQUEST =
   process.env.SAFE_LOOKUPS_PER_REQUEST !== undefined
     ? Math.max(0, Math.floor(Number(process.env.SAFE_LOOKUPS_PER_REQUEST)))
