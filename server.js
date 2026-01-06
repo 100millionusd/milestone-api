@@ -733,6 +733,27 @@ app.get('/api/voting/projects', async (req, res) => {
   }
 });
 
+// [ADMIN] Archive Voting Project
+app.put('/api/voting/projects/:id/archive', authGuard, adminGuard, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { rowCount } = await pool.query(
+      "UPDATE voting_projects SET status = 'archived' WHERE id = $1",
+      [id]
+    );
+
+    if (rowCount === 0) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Archive project error:', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // [AUTH] Cast Vote
 app.post('/api/voting/vote', softAuth, async (req, res) => {
   try {
