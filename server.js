@@ -581,6 +581,45 @@ const SAFE_CACHE_TTL_MS = Number(process.env.SAFE_CACHE_TTL_MS || 5000);
 
 
 // ==============================
+// Express app (Moved from line 4001)
+// ==============================
+const app = express();
+app.set("trust proxy", 1);
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      // Allow exact match
+      if (CORS_ORIGINS.includes(origin)) return cb(null, true);
+      // Allow subdomains of milestonex.io
+      if (origin.endsWith('.milestonex.io') || origin === 'https://milestonex.io') return cb(null, true);
+      // Allow subdomains of lithiumx.netlify.app (legacy)
+      if (origin.endsWith('.lithiumx.netlify.app')) return cb(null, true);
+      // Allow sallyuyuni.com
+      if (origin === 'https://sallyuyuni.com' || origin.endsWith('.sallyuyuni.com')) return cb(null, true);
+      // Allow milestonex-uyuni.com
+      if (origin === 'https://milestonex-uyuni.com' || origin.endsWith('.milestonex-uyuni.com')) return cb(null, true);
+
+      console.log('[CORS] Blocked origin:', origin);
+      return cb(new Error("Not allowed by CORS"));
+    },
+    credentials: true, // Required for cookies/auth headers
+  })
+);
+app.options('*', cors()); // Enable preflight for all routes
+app.use(helmet());
+app.use(limiter);
+
+app.use(express.json({ limit: "20mb" }));
+app.use(cookieParser()); // 🔐 parse JWT cookie
+app.use(resolveTenant);    // 🏢 Multi-tenancy context
+
+// Ensure JSON parsing is registered before admin routes
+app.use(express.json({ limit: '2mb' }));
+
+
+// ==============================
 // Voting & Geofencing Logic
 // ==============================
 
@@ -665,7 +704,7 @@ app.post('/api/voting/projects', requireAdmin, async (req, res) => {
 app.get('/api/voting/projects', async (req, res) => {
   try {
     const tenantId = req.headers['x-tenant-id'] || 'default';
-    
+
     // Get all active projects
     const { rows: projects } = await pool.query(
       `SELECT * FROM voting_projects WHERE status='active' AND tenant_id=$1 ORDER BY created_at DESC`,
@@ -674,17 +713,17 @@ app.get('/api/voting/projects', async (req, res) => {
 
     // Get vote counts for these projects
     const { rows: counts } = await pool.query(
-        `SELECT project_id, COUNT(*) as vote_count 
+      `SELECT project_id, COUNT(*) as vote_count 
          FROM votes 
          WHERE tenant_id=$1 
          GROUP BY project_id`,
-        [tenantId]
+      [tenantId]
     );
 
     // Merge counts
     const result = projects.map(p => {
-        const c = counts.find(x => x.project_id === p.id);
-        return { ...p, vote_count: c ? parseInt(c.vote_count) : 0 };
+      const c = counts.find(x => x.project_id === p.id);
+      return { ...p, vote_count: c ? parseInt(c.vote_count) : 0 };
     });
 
     res.json(result);
@@ -707,7 +746,7 @@ app.post('/api/voting/vote', softAuth, async (req, res) => {
 
     // 1. Geofence Check
     if (!isLocationInPotosi(lat, lng)) {
-        return res.status(403).json({ error: 'You must be in the Department of Potosi to vote.' });
+      return res.status(403).json({ error: 'You must be in the Department of Potosi to vote.' });
     }
 
     // 2. Check Project
@@ -724,7 +763,7 @@ app.post('/api/voting/vote', softAuth, async (req, res) => {
     res.json({ success: true });
   } catch (e) {
     if (e.code === '23505') { // Unique violation
-        return res.status(409).json({ error: 'You have already voted for this project.' });
+      return res.status(409).json({ error: 'You have already voted for this project.' });
     }
     console.error('Vote error:', e);
     res.status(500).json({ error: 'Internal server error' });
@@ -3998,42 +4037,7 @@ async function runAgent2OnBid(bidRow, proposalRow, { promptOverride, tenantId } 
 // ==============================
 // Express app
 // ==============================
-const app = express();
-app.set("trust proxy", 1);
-
-
-
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      // Allow exact match
-      if (CORS_ORIGINS.includes(origin)) return cb(null, true);
-      // Allow subdomains of milestonex.io
-      if (origin.endsWith('.milestonex.io') || origin === 'https://milestonex.io') return cb(null, true);
-      // Allow subdomains of lithiumx.netlify.app (legacy)
-      if (origin.endsWith('.lithiumx.netlify.app')) return cb(null, true);
-      // Allow sallyuyuni.com
-      if (origin === 'https://sallyuyuni.com' || origin.endsWith('.sallyuyuni.com')) return cb(null, true);
-      // Allow milestonex-uyuni.com
-      if (origin === 'https://milestonex-uyuni.com' || origin.endsWith('.milestonex-uyuni.com')) return cb(null, true);
-
-      console.log('[CORS] Blocked origin:', origin);
-      return cb(new Error("Not allowed by CORS"));
-    },
-    credentials: true, // Required for cookies/auth headers
-  })
-);
-app.options('*', cors()); // Enable preflight for all routes
-app.use(helmet());
-app.use(limiter);
-
-app.use(express.json({ limit: "20mb" }));
-app.use(cookieParser()); // 🔐 parse JWT cookie
-app.use(resolveTenant);    // 🏢 Multi-tenancy context
-
-// Ensure JSON parsing is registered before admin routes
-app.use(express.json({ limit: '2mb' }));
+// Express app moved to top (line 583)
 
 // DEBUG: Dump tenant members (Top Level)
 app.get("/api/debug/tenant-members", async (req, res) => {
