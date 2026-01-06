@@ -664,8 +664,24 @@ async function ensureVotingSchema() {
       tenant_id TEXT,
       UNIQUE(project_id, voter_wallet) -- One vote per project per person
     );
+    );
   `;
   await pool.query(sql);
+
+  // Ensure UNIQUE constraint exists (for legacy tables created before constraint)
+  try {
+    await pool.query(`
+      ALTER TABLE votes 
+      ADD CONSTRAINT unique_vote UNIQUE (project_id, voter_wallet);
+    `);
+    console.log('[startup] unique_vote constraint added');
+  } catch (e) {
+    // Ignore if already exists
+    if (e.code !== '42710') { // 42710 = constraint already exists
+      console.error('[startup] warning: unique_vote constraint check:', e.message);
+    }
+  }
+
   console.log('[startup] voting schema ensured');
 }
 
