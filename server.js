@@ -706,9 +706,12 @@ app.get('/api/voting/projects', async (req, res) => {
   try {
     const tenantId = req.headers['x-tenant-id'] || 'default';
 
-    // Get all active projects
+    // Get all active projects (matching tenant OR global/default)
     const { rows: projects } = await pool.query(
-      `SELECT * FROM voting_projects WHERE status='active' AND tenant_id=$1 ORDER BY created_at DESC`,
+      `SELECT * FROM voting_projects 
+       WHERE status='active' 
+         AND (tenant_id=$1 OR tenant_id IS NULL OR tenant_id='default') 
+       ORDER BY created_at DESC`,
       [tenantId]
     );
 
@@ -716,7 +719,7 @@ app.get('/api/voting/projects', async (req, res) => {
     const { rows: counts } = await pool.query(
       `SELECT project_id, COUNT(*) as vote_count 
          FROM votes 
-         WHERE tenant_id=$1 
+         WHERE (tenant_id=$1 OR tenant_id IS NULL OR tenant_id='default') 
          GROUP BY project_id`,
       [tenantId]
     );
