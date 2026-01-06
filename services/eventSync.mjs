@@ -9,7 +9,7 @@ import { sepolia } from "viem/chains";
 //   EVENT_TOPIC0           (0x keccak of the event signature to filter)
 //   ENABLE_EVENT_SYNC      (set to "false" to disable)
 
-const RPC_URL = process.env.SEPOLIA_RPC_URL;
+const RPC_URL = process.env.SEPOLIA_RPC_URL || "https://ethereum-sepolia.publicnode.com";
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
 const TOPIC0 = process.env.EVENT_TOPIC0 || null;
 
@@ -19,7 +19,15 @@ if (!CONTRACT_ADDRESS) throw new Error("Missing CONTRACT_ADDRESS");
 const CONFIRMATIONS = 5n;   // reorg safety
 const CHUNK = 2000n;        // range size per getLogs
 
-const client = createPublicClient({ chain: sepolia, transport: http(RPC_URL) });
+// Add Origin header to satisfy Ankr/Infura allowlists
+const client = createPublicClient({
+  chain: sepolia,
+  transport: http(RPC_URL, {
+    fetchOptions: {
+      headers: { Origin: 'https://milestonex.io' }
+    }
+  })
+});
 
 // In-memory state (swap to DB if you want durability)
 let lastProcessedBlock = null; // bigint
